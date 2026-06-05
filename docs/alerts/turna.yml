@@ -1,0 +1,207 @@
+groups:
+  - name: turna_turn
+    rules:
+      # ── Availability ───────────────────────────────────────────────────────
+
+      - alert: TurnaNodeDown
+        expr: up{job="turna"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna-node {{ $labels.instance }} is down"
+          description: >
+            The turna-node health endpoint has been unreachable for over 1 minute.
+            TURN allocations on this node are orphaned until failover completes.
+
+      - alert: TurnaNodeDraining
+        expr: turna_draining == 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna-node {{ $labels.instance }} is draining"
+          description: >
+            Node is in draining state (SIGTERM received or set by operator).
+            Expect reduced capacity until the node exits or drain completes.
+
+      # ── Allocations ────────────────────────────────────────────────────────
+
+      - alert: TurnaAllocationsHigh
+        expr: turna_active_allocations > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High allocation count on {{ $labels.instance }}"
+          description: >
+            Active TURN allocations ({{ $value }}) exceed 5000 for 5 minutes.
+            Review max_allocations config and consider adding nodes.
+
+      - alert: TurnaAllocationRateSpike
+        expr: rate(turna_total_allocations[5m]) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Allocation rate spike on {{ $labels.instance }}"
+          description: >
+            New allocations are being created at {{ $value | humanize }}/s.
+            May indicate a client bug or a SFU configuration issue.
+
+      # ── Auth ───────────────────────────────────────────────────────────────
+
+      - alert: TurnaAuthFailuresHigh
+        expr: rate(turna_auth_failures[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High TURN auth failure rate on {{ $labels.instance }}"
+          description: >
+            Auth failures at {{ $value | humanize }}/s over 5 minutes.
+            Could indicate credential rotation mismatch or a brute-force attempt.
+
+      # ── Bandwidth ──────────────────────────────────────────────────────────
+
+      - alert: TurnaHighBandwidth
+        expr: |
+          rate(turna_bytes_received[5m]) + rate(turna_bytes_sent[5m]) > 800e6
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High bandwidth on {{ $labels.instance }}"
+          description: >
+            Combined inbound+outbound traffic exceeds 800 MB/s for 5 minutes.
+            Verify NIC capacity and consider load-balancing to another node.
+
+      # ── Tarantool backend ──────────────────────────────────────────────────
+
+      - alert: TurnaTarantoolConnectionFailed
+        expr: tarantool_connection_state > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tarantool connection degraded on {{ $labels.instance }}"
+          description: >
+            tarantool_connection_state = {{ $value }}
+            (0 = connected, 1 = reconnecting, 2 = failed).
+            Allocations will not be persisted until the connection recovers.
+
+      - alert: TurnaTarantoolPoolBroken
+        expr: tarantool_pool_slots{state="broken"} > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Broken Tarantool pool slots on {{ $labels.instance }}"
+          description: >
+            {{ $value }} pool slot(s) are in broken state for over 1 minute.
+            Reconnect is attempted automatically; check Tarantool connectivity
+            if this persists.
+
+      - alert: TurnaTarantoolWriteErrors
+        expr: rate(tarantool_writer_errors_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tarantool write errors on {{ $labels.instance }}"
+          description: >
+            Write-behind writer is failing at {{ $value | humanize }} errors/s.
+            Allocations may not be persisted correctly.
+
+      - alert: TurnaTarantoolWritesDropped
+        expr: rate(tarantool_writes_dropped_total[5m]) > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tarantool write queue full on {{ $labels.instance }}"
+          description: >
+            Writer channel is dropping {{ $value | humanize }} events/s.
+            Tarantool may be too slow or the write rate is unusually high.
+
+      # ── Failover ───────────────────────────────────────────────────────────
+
+      - alert: TurnaFailoverActive
+        expr: rate(failover_claimed_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failover claims detected from {{ $labels.instance }}"
+          description: >
+            Node is claiming allocations from dead peers at
+            {{ $value | humanize }} claims/s. Verify cluster health.
+
+      - alert: TurnaFailoverErrors
+        expr: rate(failover_errors_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failover backend errors on {{ $labels.instance }}"
+          description: >
+            Failover sweep is hitting backend errors at
+            {{ $value | humanize }}/s. Orphaned allocations may not be reclaimed.
+
+      - alert: TurnaFailoverSweepSlow
+        expr: failover_sweep_duration_us > 5_000_000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow failover sweep on {{ $labels.instance }}"
+          description: >
+            Last failover sweep took {{ $value | humanizeDuration }} (> 5s).
+            Check Tarantool latency and the number of dead-node allocations.
+
+  # ── Node exporter baseline ────────────────────────────────────────────────
+
+  - name: node_baseline
+    rules:
+      - alert: NodeHighCPU
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | humanize }}% for 5+ minutes."
+
+      - alert: NodeLowDisk
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} /
+           node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk on {{ $labels.instance }}"
+          description: >
+            Only {{ $value | humanize }}% disk space remaining on /.
+            Clean up logs or expand the volume.
+
+      - alert: NodeCriticalDisk
+        expr: |
+          (node_filesystem_avail_bytes{mountpoint="/"} /
+           node_filesystem_size_bytes{mountpoint="/"}) * 100 < 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical disk on {{ $labels.instance }}"
+          description: "Less than 5% disk remaining — node may stop writing logs and crash."
+
+      - alert: NodeHighMemory
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | humanize }}%. Risk of OOM kill."

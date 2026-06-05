@@ -1,0 +1,22 @@
+[package]
+publish = false
+name    = "turna-state-backend"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default   = ["tarantool"]
+tarantool = ["rmpv", "sha1", "base64"]
+
+[dependencies]
+tokio.workspace      = true
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true
+dashmap.workspace    = true
+# msgpack decoder for iproto responses (only compiled with tarantool feature)
+rmpv = { version = "1", optional = true }
+# SHA-1 + base64 for chap-sha1 auth handshake (Tarantool iproto AUTH).
+sha1 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }

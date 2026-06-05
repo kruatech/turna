@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-turn
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: stun-udp
+      port: {{ .Values.turn.listenPort }}
+      targetPort: stun-udp
+      protocol: UDP
+    - name: stun-tcp
+      port: {{ .Values.turn.listenPort }}
+      targetPort: stun-tcp
+      protocol: TCP
+    - name: health
+      port: {{ .Values.turn.healthPort }}
+      targetPort: health
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+{{- if .Values.signaling.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-signaling
+  labels:
+    app.kubernetes.io/name: turna-signaling
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: ws
+      port: {{ .Values.signaling.listenPort }}
+      targetPort: ws
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: turna-signaling
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}

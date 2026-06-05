@@ -1,0 +1,16 @@
+[package]
+publish = false
+name = "turna-load-test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+rand.workspace = true
+turna-proto-stun.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+md5.workspace = true
+turna-observability.workspace = true
+clap = { version = "4", features = ["derive"] }

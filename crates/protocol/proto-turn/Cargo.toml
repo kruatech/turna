@@ -1,0 +1,9 @@
+[package]
+publish = false
+name = "turna-proto-turn"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+turna-proto-stun.workspace = true

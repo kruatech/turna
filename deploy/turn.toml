@@ -1,0 +1,159 @@
+# =============================================================================
+# turna server configuration — annotated template
+# =============================================================================
+#
+# Quick start (dev):
+#   ./turna-node deploy/turn.toml          # works as-is, warns about defaults
+#
+# Production:
+#   Set production = true below (or TURNA_PRODUCTION=true in env).
+#   Generate secrets:  openssl rand -hex 32
+#   Read docs/DEPLOY.md before deploying.
+#
+# Environment variable expansion is supported in any string value:
+#   shared_secret = "${TURNA_SHARED_SECRET}"
+#   shared_secret = "${TURNA_SHARED_SECRET:-fallback-default}"
+#   shared_secret = "file:///run/secrets/turna_shared_secret"
+#
+# See .env.example for all supported TURNA_* variables.
+
+# Master safety switch.
+# - false (default): server starts with warnings if secrets are placeholders.
+# - true: validation refuses dangerous defaults; missing external_ip is fatal;
+#         placeholder secrets are fatal.
+# Can also be set via TURNA_PRODUCTION=true.
+production = false
+
+# =============================================================================
+# [turn] — TURN server listener and identity
+# =============================================================================
+[turn]
+listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
+# Externally reachable IP. Required in production.
+# Tip: don't leave this blank behind NAT — clients receive this IP in the
+# XOR-RELAYED-ADDRESS attribute.
+external_ip = "${TURNA_EXTERNAL_IP:-}"
+realm       = "${TURNA_REALM:-turna}"
+
+[turn.auth]
+# Time-limited credentials, coturn-compatible (lt-cred-mech).
+# Clients build:
+#   username = "{expires_unix_ts}:{user}"
+#   password = base64(HMAC-SHA1(shared_secret, username))
+shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
+token_ttl     = 86400
+
+# Static long-term credentials — uncomment if you want fixed users
+# instead of (or in addition to) shared-secret. When non-empty,
+# AuthMode::LongTerm is selected in main.rs.
+# [[turn.auth.static_users]]
+# username = "alice"
+# password = "${TURNA_USER_ALICE_PASSWORD}"
+# [[turn.auth.static_users]]
+# username = "bob"
+# password = "${TURNA_USER_BOB_PASSWORD}"
+
+[turn.relay]
+min_port        = 49152
+max_port        = 65535
+max_allocations = 50000
+
+# Per-user bandwidth + allocation limits. Defaults: no bandwidth cap,
+# 100 simultaneous allocations per username. Set non-zero in prod to
+# make abuse uneconomic.
+[turn.relay.quota]
+max_bytes_per_sec = 0     # 0 = unlimited
+max_per_user      = 100   # 0 = unlimited (NOT recommended for prod)
+
+# =============================================================================
+# [turn.observability] — telemetry & tracing
+# =============================================================================
+[turn.observability]
+# OpenTelemetry OTLP endpoint. Leave empty to disable OTel export.
+# Logs still go to stdout regardless.
+otlp_endpoint        = "${TURNA_OTLP_ENDPOINT:-}"
+# Fraction of spans to sample (0.0–1.0). Errors and Allocate methods are
+# always sampled regardless of this value.
+trace_sample_rate    = 0.01
+# JSON logs (recommended for production ingestion).
+json_logs            = false
+# Hard cap on spans/second to protect against runaway tracing.
+max_spans_per_second = 1000
+
+# =============================================================================
+# [signaling] — coturn-style HTTP credentials server (optional)
+# =============================================================================
+[signaling]
+listen             = "${TURNA_SIGNALING_ADDR:-0.0.0.0:9001}"
+turn_url           = "${TURNA_TURN_URL:-turn:127.0.0.1:3478}"
+turn_shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
+
+# =============================================================================
+# [health] — Prometheus metrics + /health endpoint
+# =============================================================================
+[health]
+listen = "${TURNA_HEALTH_ADDR:-0.0.0.0:9090}"
+
+# =============================================================================
+# [cluster] — multi-node mode (PR 3 / task #3)
+# =============================================================================
+# Leave at defaults for single-node operation.  See docs/CLUSTER.md to
+# enable persistence + failover with Tarantool.
+[cluster]
+node_id     = "${TURNA_NODE_ID:-node-1}"
+gossip_port = 7946
+seeds       = []
+
+[cluster.backend]
+# "memory" (default, single-node) | "tarantool" (cluster)
+type = "${TURNA_BACKEND_TYPE:-memory}"
+# host:port for Tarantool.
+uri  = "${TURNA_BACKEND_URI:-}"
+# Authentication for the Tarantool iproto connection. Empty user = the
+# anonymous `guest` role, which has no rights on a properly-configured
+# Tarantool — only use empty for local dev against an unsecured box.
+#
+# Production: run deploy/tarantool/init.lua to create a dedicated user
+# with the minimum privileges, then set these:
+user     = "${TURNA_BACKEND_USER:-}"
+password = "${TURNA_BACKEND_PASSWORD:-}"
+# Number of parallel TCP connections to Tarantool. 0 = use the library
+# default (currently 8). Increase if you have heavy heartbeat / writer
+# concurrency; decrease only if Tarantool itself is connection-limited.
+pool_size = 0
+
+[cluster.persistence]
+# "disabled" (default, no write-behind) | "write_behind" (production cluster)
+mode               = "${TURNA_PERSISTENCE_MODE:-disabled}"
+channel_capacity   = 65536
+batch_max_size     = 256
+batch_max_delay_ms = 100
+
+# =============================================================================
+# [management] — gRPC control plane address (turna-control-plane reads this)
+# =============================================================================
+[management]
+listen = "${TURNA_GRPC_ADDR:-127.0.0.1:5350}"
+
+# =============================================================================
+# [grpc] — TLS / mTLS for the management gRPC API
+# =============================================================================
+# Read by turna-control-plane. Cert files are loaded BY PATH at startup;
+# put paths here (or in env), never PEM bodies.
+#
+# Modes:
+#   "disabled" — plaintext. Acceptable only when [management] listen is
+#                127.0.0.1 / ::1; production validation rejects "disabled"
+#                with a non-loopback listen address.
+#   "tls"      — server presents a cert; clients verify the server.
+#   "mtls"     — both server and client present certs (recommended for
+#                any deployment where the control plane is reachable
+#                beyond localhost). Requires tls_ca.
+#
+# Env overrides: TURNA_GRPC_TLS_MODE, TURNA_GRPC_TLS_CERT, TURNA_GRPC_TLS_KEY,
+# TURNA_GRPC_TLS_CA. The env value, if non-empty, wins over the file value.
+[grpc]
+tls_mode = "${TURNA_GRPC_TLS_MODE:-disabled}"
+tls_cert = "${TURNA_GRPC_TLS_CERT:-}"
+tls_key  = "${TURNA_GRPC_TLS_KEY:-}"
+tls_ca   = "${TURNA_GRPC_TLS_CA:-}"

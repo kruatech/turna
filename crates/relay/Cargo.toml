@@ -1,0 +1,28 @@
+[package]
+publish = false
+name = "turna-relay"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+io-uring = ["turna-transport/io-uring"]
+
+[dependencies]
+libc = "0.2"
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+turna-proto-stun.workspace = true
+turna-proto-turn.workspace = true
+turna-proto-rtp.workspace = true
+turna-transport.workspace = true
+turna-session.workspace = true
+turna-auth.workspace = true
+turna-qos.workspace = true
+turna-crypto.workspace = true
+turna-health.workspace = true
+turna-rtp-analyzer.workspace = true

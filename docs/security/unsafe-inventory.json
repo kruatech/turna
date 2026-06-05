@@ -1,0 +1,148 @@
+{
+  "version": "1.0",
+  "generated": "2026-05-23",
+  "scope": "crates/{transport,relay}/src/",
+  "summary": {
+    "total": 99,
+    "safety_justified": 75,
+    "needs_review": 15,
+    "suspect_fixed": 9
+  },
+  "entries": [
+    {
+      "id": "USF-001",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/hugepages.rs",
+      "lines": "alloc(), free(), prefault_pages()",
+      "category": "memory_layout",
+      "reason": "mmap region access via raw pointer arithmetic",
+      "invariant": "slot_index < slot_count maintained by Mutex<Vec<usize>>; offset + slot_size <= total_size",
+      "safety_assumptions": [
+        "Mutex<Vec<usize>> serialises all alloc/free — no concurrent slot_index aliasing",
+        "mmap region valid for lifetime of HugePagePool",
+        "HugePagePool outlives all PoolBuffer instances (enforced by drop assert)"
+      ],
+      "review_status": "FIXED",
+      "notes": "ABA race (SUSPECT #1) eliminated: Treiber CAS stack replaced with Mutex<Vec>. Drop asserts zero active buffers before munmap.",
+      "fix_commit": "unsafe-audit PR1"
+    },
+    {
+      "id": "USF-002",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/hugepages.rs",
+      "lines": "PoolBuffer::write(), as_slice(), as_mut_slice(), uninit_buf_mut()",
+      "category": "memory_layout",
+      "reason": "raw pointer access to mmap slot",
+      "invariant": "ptr valid for capacity bytes; as_slice/as_mut_slice only expose [0, len); uninit_buf_mut returns MaybeUninit",
+      "safety_assumptions": [
+        "len <= capacity always (enforced by set_len assert)",
+        "write() sets len = bytes_written before any read via as_slice()"
+      ],
+      "review_status": "FIXED",
+      "notes": "SUSPECT #4 fixed: as_mut_slice previously returned capacity bytes including uninit. Now returns only [0, len). uninit_buf_mut added for kernel I/O path."
+    },
+    {
+      "id": "USF-003",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/af_xdp.rs",
+      "lines": "Umem::frame_slice(), frame_slice_mut()",
+      "category": "transport_optimization",
+      "reason": "raw slice from mmap'd UMEM region (AF_XDP kernel-shared memory)",
+      "invariant": "addr + len <= umem.size (checked via assert before pointer arithmetic)",
+      "safety_assumptions": [
+        "addr comes from RX ring descriptor (kernel-produced)",
+        "frame_slice called only after descriptor dequeued from RX ring",
+        "frame_slice_mut requires &mut self — exclusive access"
+      ],
+      "review_status": "FIXED",
+      "notes": "SUSPECT #2 fixed: added checked_add + assert for OOB detection. NEEDS-REVIEW remains on Sync impl: concurrent kernel DMA write vs userspace read is safe only with RX ring dequeue ordering, not enforced by type system.",
+      "remaining_concern": "NEEDS-REVIEW: Sync impl allows shared refs across threads; AF_XDP ordering is semantic, not structural"
+    },
+    {
+      "id": "USF-004",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/uring.rs",
+      "lines": "MsgHdrStorage::setup_recv(), setup_send()",
+      "category": "transport_optimization",
+      "reason": "self-referential struct: msghdr.msg_iov points into same struct",
+      "invariant": "MsgHdrStorage address stable after setup; stored in Box<[MsgHdrStorage]> which never reallocates",
+      "safety_assumptions": [
+        "Box<[T]> has fixed heap address — no reallocation unlike Vec<T>",
+        "MsgHdrStorage not moved after setup_recv/setup_send called",
+        "io_uring SQE lifetime bounded by completion — msghdr not freed before CQE"
+      ],
+      "review_status": "FIXED",
+      "notes": "SUSPECT #3 fixed: Vec<MsgHdrStorage> replaced with Box<[MsgHdrStorage]>. Self-referential pointers stable for lifetime of UringEngine."
+    },
+    {
+      "id": "USF-005",
+      "crate": "turna-relay",
+      "file": "crates/relay/src/server.rs",
+      "lines": "recv loop: unsafe { recv_buf.set_len(MAX_UDP_PACKET) }",
+      "category": "transport_optimization",
+      "reason": "expose uninitialised BytesMut bytes for recv_from syscall",
+      "invariant": "recv_from overwrites first n bytes; truncate(n) before any read; no uninit bytes observed",
+      "safety_assumptions": [
+        "recv_from writes exactly n bytes it reports",
+        "truncate called immediately after recv_from with returned n"
+      ],
+      "review_status": "SAFETY_JUSTIFIED",
+      "notes": "Standard pattern for zero-copy UDP recv. SAFETY comment present in code."
+    },
+    {
+      "id": "USF-006",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/hugepages.rs",
+      "lines": "prefault_pages()",
+      "category": "memory_layout",
+      "reason": "write_volatile to every 4096th byte of mmap region",
+      "invariant": "ptr valid for total_size bytes; step 4096 covers all pages without OOB",
+      "safety_assumptions": [
+        "total_size is aligned to 2MiB (computed in new())",
+        "write_volatile does not optimise away — required for prefault semantics"
+      ],
+      "review_status": "SAFETY_JUSTIFIED"
+    },
+    {
+      "id": "USF-008",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/af_xdp.rs",
+      "lines": "Umem::new() — mmap call",
+      "category": "transport_optimization",
+      "reason": "libc::mmap for UMEM allocation",
+      "invariant": "ptr != MAP_FAILED checked; NonNull::new enforces non-null",
+      "safety_assumptions": [
+        "PROT_READ|PROT_WRITE on anonymous mapping is always valid",
+        "size computed as frame_count * frame_size without overflow (u32 * u32 fits usize on 64-bit)"
+      ],
+      "review_status": "NEEDS_REVIEW",
+      "notes": "frame_count * frame_size overflow not checked for large configs. Max: 65535 * 65535 = ~4GB which exceeds u32 but fits usize on 64-bit. Add overflow check for configs from untrusted sources."
+    },
+    {
+      "id": "USF-009",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/hugepages.rs",
+      "lines": "alloc_memory() — mmap, free_memory() — munmap",
+      "category": "transport_optimization",
+      "reason": "libc::mmap/munmap for huge pages allocation",
+      "invariant": "munmap called exactly once in Drop; no double-free; size matches original mmap",
+      "safety_assumptions": [
+        "Drop called exactly once (Rust guarantee)",
+        "total_size stored at construction, passed unchanged to munmap"
+      ],
+      "review_status": "SAFETY_JUSTIFIED"
+    }
+  ],
+  "categories": {
+    "transport_optimization": "AF_XDP, mmap, io_uring, zero-copy recv — performance-critical kernel bypass",
+    "ffi": "libc/syscall boundaries — BPF, socket operations",
+    "memory_layout": "raw pointer arithmetic over allocated regions",
+    "parser_optimization": "SIMD or manual slice ops in hot parser path",
+    "simd": "SIMD intrinsics (none currently)"
+  },
+  "minimization_status": {
+    "parser_layer": "No unsafe in proto-stun, proto-turn, proto-rtcp — pure safe Rust",
+    "auth_layer": "No unsafe in turna-auth — Argon2, HMAC via safe crates",
+    "crypto_layer": "No unsafe in turna-crypto — delegates to ring/hmac crates"
+  }
+}

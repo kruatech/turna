@@ -1,0 +1,17 @@
+[package]
+publish = false
+name = "turna-proto-stun"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+crc.workspace = true
+rand.workspace = true
+md5.workspace = true
+
+[dev-dependencies]
+proptest = "1"

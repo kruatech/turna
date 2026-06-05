@@ -1,0 +1,59 @@
+# Minimal Tarantool smoke-test config.
+#
+# Run with:
+#   export TURNA_BACKEND_PASSWORD='<password>'
+#   ./target/debug/turna-node bench/smoke-tarantool.toml
+#
+# Will:
+#   1. connect_pool to Tarantool at uri below (4 slots)
+#   2. authenticate as `turna` with chap-sha1
+#   3. init schema (idempotent — safe to re-run)
+#   4. send heartbeat every 5s
+#   5. expose health on http://127.0.0.1:9090
+
+production = false
+
+[turn]
+listen      = "127.0.0.1:3478"
+external_ip = "127.0.0.1"
+realm       = "turna-smoke"
+
+[turn.auth]
+shared_secret = "smoke-test-not-used"
+token_ttl     = 86400
+
+[turn.relay]
+min_port        = 49152
+max_port        = 49200
+max_allocations = 100
+
+[turn.relay.quota]
+max_bytes_per_sec = 0
+max_per_user      = 100
+
+[signaling]
+listen             = "127.0.0.1:9101"
+turn_url           = "turn:127.0.0.1:3478"
+turn_shared_secret = "smoke-test-not-used"
+
+[health]
+listen = "127.0.0.1:9090"
+
+[management]
+listen = "127.0.0.1:5350"
+
+[cluster]
+node_id = "macos-smoke"
+
+[cluster.backend]
+type      = "tarantool"
+uri       = "192.168.68.250:3301"
+user      = "turna"
+password  = "${TURNA_BACKEND_PASSWORD}"
+pool_size = 4
+
+[cluster.persistence]
+mode               = "write_behind"
+channel_capacity   = 65536
+batch_max_size     = 256
+batch_max_delay_ms = 100

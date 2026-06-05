@@ -1,0 +1,10 @@
+[package]
+publish = false
+name = "turna-qos"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true

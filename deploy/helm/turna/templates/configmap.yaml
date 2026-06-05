@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  turn.toml: |
+    listen = "0.0.0.0:{{ .Values.turn.listenPort }}"
+    realm = {{ .Values.turn.realm | quote }}
+    {{- if .Values.turn.externalIP }}
+    external_ip = {{ .Values.turn.externalIP | quote }}
+    {{- end }}
+    relay_port_range = [{{ .Values.turn.relayPortRange.min }}, {{ .Values.turn.relayPortRange.max }}]
+    max_allocations = {{ .Values.turn.maxAllocations }}
+
+    [auth]
+    shared_secret = {{ .Values.turn.auth.sharedSecret | quote }}
+    {{- range .Values.turn.auth.staticUsers }}
+
+    [[auth.static_users]]
+    username = {{ .username | quote }}
+    password = {{ .password | quote }}
+    {{- end }}

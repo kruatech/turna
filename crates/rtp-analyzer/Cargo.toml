@@ -1,0 +1,10 @@
+[package]
+publish = false
+name = "turna-rtp-analyzer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing.workspace = true
+dashmap.workspace = true
+turna-proto-rtp.workspace = true

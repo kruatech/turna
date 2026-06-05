@@ -1,0 +1,77 @@
+replicaCount: 1
+
+image:
+  repository: turna
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+turn:
+  realm: "turna"
+  listenPort: 3478
+  healthPort: 9090
+  externalIP: ""  # Required for production: your server's public IP
+  relayPortRange:
+    min: 49152
+    max: 65535
+  maxAllocations: 50000
+  auth:
+    sharedSecret: "change-me-in-production"
+    staticUsers: []
+  workers: 0  # 0 = auto-detect CPU count
+
+signaling:
+  enabled: true
+  listenPort: 8080
+  replicaCount: 1
+
+resources:
+  turn:
+    requests:
+      cpu: "1"
+      memory: "512Mi"
+    limits:
+      cpu: "4"
+      memory: "2Gi"
+  signaling:
+    requests:
+      cpu: "250m"
+      memory: "128Mi"
+    limits:
+      cpu: "1"
+      memory: "512Mi"
+
+service:
+  type: LoadBalancer
+  annotations: {}
+  # For AWS NLB:
+  # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Host networking for UDP performance (recommended for production)
+hostNetwork: false
+
+# Prometheus ServiceMonitor
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Sysctls for network performance
+sysctls:
+  enabled: true
+  values:
+    - name: net.core.rmem_max
+      value: "8388608"
+    - name: net.core.wmem_max
+      value: "8388608"

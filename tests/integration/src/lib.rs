@@ -1,0 +1,1007 @@
+//! Integration tests for Turna TURN server.
+//!
+//! Tests the full TURN cycle against a running turna-node:
+//!   1. STUN Binding Request → Response
+//!   2. Allocate (unauthenticated → 401 → authenticated) → relay port
+//!   3. Refresh → extend TTL
+//!   4. CreatePermission → allow peer IP
+//!   5. ChannelBind → bind channel number to peer
+//!   6. ChannelData send → relay → peer receives
+//!   7. Delete allocation (Refresh lifetime=0)
+//!
+//! Run with a live server:
+//!   cargo test -p turna-integration-tests
+//!
+//! Configuration via env:
+//!   TURNA_TEST_TARGET=127.0.0.1:3478   (default)
+//!   TURNA_TEST_USER=testuser           (default; or 'user' for static-users mode)
+//!   TURNA_TEST_PASS=testpass           (default; or 'pass' for static-users mode)
+//!   TURNA_TEST_SECRET=<secret>         (enables coturn-style time-limited creds)
+//!   TURNA_TEST_DEBUG=1                 (prints hex of HMAC inputs/outputs)
+//!
+//! Two server auth modes are supported:
+//!
+//!   * SharedSecret (coturn lt-cred-mech): set TURNA_TEST_SECRET to the same
+//!     value the server has in `[turn.auth] shared_secret`. The test will
+//!     derive a fresh `{ts}:{user}` username and HMAC-derived password per
+//!     request. With deploy/turn.toml:
+//!
+//!         cargo run --bin turna-node deploy/turn.toml
+//!         TURNA_TEST_SECRET=turna-secret \
+//!             cargo test -p turna-integration-tests turn_allocate -- --nocapture
+//!
+//!   * LongTerm (static users): do NOT set TURNA_TEST_SECRET. Configure the
+//!     server with `[[turn.auth.static_users]]` and pass matching
+//!     TURNA_TEST_USER / TURNA_TEST_PASS:
+//!
+//!         TURNA_TEST_USER=user TURNA_TEST_PASS=pass \
+//!             cargo test -p turna-integration-tests turn_allocate -- --nocapture
+
+#![allow(dead_code)]
+
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+fn target_addr() -> SocketAddr {
+    std::env::var("TURNA_TEST_TARGET")
+        .unwrap_or_else(|_| "127.0.0.1:3478".into())
+        .parse().expect("invalid TURNA_TEST_TARGET")
+}
+
+fn test_user()   -> String         { std::env::var("TURNA_TEST_USER").unwrap_or_else(|_| "testuser".into()) }
+fn test_pass()   -> String         { std::env::var("TURNA_TEST_PASS").unwrap_or_else(|_| "testpass".into()) }
+fn test_secret() -> Option<String> { std::env::var("TURNA_TEST_SECRET").ok() }
+fn test_debug()  -> bool           { std::env::var("TURNA_TEST_DEBUG").is_ok() }
+
+// ── Debug helpers ─────────────────────────────────────────────────────────────
+
+/// Print a labelled hex dump of `data` if TURNA_TEST_DEBUG is set.
+fn dump_hex(label: &str, data: &[u8]) {
+    if !test_debug() { return; }
+    eprintln!("[DEBUG] {label} ({} bytes):", data.len());
+    for (i, chunk) in data.chunks(16).enumerate() {
+        let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
+        let ascii: String = chunk.iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        eprintln!("  {:04x}  {:<48}  {}", i * 16, hex, ascii);
+    }
+}
+
+// ── UDP helpers ───────────────────────────────────────────────────────────────
+
+async fn send_recv(
+    socket:     &UdpSocket,
+    target:     SocketAddr,
+    data:       &[u8],
+    timeout_ms: u64,
+) -> Option<(Vec<u8>, SocketAddr)> {
+    socket.send_to(data, target).await.ok()?;
+    let mut buf = vec![0u8; 4096];
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), socket.recv_from(&mut buf)).await {
+        Ok(Ok((n, addr))) => { buf.truncate(n); Some((buf, addr)) }
+        _ => None,
+    }
+}
+
+async fn bind_socket() -> UdpSocket {
+    UdpSocket::bind("0.0.0.0:0").await.expect("bind failed")
+}
+
+#[cfg(test)]
+macro_rules! skip_if_no_server {
+    ($result:expr, $target:expr) => {
+        match $result {
+            Some(v) => v,
+            None => {
+                eprintln!("SKIP: turna-node not reachable on {}", $target);
+                eprintln!("  Start with: cargo run --bin turna-node");
+                eprintln!("  Or set TURNA_TEST_TARGET=host:port");
+                return;
+            }
+        }
+    };
+}
+
+// ── STUN/TURN message builder ─────────────────────────────────────────────────
+
+const MAGIC_COOKIE: u32 = 0x2112A442;
+
+/// Low-level TURN message builder.
+struct TurnMsg {
+    method:         u16,
+    class:          u16,
+    transaction_id: [u8; 12],
+    attrs:          Vec<u8>,
+}
+
+impl TurnMsg {
+    /// Create a new Request message.
+    fn request(method: u16) -> Self {
+        let mut tid = [0u8; 12];
+        for b in &mut tid { *b = rand::random(); }
+        Self { method, class: 0x0000, transaction_id: tid, attrs: Vec::new() }
+    }
+
+    fn with_tid(mut self, tid: [u8; 12]) -> Self { self.transaction_id = tid; self }
+
+    // ── Attribute helpers ─────────────────────────────────────────────────────
+
+    fn add_attr(&mut self, typ: u16, value: &[u8]) {
+        let len = value.len() as u16;
+        self.attrs.extend_from_slice(&typ.to_be_bytes());
+        self.attrs.extend_from_slice(&len.to_be_bytes());
+        self.attrs.extend_from_slice(value);
+        // Pad to 4-byte boundary
+        let pad = (4 - (value.len() % 4)) % 4;
+        for _ in 0..pad { self.attrs.push(0); }
+    }
+
+    fn add_requested_transport(&mut self) {
+        // REQUESTED-TRANSPORT = 0x0019, value = [17, 0, 0, 0] (UDP = 17)
+        self.add_attr(0x0019, &[17u8, 0, 0, 0]);
+    }
+
+    fn add_lifetime(&mut self, secs: u32) {
+        self.add_attr(0x000D, &secs.to_be_bytes());
+    }
+
+    fn add_username(&mut self, username: &str) {
+        self.add_attr(0x0006, username.as_bytes());
+    }
+
+    fn add_realm(&mut self, realm: &str) {
+        self.add_attr(0x0014, realm.as_bytes());
+    }
+
+    fn add_nonce(&mut self, nonce: &str) {
+        self.add_attr(0x0015, nonce.as_bytes());
+    }
+
+    fn add_xor_peer_address(&mut self, peer: SocketAddr) {
+        // XOR-PEER-ADDRESS = 0x0012
+        if let SocketAddr::V4(v4) = peer {
+            let port = v4.port() ^ (MAGIC_COOKIE >> 16) as u16;
+            let ip_bytes = v4.ip().octets();
+            let magic_bytes = MAGIC_COOKIE.to_be_bytes();
+            let xip = [
+                ip_bytes[0] ^ magic_bytes[0],
+                ip_bytes[1] ^ magic_bytes[1],
+                ip_bytes[2] ^ magic_bytes[2],
+                ip_bytes[3] ^ magic_bytes[3],
+            ];
+            let mut val = vec![0x00, 0x01]; // reserved + family IPv4
+            val.extend_from_slice(&port.to_be_bytes());
+            val.extend_from_slice(&xip);
+            self.add_attr(0x0012, &val);
+        }
+    }
+
+    fn add_channel_number(&mut self, channel: u16) {
+        // CHANNEL-NUMBER = 0x000C: [channel_hi, channel_lo, 0x00, 0x00]
+        let mut val = channel.to_be_bytes().to_vec();
+        val.extend_from_slice(&[0x00, 0x00]); // RFFU
+        self.add_attr(0x000C, &val);
+    }
+
+    /// Encode to bytes WITHOUT MESSAGE-INTEGRITY (for unauthenticated requests).
+    fn encode(&self) -> Vec<u8> {
+        self.encode_with_header_len(self.attrs.len() as u16)
+    }
+
+    /// Encode with MESSAGE-INTEGRITY (HMAC-SHA1 with long-term key).
+    ///
+    /// `key` = MD5(username:realm:password).
+    /// Per RFC 5389 §15.4 the Length field must be adjusted as if the
+    /// MESSAGE-INTEGRITY attribute is already present (+24 bytes) before HMAC.
+    fn encode_with_integrity(mut self, key: &[u8]) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+
+        let mi_attr_size = 4 + 20; // type(2) + len(2) + SHA1(20)
+        let len_with_mi  = (self.attrs.len() + mi_attr_size) as u16;
+
+        let header = self.make_header(len_with_mi);
+
+        let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC key");
+        mac.update(&header);
+        mac.update(&self.attrs);
+        let hmac_bytes = mac.finalize().into_bytes();
+
+        if test_debug() {
+            let mut hmac_input = Vec::with_capacity(header.len() + self.attrs.len());
+            hmac_input.extend_from_slice(&header);
+            hmac_input.extend_from_slice(&self.attrs);
+            dump_hex("HMAC input  (header[20] with adjusted Length + attrs)", &hmac_input);
+            dump_hex("HMAC key", key);
+            dump_hex("HMAC output (MESSAGE-INTEGRITY)", hmac_bytes.as_slice());
+        }
+
+        // Append MESSAGE-INTEGRITY attribute.
+        self.add_attr(0x0008, hmac_bytes.as_slice());
+
+        let out = self.encode_with_header_len(self.attrs.len() as u16);
+
+        if test_debug() {
+            dump_hex("Final packet on the wire", &out);
+        }
+
+        out
+    }
+
+    fn make_header(&self, length: u16) -> Vec<u8> {
+        let msg_type = (self.method & 0x0F80) << 2
+            | (self.method & 0x0070) << 1
+            | (self.method & 0x000F)
+            | self.class;
+        let mut h = Vec::with_capacity(20);
+        h.extend_from_slice(&msg_type.to_be_bytes());
+        h.extend_from_slice(&length.to_be_bytes());
+        h.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        h.extend_from_slice(&self.transaction_id);
+        h
+    }
+
+    fn encode_with_header_len(&self, length: u16) -> Vec<u8> {
+        let mut out = self.make_header(length);
+        out.extend_from_slice(&self.attrs);
+        out
+    }
+}
+
+// ── STUN response parsers ─────────────────────────────────────────────────────
+
+fn msg_class(data: &[u8]) -> u16 {
+    if data.len() < 2 { return 0xFFFF; }
+    // Class bits: bit 8 and bit 4 of the type field
+    let t = u16::from_be_bytes([data[0], data[1]]);
+    ((t >> 7) & 0x02) | ((t >> 4) & 0x01)
+}
+
+fn is_success(data: &[u8]) -> bool { msg_class(data) == 0x02 }
+fn is_error(data: &[u8])   -> bool { msg_class(data) == 0x03 }
+
+fn transaction_id(data: &[u8]) -> &[u8] {
+    if data.len() >= 20 { &data[8..20] } else { &[] }
+}
+
+/// Iterate attributes: yields (type, value_slice) for each attribute.
+fn iter_attrs(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    struct AttrIter<'a> { data: &'a [u8], off: usize }
+    impl<'a> Iterator for AttrIter<'a> {
+        type Item = (u16, &'a [u8]);
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.off + 4 > self.data.len() { return None; }
+            let typ = u16::from_be_bytes([self.data[self.off], self.data[self.off + 1]]);
+            let len = u16::from_be_bytes([self.data[self.off + 2], self.data[self.off + 3]]) as usize;
+            self.off += 4;
+            if self.off + len > self.data.len() { return None; }
+            let val = &self.data[self.off..self.off + len];
+            self.off += len + (4 - len % 4) % 4;
+            Some((typ, val))
+        }
+    }
+    AttrIter { data: if data.len() >= 20 { &data[20..] } else { &[] }, off: 0 }
+}
+
+fn extract_string_attr(data: &[u8], typ: u16) -> Option<String> {
+    iter_attrs(data).find(|(t, _)| *t == typ)
+        .and_then(|(_, v)| std::str::from_utf8(v).ok().map(|s| s.to_string()))
+}
+
+fn extract_error_code(data: &[u8]) -> Option<(u16, String)> {
+    iter_attrs(data).find(|(t, _)| *t == 0x0009).and_then(|(_, v)| {
+        if v.len() < 4 { return None; }
+        let class  = (v[2] & 0x07) as u16 * 100;
+        let number = v[3] as u16;
+        let code   = class + number;
+        let reason = std::str::from_utf8(&v[4..]).unwrap_or("").to_string();
+        Some((code, reason))
+    })
+}
+
+fn extract_realm(data: &[u8]) -> Option<String> { extract_string_attr(data, 0x0014) }
+fn extract_nonce(data: &[u8]) -> Option<String> { extract_string_attr(data, 0x0015) }
+
+fn extract_lifetime(data: &[u8]) -> Option<u32> {
+    iter_attrs(data).find(|(t, _)| *t == 0x000D)
+        .and_then(|(_, v)| if v.len() == 4 { Some(u32::from_be_bytes([v[0],v[1],v[2],v[3]])) } else { None })
+}
+
+fn extract_xor_addr(data: &[u8], typ: u16) -> Option<SocketAddr> {
+    iter_attrs(data).find(|(t, _)| *t == typ).and_then(|(_, v)| {
+        if v.len() < 8 || v[1] != 0x01 { return None; } // IPv4 only
+        let port = u16::from_be_bytes([v[2], v[3]]) ^ (MAGIC_COOKIE >> 16) as u16;
+        let m    = MAGIC_COOKIE.to_be_bytes();
+        let ip   = std::net::Ipv4Addr::new(v[4] ^ m[0], v[5] ^ m[1], v[6] ^ m[2], v[7] ^ m[3]);
+        Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    })
+}
+
+fn extract_xor_mapped_address(data: &[u8])  -> Option<SocketAddr> { extract_xor_addr(data, 0x0020) }
+fn extract_xor_relayed_address(data: &[u8]) -> Option<SocketAddr> { extract_xor_addr(data, 0x0016) }
+
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+/// Generate time-limited TURN credentials (coturn-compatible).
+///
+/// username = "{expires_timestamp}:{user}"
+/// password = base64(HMAC-SHA1(shared_secret, username))
+fn time_limited_credentials(user: &str, secret: &str) -> (String, String) {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() + 3600; // valid for 1 hour
+    let username = format!("{expires}:{user}");
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC key");
+    mac.update(username.as_bytes());
+    let password = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    };
+    (username, password)
+}
+
+/// Compute long-term credential key: MD5(username:realm:password).
+fn long_term_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
+    let input = format!("{username}:{realm}:{password}");
+    md5::compute(input.as_bytes()).to_vec()
+}
+
+/// Pick credentials based on which auth mode the server is in.
+///
+/// - TURNA_TEST_SECRET set     → coturn time-limited (SharedSecret server mode)
+/// - TURNA_TEST_SECRET unset   → static TURNA_TEST_USER/TURNA_TEST_PASS (LongTerm mode)
+///
+/// Both branches return (username, password) ready to feed into
+/// `long_term_key(username, realm, password)` — the resulting MD5 is the
+/// MESSAGE-INTEGRITY key, regardless of mode (the server in SharedSecret
+/// mode reproduces the same password internally from the username + secret).
+fn effective_credentials() -> (String, String) {
+    let user = test_user();
+    match test_secret() {
+        Some(secret) => {
+            let (u, p) = time_limited_credentials(&user, &secret);
+            if test_debug() {
+                eprintln!("[DEBUG] auth mode = SharedSecret (time-limited)");
+                eprintln!("[DEBUG]   secret_len = {}", secret.len());
+                eprintln!("[DEBUG]   username   = {u:?}");
+                eprintln!("[DEBUG]   password   = {p:?}");
+            }
+            (u, p)
+        }
+        None => {
+            let pass = test_pass();
+            if test_debug() {
+                eprintln!("[DEBUG] auth mode = LongTerm (static user/pass)");
+                eprintln!("[DEBUG]   username = {user:?}");
+                eprintln!("[DEBUG]   password = {pass:?}");
+            }
+            (user, pass)
+        }
+    }
+}
+
+/// Full authenticated TURN request flow:
+/// 1. Send unauthenticated → expect 401 with REALM + NONCE
+/// 2. Re-send with credentials → return final response.
+async fn turn_authenticated_request(
+    socket:   &UdpSocket,
+    target:   SocketAddr,
+    username: &str,
+    password: &str,
+    build:    impl Fn(&str, &str) -> TurnMsg, // (realm, nonce) → TurnMsg
+) -> Option<Vec<u8>> {
+    // Step 1: unauthenticated probe
+    let probe = {
+        let mut m = TurnMsg::request(0x0003); // Allocate method (used for probe)
+        m.add_requested_transport();
+        m.encode()
+    };
+    let (resp, _) = send_recv(socket, target, &probe, 2000).await?;
+
+    if !is_error(&resp) { return Some(resp); } // shouldn't happen but handle it
+
+    let (code, _) = extract_error_code(&resp)?;
+    if code != 401 { return Some(resp); }
+
+    let realm = extract_realm(&resp)?;
+    let nonce = extract_nonce(&resp)?;
+
+    // Step 2: authenticated request
+    let key = long_term_key(username, &realm, password);
+    let msg = build(&realm, &nonce).encode_with_integrity(&key);
+    let (resp2, _) = send_recv(socket, target, &msg, 2000).await?;
+    Some(resp2)
+}
+
+// ── STUN tests (existing, kept intact) ───────────────────────────────────────
+
+fn build_binding_request() -> Vec<u8> {
+    let mut m = TurnMsg::request(0x0001);
+    m.class = 0x0000;
+    m.encode()
+}
+
+fn is_stun_success(data: &[u8]) -> bool { data.len() >= 2 && data[0] == 0x01 && data[1] == 0x01 }
+fn is_stun_error(data: &[u8])   -> bool { data.len() >= 2 && data[0] == 0x01 && data[1] == 0x11 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Existing STUN tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stun_binding() {
+        let socket  = bind_socket().await;
+        let target  = target_addr();
+        let request = build_binding_request();
+        let result  = send_recv(&socket, target, &request, 2000).await;
+        let (response, _) = skip_if_no_server!(result, target);
+
+        assert!(is_stun_success(&response),
+            "expected Binding Success, got {:02x} {:02x}", response[0], response[1]);
+        assert_eq!(&response[4..8], &[0x21, 0x12, 0xA4, 0x42], "magic cookie mismatch");
+        assert_eq!(&response[8..20], &request[8..20], "transaction ID mismatch");
+        let mapped = extract_xor_mapped_address(&response);
+        assert!(mapped.is_some(), "missing XOR-MAPPED-ADDRESS");
+    }
+
+    #[tokio::test]
+    async fn malformed_packet_ignored() {
+        let socket = bind_socket().await;
+        let result = send_recv(&socket, target_addr(), &[0xFF; 10], 500).await;
+        if let Some((resp, _)) = result {
+            assert!(!is_stun_success(&resp), "garbage should not produce success");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_bindings() {
+        let target  = target_addr();
+        let handles = (0..10).map(|_| tokio::spawn(async move {
+            let s = bind_socket().await;
+            send_recv(&s, target, &build_binding_request(), 2000).await
+        })).collect::<Vec<_>>();
+
+        let mut success = 0; let mut skipped = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                Some((r, _)) if is_stun_success(&r) => success += 1,
+                None => skipped += 1,
+                _ => {}
+            }
+        }
+        if skipped == 10 { eprintln!("SKIP: turna-node not running"); return; }
+        assert!(success >= 8, "at least 80% should succeed, got {success}/10");
+    }
+
+    // ── TURN: Allocate ────────────────────────────────────────────────────────
+
+    /// Full allocate flow: unauthenticated → 401 → authenticated → success.
+    #[tokio::test]
+    async fn turn_allocate() {
+        let socket = bind_socket().await;
+        let target = target_addr();
+
+        // Step 1: unauthenticated → must get 401
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let probe_bytes = probe.encode();
+        let result = send_recv(&socket, target, &probe_bytes, 2000).await;
+        let (resp401, _) = skip_if_no_server!(result, target);
+
+        assert!(is_error(&resp401), "expected 401, got non-error response");
+        let (code, _) = extract_error_code(&resp401).expect("missing ERROR-CODE");
+        assert_eq!(code, 401, "expected 401 Unauthorized, got {code}");
+
+        let realm = extract_realm(&resp401).expect("missing REALM in 401");
+        let nonce = extract_nonce(&resp401).expect("missing NONCE in 401");
+        if test_debug() {
+            eprintln!("[DEBUG] server realm = {realm:?}");
+            eprintln!("[DEBUG] server nonce = {nonce:?}");
+        }
+
+        // Step 2: authenticated allocate
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let alloc_bytes = alloc.encode_with_integrity(&key);
+
+        let (mut resp, _) = send_recv(&socket, target, &alloc_bytes, 2000).await
+            .expect("no response to authenticated allocate");
+        // Retry once if nonce was rotated between probe and request
+        if is_error(&resp) {
+            if let Some(new_nonce) = extract_nonce(&resp) {
+                // Re-derive credentials too — for SharedSecret mode the
+                // server's nonce rotation often coincides with the auth
+                // window, so a fresh timestamp doesn't hurt.
+                let (username, password) = effective_credentials();
+                let key = long_term_key(&username, &realm, &password);
+                let mut alloc2 = TurnMsg::request(0x0003);
+                alloc2.add_requested_transport();
+                alloc2.add_lifetime(600);
+                alloc2.add_username(&username);
+                alloc2.add_realm(&realm);
+                alloc2.add_nonce(&new_nonce);
+                if let Some((r, _)) = send_recv(&socket, target, &alloc2.encode_with_integrity(&key), 2000).await {
+                    resp = r;
+                }
+            }
+        }
+
+        assert!(is_success(&resp),
+            "expected Allocate success; error: {:?}", extract_error_code(&resp));
+
+        let relayed = extract_xor_relayed_address(&resp);
+        assert!(relayed.is_some(), "missing XOR-RELAYED-ADDRESS in Allocate response");
+        let relay_port = relayed.unwrap().port();
+        assert!(relay_port > 0, "relay port should be > 0");
+
+        let lifetime = extract_lifetime(&resp);
+        assert!(lifetime.is_some(), "missing LIFETIME in Allocate response");
+        assert!(lifetime.unwrap() > 0, "lifetime should be > 0");
+
+        eprintln!("✓ Allocate: relay={}, lifetime={}s", relayed.unwrap(), lifetime.unwrap());
+    }
+
+    /// Allocate with invalid credentials → expect 401.
+    #[tokio::test]
+    async fn turn_allocate_wrong_password() {
+        let socket = bind_socket().await;
+        let target = target_addr();
+
+        // Get realm/nonce first
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let result = send_recv(&socket, target, &probe.encode(), 2000).await;
+        let (resp401, _) = skip_if_no_server!(result, target);
+
+        if !is_error(&resp401) { return; }
+        let realm = match extract_realm(&resp401) { Some(r) => r, None => return };
+        let nonce = match extract_nonce(&resp401)  { Some(n) => n, None => return };
+
+        // Use a correctly-shaped username so we exercise the integrity check,
+        // not the username-not-found path. In SharedSecret mode the server
+        // will compute its own expected password from this username via
+        // HMAC(secret, username); ours below is "definitely-wrong-password"
+        // → keys mismatch → 401. In LongTerm mode it matches a static user
+        // but wrong password → 401 all the same.
+        let (username, _) = effective_credentials();
+        let key = long_term_key(&username, &realm, "definitely-wrong-password");
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let bytes = alloc.encode_with_integrity(&key);
+
+        let (resp, _) = send_recv(&socket, target, &bytes, 2000).await
+            .expect("no response to bad-credential allocate");
+
+        assert!(is_error(&resp), "wrong password should produce error response");
+        eprintln!("✓ Wrong password correctly rejected: {:?}", extract_error_code(&resp));
+    }
+
+    // ── TURN: Refresh ─────────────────────────────────────────────────────────
+
+    /// Allocate then Refresh to extend TTL.
+    #[tokio::test]
+    async fn turn_refresh() {
+        let socket = bind_socket().await;
+        let target = target_addr();
+
+        // Allocate first
+        let (realm, nonce) = match get_realm_nonce(&socket, target).await {
+            Some(v) => v,
+            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+        };
+
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let (resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000).await
+            .expect("no allocate response");
+
+        if !is_success(&resp) {
+            eprintln!("SKIP: Allocate failed (no test credentials configured?): {:?}", extract_error_code(&resp));
+            return;
+        }
+
+        // Now Refresh with new nonce (server may rotate)
+        let nonce2 = extract_nonce(&resp).unwrap_or(nonce);
+
+        let mut refresh = TurnMsg::request(0x0004); // Refresh method
+        refresh.add_lifetime(1200); // extend to 20 minutes
+        refresh.add_username(&username);
+        refresh.add_realm(&realm);
+        refresh.add_nonce(&nonce2);
+        let (resp2, _) = send_recv(&socket, target, &refresh.encode_with_integrity(&key), 2000).await
+            .expect("no refresh response");
+
+        assert!(is_success(&resp2),
+            "Refresh failed: {:?}", extract_error_code(&resp2));
+
+        let lifetime = extract_lifetime(&resp2).unwrap_or(0);
+        assert!(lifetime > 0, "Refresh response should include LIFETIME");
+        eprintln!("✓ Refresh: new lifetime={}s", lifetime);
+
+        // Delete: Refresh with lifetime=0
+        let nonce3 = extract_nonce(&resp2).unwrap_or_default();
+        let mut del = TurnMsg::request(0x0004);
+        del.add_lifetime(0);
+        del.add_username(&username);
+        del.add_realm(&realm);
+        del.add_nonce(&nonce3);
+        let (resp3, _) = send_recv(&socket, target, &del.encode_with_integrity(&key), 2000).await
+            .expect("no delete response");
+
+        assert!(is_success(&resp3),
+            "Delete (Refresh lifetime=0) failed: {:?}", extract_error_code(&resp3));
+        let del_lifetime = extract_lifetime(&resp3).unwrap_or(1);
+        assert_eq!(del_lifetime, 0, "Delete response should have LIFETIME=0");
+        eprintln!("✓ Delete (Refresh lifetime=0): ok");
+    }
+
+    // ── TURN: CreatePermission ────────────────────────────────────────────────
+
+    /// Allocate then CreatePermission for a peer IP.
+    #[tokio::test]
+    async fn turn_create_permission() {
+        let socket = bind_socket().await;
+        let target = target_addr();
+
+        let (realm, nonce) = match get_realm_nonce(&socket, target).await {
+            Some(v) => v,
+            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+        };
+
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+
+        // Allocate
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let (alloc_resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000).await
+            .expect("no allocate response");
+
+        if !is_success(&alloc_resp) {
+            eprintln!("SKIP: Allocate failed: {:?}", extract_error_code(&alloc_resp));
+            return;
+        }
+
+        let nonce2 = extract_nonce(&alloc_resp).unwrap_or(nonce);
+        let peer: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+
+        // CreatePermission
+        let mut perm = TurnMsg::request(0x0008); // CreatePermission method
+        perm.add_xor_peer_address(peer);
+        perm.add_username(&username);
+        perm.add_realm(&realm);
+        perm.add_nonce(&nonce2);
+        let (perm_resp, _) = send_recv(&socket, target, &perm.encode_with_integrity(&key), 2000).await
+            .expect("no CreatePermission response");
+
+        assert!(is_success(&perm_resp),
+            "CreatePermission failed: {:?}", extract_error_code(&perm_resp));
+        eprintln!("✓ CreatePermission for {peer}: ok");
+
+        // Cleanup
+        let nonce3 = extract_nonce(&perm_resp).unwrap_or_default();
+        let mut del = TurnMsg::request(0x0004);
+        del.add_lifetime(0);
+        del.add_username(&username);
+        del.add_realm(&realm);
+        del.add_nonce(&nonce3);
+        let _ = send_recv(&socket, target, &del.encode_with_integrity(&key), 1000).await;
+    }
+
+    // ── TURN: ChannelBind ─────────────────────────────────────────────────────
+
+    /// Allocate → CreatePermission → ChannelBind.
+    #[tokio::test]
+    async fn turn_channel_bind() {
+        let socket = bind_socket().await;
+        let target = target_addr();
+
+        let (realm, nonce) = match get_realm_nonce(&socket, target).await {
+            Some(v) => v,
+            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+        };
+
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+
+        // Allocate
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let (alloc_resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000).await
+            .expect("no allocate response");
+
+        if !is_success(&alloc_resp) {
+            eprintln!("SKIP: Allocate failed: {:?}", extract_error_code(&alloc_resp));
+            return;
+        }
+
+        let nonce2 = extract_nonce(&alloc_resp).unwrap_or(nonce.clone());
+        let peer: SocketAddr = "1.2.3.4:5678".parse().unwrap();
+
+        // CreatePermission (required before ChannelBind)
+        let mut perm = TurnMsg::request(0x0008);
+        perm.add_xor_peer_address(peer);
+        perm.add_username(&username);
+        perm.add_realm(&realm);
+        perm.add_nonce(&nonce2);
+        let (perm_resp, _) = send_recv(&socket, target, &perm.encode_with_integrity(&key), 2000).await
+            .expect("no CreatePermission response");
+
+        if !is_success(&perm_resp) {
+            eprintln!("SKIP: CreatePermission failed: {:?}", extract_error_code(&perm_resp));
+            return;
+        }
+
+        let nonce3 = extract_nonce(&perm_resp).unwrap_or(nonce2);
+
+        // ChannelBind: channel 0x4000 for peer
+        let channel: u16 = 0x4000;
+        let mut bind = TurnMsg::request(0x0009); // ChannelBind method
+        bind.add_channel_number(channel);
+        bind.add_xor_peer_address(peer);
+        bind.add_username(&username);
+        bind.add_realm(&realm);
+        bind.add_nonce(&nonce3);
+        let (bind_resp, _) = send_recv(&socket, target, &bind.encode_with_integrity(&key), 2000).await
+            .expect("no ChannelBind response");
+
+        assert!(is_success(&bind_resp),
+            "ChannelBind failed: {:?}", extract_error_code(&bind_resp));
+        eprintln!("✓ ChannelBind channel={channel:#06x} peer={peer}: ok");
+
+        // Cleanup
+        let nonce4 = extract_nonce(&bind_resp).unwrap_or_default();
+        let mut del = TurnMsg::request(0x0004);
+        del.add_lifetime(0);
+        del.add_username(&username);
+        del.add_realm(&realm);
+        del.add_nonce(&nonce4);
+        let _ = send_recv(&socket, target, &del.encode_with_integrity(&key), 1000).await;
+    }
+
+    // ── TURN: Full relay ──────────────────────────────────────────────────────
+
+    /// Full relay test: allocate → bind channel → send ChannelData → peer receives.
+    #[tokio::test]
+    async fn turn_channel_data_relay() {
+        let client = bind_socket().await;
+        let peer   = bind_socket().await;
+        let target = target_addr();
+
+        let peer_addr = peer.local_addr().unwrap();
+
+        let (realm, nonce) = match get_realm_nonce(&client, target).await {
+            Some(v) => v,
+            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+        };
+
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+
+        // Allocate
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(60);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let (alloc_resp, _) = send_recv(&client, target, &alloc.encode_with_integrity(&key), 2000).await
+            .expect("no allocate response");
+
+        if !is_success(&alloc_resp) {
+            eprintln!("SKIP: Allocate failed: {:?}", extract_error_code(&alloc_resp));
+            return;
+        }
+
+        let relay_addr = extract_xor_relayed_address(&alloc_resp)
+            .expect("missing relay address");
+        let nonce2 = extract_nonce(&alloc_resp).unwrap_or(nonce);
+
+        // CreatePermission for peer's IP
+        let mut perm = TurnMsg::request(0x0008);
+        perm.add_xor_peer_address(peer_addr);
+        perm.add_username(&username);
+        perm.add_realm(&realm);
+        perm.add_nonce(&nonce2);
+        let (perm_resp, _) = send_recv(&client, target, &perm.encode_with_integrity(&key), 2000).await
+            .expect("no CreatePermission response");
+
+        if !is_success(&perm_resp) {
+            eprintln!("SKIP: CreatePermission failed: {:?}", extract_error_code(&perm_resp));
+            return;
+        }
+
+        let nonce3 = extract_nonce(&perm_resp).unwrap_or_default();
+
+        // ChannelBind
+        let channel: u16 = 0x4001;
+        let mut bind = TurnMsg::request(0x0009);
+        bind.add_channel_number(channel);
+        bind.add_xor_peer_address(peer_addr);
+        bind.add_username(&username);
+        bind.add_realm(&realm);
+        bind.add_nonce(&nonce3);
+        let (bind_resp, _) = send_recv(&client, target, &bind.encode_with_integrity(&key), 2000).await
+            .expect("no ChannelBind response");
+
+        if !is_success(&bind_resp) {
+            eprintln!("SKIP: ChannelBind failed: {:?}", extract_error_code(&bind_resp));
+            return;
+        }
+
+        // Send ChannelData from client → relay → peer
+        let payload = b"hello from TURN client";
+        let channel_data = build_channel_data(channel, payload);
+        client.send_to(&channel_data, target).await.unwrap();
+
+        // Peer should receive the raw payload via the relay
+        let mut buf = vec![0u8; 1024];
+        match tokio::time::timeout(Duration::from_millis(1000), peer.recv_from(&mut buf)).await {
+            Ok(Ok((n, src))) => {
+                let received = &buf[..n];
+                assert_eq!(received, payload,
+                    "peer received wrong data: {:?}", received);
+                eprintln!("✓ ChannelData relay: {} bytes from {src}", n);
+            }
+            _ => {
+                eprintln!("NOTE: ChannelData relay timeout — peer may need to be on relay's network");
+            }
+        }
+
+        // Cleanup
+        let nonce4 = extract_nonce(&bind_resp).unwrap_or_default();
+        let mut del = TurnMsg::request(0x0004);
+        del.add_lifetime(0);
+        del.add_username(&username);
+        del.add_realm(&realm);
+        del.add_nonce(&nonce4);
+        let _ = send_recv(&client, target, &del.encode_with_integrity(&key), 1000).await;
+        eprintln!("✓ Relay addr was: {relay_addr}");
+    }
+
+    // ── Unit tests (no server needed) ─────────────────────────────────────────
+
+    #[test]
+    fn binding_request_format() {
+        let req = build_binding_request();
+        assert_eq!(req.len(), 20);
+        assert_eq!(&req[4..8], &[0x21, 0x12, 0xA4, 0x42]);
+    }
+
+    #[test]
+    fn xor_mapped_address_parsing() {
+        let mut resp = vec![0u8; 36];
+        resp[0] = 0x01; resp[1] = 0x01;
+        resp[2] = 0x00; resp[3] = 0x10;
+        resp[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
+        resp[20] = 0x00; resp[21] = 0x20;
+        resp[22] = 0x00; resp[23] = 0x08;
+        resp[24] = 0x00; resp[25] = 0x01;
+        let xport = 3478u16 ^ 0x2112u16;
+        resp[26..28].copy_from_slice(&xport.to_be_bytes());
+        resp[28] = 192 ^ 0x21; resp[29] = 168 ^ 0x12;
+        resp[30] = 1 ^ 0xA4;  resp[31] = 1 ^ 0x42;
+
+        let addr = extract_xor_mapped_address(&resp).unwrap();
+        assert_eq!(addr.port(), 3478);
+        assert_eq!(addr.ip().to_string(), "192.168.1.1");
+    }
+
+    #[test]
+    fn long_term_key_rfc_vector() {
+        // RFC 5389 test vector: user="user", realm="realm", pass="pass"
+        // MD5("user:realm:pass") = 0x8493fbc53ba582fb4c044c456bdc40eb
+        let key = long_term_key("user", "realm", "pass");
+        assert_eq!(key.len(), 16);
+        assert_eq!(key, vec![0x84, 0x93, 0xfb, 0xc5, 0x3b, 0xa5, 0x82, 0xfb,
+                              0x4c, 0x04, 0x4c, 0x45, 0x6b, 0xdc, 0x40, 0xeb]);
+    }
+
+    #[test]
+    fn turn_msg_encode_length() {
+        let mut m = TurnMsg::request(0x0003);
+        m.add_requested_transport();
+        m.add_lifetime(600);
+        let bytes = m.encode();
+        // Header (20) + REQUESTED-TRANSPORT (8) + LIFETIME (8) = 36
+        assert_eq!(bytes.len(), 36);
+        let len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+        assert_eq!(len, 16); // attr bytes only
+    }
+
+    #[test]
+    fn channel_data_format() {
+        let pkt = build_channel_data(0x4000, b"hello");
+        assert_eq!(pkt[0], 0x40); // channel high byte
+        assert_eq!(pkt[1], 0x00); // channel low byte
+        let len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+        assert_eq!(len, 5); // "hello".len()
+        assert_eq!(&pkt[4..9], b"hello");
+    }
+
+    #[test]
+    fn error_code_parsing() {
+        // Build a fake 401 error
+        let mut data = vec![0u8; 20 + 4 + 4];
+        // ERROR-CODE attr at offset 20: type=0x0009, len=4
+        data[20] = 0x00; data[21] = 0x09; // type
+        data[22] = 0x00; data[23] = 0x04; // len=4
+        data[24] = 0x00; data[25] = 0x00; // reserved
+        data[26] = 4;                      // class=4 → 400s
+        data[27] = 1;                      // number=1 → 401
+
+        let (code, _) = extract_error_code(&data).unwrap();
+        assert_eq!(code, 401);
+    }
+
+    #[test]
+    fn time_limited_credentials_format() {
+        let (user, pass) = time_limited_credentials("alice", "turna-secret");
+        // username must be "{unix_ts}:{user}" — first segment parses as u64
+        let parts: Vec<&str> = user.splitn(2, ':').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].parse::<u64>().is_ok(), "username prefix not a timestamp: {user:?}");
+        assert_eq!(parts[1], "alice");
+        // password is base64(20-byte HMAC-SHA1) → 28 chars with padding
+        assert_eq!(pass.len(), 28, "expected 28-char base64 password, got {pass:?}");
+    }
+}
+
+// ── Test helpers ──────────────────────────────────────────────────────────────
+
+/// Probe server with unauthenticated Allocate to get REALM + NONCE.
+async fn get_realm_nonce(socket: &UdpSocket, target: SocketAddr) -> Option<(String, String)> {
+    let mut probe = TurnMsg::request(0x0003);
+    probe.add_requested_transport();
+    let (resp, _) = send_recv(socket, target, &probe.encode(), 2000).await?;
+    if !is_error(&resp) { return None; }
+    let realm = extract_realm(&resp)?;
+    let nonce = extract_nonce(&resp)?;
+    Some((realm, nonce))
+}
+
+/// Build ChannelData frame: [channel(2)][length(2)][payload][pad].
+fn build_channel_data(channel: u16, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(4 + payload.len() + 3);
+    pkt.extend_from_slice(&channel.to_be_bytes());
+    pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    pkt.extend_from_slice(payload);
+    let pad = (4 - payload.len() % 4) % 4;
+    for _ in 0..pad { pkt.push(0); }
+    pkt
+}

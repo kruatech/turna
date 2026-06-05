@@ -1,0 +1,19 @@
+[package]
+publish = false
+name = "turna-session"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+# PR1 (allocation-store persistence): mpsc channel for write-behind WriteOp events.
+# Inherits `features = ["full"]` from the workspace — `sync` is what we actually need.
+tokio.workspace = true
+
+[dev-dependencies]
+# Tests use #[tokio::test]; workspace `full` already covers `macros` + `rt`.
+tokio.workspace = true

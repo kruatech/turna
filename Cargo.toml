@@ -1,0 +1,127 @@
+# turna — high-performance TURN server in Rust
+# https://github.com/kruatech/turna
+
+[workspace]
+resolver = "2"
+members = [
+    # protocol
+    "crates/protocol/proto-stun",
+    "crates/protocol/proto-turn",
+    "crates/protocol/proto-rtp",
+    "crates/rtp-analyzer",
+    "crates/packet",
+    "crates/crypto",
+    "crates/common",
+
+    # core
+    "crates/relay",
+    "crates/session",
+    "crates/auth",
+    "crates/qos",
+    "crates/config",
+    "crates/transport",
+    "crates/state-backend",
+
+    # infra
+    "crates/health",
+    "crates/observability",
+    "crates/control",
+    "crates/management",
+
+    # binaries
+    "services/node",
+    "services/control-plane",
+
+    # tools
+    "tools/turnactl",
+    "tools/benchmark",
+    "tools/load-test",
+    "tools/diff-test",
+    "tools/garbage-gen",
+
+    # tests
+    "tests/integration",
+    "tests/soak",
+]
+# fuzz — изолированный workspace для cargo-fuzz (как и было)
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/kruatech/turna"
+# publish = false убран: крейты должны быть доступны как git-зависимость
+# (для crates.io потребуется дополнительно description у каждого крейта)
+
+[workspace.dependencies]
+# async runtime / основа
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+thiserror = "2"
+
+# сериализация / конфиг
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# криптография STUN/TURN (RFC 5389/5766: long-term credentials)
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+md5 = "0.7"
+crc = "3"
+rand = "0.8"
+base64 = "0.22"
+
+# auth
+jsonwebtoken = "9"
+argon2 = "0.5"
+uuid = { version = "1", features = ["v4"] }
+
+# наблюдаемость
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = "0.23"
+opentelemetry_sdk = { version = "0.23", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.16", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.24"
+hostname = "0.3"
+
+# структуры данных
+dashmap = "6"
+# Hot-path locks: parking_lot has no poison state, so a panic while holding a
+# lock can't cascade into worker-wide crashes via downstream .unwrap().
+parking_lot = "0.12"
+
+# workspace-крейты
+turna-common        = { path = "crates/common" }
+turna-proto-stun    = { path = "crates/protocol/proto-stun" }
+turna-proto-turn    = { path = "crates/protocol/proto-turn" }
+turna-proto-rtp     = { path = "crates/protocol/proto-rtp" }
+turna-rtp-analyzer  = { path = "crates/rtp-analyzer" }
+turna-packet        = { path = "crates/packet" }
+turna-crypto        = { path = "crates/crypto" }
+turna-relay         = { path = "crates/relay" }
+turna-session       = { path = "crates/session" }
+turna-auth          = { path = "crates/auth" }
+turna-qos           = { path = "crates/qos" }
+turna-config        = { path = "crates/config" }
+turna-transport     = { path = "crates/transport" }
+turna-state-backend = { path = "crates/state-backend" }
+turna-health        = { path = "crates/health" }
+turna-observability = { path = "crates/observability" }
+turna-control       = { path = "crates/control" }
+turna-management    = { path = "crates/management" }
+
+# ВЫРЕЗАНО из исходного workspace (использовалось только SFU/сиротами):
+#   aes, openssl, tokio-tungstenite, futures-util — проверить, что сборка
+#   проходит без них; если какой-то крейт их всё же тянет напрямую через
+#   .workspace = true, вернуть соответствующую строку.
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true

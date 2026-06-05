@@ -1,0 +1,25 @@
+[package]
+publish = false
+name = "turna-node"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+io-uring = ["turna-transport/io-uring", "turna-relay/io-uring"]
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+turna-config.workspace = true
+turna-observability.workspace = true
+turna-transport.workspace = true
+turna-relay.workspace = true
+turna-session.workspace = true
+turna-auth.workspace = true
+turna-health.workspace = true
+hostname.workspace = true
+# PR2 (task #3): write-behind writer task uses the state backend.
+turna-state-backend.workspace = true
+# PR A (task 2.4): system resource metrics in heartbeat.
+sysinfo = "0.30"

@@ -1,0 +1,49 @@
+[package]
+name = "turna-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Declare an isolated workspace so `cargo fuzz` doesn't pull in the whole
+# turna_server workspace (which has hardware/BPF crates that won't build in CI).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+turna-proto-stun = { path = "../crates/protocol/proto-stun" }
+turna-proto-turn = { path = "../crates/protocol/proto-turn" }
+
+# opt-level=3 matters for fuzzer throughput: at level 0 the fuzzer runs ~5×
+# slower and LLVM cannot inline the hot parse loops, severely reducing
+# coverage signal per second.  Keep debug=true so crash stack traces have
+# line numbers.
+[profile.release]
+opt-level = 3
+debug = true
+
+[[bin]]
+name = "fuzz_stun"
+path = "fuzz_targets/fuzz_stun.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_turn"
+path = "fuzz_targets/fuzz_turn.rs"
+doc = false
+
+
+[[bin]]
+name = "fuzz_turn_lifecycle"
+path = "fuzz_targets/fuzz_turn_lifecycle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_stun_semantic"
+path = "fuzz_targets/fuzz_stun_semantic.rs"
+test = false
+doc = false

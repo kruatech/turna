@@ -1,0 +1,14 @@
+[package]
+publish = false
+name    = "turna-control-plane"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace        = true
+tracing.workspace      = true
+turna-config.workspace   = true
+turna-observability.workspace = true
+turna-session.workspace  = true
+turna-health.workspace   = true
+turna-control            = { path = "../../crates/control" }

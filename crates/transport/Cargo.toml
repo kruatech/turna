@@ -1,0 +1,32 @@
+[package]
+publish = false
+name = "turna-transport"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+io-uring = ["dep:io-uring"]
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
+
+[dependencies]
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+turna-packet.workspace = true
+libc = "0.2"
+hmac.workspace = true
+sha1.workspace = true
+rand.workspace = true
+
+# TLS/TCP transport (feature: tls)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }

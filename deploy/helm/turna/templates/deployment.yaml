@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-turn
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: turna
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: turna
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- if .Values.sysctls.enabled }}
+      securityContext:
+        sysctls:
+        {{- range .Values.sysctls.values }}
+        - name: {{ .name }}
+          value: {{ .value | quote }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: turn
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["/etc/turna/turn.toml"]
+          ports:
+            - name: stun-udp
+              containerPort: {{ .Values.turn.listenPort }}
+              protocol: UDP
+              {{- if .Values.hostNetwork }}
+              hostPort: {{ .Values.turn.listenPort }}
+              {{- end }}
+            - name: stun-tcp
+              containerPort: {{ .Values.turn.listenPort }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.turn.healthPort }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: "info,turna=debug"
+            - name: TURNA_WORKERS
+              value: {{ .Values.turn.workers | quote }}
+          resources:
+            {{- toYaml .Values.resources.turn | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/turna/turn.toml
+              subPath: turn.toml
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- if .Values.signaling.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-signaling
+  labels:
+    app.kubernetes.io/name: turna-signaling
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.signaling.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: turna-signaling
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: turna-signaling
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: signaling
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["turna-signaling"]
+          ports:
+            - name: ws
+              containerPort: {{ .Values.signaling.listenPort }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            {{- toYaml .Values.resources.signaling | nindent 12 }}
+          livenessProbe:
+            tcpSocket:
+              port: ws
+            initialDelaySeconds: 5
+            periodSeconds: 10
+{{- end }}

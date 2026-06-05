@@ -1,0 +1,36 @@
+# Minimal eturnal config for the benchmark matrix.
+#
+# Install (Ubuntu): https://eturnal.net/documentation/#Installation
+#   sudo apt install extrepo && sudo extrepo enable eturnal
+#   sudo apt update && sudo apt install eturnal
+# Run for the bench (foreground, this config):
+#   ETURNAL_ETC_DIR=$(pwd)/bench eturnalctl foreground
+# or point the script at the binary with ETURNAL_BIN.
+#
+# Same REST shared secret as turna/coturn/pion so a single load-test
+# credential setting works against every server in the matrix.
+
+eturnal:
+  listen:
+    -
+      ip: "127.0.0.1"
+      port: 3480
+      transport: udp
+
+  ## TURN REST API secret (HMAC-SHA1 ephemeral credentials):
+  secret: "bench-secret"
+
+  realm: "bench"
+
+  relay_ipv4_addr: "127.0.0.1"
+  relay_min_port: 30000
+  relay_max_port: 39999
+
+  ## Keep logs quiet so I/O doesn't pollute the measurement:
+  log_level: warning
+  log_dir: /tmp
+
+  ## Bench runs many short-lived allocations:
+  max_allocations: 20000
+  ## Disable per-IP allocation cap for load testing (the client is one IP):
+  max_permissions: 65535

@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+**/target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local logs and bench output
+*.log
+/tmp/
+bench/*.json
+
+# Local environment files — never commit secrets
+.env
+.env.*
+*.pem
+*.key
+
+bench/results/
+*.bak

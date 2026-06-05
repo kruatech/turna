@@ -1,0 +1,35 @@
+# Minimal turna config for the benchmark — no auth, no TLS, plain STUN
+# binding on a dedicated port. Used by bench/run.sh against an
+# identically-configured coturn instance.
+#
+# Listens on 3478 to match coturn's default; bench/run.sh manages this.
+
+production = false
+
+[turn]
+listen      = "0.0.0.0:3478"
+external_ip = "127.0.0.1"
+realm       = "bench"
+
+[turn.auth]
+# REST shared secret — the same value is configured into coturn
+# (use-auth-secret), eturnal (secret) and the pion bench server, so
+# one load-test invocation works against all of them.
+shared_secret = "bench-secret"
+token_ttl     = 86400
+
+[turn.relay]
+min_port        = 50000
+max_port        = 65535
+max_allocations = 20000
+
+[signaling]
+listen             = "0.0.0.0:9101"
+turn_url           = "turn:127.0.0.1:3478"
+turn_shared_secret = "bench-secret"
+
+[health]
+listen = "0.0.0.0:9190"
+
+[management]
+listen = "127.0.0.1:5350"

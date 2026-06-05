@@ -1,0 +1,21 @@
+[package]
+name    = "turna-soak"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Add "tests/soak" to the [workspace] members list in the root Cargo.toml:
+#   members = [..., "tests/soak"]
+
+[dev-dependencies]
+tokio  = { version = "1", features = ["full"] }
+bytes  = "1"
+
+[dependencies]
+tokio       = { version = "1", features = ["full"] }
+bytes       = "1"
+turna-session = { path = "../../crates/session" }
+turna-relay   = { path = "../../crates/relay" }
+turna-health  = { path = "../../crates/health" }
+turna-auth    = { path = "../../crates/auth" }
+turna-transport = { path = "../../crates/transport" }

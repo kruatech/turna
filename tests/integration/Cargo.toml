@@ -1,0 +1,21 @@
+[package]
+publish = false
+name    = "turna-integration-tests"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# Doc-comment examples here are shell usage notes, not Rust — don't
+# compile them as doctests.
+doctest = false
+
+[dependencies]
+tokio.workspace       = true
+tracing.workspace     = true
+rand.workspace        = true
+hmac.workspace        = true
+sha1.workspace        = true
+md5.workspace         = true
+turna-proto-stun.workspace = true
+base64 = "0.22"
+turna-common = { path = "../../crates/common" }

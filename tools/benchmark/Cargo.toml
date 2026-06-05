@@ -1,0 +1,10 @@
+[package]
+name = "turna-benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tracing = "0.1"
+rand = "0.8"
+turna-observability = { path = "../../crates/observability" }
