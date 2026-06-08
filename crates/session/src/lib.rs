@@ -103,6 +103,8 @@ pub struct Allocation {
     pub relay_addr: SocketAddr,
     pub username: String,
     pub key: Vec<u8>,
+    /// Owning tenant (multi-tenancy). `None` = base/default tenant.
+    pub tenant_id: Option<String>,
     /// Permissions with expiry.
     permissions: HashMap<std::net::IpAddr, Permission>,
     /// Channel bindings with expiry.
@@ -245,6 +247,13 @@ impl PortAllocator {
         }
     }
 
+    /// Whether `port` falls within this allocator's range. Used to route a
+    /// port back to its owning pool on release/reserve (tenant ranges are
+    /// disjoint by config validation, so the match is unique).
+    pub fn contains(&self, port: u16) -> bool {
+        port >= self.min_port && port <= self.max_port
+    }
+
     pub fn allocate(&self) -> Result<u16, SessionError> {
         let mut next = self.next_port.lock();
         let mut used = self.used.lock();
@@ -343,6 +352,18 @@ impl Default for BandwidthQuota {
     }
 }
 
+/// An isolated relay-port pool for one tenant (multi-tenancy). Disjoint ranges
+/// across tenants (config-validated) guarantee a port maps to exactly one pool.
+pub struct TenantPool {
+    pub id: String,
+    pub ports: PortAllocator,
+    /// Max simultaneous allocations for this tenant. 0 = unlimited.
+    pub max_allocations: usize,
+    /// Per-tenant bandwidth / per-user limits. A zero field means "inherit the
+    /// global quota" for that dimension.
+    pub quota: BandwidthQuota,
+}
+
 /// Main allocation store — thread-safe via DashMap.
 pub struct AllocationStore {
     allocations: DashMap<SocketAddr, Allocation>,
@@ -351,6 +372,10 @@ pub struct AllocationStore {
     /// Username -> list of client addresses (for multi-allocation tracking).
     user_allocations: DashMap<String, Vec<SocketAddr>>,
     pub ports: PortAllocator,
+    /// Per-tenant isolated port pools (multi-tenancy). Empty = single-tenant.
+    /// Built once at startup via [`AllocationStore::with_tenant_pool`]; read-only
+    /// afterwards (small N → linear scan in `pool`/`pool_for_port` is fine).
+    tenant_pools: Vec<TenantPool>,
     max_allocations: usize,
     pub quota: BandwidthQuota,
     /// Optional sink for write-behind persistence events.
@@ -378,6 +403,7 @@ impl AllocationStore {
             channel_to_client: DashMap::new(),
             user_allocations: DashMap::new(),
             ports: PortAllocator::new(min_port, max_port),
+            tenant_pools: Vec::new(),
             max_allocations,
             quota: BandwidthQuota::default(),
             write_tx: OnceLock::new(),
@@ -388,6 +414,92 @@ impl AllocationStore {
     pub fn with_quota(mut self, quota: BandwidthQuota) -> Self {
         self.quota = quota;
         self
+    }
+
+    /// Register an isolated relay-port pool for a tenant. Builder; call once per
+    /// tenant at startup. Ranges must be disjoint (the config layer validates).
+    pub fn with_tenant_pool(
+        mut self,
+        id: impl Into<String>,
+        min_port: u16,
+        max_port: u16,
+        max_allocations: usize,
+        quota: BandwidthQuota,
+    ) -> Self {
+        self.tenant_pools.push(TenantPool {
+            id: id.into(),
+            ports: PortAllocator::new(min_port, max_port),
+            max_allocations,
+            quota,
+        });
+        self
+    }
+
+    /// The tenant's quota, if `tenant_id` names a registered tenant.
+    fn tenant_quota(&self, tenant_id: Option<&str>) -> Option<&BandwidthQuota> {
+        let id = tenant_id?;
+        self.tenant_pools
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| &p.quota)
+    }
+
+    /// Effective bandwidth limit (bytes/sec) for an allocation: the tenant's
+    /// value when set (> 0), otherwise the global quota. `0` = unlimited.
+    pub fn bandwidth_limit_for(&self, tenant_id: Option<&str>) -> u64 {
+        match self.tenant_quota(tenant_id) {
+            Some(q) if q.max_bytes_per_sec > 0 => q.max_bytes_per_sec,
+            _ => self.quota.max_bytes_per_sec,
+        }
+    }
+
+    /// Effective per-user allocation cap: the tenant's value when set (> 0),
+    /// otherwise the global quota. `0` = no per-user cap.
+    fn effective_max_per_user(&self, tenant_id: Option<&str>) -> usize {
+        match self.tenant_quota(tenant_id) {
+            Some(q) if q.max_per_user > 0 => q.max_per_user,
+            _ => self.quota.max_per_user,
+        }
+    }
+
+    /// Select the port pool for a tenant at allocation time. `None` or an
+    /// unknown id → the base pool.
+    pub fn pool(&self, tenant_id: Option<&str>) -> &PortAllocator {
+        match tenant_id {
+            Some(id) => self
+                .tenant_pools
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| &p.ports)
+                .unwrap_or(&self.ports),
+            None => &self.ports,
+        }
+    }
+
+    /// Route a port back to its owning pool (release/reserve), by range.
+    pub fn pool_for_port(&self, port: u16) -> &PortAllocator {
+        self.tenant_pools
+            .iter()
+            .find(|p| p.ports.contains(port))
+            .map(|p| &p.ports)
+            .unwrap_or(&self.ports)
+    }
+
+    /// Tenant id owning `port` by range, or `None` for the base pool.
+    pub fn tenant_id_for_port(&self, port: u16) -> Option<String> {
+        self.tenant_pools
+            .iter()
+            .find(|p| p.ports.contains(port))
+            .map(|p| p.id.clone())
+    }
+
+    /// Per-tenant allocation cap, if configured (0 = unlimited).
+    fn tenant_max_allocations(&self, tenant_id: &str) -> usize {
+        self.tenant_pools
+            .iter()
+            .find(|p| p.id == tenant_id)
+            .map(|p| p.max_allocations)
+            .unwrap_or(0)
     }
 
     /// Enable write-behind persistence by attaching a bounded sender to
@@ -451,18 +563,51 @@ impl AllocationStore {
         key: Vec<u8>,
         lifetime: u32,
     ) -> Result<(), SessionError> {
+        self.create_for_tenant(client_addr, relay_addr, username, key, lifetime, None)
+    }
+
+    /// Like [`create`](Self::create) but records the owning tenant and enforces
+    /// the tenant's allocation cap. `tenant_id = None` is the base tenant and is
+    /// identical to `create`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_for_tenant(
+        &self,
+        client_addr: SocketAddr,
+        relay_addr: SocketAddr,
+        username: String,
+        key: Vec<u8>,
+        lifetime: u32,
+        tenant_id: Option<String>,
+    ) -> Result<(), SessionError> {
         if self.allocations.len() >= self.max_allocations {
             return Err(SessionError::MaxAllocations);
         }
 
-        // Check per-user limit
-        if self.quota.max_per_user > 0 {
+        // Per-tenant allocation cap (isolation): a tenant cannot exceed its own
+        // limit, independent of other tenants or the global cap.
+        if let Some(tid) = tenant_id.as_deref() {
+            let cap = self.tenant_max_allocations(tid);
+            if cap > 0 {
+                let count = self
+                    .allocations
+                    .iter()
+                    .filter(|e| e.value().tenant_id.as_deref() == Some(tid))
+                    .count();
+                if count >= cap {
+                    return Err(SessionError::MaxAllocations);
+                }
+            }
+        }
+
+        // Check per-user limit (per-tenant override when the tenant sets one).
+        let max_per_user = self.effective_max_per_user(tenant_id.as_deref());
+        if max_per_user > 0 {
             let count = self
                 .user_allocations
                 .get(&username)
                 .map(|v| v.len())
                 .unwrap_or(0);
-            if count >= self.quota.max_per_user {
+            if count >= max_per_user {
                 return Err(SessionError::MaxAllocationsPerUser);
             }
         }
@@ -473,6 +618,7 @@ impl AllocationStore {
             relay_addr,
             username: username.clone(),
             key,
+            tenant_id,
             permissions: HashMap::new(),
             channel_bindings: HashMap::new(),
             channels_reverse: HashMap::new(),
@@ -573,8 +719,11 @@ impl AllocationStore {
         }
 
         // Reserve the port. If it's already taken, somebody else (live
-        // create()? a duplicate record?) got there first.
-        self.ports.reserve(relay_addr.port())?;
+        // create()? a duplicate record?) got there first. Route to the owning
+        // pool by range so tenant-range ports are reserved in the tenant pool
+        // (the base pool would reject an out-of-range port).
+        self.pool_for_port(relay_addr.port())
+            .reserve(relay_addr.port())?;
 
         // Convert wall-clock epoch_ms back into a monotonic `Instant` by
         // anchoring against `Instant::now()`. We lose accuracy of the
@@ -629,6 +778,8 @@ impl AllocationStore {
             username: username.clone(),
             // See doc comment above — recomputed on first auth.
             key: Vec::new(),
+            // Derived from the port's owning pool (tenant ranges are disjoint).
+            tenant_id: self.tenant_id_for_port(relay_addr.port()),
             permissions: perms_map,
             channel_bindings: chan_map,
             channels_reverse: chans_reverse,
@@ -771,15 +922,17 @@ impl AllocationStore {
     }
 
     /// Check bandwidth quota for an allocation. Returns Err if exceeded.
+    /// Uses the allocation's tenant limit when set, else the global quota.
     pub fn check_bandwidth(&self, client_addr: &SocketAddr) -> Result<(), SessionError> {
-        if self.quota.max_bytes_per_sec == 0 {
-            return Ok(()); // No limit
-        }
         let alloc = self
             .allocations
             .get(client_addr)
             .ok_or(SessionError::NotFound)?;
-        match alloc.check_bandwidth(self.quota.max_bytes_per_sec) {
+        let limit = self.bandwidth_limit_for(alloc.tenant_id.as_deref());
+        if limit == 0 {
+            return Ok(()); // No limit
+        }
+        match alloc.check_bandwidth(limit) {
             Ok(_) => Ok(()),
             Err(()) => {
                 let username = alloc.username.clone();
@@ -824,7 +977,8 @@ impl AllocationStore {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
             }
             self.relay_to_client.remove(&relay_addr);
-            self.ports.release(relay_addr.port());
+            self.pool_for_port(relay_addr.port())
+                .release(relay_addr.port());
 
             // Remove from user tracking
             if let Some(mut addrs) = self.user_allocations.get_mut(&alloc.username) {
@@ -892,7 +1046,7 @@ impl AllocationStore {
                     .remove(&(alloc.relay_addr.port(), ch));
             }
             let relay_port = alloc.relay_addr.port();
-            self.ports.release(relay_port);
+            self.pool_for_port(relay_port).release(relay_port);
             if let Some(mut user_allocs) = self.user_allocations.get_mut(&alloc.username) {
                 user_allocs.retain(|a| a != client_addr);
             }
@@ -1275,5 +1429,133 @@ mod tests_write_behind {
             store.get_by_channel(40054, 0x4001).is_none(),
             "expired channel must not be present"
         );
+    }
+}
+
+#[cfg(test)]
+mod tenant_pool_tests {
+    use super::*;
+
+    fn addr(p: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], p))
+    }
+
+    #[tokio::test]
+    async fn pools_are_isolated_and_routed_by_range() {
+        let store = AllocationStore::new(40000, 40099, 10_000)
+            .with_tenant_pool("acme", 50000, 50099, 0, BandwidthQuota::default())
+            .with_tenant_pool("beta", 51000, 51099, 0, BandwidthQuota::default());
+
+        // Each tenant allocates only from its own range; base from the base range.
+        let pa = store.pool(Some("acme")).allocate().unwrap();
+        let pb = store.pool(Some("beta")).allocate().unwrap();
+        let p0 = store.pool(None).allocate().unwrap();
+        assert!((50000..=50099).contains(&pa), "acme port {pa}");
+        assert!((51000..=51099).contains(&pb), "beta port {pb}");
+        assert!((40000..=40099).contains(&p0), "base port {p0}");
+
+        // Range-based routing for release/reserve.
+        assert_eq!(store.tenant_id_for_port(pa).as_deref(), Some("acme"));
+        assert_eq!(store.tenant_id_for_port(pb).as_deref(), Some("beta"));
+        assert_eq!(store.tenant_id_for_port(p0), None);
+        assert!(store.pool_for_port(pa).contains(pa));
+        assert!(store.pool_for_port(p0).contains(p0));
+    }
+
+    #[tokio::test]
+    async fn per_tenant_allocation_cap_enforced() {
+        let store = AllocationStore::new(40000, 40999, 10_000)
+            .with_tenant_pool("acme", 50000, 50999, 2, BandwidthQuota::default()); // cap = 2
+
+        store
+            .create_for_tenant(addr(1000), addr(50000), "u".into(), vec![], 600, Some("acme".into()))
+            .unwrap();
+        store
+            .create_for_tenant(addr(1001), addr(50001), "u".into(), vec![], 600, Some("acme".into()))
+            .unwrap();
+        // Third allocation for the same tenant must hit the per-tenant cap.
+        let third = store.create_for_tenant(
+            addr(1002),
+            addr(50002),
+            "u".into(),
+            vec![],
+            600,
+            Some("acme".into()),
+        );
+        assert!(matches!(third, Err(SessionError::MaxAllocations)));
+
+        // A different tenant (or base) is unaffected by acme's cap.
+        store
+            .create_for_tenant(addr(2000), addr(40000), "u".into(), vec![], 600, None)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_returns_port_to_tenant_pool() {
+        let store = AllocationStore::new(40000, 40099, 10_000)
+            .with_tenant_pool("acme", 50000, 50001, 0, BandwidthQuota::default()); // 2-port range
+
+        let p = store.pool(Some("acme")).allocate().unwrap();
+        store
+            .create_for_tenant(addr(1000), addr(p), "u".into(), vec![], 600, Some("acme".into()))
+            .unwrap();
+        // The port is taken in acme's pool; re-reserving must fail.
+        assert!(store.pool_for_port(p).reserve(p).is_err());
+
+        // Removing the allocation must return the port to acme's pool.
+        store.remove(&addr(1000), addr(p)).unwrap();
+        assert!(
+            store.pool_for_port(p).reserve(p).is_ok(),
+            "port should be reusable in the tenant pool after release"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tenant_quota_tests {
+    use super::*;
+
+    fn addr(p: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], p))
+    }
+
+    #[tokio::test]
+    async fn bandwidth_limit_resolves_tenant_then_global() {
+        let store = AllocationStore::new(40000, 40099, 10_000)
+            .with_quota(BandwidthQuota { max_bytes_per_sec: 1000, max_per_user: 0 })
+            .with_tenant_pool("acme", 50000, 50099, 0,
+                BandwidthQuota { max_bytes_per_sec: 500, max_per_user: 0 })
+            .with_tenant_pool("beta", 51000, 51099, 0,
+                BandwidthQuota { max_bytes_per_sec: 0, max_per_user: 0 });
+
+        assert_eq!(store.bandwidth_limit_for(Some("acme")), 500); // tenant override
+        assert_eq!(store.bandwidth_limit_for(Some("beta")), 1000); // 0 → inherit global
+        assert_eq!(store.bandwidth_limit_for(None), 1000); // base → global
+        assert_eq!(store.bandwidth_limit_for(Some("ghost")), 1000); // unknown → global
+    }
+
+    #[tokio::test]
+    async fn per_tenant_max_per_user_overrides_global() {
+        // Global per-user cap disabled; acme caps at 2 per user.
+        let store = AllocationStore::new(40000, 40999, 10_000)
+            .with_quota(BandwidthQuota { max_bytes_per_sec: 0, max_per_user: 0 })
+            .with_tenant_pool("acme", 50000, 50999, 0,
+                BandwidthQuota { max_bytes_per_sec: 0, max_per_user: 2 });
+
+        assert_eq!(store.effective_max_per_user(Some("acme")), 2);
+        assert_eq!(store.effective_max_per_user(None), 0); // base → global (0)
+
+        let mk = |c: u16, r: u16| store.create_for_tenant(
+            addr(c), addr(r), "sameuser".into(), vec![], 600, Some("acme".into()));
+        mk(1000, 50000).unwrap();
+        mk(1001, 50001).unwrap();
+        // Third allocation for the same user in acme hits the per-tenant cap.
+        assert!(matches!(mk(1002, 50002), Err(SessionError::MaxAllocationsPerUser)));
+
+        // Base tenant (global cap = 0) is unlimited for the same volume.
+        for i in 0..5u16 {
+            store.create_for_tenant(addr(2000 + i), addr(40000 + i),
+                "baseuser".into(), vec![], 600, None).unwrap();
+        }
     }
 }

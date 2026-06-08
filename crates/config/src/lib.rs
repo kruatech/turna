@@ -79,6 +79,12 @@ pub struct TurnaConfig {
     /// Disabled by default; enable for clients on UDP-blocked networks.
     #[serde(default)]
     pub tls: TlsConfig,
+
+    /// Multi-tenancy (P1). Empty = single-tenant (use `[turn]` realm/auth).
+    /// Each tenant is matched by its `realm` and gets an isolated relay-port
+    /// pool plus its own credentials and limits.
+    #[serde(default)]
+    pub tenants: Vec<TenantConfig>,
 }
 
 impl TurnaConfig {
@@ -192,6 +198,51 @@ impl TurnaConfig {
         // the management listener is bound to loopback.
         errors.extend(self.grpc.validate(prod, self.management.listen));
 
+        // Multi-tenancy validation (P1): unique ids/realms, sane and disjoint
+        // relay-port ranges (disjointness is the whole point — isolation),
+        // and authenticatable credentials.
+        if !self.tenants.is_empty() {
+            let mut seen_ids = HashSet::new();
+            let mut seen_realms = HashSet::new();
+            let mut ranges: Vec<(String, u16, u16)> = Vec::new();
+            for t in &self.tenants {
+                if t.id.trim().is_empty() {
+                    errors.push("a tenant has an empty id".into());
+                } else if !seen_ids.insert(t.id.clone()) {
+                    errors.push(format!("duplicate tenant id '{}'", t.id));
+                }
+                if t.realm.trim().is_empty() {
+                    errors.push(format!("tenant '{}' has an empty realm", t.id));
+                } else if !seen_realms.insert(t.realm.clone()) {
+                    errors.push(format!("duplicate tenant realm '{}'", t.realm));
+                }
+                let [lo, hi] = t.relay_port_range;
+                if lo >= hi {
+                    errors.push(format!(
+                        "tenant '{}' relay_port_range [{lo}, {hi}] is empty or inverted",
+                        t.id
+                    ));
+                }
+                if t.shared_secret.is_empty() && t.static_users.is_empty() {
+                    errors.push(format!(
+                        "tenant '{}' has neither shared_secret nor static_users — \
+                         no client could authenticate",
+                        t.id
+                    ));
+                }
+                for (oid, olo, ohi) in &ranges {
+                    if lo <= *ohi && *olo <= hi {
+                        errors.push(format!(
+                            "tenant '{}' port range [{lo}, {hi}] overlaps tenant '{}' \
+                             [{olo}, {ohi}] — port isolation requires disjoint ranges",
+                            t.id, oid
+                        ));
+                    }
+                }
+                ranges.push((t.id.clone(), lo, hi));
+            }
+        }
+
         if !errors.is_empty() {
             return Err(ConfigError::Validation(errors.join("; ")));
         }
@@ -242,6 +293,7 @@ impl Default for TurnaConfig {
             recording: RecordingConfig::default(),
             grpc: GrpcConfigSection::default(),
             tls: TlsConfig::default(),
+            tenants: Vec::new(),
         }
     }
 }
@@ -737,6 +789,38 @@ impl Default for TlsConfig {
             enable_alpn: true,
         }
     }
+}
+
+/// One tenant in a multi-tenant deployment. Matched by `realm`; isolated relay
+/// port pool, own credentials, own limits. No `Default` — every field that
+/// isn't `#[serde(default)]` must be set explicitly per tenant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantConfig {
+    /// Stable identifier (metrics label, logs). Must be unique.
+    pub id: String,
+    /// TURN realm clients authenticate against. Must be unique across tenants.
+    pub realm: String,
+    /// Isolated relay UDP port range `[min, max]` for this tenant — clients of
+    /// one tenant cannot exhaust another tenant's ports.
+    pub relay_port_range: [u16; 2],
+    /// coturn-style time-limited credentials secret. Empty → use `static_users`.
+    #[serde(default)]
+    pub shared_secret: String,
+    /// Static long-term users for this tenant.
+    #[serde(default)]
+    pub static_users: Vec<StaticUser>,
+    /// Max simultaneous allocations for this tenant. 0 = unlimited.
+    #[serde(default)]
+    pub max_allocations: usize,
+    /// Per-tenant bandwidth / per-user limits.
+    #[serde(default)]
+    pub quota: QuotaConfig,
+    /// Optional dedicated listener. `None` (default) = share the main `[turn]`
+    /// listener and match the tenant by request REALM. `Some(addr)` reserves a
+    /// per-tenant listener (stronger isolation; future option-A wiring).
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

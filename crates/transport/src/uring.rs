@@ -6,6 +6,7 @@
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
 use crate::buffer::{BufferRing, MAX_UDP_PACKET};
+use io_uring::types::CancelBuilder;
 use io_uring::{opcode, types, IoUring};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ const RELAY_RECV_BATCH: u16 = 32; // per relay socket
 /// Number of pre-allocated main-socket send slots (one `u64` bitmap covers it).
 const MAIN_SEND_SLOTS: u16 = 64;
 /// Number of send slots reserved per relay socket (one `u32` bitmap covers it).
+#[allow(dead_code)] // reserved for io_uring multi-worker relay
 const RELAY_SEND_SLOTS: u16 = RELAY_RECV_BATCH; // 32
 
 // ── Slot bitmaps ────────────────────────────────────────────────────────────
@@ -72,6 +74,7 @@ const TAG_MAIN_RECV: u64 = 0x01 << 56;
 const TAG_MAIN_SEND: u64 = 0x02 << 56;
 const TAG_RELAY_RECV: u64 = 0x03 << 56;
 const TAG_RELAY_SEND: u64 = 0x04 << 56;
+const TAG_RELAY_CANCEL: u64 = 0x05 << 56;
 const TAG_MASK: u64 = 0xFF << 56;
 
 fn encode_user_data(tag: u64, relay_port: u16, msghdr_idx: u16, buf_or_slot: u16) -> u64 {
@@ -165,14 +168,26 @@ impl MsgHdrStorage {
 /// Relay socket state.
 struct RelaySocket {
     fd: RawFd,
-    _socket: Socket,
+    /// Held only to keep the relay fd open until the relay is reclaimed; the
+    /// Socket is dropped (closing the fd) when the map entry is removed after
+    /// the in-flight ops drain. Never read directly.
+    #[allow(dead_code)]
+    socket: Option<Socket>,
+    #[allow(dead_code)]
     port: u16,
     // Dedicated msghdr slots for this relay (recv + send)
-    recv_msghdr_base: u16, // starting index in relay_msghdrs
+    recv_msghdr_base: u16, // block base in relay_msghdrs; returned to free-list on reclaim
     send_msghdr_base: u16,
     /// Free-slot bitmap for this relay's send slots (bit i set = free).
     /// Prevents reuse of a send slot before its SendMsg completion arrives.
     send_free: u32,
+    /// In-flight SQEs (recv + send) for this relay. The msghdr block is only
+    /// returned to the free-list once this hits 0 — reusing it earlier would
+    /// let the kernel write into another relay's reused msghdrs (corruption).
+    inflight: u32,
+    /// Set by `remove_relay`. Suppresses event emission / resubmits and gates
+    /// block reclaim on a full in-flight drain.
+    closing: bool,
 }
 
 /// Multi-fd io_uring manager: main socket + relay sockets.
@@ -208,7 +223,9 @@ pub struct UringEngine {
     relay_sockets: HashMap<u16, RelaySocket>,
     /// FIX (SUSPECT #3): same as above.
     relay_msghdrs: Box<[MsgHdrStorage]>,
-    relay_msghdr_next: u16,
+    /// Free-list of 64-slot relay msghdr blocks (32 recv + 32 send each).
+    /// A block returns here only once its relay has fully drained.
+    relay_free_blocks: Vec<u16>,
     /// Free-slot bitmap for the 64 main-socket send slots (bit i set = free).
     main_send_free: u64,
 }
@@ -220,6 +237,13 @@ pub enum CompletionEvent {
         msghdr_idx: u16,
         len: usize,
         source: SocketAddr,
+    },
+    /// A main-socket recv completed with an error (e.g. transient -EAGAIN).
+    /// The worker re-arms this exact msghdr/buffer so the recv slot is not
+    /// retired and the buffer is not leaked.
+    MainRecvError {
+        msghdr_idx: u16,
+        buf_idx: u16,
     },
     MainSend {
         send_slot: u16,
@@ -308,7 +332,9 @@ impl UringEngine {
             main_send_msghdrs,
             relay_sockets: HashMap::new(),
             relay_msghdrs,
-            relay_msghdr_next: 0,
+            relay_free_blocks: (0..relay_pool_size as u16)
+                .step_by(RELAY_RECV_BATCH as usize * 2)
+                .collect(),
             // All MAIN_SEND_SLOTS slots start free. MAIN_SEND_SLOTS == 64, so
             // the full u64 is "all free"; if it ever shrinks below 64, mask.
             main_send_free: u64::MAX,
@@ -396,20 +422,36 @@ impl UringEngine {
         socket.bind(&SockAddr::from(bind_addr))?;
         let fd = socket.as_raw_fd();
 
-        let recv_base = self.relay_msghdr_next;
+        // Free-list reclaim: pop a 64-slot block (32 recv + 32 send). On
+        // exhaustion, reject the relay cleanly — the worker survives and the
+        // client gets a 508 instead of a crash. Blocks return to the list once
+        // a relay's in-flight ops fully drain (see remove_relay /
+        // collect_completions).
+        let Some(recv_base) = self.relay_free_blocks.pop() else {
+            warn!(
+                port,
+                cap = self.relay_msghdrs.len(),
+                "io_uring relay msghdr pool exhausted — rejecting relay"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "io_uring relay msghdr pool exhausted",
+            ));
+        };
         let send_base = recv_base + RELAY_RECV_BATCH;
-        self.relay_msghdr_next = send_base + RELAY_RECV_BATCH;
 
         self.relay_sockets.insert(
             port,
             RelaySocket {
                 fd,
-                _socket: socket,
+                socket: Some(socket),
                 port,
                 recv_msghdr_base: recv_base,
                 send_msghdr_base: send_base,
                 // RELAY_SEND_SLOTS (32) slots, all free → low 32 bits set.
                 send_free: u32::MAX,
+                inflight: 0,
+                closing: false,
             },
         );
 
@@ -446,6 +488,9 @@ impl UringEngine {
                 .push(&entry)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
         }
+        if let Some(relay) = self.relay_sockets.get_mut(&port) {
+            relay.inflight += 1; // recv in flight
+        }
         Ok(())
     }
 
@@ -455,12 +500,16 @@ impl UringEngine {
         msghdr_idx: u16,
         buf_idx: u16,
     ) -> std::io::Result<()> {
-        if let Some(relay) = self.relay_sockets.get(&port) {
-            let fd = relay.fd;
-            self.submit_relay_recv(port, fd, msghdr_idx, buf_idx)
-        } else {
-            Ok(())
-        }
+        // Only re-arm an open, non-closing relay. If it was reclaimed or is
+        // draining, return the recv buffer to the pool instead of leaking it.
+        let fd = match self.relay_sockets.get(&port) {
+            Some(relay) if !relay.closing => relay.fd,
+            _ => {
+                self.buffers.release(buf_idx);
+                return Ok(());
+            }
+        };
+        self.submit_relay_recv(port, fd, msghdr_idx, buf_idx)
     }
 
     pub fn submit_relay_send(
@@ -478,6 +527,12 @@ impl UringEngine {
                     "relay not found",
                 ));
             };
+            if relay.closing {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "relay closing",
+                ));
+            }
             let slot = alloc_bit_u32(&mut relay.send_free).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::WouldBlock, "relay send slots exhausted")
             })?;
@@ -498,6 +553,9 @@ impl UringEngine {
                 free_bit_u32(&mut relay.send_free, slot);
             }
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"));
+        }
+        if let Some(relay) = self.relay_sockets.get_mut(&port) {
+            relay.inflight += 1; // send in flight
         }
         Ok(slot)
     }
@@ -523,7 +581,16 @@ impl UringEngine {
             let event = match tag {
                 t if t == TAG_MAIN_RECV => {
                     if result < 0 {
-                        warn!(err = result, "main recv error");
+                        // Transient error (commonly -EAGAIN == -11): re-arm the
+                        // slot via the worker instead of retiring it + leaking
+                        // the buffer. -EAGAIN is too noisy for warn!.
+                        if result != -11 {
+                            warn!(err = result, "main recv error");
+                        }
+                        events.push(CompletionEvent::MainRecvError {
+                            msghdr_idx,
+                            buf_idx: buf_or_slot,
+                        });
                         continue;
                     }
                     let source = self.main_recv_msghdrs[msghdr_idx as usize]
@@ -546,8 +613,34 @@ impl UringEngine {
                     }
                 }
                 t if t == TAG_RELAY_RECV => {
+                    // Account for the in-flight recv that just completed.
+                    let mut closing = false;
+                    let mut reclaim_base: Option<u16> = None;
+                    if let Some(relay) = self.relay_sockets.get_mut(&relay_port) {
+                        relay.inflight = relay.inflight.saturating_sub(1);
+                        if relay.closing {
+                            closing = true;
+                            if relay.inflight == 0 {
+                                reclaim_base = Some(relay.recv_msghdr_base);
+                            }
+                        }
+                    }
+                    if closing {
+                        // Draining relay: drop the buffer, emit nothing, and
+                        // reclaim the block once fully drained.
+                        self.buffers.release(buf_or_slot);
+                        if let Some(base) = reclaim_base {
+                            self.relay_sockets.remove(&relay_port);
+                            self.relay_free_blocks.push(base);
+                            info!(port = relay_port, "io_uring relay reclaimed (drained)");
+                        }
+                        continue;
+                    }
                     if result < 0 {
                         warn!(relay_port, err = result, "relay recv error");
+                        // Recv errored on an open relay: release the buffer
+                        // (the worker won't resubmit this slot).
+                        self.buffers.release(buf_or_slot);
                         continue;
                     }
                     let source = self.relay_msghdrs[msghdr_idx as usize]
@@ -562,9 +655,21 @@ impl UringEngine {
                     }
                 }
                 t if t == TAG_RELAY_SEND => {
-                    // Release this relay's send slot now that the kernel is done.
+                    // Release the send slot and account for the in-flight send;
+                    // reclaim the block if a closing relay just drained.
+                    let mut reclaim_base: Option<u16> = None;
                     if let Some(relay) = self.relay_sockets.get_mut(&relay_port) {
                         free_bit_u32(&mut relay.send_free, buf_or_slot);
+                        relay.inflight = relay.inflight.saturating_sub(1); // send drained
+                        if relay.closing && relay.inflight == 0 {
+                            reclaim_base = Some(relay.recv_msghdr_base);
+                        }
+                    }
+                    if let Some(base) = reclaim_base {
+                        self.relay_sockets.remove(&relay_port);
+                        self.relay_free_blocks.push(base);
+                        info!(port = relay_port, "io_uring relay reclaimed (drained)");
+                        continue;
                     }
                     CompletionEvent::RelaySend {
                         relay_port,
@@ -572,6 +677,7 @@ impl UringEngine {
                         result,
                     }
                 }
+                t if t == TAG_RELAY_CANCEL => continue,
                 _ => continue,
             };
             events.push(event);
@@ -592,6 +698,47 @@ impl UringEngine {
     pub fn buffers_available(&self) -> usize {
         self.buffers.available()
     }
+    /// Begin closing a relay: mark it draining and drop its `Socket` (closing
+    /// the fd, so the kernel completes any in-flight recvs). The msghdr block
+    /// is returned to the free-list only once all in-flight ops have drained
+    /// (here if already idle, otherwise in `collect_completions`). Reusing the
+    /// block before the drain would let late kernel writes corrupt a reused
+    /// relay's msghdrs.
+    pub fn remove_relay(&mut self, port: u16) {
+        // Snapshot fd + drain state; mark closing so no new recvs are armed.
+        let (fd, idle, base) = match self.relay_sockets.get_mut(&port) {
+            Some(relay) => {
+                relay.closing = true;
+                (relay.fd, relay.inflight == 0, relay.recv_msghdr_base)
+            }
+            None => return,
+        };
+        if idle {
+            // No in-flight ops: reclaim now (drops the Socket -> closes fd).
+            self.relay_sockets.remove(&port);
+            self.relay_free_blocks.push(base);
+            info!(port, "io_uring relay reclaimed (idle)");
+            return;
+        }
+        // Closing an fd does NOT drain io_uring ops — the kernel holds its own
+        // file reference, so armed RecvMsg SQEs would hang forever waiting for a
+        // datagram that never comes. Explicitly cancel every in-flight op on
+        // this fd; the recvs complete with -ECANCELED, drive `inflight` to 0,
+        // and reclaim fires in collect_completions. The Socket stays alive (fd
+        // valid) until reclaim removes the entry and drops it.
+        let ud = encode_user_data(TAG_RELAY_CANCEL, port, 0, 0);
+        let entry = opcode::AsyncCancel2::new(CancelBuilder::fd(types::Fd(fd)).all())
+            .build()
+            .user_data(ud);
+        if unsafe { self.ring.submission().push(&entry) }.is_err() {
+            // SQ full: stay closing (nothing new is armed); a later close/drain
+            // pass can re-issue. The block stays reserved until drained.
+            warn!(port, "SQ full — relay cancel not submitted, will retry");
+        } else {
+            info!(port, "io_uring relay closing — cancelling in-flight ops");
+        }
+    }
+
     pub fn has_relay(&self, port: u16) -> bool {
         self.relay_sockets.contains_key(&port)
     }

@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use turna_auth::AuthMode;
+use turna_auth::{AuthMode, AuthRegistry};
 use turna_health::Metrics;
 use turna_relay::processor::PacketProcessor;
 use turna_session::AllocationStore;
@@ -158,10 +158,10 @@ fn allocation_store_arc_no_leak() {
 
     let store = Arc::new(AllocationStore::new(49152, 65535, 1000));
     let metrics = Arc::new(Metrics::new());
-    let auth = Arc::new(AuthMode::SharedSecret {
+    let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
         realm: "turna-soak".into(),
         secret: b"soak-test-secret".to_vec(),
-    });
+    }));
 
     // ── Create allocations ───────────────────────────────────────────────────
     for i in 0..N_ALLOCS {
@@ -244,10 +244,10 @@ fn allocation_store_arc_no_leak() {
 fn processor_actually_processes_packets() {
     let store = Arc::new(AllocationStore::new(49152, 65535, 10));
     let metrics = Arc::new(Metrics::new());
-    let auth = Arc::new(AuthMode::SharedSecret {
+    let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
         realm: "turna-soak".into(),
         secret: b"key".to_vec(),
-    });
+    }));
 
     let processor = PacketProcessor::new(
         Arc::clone(&store),
@@ -280,10 +280,10 @@ fn full_soak_10k_allocs_1m_packets() {
 
     let store = Arc::new(AllocationStore::new(39152, 65535, N_ALLOCS as usize + 100));
     let metrics = Arc::new(Metrics::new());
-    let auth = Arc::new(AuthMode::SharedSecret {
+    let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
         realm: "turna-soak".into(),
         secret: b"soak-secret".to_vec(),
-    });
+    }));
 
     for i in 0..N_ALLOCS {
         let port = 39152 + i;

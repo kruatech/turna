@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use turna_auth::AuthMode;
+use turna_auth::AuthRegistry;
 use turna_health::Metrics;
 use turna_session::AllocationStore;
 use turna_transport::buffer::{BytesPool, MAX_UDP_PACKET};
@@ -102,7 +102,7 @@ impl RelayServer {
     pub fn new(
         transport: TokioTransport,
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -112,7 +112,7 @@ impl RelayServer {
     pub fn new_with_cluster(
         transport: TokioTransport,
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
         cluster: Option<ClusterRouting>,

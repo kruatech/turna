@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
-use turna_auth::AuthMode;
+use turna_auth::{AuthMode, AuthRegistry};
 use turna_cluster::gossip::{run_gossip, GossipConfig};
 use turna_cluster::{ClusterNode, HashRing};
 use turna_config::{ClusterConfig, TurnConfig, TurnaConfig};
@@ -50,12 +50,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (config, cluster, health_listen, tls_cfg) = match config_path {
+    let (config, cluster, health_listen, tls_cfg, tenants) = match config_path {
         Some(path) => {
             let root = TurnaConfig::load(&path)?;
             let health_listen = root.health.listen;
             let tls_cfg = root.tls.clone();
-            (root.turn, root.cluster, health_listen, tls_cfg)
+            (root.turn, root.cluster, health_listen, tls_cfg, root.tenants)
         }
         None => {
             turna_observability::init();
@@ -65,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ClusterConfig::default(),
                 "0.0.0.0:9090".parse().unwrap(),
                 turna_config::TlsConfig::default(),
+                Vec::new(),
             )
         }
     };
@@ -117,13 +118,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let auth: Arc<AuthMode> = if config.auth.static_users.is_empty() {
-        Arc::new(AuthMode::SharedSecret {
+    // Base ([turn]) auth backend.
+    let base_auth = if config.auth.static_users.is_empty() {
+        AuthMode::SharedSecret {
             realm: config.realm.clone(),
             secret: config.auth.shared_secret.as_bytes().to_vec(),
-        })
+        }
     } else {
-        Arc::new(AuthMode::LongTerm {
+        AuthMode::LongTerm {
             realm: config.realm.clone(),
             users: config
                 .auth
@@ -131,7 +133,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|u| (u.username.clone(), u.password.clone()))
                 .collect(),
-        })
+        }
+    };
+    // Multi-tenancy: register each [[tenants]] entry under its own realm. Tenant
+    // identity is resolved from the authenticated realm at request time (see
+    // turna_auth::AuthRegistry); the listener never selects the tenant.
+    let auth: Arc<AuthRegistry> = {
+        let mut registry = AuthRegistry::new(base_auth);
+        for t in &tenants {
+            let tenant_auth = if t.static_users.is_empty() {
+                AuthMode::SharedSecret {
+                    realm: t.realm.clone(),
+                    secret: t.shared_secret.as_bytes().to_vec(),
+                }
+            } else {
+                AuthMode::LongTerm {
+                    realm: t.realm.clone(),
+                    users: t
+                        .static_users
+                        .iter()
+                        .map(|u| (u.username.clone(), u.password.clone()))
+                        .collect(),
+                }
+            };
+            info!(tenant = %t.id, realm = %t.realm, ports = ?t.relay_port_range,
+                  "tenant registered");
+            registry = registry.with_tenant(t.id.clone(), tenant_auth);
+        }
+        Arc::new(registry)
     };
 
     let store = Arc::new({
@@ -144,6 +173,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_bytes_per_sec: config.relay.quota.max_bytes_per_sec,
             max_per_user: config.relay.quota.max_per_user,
         };
+        // Multi-tenancy: isolated relay-port pool per tenant (disjoint ranges).
+        for t in &tenants {
+            s = s.with_tenant_pool(
+                t.id.clone(),
+                t.relay_port_range[0],
+                t.relay_port_range[1],
+                t.max_allocations,
+                turna_session::BandwidthQuota {
+                    max_bytes_per_sec: t.quota.max_bytes_per_sec,
+                    max_per_user: t.quota.max_per_user,
+                },
+            );
+        }
         s
     });
 
@@ -184,7 +226,7 @@ fn run_tokio(
     config: TurnConfig,
     cluster: ClusterConfig,
     store: Arc<AllocationStore>,
-    auth: Arc<AuthMode>,
+    auth: Arc<AuthRegistry>,
     external_ip: std::net::IpAddr,
     metrics: Arc<Metrics>,
     health_listen: std::net::SocketAddr,
@@ -530,14 +572,35 @@ fn run_tokio(
                     use turna_relay::handler::RelayHandler;
                     use turna_transport::worker::{spawn_worker_pool, WorkerPoolConfig};
 
-                    // Single worker for now: each io_uring engine owns its own
-                    // relay sockets, and there is no cross-worker relay routing
-                    // for the shared allocation store yet — with >1 worker, media
-                    // landing on a worker that didn't bind that relay port would
-                    // be dropped. Multi-worker sharding is future work.
+                    // Multi-worker thread-per-core. Each io_uring engine binds
+                    // the listen address with SO_REUSEPORT (set in
+                    // UringEngine::new), so the kernel shards inbound datagrams
+                    // by client 4-tuple: a given client always lands on the same
+                    // worker — which is exactly where its allocation and relay
+                    // socket live. Peer->relay traffic lands on the worker that
+                    // bound that relay port. The AllocationStore is DashMap-backed
+                    // (lock-free reads on the media path) and shared across
+                    // workers; only the rare PortAllocator path takes a mutex.
+                    //
+                    // Worker count defaults to the CPU count; override with
+                    // TURNA_IOURING_WORKERS=<n>.
+                    //
+                    // Limitation: a client that changes its source 5-tuple (NAT
+                    // rebind) may rehash to another worker with no allocation for
+                    // it and must re-Allocate (zero-downtime migration is P2).
+                    let num_workers = std::env::var("TURNA_IOURING_WORKERS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|&n| n >= 1)
+                        .unwrap_or_else(|| {
+                            std::thread::available_parallelism()
+                                .map(|n| n.get())
+                                .unwrap_or(1)
+                        });
+                    info!(num_workers, "io_uring multi-worker pool");
                     let pool_cfg = WorkerPoolConfig {
                         listen_addr: config.listen,
-                        num_workers: 1,
+                        num_workers,
                         buffers_per_worker: 2048,
                         external_ip,
                     };

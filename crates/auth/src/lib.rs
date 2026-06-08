@@ -12,7 +12,10 @@
 pub mod jwt;
 pub mod rotation;
 pub mod store;
+pub mod tenant;
 pub mod user;
+
+pub use tenant::{AuthRegistry, AuthResolution};
 
 use thiserror::Error;
 use turna_proto_stun::message::StunMessage;

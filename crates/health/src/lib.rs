@@ -128,6 +128,13 @@ pub struct Metrics {
     /// Current number of live nodes in the gossip ring (including self).
     /// Updated by the gossip topology callback in main.rs.
     pub cluster_nodes: AtomicU64,
+
+    // ── Multi-tenancy ─────────────────────────────────────────────────────────
+    /// Per-tenant total allocations (monotonic). Keyed by tenant id. A `Mutex`
+    /// is fine here — allocation is not the per-packet hot path. Expiry happens
+    /// in the session crate (which has no metrics handle), so this is a total
+    /// counter, not an active gauge.
+    pub tenant_allocations_total: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl Metrics {
@@ -179,6 +186,7 @@ impl Metrics {
             // Cluster
             cluster_redirects: AtomicU64::new(0),
             cluster_nodes: AtomicU64::new(0),
+            tenant_allocations_total: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -188,6 +196,38 @@ impl Metrics {
 
     pub fn is_draining(&self) -> bool {
         self.is_draining.load(Ordering::SeqCst)
+    }
+
+    /// Record one allocation for a tenant (multi-tenancy observability).
+    /// Called from the relay processor when a tenant-scoped allocation succeeds.
+    pub fn record_tenant_allocation(&self, tenant: &str) {
+        if let Ok(mut map) = self.tenant_allocations_total.lock() {
+            *map.entry(tenant.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Render per-tenant Prometheus lines (labelled counter). Empty when no
+    /// tenant allocations have occurred, so single-tenant output is unchanged.
+    fn render_tenant_metrics(&self) -> String {
+        let map = match self.tenant_allocations_total.lock() {
+            Ok(g) => g,
+            Err(_) => return String::new(),
+        };
+        if map.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "# HELP turna_tenant_allocations_total Total allocations per tenant\n\
+             # TYPE turna_tenant_allocations_total counter\n",
+        );
+        for (tenant, count) in map.iter() {
+            // Escape per Prometheus label-value rules: backslash then quote.
+            let esc = tenant.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!(
+                "turna_tenant_allocations_total{{tenant=\"{esc}\"}} {count}\n"
+            ));
+        }
+        out
     }
 }
 
@@ -328,7 +368,7 @@ pub async fn serve_with_cluster(
                 }
                 "/metrics" => {
                     let m = &metrics;
-                    let body = format!(
+                    let mut body = format!(
                         "# HELP turna_active_allocations Current active TURN allocations\n\
                          # TYPE turna_active_allocations gauge\n\
                          turna_active_allocations {}\n\
@@ -494,6 +534,7 @@ pub async fn serve_with_cluster(
                         m.cluster_redirects.load(Ordering::Relaxed),
                         m.cluster_nodes.load(Ordering::Relaxed),
                     );
+                    body.push_str(&m.render_tenant_metrics());
                     ("200 OK", body, "text/plain; version=0.0.4")
                 }
                 _ => ("404 Not Found", "not found".to_string(), "text/plain"),

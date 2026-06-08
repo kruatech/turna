@@ -1,0 +1,118 @@
+name: fuzz
+
+# libFuzzer / cargo-fuzz require a nightly toolchain and run on Linux runners.
+# Two modes:
+#   * smoke   — on PRs / pushes: build every target + a short run to catch
+#               regressions fast (crashing inputs from the committed corpus).
+#   * nightly — scheduled / manual: longer runs, corpus is cached & grown,
+#               crashes and the corpus are uploaded as artifacts.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # 03:17 UTC daily — odd minute to avoid the top-of-hour runner stampede.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Smoke (PR/push) is short; nightly/manual is long. workflow_dispatch may
+      # override via the input above.
+      PER_TARGET_SECONDS: >-
+        ${{ github.event_name == 'pull_request' && '30'
+          || github.event_name == 'push' && '30'
+          || github.event.inputs.max_total_time || '600' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default nightly
+          cargo install cargo-fuzz --locked || cargo install cargo-fuzz
+
+      - name: List fuzz targets
+        id: targets
+        run: |
+          set -euo pipefail
+          targets="$(cargo +nightly fuzz list)"
+          echo "Discovered targets:"
+          echo "$targets"
+          {
+            echo "list<<EOF"
+            echo "$targets"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Cache the corpus so nightly runs accumulate interesting inputs across
+      # days. Keyed by week so it doesn't grow without bound forever.
+      - name: Cache corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-
+
+      - name: Run fuzz targets
+        run: |
+          set -euo pipefail
+          secs="${PER_TARGET_SECONDS}"
+          echo "Fuzzing each target for ${secs}s"
+          rc=0
+          while IFS= read -r target; do
+            [ -z "$target" ] && continue
+            echo "::group::fuzz ${target}"
+            # -max_total_time bounds wall-clock; -timeout flags a single slow
+            # input as a hang. RUST_BACKTRACE for readable crash reports.
+            if ! RUST_BACKTRACE=1 cargo +nightly fuzz run "$target" -- \
+                  -max_total_time="${secs}" -timeout=15; then
+              echo "::error::fuzz target ${target} found a crash or hang"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done <<< "${{ steps.targets.outputs.list }}"
+          exit "$rc"
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload corpus
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ github.run_id }}
+          path: fuzz/corpus/
+          if-no-files-found: ignore
+          retention-days: 7

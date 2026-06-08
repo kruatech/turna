@@ -88,6 +88,10 @@ pub enum ForwardAction {
     CreateRelay {
         port: u16,
     },
+    /// Close a relay socket on this port (allocation released or expired).
+    CloseRelay {
+        port: u16,
+    },
     /// Multiple actions (e.g. CreateRelay + Send).
     Multi(Vec<ForwardAction>),
 }
@@ -168,6 +172,7 @@ fn run_worker<H: PacketHandler>(
         let mut resubmit_main: Vec<(u16, u16)> = Vec::new();
         let mut resubmit_relay: Vec<(u16, u16, u16)> = Vec::new();
         let mut new_relays: Vec<u16> = Vec::new();
+        let mut close_relays: Vec<u16> = Vec::new();
 
         let events = engine.collect_completions();
         for event in events {
@@ -191,6 +196,7 @@ fn run_worker<H: PacketHandler>(
                         &mut zc_relay_sends,
                         &mut resubmit_main,
                         &mut new_relays,
+                        &mut close_relays,
                         &mut stats,
                     );
                 }
@@ -227,6 +233,12 @@ fn run_worker<H: PacketHandler>(
                         stats.errors += 1;
                     }
                 }
+                CompletionEvent::MainRecvError { msghdr_idx, buf_idx } => {
+                    // Re-arm the main recv slot (reuses the buffer) so a
+                    // transient error doesn't permanently shrink the recv ring.
+                    stats.errors += 1;
+                    resubmit_main.push((msghdr_idx, buf_idx));
+                }
             }
         }
 
@@ -237,6 +249,14 @@ fn run_worker<H: PacketHandler>(
                     warn!(worker_id, port, %e, "failed to add relay");
                 }
             }
+        }
+
+        // Close relays whose allocation was released/expired. The engine marks
+        // them draining and reclaims the msghdr block once all in-flight ops
+        // complete (in-flight-safe). Done before resubmits so a relay closed in
+        // this same batch isn't re-armed.
+        for port in &close_relays {
+            engine.remove_relay(*port);
         }
 
         // Submit main sends. The engine now allocates an in-flight-safe send
@@ -306,6 +326,7 @@ fn process_action(
     zc_relay_sends: &mut Vec<(u16, u16, usize, usize, SocketAddr)>,
     resubmit_main: &mut Vec<(u16, u16)>,
     new_relays: &mut Vec<u16>,
+    close_relays: &mut Vec<u16>,
     stats: &mut Stats,
 ) {
     match action {
@@ -346,6 +367,12 @@ fn process_action(
                 resubmit_main.push((msghdr_idx, buf_idx));
             }
         }
+        ForwardAction::CloseRelay { port } => {
+            close_relays.push(port);
+            if is_main {
+                resubmit_main.push((msghdr_idx, buf_idx));
+            }
+        }
         ForwardAction::Multi(actions) => {
             let mut has_zc = false;
             for a in actions {
@@ -367,6 +394,7 @@ fn process_action(
                         zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
                     }
                     ForwardAction::CreateRelay { port } => new_relays.push(port),
+                    ForwardAction::CloseRelay { port } => close_relays.push(port),
                     _ => {}
                 }
             }

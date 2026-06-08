@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use turna_auth::AuthMode;
+use turna_auth::AuthRegistry;
 use turna_cluster::HashRing;
 use turna_health::Metrics;
 use turna_proto_stun::attribute::Attribute;
@@ -202,7 +202,7 @@ impl ClusterRouting {
 /// Pure packet processor — shared between async (tokio) and io_uring modes.
 pub struct PacketProcessor {
     store: Arc<AllocationStore>,
-    auth: Arc<AuthMode>,
+    auth: Arc<AuthRegistry>,
     rate_limiter: TieredRateLimiter,
     external_ip: std::net::IpAddr,
     nonce_mgr: NonceManager,
@@ -215,7 +215,7 @@ pub struct PacketProcessor {
 impl PacketProcessor {
     pub fn new(
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -224,7 +224,7 @@ impl PacketProcessor {
 
     pub fn new_with_cluster(
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
         cluster: Option<ClusterRouting>,
@@ -234,7 +234,7 @@ impl PacketProcessor {
 
     pub fn with_mtu(
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
         mtu: u16,
@@ -244,7 +244,7 @@ impl PacketProcessor {
 
     pub fn with_mtu_and_cluster(
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
         mtu: u16,
@@ -461,11 +461,9 @@ impl PacketProcessor {
             return vec![Action::None];
         };
 
-        if self.store.quota.max_bytes_per_sec > 0 {
-            if alloc
-                .check_bandwidth(self.store.quota.max_bytes_per_sec)
-                .is_err()
-            {
+        let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
+        if bw_limit > 0 {
+            if alloc.check_bandwidth(bw_limit).is_err() {
                 debug!(%src, "bandwidth quota exceeded, dropping packet");
                 self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
                 return vec![Action::None];
@@ -662,16 +660,26 @@ impl PacketProcessor {
             return stale;
         }
 
-        let key = match self.auth.validate(msg, raw) {
-            Ok(k) => k,
+        let resolution = match self.auth.validate(msg, raw) {
+            Ok(r) => r,
             Err(e) => {
                 warn!(%src, %e, "auth failed");
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
             }
         };
+        // Tenant identity is the result of auth resolution — derived ONLY from
+        // the authenticated realm (see turna_auth::AuthRegistry). Network/listener
+        // hints never enter here.
+        let key = resolution.key;
+        let tenant_id = resolution.tenant_id;
 
-        let (relay_port, relay_sock) = match self.store.ports.allocate_and_bind() {
+        // Allocate the relay port from the *resolved tenant's* isolated pool.
+        let (relay_port, relay_sock) = match self
+            .store
+            .pool(tenant_id.as_deref())
+            .allocate_and_bind()
+        {
             Some(x) => x,
             None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
         };
@@ -683,11 +691,15 @@ impl PacketProcessor {
             .min(turn::MAX_LIFETIME);
         let username = msg.get_username().unwrap_or("").to_string();
 
-        if let Err(_) = self
-            .store
-            .create(src, relay_addr, username, key.clone(), lifetime)
-        {
-            self.store.ports.release(relay_port);
+        if let Err(_) = self.store.create_for_tenant(
+            src,
+            relay_addr,
+            username,
+            key.clone(),
+            lifetime,
+            tenant_id.clone(),
+        ) {
+            self.store.pool_for_port(relay_port).release(relay_port);
             // relay_sock dropped here → socket closed, port freed.
             return self.encode_error(msg, src, 508, "Insufficient Capacity");
         }
@@ -698,6 +710,11 @@ impl PacketProcessor {
         self.metrics
             .total_allocations
             .fetch_add(1, Ordering::Relaxed);
+        // Per-tenant observability (multi-tenancy). Base tenant (None) is not
+        // labelled — it is already covered by turna_total_allocations.
+        if let Some(t) = tenant_id.as_deref() {
+            self.metrics.record_tenant_allocation(t);
+        }
 
         let resp = turn::build_allocate_response(msg.transaction_id, relay_addr, src, lifetime);
         let mut buf = [0u8; 1024];
@@ -726,7 +743,7 @@ impl PacketProcessor {
             return stale;
         }
         let key = match self.auth.validate(msg, raw) {
-            Ok(k) => k,
+            Ok(r) => r.key,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
@@ -778,7 +795,7 @@ impl PacketProcessor {
             return stale;
         }
         let key = match self.auth.validate(msg, raw) {
-            Ok(k) => k,
+            Ok(r) => r.key,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
@@ -821,7 +838,7 @@ impl PacketProcessor {
             return stale;
         }
         let key = match self.auth.validate(msg, raw) {
-            Ok(k) => k,
+            Ok(r) => r.key,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
@@ -946,7 +963,7 @@ impl PacketProcessor {
         let resp = turn::build_auth_challenge(
             msg.method,
             msg.transaction_id,
-            self.auth.realm(),
+            self.auth.default_realm(),
             &self.nonce_mgr.current(),
         );
         let mut buf = [0u8; 512];
@@ -961,7 +978,7 @@ impl PacketProcessor {
     fn encode_stale_nonce(&self, msg: &StunMessage, dst: SocketAddr) -> Vec<Action> {
         let mut resp =
             turn::build_error_response(msg.method, msg.transaction_id, 438, "Stale Nonce");
-        resp.add(Attribute::Realm(self.auth.realm().to_string()));
+        resp.add(Attribute::Realm(self.auth.default_realm().to_string()));
         resp.add(Attribute::Nonce(self.nonce_mgr.current()));
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);

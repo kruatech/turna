@@ -4,7 +4,6 @@
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
 use crate::processor::{Action, ClusterRouting, PacketProcessor};
-use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use turna_auth::AuthMode;
@@ -81,7 +80,7 @@ impl RelayHandler {
             // (non-transactional) relay lifecycle.
             Action::RegisterRelay { port, .. } => ForwardAction::CreateRelay { port },
 
-            Action::CloseRelay { .. } => ForwardAction::None,
+            Action::CloseRelay { port } => ForwardAction::CloseRelay { port },
 
             Action::None => ForwardAction::None,
         }
