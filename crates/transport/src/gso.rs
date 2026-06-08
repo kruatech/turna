@@ -166,9 +166,7 @@ pub fn parse_gro_cmsg(cmsg_buf: &[u8]) -> Option<u16> {
         // SAFETY: we checked that offset + size_of::<cmsghdr> <= buf.len(),
         // so the pointer is within the slice bounds.
         let hdr: libc::cmsghdr = unsafe {
-            std::ptr::read_unaligned(
-                cmsg_buf.as_ptr().add(offset) as *const libc::cmsghdr
-            )
+            std::ptr::read_unaligned(cmsg_buf.as_ptr().add(offset) as *const libc::cmsghdr)
         };
         if hdr.cmsg_len == 0 {
             break;
@@ -176,10 +174,8 @@ pub fn parse_gro_cmsg(cmsg_buf: &[u8]) -> Option<u16> {
         if hdr.cmsg_level == libc::SOL_UDP && hdr.cmsg_type == UDP_GRO {
             let data_offset = offset + std::mem::size_of::<libc::cmsghdr>();
             if data_offset + 2 <= cmsg_buf.len() {
-                let segment = u16::from_ne_bytes([
-                    cmsg_buf[data_offset],
-                    cmsg_buf[data_offset + 1],
-                ]);
+                let segment =
+                    u16::from_ne_bytes([cmsg_buf[data_offset], cmsg_buf[data_offset + 1]]);
                 return Some(segment);
             }
         }
@@ -202,9 +198,7 @@ pub fn build_gso_cmsg(segment_size: u16) -> Vec<u8> {
     let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::cmsghdr) };
     hdr.cmsg_level = libc::SOL_UDP;
     hdr.cmsg_type = UDP_SEGMENT;
-    hdr.cmsg_len = unsafe {
-        libc::CMSG_LEN(std::mem::size_of::<u16>() as u32)
-    } as usize;
+    hdr.cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) } as usize;
 
     let data_ptr = unsafe { libc::CMSG_DATA(hdr) } as *mut u16;
     unsafe { *data_ptr = segment_size };

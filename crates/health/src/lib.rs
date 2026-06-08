@@ -6,13 +6,30 @@
 //! - GET /metrics → Prometheus text format
 pub mod load_reporter;
 
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::info;
-use serde::Serialize;
+
+/// One node as reported by `GET /cluster`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterNodeInfo {
+    pub node_id: String,
+    pub turn_addr: String,
+    /// True for the node answering the request.
+    pub is_self: bool,
+}
+
+/// Supplies the current cluster membership to the health server's `/cluster`
+/// endpoint. Implemented in turna-node over the gossip ring; a single-node
+/// deployment returns just the local node, so the endpoint behaves the same
+/// whether you run one instance or many.
+pub trait ClusterView: Send + Sync {
+    fn nodes(&self) -> Vec<ClusterNodeInfo>;
+}
 
 /// Shared metrics that are updated by relay workers.
 pub struct Metrics {
@@ -39,9 +56,9 @@ pub struct Metrics {
     pub peer_rejected: AtomicU64,
     // RTP quality (updated periodically)
     pub rtp_streams: AtomicU64,
-    pub rtp_avg_loss_pct_x100: AtomicU64,   // loss% * 100 (e.g. 250 = 2.50%)
+    pub rtp_avg_loss_pct_x100: AtomicU64, // loss% * 100 (e.g. 250 = 2.50%)
     pub rtp_max_loss_pct_x100: AtomicU64,
-    pub rtp_avg_jitter_us: AtomicU64,        // jitter in microseconds
+    pub rtp_avg_jitter_us: AtomicU64, // jitter in microseconds
     pub rtp_max_jitter_us: AtomicU64,
     pub rtp_total_bitrate_kbps: AtomicU64,
     pub start_time: std::time::Instant,
@@ -53,26 +70,26 @@ pub struct Metrics {
     //   metrics.tarantool_reconnect_attempts.store(s.attempts, Ordering::Relaxed);
     //   metrics.tarantool_reconnect_successes.store(s.successes, Ordering::Relaxed);
     //   metrics.tarantool_connection_state.store(s.state as u64, Ordering::Relaxed);
-    pub tarantool_reconnect_attempts:  AtomicU64,
+    pub tarantool_reconnect_attempts: AtomicU64,
     pub tarantool_reconnect_successes: AtomicU64,
     /// 0 = connected, 1 = reconnecting, 2 = failed (matches `ConnState` in turna-state-backend).
-    pub tarantool_connection_state:    AtomicU64,
+    pub tarantool_connection_state: AtomicU64,
 
     // ── gRPC server metrics ───────────────────────────────────────────────────
     /// Number of currently open streaming RPCs (WatchAllocations, WatchMetrics).
-    pub grpc_active_streams:       AtomicU64,
+    pub grpc_active_streams: AtomicU64,
     /// Duration of the most recent graceful drain in milliseconds.
-    pub grpc_shutdown_drain_ms:    AtomicU64,
+    pub grpc_shutdown_drain_ms: AtomicU64,
     /// Total number of times drain timeout expired before all streams closed.
-    pub grpc_forced_kills:         AtomicU64,
+    pub grpc_forced_kills: AtomicU64,
 
     // ── Failover metrics (PR A, task 2.1) ─────────────────────────────────────
     /// Total allocations successfully claimed from dead nodes.
-    pub failover_claimed_total:     AtomicU64,
+    pub failover_claimed_total: AtomicU64,
     /// Total CAS attempts lost to a concurrent claim by another node.
-    pub failover_lost_race_total:   AtomicU64,
+    pub failover_lost_race_total: AtomicU64,
     /// Total backend errors during failover sweeps.
-    pub failover_errors_total:      AtomicU64,
+    pub failover_errors_total: AtomicU64,
     /// Duration of the most recent failover sweep in microseconds.
     pub failover_sweep_duration_us: AtomicU64,
 
@@ -80,9 +97,9 @@ pub struct Metrics {
     // Updated by TarantoolBackend::pool_states() via a periodic background
     // task in main.rs (same pattern as tarantool_reconnect_* above).
     /// Pool slots currently idle (mutex not held).
-    pub tarantool_pool_idle:   AtomicU64,
+    pub tarantool_pool_idle: AtomicU64,
     /// Pool slots currently busy (request in flight).
-    pub tarantool_pool_busy:   AtomicU64,
+    pub tarantool_pool_busy: AtomicU64,
     /// Pool slots currently broken (last I/O failed, awaiting reconnect).
     pub tarantool_pool_broken: AtomicU64,
 
@@ -91,18 +108,26 @@ pub struct Metrics {
     // task copies its internal `WriterCounters` here after every flush so
     // they show up on `/metrics`.
     /// Total batches flushed to the backend.
-    pub tarantool_writer_batches:   AtomicU64,
+    pub tarantool_writer_batches: AtomicU64,
     /// Total operations applied (sum across Create/Refresh/Remove/Perm/Chan).
-    pub tarantool_writer_ops:       AtomicU64,
+    pub tarantool_writer_ops: AtomicU64,
     /// Number of events the writer was able to merge with another
     /// (e.g. Refresh+Refresh → keep latest, Create+Remove → drop both).
     pub tarantool_writer_coalesced: AtomicU64,
     /// Backend errors from per-port flush attempts. Independent of
     /// `tarantool_reconnect_*` (those track the transport layer).
-    pub tarantool_writer_errors:    AtomicU64,
+    pub tarantool_writer_errors: AtomicU64,
     /// Events dropped on the hot path because the writer's bounded
     /// channel was full. Indicates Tarantool is keeping up or not.
-    pub tarantool_writes_dropped:   AtomicU64,
+    pub tarantool_writes_dropped: AtomicU64,
+
+    // ── Cluster (gossip + TURN-redirect balancing) ───────────────────────────
+    /// Total `300 Try Alternate` redirects this node has sent to hand a new
+    /// client to its owner node.
+    pub cluster_redirects: AtomicU64,
+    /// Current number of live nodes in the gossip ring (including self).
+    /// Updated by the gossip topology callback in main.rs.
+    pub cluster_nodes: AtomicU64,
 }
 
 impl Metrics {
@@ -121,8 +146,8 @@ impl Metrics {
             send_queue_dropped: AtomicU64::new(0),
             parser_rejections: AtomicU64::new(0),
             malformed_packets: AtomicU64::new(0),
-            quota_exceeded:    AtomicU64::new(0),
-            peer_rejected:     AtomicU64::new(0),
+            quota_exceeded: AtomicU64::new(0),
+            peer_rejected: AtomicU64::new(0),
             rtp_streams: AtomicU64::new(0),
             rtp_avg_loss_pct_x100: AtomicU64::new(0),
             rtp_max_loss_pct_x100: AtomicU64::new(0),
@@ -130,27 +155,30 @@ impl Metrics {
             rtp_max_jitter_us: AtomicU64::new(0),
             rtp_total_bitrate_kbps: AtomicU64::new(0),
             start_time: std::time::Instant::now(),
-            tarantool_reconnect_attempts:  AtomicU64::new(0),
+            tarantool_reconnect_attempts: AtomicU64::new(0),
             tarantool_reconnect_successes: AtomicU64::new(0),
-            tarantool_connection_state:    AtomicU64::new(0),
-            grpc_active_streams:           AtomicU64::new(0),
-            grpc_shutdown_drain_ms:        AtomicU64::new(0),
-            grpc_forced_kills:             AtomicU64::new(0),
+            tarantool_connection_state: AtomicU64::new(0),
+            grpc_active_streams: AtomicU64::new(0),
+            grpc_shutdown_drain_ms: AtomicU64::new(0),
+            grpc_forced_kills: AtomicU64::new(0),
             // PR2: writer
-            tarantool_writer_batches:      AtomicU64::new(0),
-            tarantool_writer_ops:          AtomicU64::new(0),
-            tarantool_writer_coalesced:    AtomicU64::new(0),
-            tarantool_writer_errors:       AtomicU64::new(0),
-            tarantool_writes_dropped:      AtomicU64::new(0),
+            tarantool_writer_batches: AtomicU64::new(0),
+            tarantool_writer_ops: AtomicU64::new(0),
+            tarantool_writer_coalesced: AtomicU64::new(0),
+            tarantool_writer_errors: AtomicU64::new(0),
+            tarantool_writes_dropped: AtomicU64::new(0),
             // PR A: failover
-            failover_claimed_total:        AtomicU64::new(0),
-            failover_lost_race_total:      AtomicU64::new(0),
-            failover_errors_total:         AtomicU64::new(0),
-            failover_sweep_duration_us:    AtomicU64::new(0),
+            failover_claimed_total: AtomicU64::new(0),
+            failover_lost_race_total: AtomicU64::new(0),
+            failover_errors_total: AtomicU64::new(0),
+            failover_sweep_duration_us: AtomicU64::new(0),
             // PR A: pool gauge
-            tarantool_pool_idle:           AtomicU64::new(0),
-            tarantool_pool_busy:           AtomicU64::new(0),
-            tarantool_pool_broken:         AtomicU64::new(0),
+            tarantool_pool_idle: AtomicU64::new(0),
+            tarantool_pool_busy: AtomicU64::new(0),
+            tarantool_pool_broken: AtomicU64::new(0),
+            // Cluster
+            cluster_redirects: AtomicU64::new(0),
+            cluster_nodes: AtomicU64::new(0),
         }
     }
 
@@ -198,12 +226,23 @@ struct StatusResponse {
 
 /// Start health check HTTP server.
 pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<()> {
+    serve_with_cluster(addr, metrics, None).await
+}
+
+/// Like [`serve`], but also answers `GET /cluster` with the current cluster
+/// membership supplied by `cluster`. Pass `None` for no `/cluster` endpoint.
+pub async fn serve_with_cluster(
+    addr: SocketAddr,
+    metrics: Arc<Metrics>,
+    cluster: Option<Arc<dyn ClusterView>>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "health check server started");
 
     loop {
         let (mut stream, _) = listener.accept().await?;
         let metrics = metrics.clone();
+        let cluster = cluster.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
@@ -220,16 +259,36 @@ pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<(
                 .unwrap_or("/");
 
             let (status, body, content_type) = match path {
+                "/cluster" => match &cluster {
+                    Some(cv) => (
+                        "200 OK",
+                        serde_json::to_string(&cv.nodes()).unwrap_or_else(|_| "[]".into()),
+                        "application/json",
+                    ),
+                    None => (
+                        "200 OK",
+                        "[]".to_string(),
+                        "application/json",
+                    ),
+                },
                 "/health" => {
                     if metrics.is_draining() {
-                        ("503 Service Unavailable", "draining".to_string(), "text/plain")
+                        (
+                            "503 Service Unavailable",
+                            "draining".to_string(),
+                            "text/plain",
+                        )
                     } else {
                         ("200 OK", "ok".to_string(), "text/plain")
                     }
                 }
                 "/status" => {
                     let resp = StatusResponse {
-                        status: if metrics.is_draining() { "draining" } else { "ok" },
+                        status: if metrics.is_draining() {
+                            "draining"
+                        } else {
+                            "ok"
+                        },
                         draining: metrics.is_draining(),
                         uptime_secs: metrics.start_time.elapsed().as_secs(),
                         active_allocations: metrics.active_allocations.load(Ordering::Relaxed),
@@ -247,13 +306,25 @@ pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<(
                         quota_exceeded: metrics.quota_exceeded.load(Ordering::Relaxed),
                         peer_rejected: metrics.peer_rejected.load(Ordering::Relaxed),
                         rtp_streams: metrics.rtp_streams.load(Ordering::Relaxed),
-                        rtp_avg_loss_percent: metrics.rtp_avg_loss_pct_x100.load(Ordering::Relaxed) as f64 / 100.0,
-                        rtp_max_loss_percent: metrics.rtp_max_loss_pct_x100.load(Ordering::Relaxed) as f64 / 100.0,
-                        rtp_avg_jitter_ms: metrics.rtp_avg_jitter_us.load(Ordering::Relaxed) as f64 / 1000.0,
-                        rtp_max_jitter_ms: metrics.rtp_max_jitter_us.load(Ordering::Relaxed) as f64 / 1000.0,
-                        rtp_total_bitrate_kbps: metrics.rtp_total_bitrate_kbps.load(Ordering::Relaxed),
+                        rtp_avg_loss_percent: metrics.rtp_avg_loss_pct_x100.load(Ordering::Relaxed)
+                            as f64
+                            / 100.0,
+                        rtp_max_loss_percent: metrics.rtp_max_loss_pct_x100.load(Ordering::Relaxed)
+                            as f64
+                            / 100.0,
+                        rtp_avg_jitter_ms: metrics.rtp_avg_jitter_us.load(Ordering::Relaxed) as f64
+                            / 1000.0,
+                        rtp_max_jitter_ms: metrics.rtp_max_jitter_us.load(Ordering::Relaxed) as f64
+                            / 1000.0,
+                        rtp_total_bitrate_kbps: metrics
+                            .rtp_total_bitrate_kbps
+                            .load(Ordering::Relaxed),
                     };
-                    ("200 OK", serde_json::to_string_pretty(&resp).unwrap(), "application/json")
+                    (
+                        "200 OK",
+                        serde_json::to_string_pretty(&resp).unwrap(),
+                        "application/json",
+                    )
                 }
                 "/metrics" => {
                     let m = &metrics;
@@ -373,7 +444,13 @@ pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<(
                          # TYPE tarantool_pool_slots gauge\n\
                          tarantool_pool_slots{{state=\"idle\"}} {}\n\
                          tarantool_pool_slots{{state=\"busy\"}} {}\n\
-                         tarantool_pool_slots{{state=\"broken\"}} {}\n",
+                         tarantool_pool_slots{{state=\"broken\"}} {}\n\
+                         # HELP turna_cluster_redirects_total Total 300 Try Alternate redirects sent\n\
+                         # TYPE turna_cluster_redirects_total counter\n\
+                         turna_cluster_redirects_total {}\n\
+                         # HELP turna_cluster_nodes Live nodes in the gossip ring (including self)\n\
+                         # TYPE turna_cluster_nodes gauge\n\
+                         turna_cluster_nodes {}\n",
                         m.active_allocations.load(Ordering::Relaxed),
                         m.total_allocations.load(Ordering::Relaxed),
                         m.packets_received.load(Ordering::Relaxed),
@@ -414,6 +491,8 @@ pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<(
                         m.tarantool_pool_idle.load(Ordering::Relaxed),
                         m.tarantool_pool_busy.load(Ordering::Relaxed),
                         m.tarantool_pool_broken.load(Ordering::Relaxed),
+                        m.cluster_redirects.load(Ordering::Relaxed),
+                        m.cluster_nodes.load(Ordering::Relaxed),
                     );
                     ("200 OK", body, "text/plain; version=0.0.4")
                 }
@@ -428,4 +507,5 @@ pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<(
             let _ = stream.write_all(response.as_bytes()).await;
         });
     }
-}pub mod histogram;
+}
+pub mod histogram;

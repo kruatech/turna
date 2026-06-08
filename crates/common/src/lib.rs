@@ -70,7 +70,9 @@ pub fn hex_encode(data: &[u8]) -> String {
 
 /// Hex-decode string to bytes. Returns None on invalid hex.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
+    if s.len() % 2 != 0 {
+        return None;
+    }
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
@@ -84,8 +86,13 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// Constant-time byte comparison (prevents timing attacks).
 #[inline]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 // ---------------------------------------------------------------------------

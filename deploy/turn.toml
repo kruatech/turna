@@ -34,6 +34,11 @@ listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
 # XOR-RELAYED-ADDRESS attribute.
 external_ip = "${TURNA_EXTERNAL_IP:-}"
 realm       = "${TURNA_REALM:-turna}"
+# Transport backend: auto | io_uring | tokio.
+# - auto (default): use io_uring when usable at runtime, else tokio.
+# - io_uring: force io_uring (Linux + io-uring build; not production-ready yet).
+# - tokio: force epoll + recvmmsg/sendmmsg.
+transport   = "auto"
 
 [turn.auth]
 # Time-limited credentials, coturn-compatible (lt-cred-mech).
@@ -95,14 +100,48 @@ turn_shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
 listen = "${TURNA_HEALTH_ADDR:-0.0.0.0:9090}"
 
 # =============================================================================
-# [cluster] — multi-node mode (PR 3 / task #3)
+# [cluster] — multi-node mode
 # =============================================================================
-# Leave at defaults for single-node operation.  See docs/CLUSTER.md to
-# enable persistence + failover with Tarantool.
+# Leave cluster_mode=false for single-node operation. Enable it when several
+# turna nodes should distribute NEW clients via consistent hashing + TURN 300
+# redirects. Existing local allocations stay local until they expire.
 [cluster]
-node_id     = "${TURNA_NODE_ID:-node-1}"
+# node_id MUST be unique per host. Identical ids collapse the ring to one entry
+# and balancing silently no-ops. Override per host, e.g. TURNA_NODE_ID=node-east-1.
+node_id      = "${TURNA_NODE_ID:-node-1}"
+cluster_mode = ${TURNA_CLUSTER_MODE:-false}
+
+# Legacy fields kept for compatibility with older configs. Prefer the explicit
+# bind/seeds below for new deployments.
 gossip_port = 7946
 seeds       = []
+
+# UDP gossip endpoint and seed list. Seeds are host:port strings, for example:
+# gossip_seeds = ["10.0.0.11:7946", "10.0.0.12:7946"]
+gossip_bind          = "${TURNA_GOSSIP_BIND:-0.0.0.0:7946}"
+gossip_seeds         = []
+gossip_interval_secs = 2
+gossip_timeout_secs  = 30
+
+# Externally reachable TURN address to put into ALTERNATE-SERVER.
+# Leave as 0.0.0.0:0 to derive from [turn].external_ip + [turn].listen port.
+turn_announce_addr = "${TURNA_TURN_ANNOUNCE_ADDR:-0.0.0.0:0}"
+
+# Cluster identity: nodes only merge with peers sharing this name. Stops a stray
+# staging node from joining a prod ring.
+cluster_name = "${TURNA_CLUSTER_NAME:-turna}"
+
+# Gossip address peers should use to reach this node. Leave 0.0.0.0:0 to infer
+# from the packet source; set explicitly behind NAT / in Kubernetes.
+gossip_advertise_addr = "${TURNA_GOSSIP_ADVERTISE:-0.0.0.0:0}"
+
+# Shared secret for gossip HMAC auth. Empty = unauthenticated (a warning is
+# logged). Set it so only trusted hosts can add/remove nodes from the ring.
+cluster_secret = "${TURNA_CLUSTER_SECRET:-}"
+
+# Lame-duck window (seconds): on shutdown the node announces it is leaving and
+# redirects new clients away for this long before exiting. 0 = exit at once.
+drain_grace_secs = 5
 
 [cluster.backend]
 # "memory" (default, single-node) | "tarantool" (cluster)

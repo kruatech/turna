@@ -19,6 +19,7 @@ members = [
     "crates/auth",
     "crates/qos",
     "crates/config",
+    "crates/cluster",
     "crates/transport",
     "crates/state-backend",
 
@@ -93,6 +94,7 @@ dashmap = "6"
 # Hot-path locks: parking_lot has no poison state, so a panic while holding a
 # lock can't cascade into worker-wide crashes via downstream .unwrap().
 parking_lot = "0.12"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # workspace-крейты
 turna-common        = { path = "crates/common" }
@@ -107,6 +109,7 @@ turna-session       = { path = "crates/session" }
 turna-auth          = { path = "crates/auth" }
 turna-qos           = { path = "crates/qos" }
 turna-config        = { path = "crates/config" }
+turna-cluster       = { path = "crates/cluster" }
 turna-transport     = { path = "crates/transport" }
 turna-state-backend = { path = "crates/state-backend" }
 turna-health        = { path = "crates/health" }

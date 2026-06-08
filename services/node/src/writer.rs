@@ -27,9 +27,7 @@ use tracing::{debug, info, warn};
 
 use turna_health::Metrics;
 use turna_session::{AllocationStore, WriteOp};
-use turna_state_backend::{
-    Backend, BackendError, StoredAllocation, StoredChannel,
-};
+use turna_state_backend::{Backend, BackendError, StoredAllocation, StoredChannel};
 
 // ---------------------------------------------------------------------------
 // Public configuration & metrics
@@ -39,13 +37,13 @@ use turna_state_backend::{
 /// `turna_config::PersistenceConfig` so the caller can pass them in directly.
 #[derive(Debug, Clone)]
 pub struct WriterConfig {
-    pub channel_capacity:   usize,
-    pub batch_max_size:     usize,
-    pub batch_max_delay:    Duration,
+    pub channel_capacity: usize,
+    pub batch_max_size: usize,
+    pub batch_max_delay: Duration,
     /// Node identity stamped onto every `StoredAllocation`. Required so
     /// PR5's failover task can ask `Backend::find_by_node(my_id)` and pick
     /// up orphans.
-    pub node_id:            String,
+    pub node_id: String,
 }
 
 /// Counters owned by the writer task. We bump these as we go and then
@@ -54,13 +52,13 @@ pub struct WriterConfig {
 /// `Metrics` struct itself decoupled from this module's internals.
 #[derive(Debug, Default)]
 pub struct WriterCounters {
-    pub batches:     AtomicU64,
-    pub ops_create:  AtomicU64,
+    pub batches: AtomicU64,
+    pub ops_create: AtomicU64,
     pub ops_refresh: AtomicU64,
-    pub ops_remove:  AtomicU64,
-    pub ops_perm:    AtomicU64,
-    pub ops_chan:    AtomicU64,
-    pub coalesced:   AtomicU64,
+    pub ops_remove: AtomicU64,
+    pub ops_perm: AtomicU64,
+    pub ops_chan: AtomicU64,
+    pub coalesced: AtomicU64,
     pub backend_errors: AtomicU64,
 }
 
@@ -90,34 +88,42 @@ enum PortState {
 
 #[derive(Debug, Clone)]
 struct CreateData {
-    client_addr:   SocketAddr,
-    relay_addr:    SocketAddr,
-    username:      String,
+    client_addr: SocketAddr,
+    relay_addr: SocketAddr,
+    username: String,
     created_at_ms: u64,
     expires_at_ms: u64,
 }
 
 #[derive(Debug)]
 struct PortBatch {
-    state:        PortState,
+    state: PortState,
     /// Latest expires_at_ms from any Refresh seen for this port.
     /// Applied to whichever `StoredAllocation` we end up writing.
     refresh_expires: Option<u64>,
     /// peer_ip → expires_at_ms. Last write wins.
-    perms:        HashMap<IpAddr, u64>,
+    perms: HashMap<IpAddr, u64>,
     /// channel_number → (peer, expires_at_ms). Last write wins.
-    chans:        HashMap<u16, (SocketAddr, u64)>,
+    chans: HashMap<u16, (SocketAddr, u64)>,
 }
 
 impl PortBatch {
     fn new_touched() -> Self {
-        Self { state: PortState::Touched, refresh_expires: None,
-               perms: HashMap::new(), chans: HashMap::new() }
+        Self {
+            state: PortState::Touched,
+            refresh_expires: None,
+            perms: HashMap::new(),
+            chans: HashMap::new(),
+        }
     }
 
     fn new_created(data: CreateData) -> Self {
-        Self { state: PortState::New(data), refresh_expires: None,
-               perms: HashMap::new(), chans: HashMap::new() }
+        Self {
+            state: PortState::New(data),
+            refresh_expires: None,
+            perms: HashMap::new(),
+            chans: HashMap::new(),
+        }
     }
 }
 
@@ -132,10 +138,21 @@ impl PortBatch {
 fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
     let port = op.relay_port();
     match op {
-        WriteOp::Create { client_addr, relay_addr, username,
-                          created_at_ms, expires_at_ms, .. } => {
-            let data = CreateData { client_addr, relay_addr, username,
-                                    created_at_ms, expires_at_ms };
+        WriteOp::Create {
+            client_addr,
+            relay_addr,
+            username,
+            created_at_ms,
+            expires_at_ms,
+            ..
+        } => {
+            let data = CreateData {
+                client_addr,
+                relay_addr,
+                username,
+                created_at_ms,
+                expires_at_ms,
+            };
             let coalesced = matches!(
                 batch.get(&port).map(|b| &b.state),
                 Some(PortState::New(_)) | Some(PortState::Removed)
@@ -151,7 +168,10 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             // the allocation never made it to the backend — there's
             // nothing to remove there. We drop the port entirely.
             match batch.remove(&port) {
-                Some(PortBatch { state: PortState::New(_), .. }) => {
+                Some(PortBatch {
+                    state: PortState::New(_),
+                    ..
+                }) => {
                     // Create+Remove in same batch → no backend roundtrip.
                     true
                 }
@@ -181,14 +201,26 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             // unless a future Create overrides it.
             coalesced
         }
-        WriteOp::Permission { peer_ip, expires_at_ms, .. } => {
+        WriteOp::Permission {
+            peer_ip,
+            expires_at_ms,
+            ..
+        } => {
             let pb = batch.entry(port).or_insert_with(PortBatch::new_touched);
             let coalesced = pb.perms.insert(peer_ip, expires_at_ms).is_some();
             coalesced
         }
-        WriteOp::Channel { number, peer_addr, expires_at_ms, .. } => {
+        WriteOp::Channel {
+            number,
+            peer_addr,
+            expires_at_ms,
+            ..
+        } => {
             let pb = batch.entry(port).or_insert_with(PortBatch::new_touched);
-            let coalesced = pb.chans.insert(number, (peer_addr, expires_at_ms)).is_some();
+            let coalesced = pb
+                .chans
+                .insert(number, (peer_addr, expires_at_ms))
+                .is_some();
             coalesced
         }
     }
@@ -201,9 +233,9 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
 async fn flush_port(
     backend: &Backend,
     node_id: &str,
-    realm:   &str,
-    port:    u16,
-    batch:   PortBatch,
+    realm: &str,
+    port: u16,
+    batch: PortBatch,
     counters: &WriterCounters,
 ) -> Result<(), BackendError> {
     match batch.state {
@@ -214,8 +246,15 @@ async fn flush_port(
         PortState::New(data) => {
             counters.ops_create.fetch_add(1, Ordering::Relaxed);
             let expires = batch.refresh_expires.unwrap_or(data.expires_at_ms);
-            let stored = build_stored(node_id, realm, port, &data, expires,
-                                       &batch.perms, &batch.chans);
+            let stored = build_stored(
+                node_id,
+                realm,
+                port,
+                &data,
+                expires,
+                &batch.perms,
+                &batch.chans,
+            );
             backend.store_allocation(&stored).await
         }
         PortState::Touched => {
@@ -239,51 +278,61 @@ async fn flush_port(
             // Permissions: replace if a newer expiry was emitted.
             // Stored as plain Vec<String>; we keep that shape but dedupe.
             apply_perms(&mut merged.permissions, &batch.perms, counters);
-            apply_chans(&mut merged.channels,    &batch.chans, counters);
+            apply_chans(&mut merged.channels, &batch.chans, counters);
             backend.store_allocation(&merged).await
         }
     }
 }
 
 fn build_stored(
-    node_id: &str, realm: &str,
-    port: u16, data: &CreateData, expires_at_ms: u64,
+    node_id: &str,
+    realm: &str,
+    port: u16,
+    data: &CreateData,
+    expires_at_ms: u64,
     perms: &HashMap<IpAddr, u64>,
     chans: &HashMap<u16, (SocketAddr, u64)>,
 ) -> StoredAllocation {
     StoredAllocation {
-        id:             format!("{node_id}:{port}"),
-        relay_port:     port,
-        client_addr:    data.client_addr.to_string(),
-        relay_addr:     data.relay_addr.to_string(),
-        user_id:        data.username.clone(),
-        realm:          realm.to_string(),
-        node_id:        node_id.to_string(),
-        created_at_ms:  data.created_at_ms,
+        id: format!("{node_id}:{port}"),
+        relay_port: port,
+        client_addr: data.client_addr.to_string(),
+        relay_addr: data.relay_addr.to_string(),
+        user_id: data.username.clone(),
+        realm: realm.to_string(),
+        node_id: node_id.to_string(),
+        created_at_ms: data.created_at_ms,
         expires_at_ms,
-        bytes_in:       0,
-        bytes_out:      0,
-        packets_in:     0,
-        packets_out:    0,
-        permissions:    perms.keys().map(|ip| ip.to_string()).collect(),
-        channels:       chans.iter()
-                            .map(|(&n, &(addr, exp))| StoredChannel {
-                                number: n,
-                                peer_addr: addr.to_string(),
-                                expires_at_ms: exp,
-                            })
-                            .collect(),
+        bytes_in: 0,
+        bytes_out: 0,
+        packets_in: 0,
+        packets_out: 0,
+        permissions: perms.keys().map(|ip| ip.to_string()).collect(),
+        channels: chans
+            .iter()
+            .map(|(&n, &(addr, exp))| StoredChannel {
+                number: n,
+                peer_addr: addr.to_string(),
+                expires_at_ms: exp,
+            })
+            .collect(),
     }
 }
 
 fn apply_perms(dst: &mut Vec<String>, src: &HashMap<IpAddr, u64>, counters: &WriterCounters) {
-    if src.is_empty() { return; }
-    counters.ops_perm.fetch_add(src.len() as u64, Ordering::Relaxed);
+    if src.is_empty() {
+        return;
+    }
+    counters
+        .ops_perm
+        .fetch_add(src.len() as u64, Ordering::Relaxed);
     // The schema stores permissions as Vec<String> of IPs without expiry
     // (StoredAllocation::permissions is just IPs). We just merge unique.
     use std::collections::BTreeSet;
     let mut set: BTreeSet<String> = dst.drain(..).collect();
-    for ip in src.keys() { set.insert(ip.to_string()); }
+    for ip in src.keys() {
+        set.insert(ip.to_string());
+    }
     dst.extend(set);
 }
 
@@ -292,8 +341,12 @@ fn apply_chans(
     src: &HashMap<u16, (SocketAddr, u64)>,
     counters: &WriterCounters,
 ) {
-    if src.is_empty() { return; }
-    counters.ops_chan.fetch_add(src.len() as u64, Ordering::Relaxed);
+    if src.is_empty() {
+        return;
+    }
+    counters
+        .ops_chan
+        .fetch_add(src.len() as u64, Ordering::Relaxed);
     // Overwrite by channel number.
     dst.retain(|c| !src.contains_key(&c.number));
     for (&number, &(peer, expires_at_ms)) in src {
@@ -306,12 +359,12 @@ fn apply_chans(
 }
 
 async fn flush_batch(
-    backend:  &Backend,
-    node_id:  &str,
-    realm:    &str,
-    batch:    HashMap<u16, PortBatch>,
+    backend: &Backend,
+    node_id: &str,
+    realm: &str,
+    batch: HashMap<u16, PortBatch>,
     counters: &WriterCounters,
-    metrics:  &Metrics,
+    metrics: &Metrics,
 ) {
     let n_ports = batch.len() as u64;
     let mut errors = 0u64;
@@ -330,20 +383,27 @@ async fn flush_batch(
 }
 
 fn sync_metrics(metrics: &Metrics, counters: &WriterCounters, dropped: u64) {
-    metrics.tarantool_writer_batches
+    metrics
+        .tarantool_writer_batches
         .store(counters.batches.load(Ordering::Relaxed), Ordering::Relaxed);
     let ops = counters.ops_create.load(Ordering::Relaxed)
-            + counters.ops_refresh.load(Ordering::Relaxed)
-            + counters.ops_remove.load(Ordering::Relaxed)
-            + counters.ops_perm.load(Ordering::Relaxed)
-            + counters.ops_chan.load(Ordering::Relaxed);
+        + counters.ops_refresh.load(Ordering::Relaxed)
+        + counters.ops_remove.load(Ordering::Relaxed)
+        + counters.ops_perm.load(Ordering::Relaxed)
+        + counters.ops_chan.load(Ordering::Relaxed);
     metrics.tarantool_writer_ops.store(ops, Ordering::Relaxed);
-    metrics.tarantool_writer_coalesced
-        .store(counters.coalesced.load(Ordering::Relaxed), Ordering::Relaxed);
-    metrics.tarantool_writer_errors
-        .store(counters.backend_errors.load(Ordering::Relaxed), Ordering::Relaxed);
+    metrics.tarantool_writer_coalesced.store(
+        counters.coalesced.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    metrics.tarantool_writer_errors.store(
+        counters.backend_errors.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
     if dropped > 0 {
-        metrics.tarantool_writes_dropped.store(dropped, Ordering::Relaxed);
+        metrics
+            .tarantool_writes_dropped
+            .store(dropped, Ordering::Relaxed);
     }
 }
 
@@ -355,12 +415,12 @@ fn sync_metrics(metrics: &Metrics, counters: &WriterCounters, dropped: u64) {
 /// (sender dropped) or when `shutdown_rx` flips to `true`.
 pub async fn run_writer(
     backend: Arc<Backend>,
-    store:   Arc<AllocationStore>,
-    realm:   String,
-    config:  WriterConfig,
+    store: Arc<AllocationStore>,
+    realm: String,
+    config: WriterConfig,
     metrics: Arc<Metrics>,
     counters: Arc<WriterCounters>,
-    mut rx:  mpsc::Receiver<WriteOp>,
+    mut rx: mpsc::Receiver<WriteOp>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     info!(
@@ -478,9 +538,13 @@ mod tests {
         store: Arc<AllocationStore>,
         batch_max: usize,
         delay_ms: u64,
-    ) -> (mpsc::Sender<WriteOp>, watch::Sender<bool>,
-          Arc<WriterCounters>, Arc<Metrics>, tokio::task::JoinHandle<()>)
-    {
+    ) -> (
+        mpsc::Sender<WriteOp>,
+        watch::Sender<bool>,
+        Arc<WriterCounters>,
+        Arc<Metrics>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::channel(1024);
         let (sd_tx, sd_rx) = watch::channel(false);
         let counters = Arc::new(WriterCounters::default());
@@ -496,8 +560,7 @@ mod tests {
         let ct_c = counters.clone();
         let mt_c = metrics.clone();
         let handle = tokio::spawn(async move {
-            run_writer(bk_c, st_c, "test-realm".into(),
-                       cfg, mt_c, ct_c, rx, sd_rx).await;
+            run_writer(bk_c, st_c, "test-realm".into(), cfg, mt_c, ct_c, rx, sd_rx).await;
         });
         (tx, sd_tx, counters, metrics, handle)
     }
@@ -506,17 +569,20 @@ mod tests {
     #[tokio::test]
     async fn create_flushes_on_batch_size() {
         let backend = fresh_backend().await;
-        let store   = fresh_store();
+        let store = fresh_store();
         let (tx, sd, counters, _metrics, handle) =
             spawn_writer(backend.clone(), store.clone(), 1, 60_000);
 
         tx.send(WriteOp::Create {
             relay_port: 40000,
-            client_addr: ipv4(127,0,0,1, 9000),
-            relay_addr:  ipv4(10,0,0,1, 40000),
+            client_addr: ipv4(127, 0, 0, 1, 9000),
+            relay_addr: ipv4(10, 0, 0, 1, 40000),
             username: "alice".into(),
-            created_at_ms: 1000, expires_at_ms: 1_600_000,
-        }).await.unwrap();
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
 
         // batch_max=1 → immediate flush. Give it a moment.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -537,19 +603,24 @@ mod tests {
     #[tokio::test]
     async fn create_then_remove_coalesces_to_nothing() {
         let backend = fresh_backend().await;
-        let store   = fresh_store();
+        let store = fresh_store();
         // batch_max big, deadline short → both events arrive in same batch.
         let (tx, sd, counters, _metrics, handle) =
             spawn_writer(backend.clone(), store.clone(), 100, 30);
 
         tx.send(WriteOp::Create {
             relay_port: 40001,
-            client_addr: ipv4(127,0,0,1, 9001),
-            relay_addr:  ipv4(10,0,0,1, 40001),
+            client_addr: ipv4(127, 0, 0, 1, 9001),
+            relay_addr: ipv4(10, 0, 0, 1, 40001),
             username: "bob".into(),
-            created_at_ms: 1000, expires_at_ms: 1_600_000,
-        }).await.unwrap();
-        tx.send(WriteOp::Remove { relay_port: 40001 }).await.unwrap();
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
+        tx.send(WriteOp::Remove { relay_port: 40001 })
+            .await
+            .unwrap();
 
         // Wait past the deadline so the batch is flushed.
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -557,12 +628,16 @@ mod tests {
         // Remove without prior persisted Create still goes through to the
         // backend (it's idempotent), and we count it. What matters is the
         // record doesn't end up persisted.
-        assert!(backend.get_allocation(40001).await.unwrap().is_none(),
-                "create+remove should leave nothing in backend");
+        assert!(
+            backend.get_allocation(40001).await.unwrap().is_none(),
+            "create+remove should leave nothing in backend"
+        );
 
         // Coalescing counter should have incremented at least once.
-        assert!(counters.coalesced.load(Ordering::Relaxed) >= 1,
-                "expected at least one coalesce event");
+        assert!(
+            counters.coalesced.load(Ordering::Relaxed) >= 1,
+            "expected at least one coalesce event"
+        );
 
         sd.send(true).unwrap();
         handle.await.unwrap();
@@ -572,25 +647,40 @@ mod tests {
     #[tokio::test]
     async fn refresh_coalesces_to_latest() {
         let backend = fresh_backend().await;
-        let store   = fresh_store();
+        let store = fresh_store();
         let (tx, sd, _counters, _metrics, handle) =
             spawn_writer(backend.clone(), store.clone(), 100, 30);
 
         tx.send(WriteOp::Create {
             relay_port: 40002,
-            client_addr: ipv4(127,0,0,1, 9002),
-            relay_addr:  ipv4(10,0,0,1, 40002),
+            client_addr: ipv4(127, 0, 0, 1, 9002),
+            relay_addr: ipv4(10, 0, 0, 1, 40002),
             username: "carol".into(),
-            created_at_ms: 1000, expires_at_ms: 1_600_000,
-        }).await.unwrap();
-        tx.send(WriteOp::Refresh { relay_port: 40002, expires_at_ms: 2_000_000 }).await.unwrap();
-        tx.send(WriteOp::Refresh { relay_port: 40002, expires_at_ms: 3_000_000 }).await.unwrap();
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
+        tx.send(WriteOp::Refresh {
+            relay_port: 40002,
+            expires_at_ms: 2_000_000,
+        })
+        .await
+        .unwrap();
+        tx.send(WriteOp::Refresh {
+            relay_port: 40002,
+            expires_at_ms: 3_000_000,
+        })
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(120)).await;
 
         let got = backend.get_allocation(40002).await.unwrap().unwrap();
-        assert_eq!(got.expires_at_ms, 3_000_000,
-                   "latest Refresh should win the coalesce");
+        assert_eq!(
+            got.expires_at_ms, 3_000_000,
+            "latest Refresh should win the coalesce"
+        );
 
         sd.send(true).unwrap();
         handle.await.unwrap();
@@ -600,26 +690,32 @@ mod tests {
     #[tokio::test]
     async fn size_limit_triggers_flush() {
         let backend = fresh_backend().await;
-        let store   = fresh_store();
+        let store = fresh_store();
         let (tx, sd, counters, _metrics, handle) =
             spawn_writer(backend.clone(), store.clone(), 3, 60_000);
 
         for i in 0..3u16 {
             tx.send(WriteOp::Create {
                 relay_port: 40010 + i,
-                client_addr: ipv4(127,0,0,1, 9000 + i),
-                relay_addr:  ipv4(10,0,0,1, 40010 + i),
+                client_addr: ipv4(127, 0, 0, 1, 9000 + i),
+                relay_addr: ipv4(10, 0, 0, 1, 40010 + i),
                 username: format!("u{i}"),
-                created_at_ms: 1000, expires_at_ms: 1_600_000,
-            }).await.unwrap();
+                created_at_ms: 1000,
+                expires_at_ms: 1_600_000,
+            })
+            .await
+            .unwrap();
         }
 
         // Should flush immediately on the 3rd create — give it a beat.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         for i in 0..3u16 {
-            assert!(backend.get_allocation(40010 + i).await.unwrap().is_some(),
-                    "port {} should be persisted", 40010 + i);
+            assert!(
+                backend.get_allocation(40010 + i).await.unwrap().is_some(),
+                "port {} should be persisted",
+                40010 + i
+            );
         }
         assert!(counters.batches.load(Ordering::Relaxed) >= 1);
 
@@ -631,24 +727,29 @@ mod tests {
     #[tokio::test]
     async fn shutdown_flushes_partial_batch() {
         let backend = fresh_backend().await;
-        let store   = fresh_store();
+        let store = fresh_store();
         // Very large batch + long delay: only shutdown can flush.
         let (tx, sd, _counters, _metrics, handle) =
             spawn_writer(backend.clone(), store.clone(), 10_000, 60_000);
 
         tx.send(WriteOp::Create {
             relay_port: 40020,
-            client_addr: ipv4(127,0,0,1, 9020),
-            relay_addr:  ipv4(10,0,0,1, 40020),
+            client_addr: ipv4(127, 0, 0, 1, 9020),
+            relay_addr: ipv4(10, 0, 0, 1, 40020),
             username: "dave".into(),
-            created_at_ms: 1000, expires_at_ms: 1_600_000,
-        }).await.unwrap();
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
 
         // Trigger shutdown before deadline.
         sd.send(true).unwrap();
         handle.await.unwrap();
 
-        assert!(backend.get_allocation(40020).await.unwrap().is_some(),
-                "shutdown should flush partial batch");
+        assert!(
+            backend.get_allocation(40020).await.unwrap().is_some(),
+            "shutdown should flush partial batch"
+        );
     }
 }

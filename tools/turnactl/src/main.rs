@@ -29,10 +29,20 @@ async fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--addr" => { i += 1; addr = args[i].parse().expect("invalid addr"); }
-            "--json" => { json_output = true; }
-            "--help" | "-h" => { print_help(); return; }
-            _ => { cmd_args.push(args[i].clone()); }
+            "--addr" => {
+                i += 1;
+                addr = args[i].parse().expect("invalid addr");
+            }
+            "--json" => {
+                json_output = true;
+            }
+            "--help" | "-h" => {
+                print_help();
+                return;
+            }
+            _ => {
+                cmd_args.push(args[i].clone());
+            }
         }
         i += 1;
     }
@@ -70,50 +80,101 @@ fn parse_command(args: &[String]) -> (String, serde_json::Value) {
         Some("status") => ("node.status".into(), serde_json::json!({})),
         Some("drain") => ("node.drain".into(), serde_json::json!({})),
         Some("undrain") => ("node.undrain".into(), serde_json::json!({})),
-        Some("allocations") => {
-            match args.get(1).map(|s| s.as_str()) {
-                Some("list") => ("allocations.list".into(), serde_json::json!({"limit": 50})),
-                Some("count") => ("allocations.count".into(), serde_json::json!({})),
-                Some("get") => {
-                    let port: u16 = args.get(2)
-                        .and_then(|s| s.parse().ok())
-                        .expect("usage: turnactl allocations get <relay_port>");
-                    ("allocations.get".into(), serde_json::json!({"relay_port": port}))
-                }
-                Some("kill") => {
-                    let port: u16 = args.get(2)
-                        .and_then(|s| s.parse().ok())
-                        .expect("usage: turnactl allocations kill <relay_port>");
-                    ("allocations.kill".into(), serde_json::json!({"relay_port": port}))
-                }
-                _ => { eprintln!("Unknown: allocations {}", args.get(1).unwrap_or(&String::new())); std::process::exit(1); }
+        Some("allocations") => match args.get(1).map(|s| s.as_str()) {
+            Some("list") => ("allocations.list".into(), serde_json::json!({"limit": 50})),
+            Some("count") => ("allocations.count".into(), serde_json::json!({})),
+            Some("get") => {
+                let port: u16 = args
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .expect("usage: turnactl allocations get <relay_port>");
+                (
+                    "allocations.get".into(),
+                    serde_json::json!({"relay_port": port}),
+                )
             }
-        }
-        Some("rooms") => {
-            match args.get(1).map(|s| s.as_str()) {
-                Some("list") => ("rooms.list".into(), serde_json::json!({"limit": 50})),
-                _ => ("rooms.list".into(), serde_json::json!({"limit": 50})),
+            Some("kill") => {
+                let port: u16 = args
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .expect("usage: turnactl allocations kill <relay_port>");
+                (
+                    "allocations.kill".into(),
+                    serde_json::json!({"relay_port": port}),
+                )
             }
+            _ => {
+                eprintln!(
+                    "Unknown: allocations {}",
+                    args.get(1).unwrap_or(&String::new())
+                );
+                std::process::exit(1);
+            }
+        },
+        Some("rooms") => match args.get(1).map(|s| s.as_str()) {
+            Some("list") => ("rooms.list".into(), serde_json::json!({"limit": 50})),
+            _ => ("rooms.list".into(), serde_json::json!({"limit": 50})),
+        },
+        Some("cluster") => match args.get(1).map(|s| s.as_str()) {
+            Some("nodes") | None => ("cluster.nodes".into(), serde_json::json!({})),
+            other => {
+                eprintln!("Unknown: cluster {}", other.unwrap_or(""));
+                std::process::exit(1);
+            }
+        },
+        _ => {
+            eprintln!(
+                "Unknown command: {}",
+                args.first().unwrap_or(&String::new())
+            );
+            std::process::exit(1);
         }
-        _ => { eprintln!("Unknown command: {}", args.first().unwrap_or(&String::new())); std::process::exit(1); }
     }
 }
 
 fn print_formatted(command: &str, data: &Option<serde_json::Value>) {
-    let Some(data) = data else { println!("OK"); return; };
+    let Some(data) = data else {
+        println!("OK");
+        return;
+    };
 
     match command {
         "ping" => println!("pong"),
         "node.status" => {
             println!("Node:        {}", data["node_id"].as_str().unwrap_or("?"));
-            println!("Uptime:      {}s", data["uptime_secs"].as_u64().unwrap_or(0));
-            println!("Allocations: {}", data["active_allocations"].as_u64().unwrap_or(0));
-            println!("Draining:    {}", data["draining"].as_bool().unwrap_or(false));
+            println!(
+                "Uptime:      {}s",
+                data["uptime_secs"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "Allocations: {}",
+                data["active_allocations"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "Draining:    {}",
+                data["draining"].as_bool().unwrap_or(false)
+            );
         }
         "node.drain" => println!("Drain mode enabled"),
         "node.undrain" => println!("Drain mode disabled"),
         "allocations.count" => println!("{}", data["count"].as_u64().unwrap_or(0)),
         "allocations.kill" => println!("Killed allocation on port {}", data["killed"]),
+        "cluster.nodes" => {
+            if let Some(nodes) = data.as_array() {
+                println!("{:<28} {:<24} {}", "NODE_ID", "TURN_ADDR", "SELF");
+                for n in nodes {
+                    println!(
+                        "{:<28} {:<24} {}",
+                        n["node_id"].as_str().unwrap_or("?"),
+                        n["turn_addr"].as_str().unwrap_or("?"),
+                        if n["is_self"].as_bool().unwrap_or(false) { "*" } else { "" }
+                    );
+                }
+                println!("({} node(s))", nodes.len());
+            } else {
+                println!("{}", serde_json::to_string_pretty(data).unwrap());
+            }
+        }
         _ => println!("{}", serde_json::to_string_pretty(data).unwrap()),
     }
 }
@@ -131,4 +192,5 @@ fn print_help() {
     println!("  allocations get <port>   Get allocation details");
     println!("  allocations kill <port>  Force-remove allocation");
     println!("  rooms list               List active rooms");
+    println!("  cluster nodes            List live cluster nodes (gossip ring)");
 }

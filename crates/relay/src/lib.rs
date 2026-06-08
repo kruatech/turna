@@ -4,14 +4,18 @@
 //! - `RelayServer`: async, uses tokio Transport (all platforms)
 //! - `RelayHandler`: sync, implements `PacketHandler` for io_uring workers (Linux)
 
-pub mod processor;
-pub mod peer_filter;
-pub mod server;
 pub mod migration;
+pub mod peer_filter;
+pub mod processor;
+pub mod server;
+
+#[cfg(feature = "tls")]
+pub mod tls_bridge;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod handler;
 
 pub use processor::PacketProcessor;
 pub use server::RelayServer;
-#[cfg(target_os = "linux")] pub mod splice;
+#[cfg(target_os = "linux")]
+pub mod splice;

@@ -3,30 +3,46 @@
 
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
-use std::sync::Arc;
-use std::net::SocketAddr;
+use crate::processor::{Action, ClusterRouting, PacketProcessor};
 use bytes::Bytes;
-use turna_transport::worker::{PacketHandler, ForwardAction};
-use turna_session::AllocationStore;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use turna_auth::AuthMode;
 use turna_health::Metrics;
-use crate::processor::{PacketProcessor, Action};
+use turna_session::AllocationStore;
+use turna_transport::worker::{ForwardAction, PacketHandler};
 
 /// TURN packet handler for io_uring workers.
 pub struct RelayHandler {
-    processor:   Arc<PacketProcessor>,
+    processor: Arc<PacketProcessor>,
     external_ip: std::net::IpAddr,
 }
 
 impl RelayHandler {
     pub fn new(
-        store:       Arc<AllocationStore>,
-        auth:        Arc<AuthMode>,
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthMode>,
         external_ip: std::net::IpAddr,
-        metrics:     Arc<Metrics>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::new_with_cluster(store, auth, external_ip, metrics, None)
+    }
+
+    pub fn new_with_cluster(
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthMode>,
+        external_ip: std::net::IpAddr,
+        metrics: Arc<Metrics>,
+        cluster: Option<ClusterRouting>,
     ) -> Self {
         Self {
-            processor: Arc::new(PacketProcessor::new(store, auth, external_ip, metrics)),
+            processor: Arc::new(PacketProcessor::new_with_cluster(
+                store,
+                auth,
+                external_ip,
+                metrics,
+                cluster,
+            )),
             external_ip,
         }
     }
@@ -34,30 +50,40 @@ impl RelayHandler {
     /// Map a single `Action` to a `ForwardAction` for the io_uring send path.
     fn convert_action(&self, action: Action) -> ForwardAction {
         match action {
-            Action::Send { data, target } =>
-                ForwardAction::Send { data, target },
+            Action::Send { data, target } => ForwardAction::Send { data, target },
 
             // Action::Forward replaces the old ZeroCopyForward{offset, len}.
             // data is already a Bytes::slice() — no copy in the io_uring path either.
-            Action::Forward { data, target, relay_port } =>
-                ForwardAction::SendViaRelay { data, target, relay_port },
+            Action::Forward {
+                data,
+                target,
+                relay_port,
+            } => ForwardAction::SendViaRelay {
+                data,
+                target,
+                relay_port,
+            },
 
-            Action::SendViaRelay { data, target, relay_port } =>
-                ForwardAction::SendViaRelay { data, target, relay_port },
+            Action::SendViaRelay {
+                data,
+                target,
+                relay_port,
+            } => ForwardAction::SendViaRelay {
+                data,
+                target,
+                relay_port,
+            },
 
             // The io_uring/worker path binds its own relay socket, so the
             // pre-bound socket from handle_allocate is dropped here (closed),
             // freeing the port for the worker to rebind. CloseRelay has no
             // worker equivalent yet — the worker path keeps its prior
             // (non-transactional) relay lifecycle.
-            Action::RegisterRelay { port, .. } =>
-                ForwardAction::CreateRelay { port },
+            Action::RegisterRelay { port, .. } => ForwardAction::CreateRelay { port },
 
-            Action::CloseRelay { .. } =>
-                ForwardAction::None,
+            Action::CloseRelay { .. } => ForwardAction::None,
 
-            Action::None =>
-                ForwardAction::None,
+            Action::None => ForwardAction::None,
         }
     }
 
@@ -91,12 +117,12 @@ impl PacketHandler for RelayHandler {
 
     fn handle_relay_packet(
         &mut self,
-        data:       &[u8],
-        source:     SocketAddr,
+        data: &[u8],
+        source: SocketAddr,
         relay_port: u16,
     ) -> ForwardAction {
         let relay_addr = SocketAddr::new(self.external_ip, relay_port);
-        let actions    = self.processor.process_relay_recv(data, source, relay_addr);
+        let actions = self.processor.process_relay_recv(data, source, relay_addr);
         self.convert_actions(actions)
     }
 }

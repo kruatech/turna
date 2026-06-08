@@ -26,7 +26,9 @@ impl BufferPool {
 
     /// Get a buffer from pool, or allocate new one if empty.
     pub fn get(&mut self) -> BytesMut {
-        self.pool.pop_front().unwrap_or_else(|| BytesMut::with_capacity(self.buf_capacity))
+        self.pool
+            .pop_front()
+            .unwrap_or_else(|| BytesMut::with_capacity(self.buf_capacity))
     }
 
     /// Return a buffer to the pool for reuse.

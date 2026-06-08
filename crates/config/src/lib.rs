@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -73,16 +74,21 @@ pub struct TurnaConfig {
     /// means plaintext.
     #[serde(default)]
     pub grpc: GrpcConfigSection,
+
+    /// TURNS — TURN over TLS-over-TCP (RFC 5766/8656), typically port 5349.
+    /// Disabled by default; enable for clients on UDP-blocked networks.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 impl TurnaConfig {
     /// Load from TOML file with ENV substitution.
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|_| ConfigError::FileNotFound(path.into()))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|_| ConfigError::FileNotFound(path.into()))?;
         let expanded = expand_env_vars(&content)?;
-        let config: TurnaConfig = toml::from_str(&expanded)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: TurnaConfig =
+            toml::from_str(&expanded).map_err(|e| ConfigError::ParseError(e.to_string()))?;
         config.validate()?;
         info!(path, "config loaded and validated");
         Ok(config)
@@ -91,8 +97,8 @@ impl TurnaConfig {
     /// Load from string (for testing).
     pub fn from_str(toml_str: &str) -> Result<Self> {
         let expanded = expand_env_vars(toml_str)?;
-        let config: TurnaConfig = toml::from_str(&expanded)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: TurnaConfig =
+            toml::from_str(&expanded).map_err(|e| ConfigError::ParseError(e.to_string()))?;
         config.validate()?;
         Ok(config)
     }
@@ -112,7 +118,10 @@ impl TurnaConfig {
         ];
         for (name, addr) in &all_ports {
             if !ports.insert(addr.port()) {
-                errors.push(format!("{name} port {} conflicts with another service", addr.port()));
+                errors.push(format!(
+                    "{name} port {} conflicts with another service",
+                    addr.port()
+                ));
             }
         }
 
@@ -129,7 +138,8 @@ impl TurnaConfig {
                 errors.push(
                     "turn.auth.shared_secret is the public placeholder default; \
                      generate one with `openssl rand -hex 32` and set \
-                     TURNA_SHARED_SECRET or edit turn.toml".into()
+                     TURNA_SHARED_SECRET or edit turn.toml"
+                        .into(),
                 );
             } else {
                 warn!(
@@ -147,8 +157,11 @@ impl TurnaConfig {
         }
         if self.turn.external_ip.is_empty() {
             if prod {
-                errors.push("turn.external_ip must be set in production \
-                             (NAT traversal cannot work without it)".into());
+                errors.push(
+                    "turn.external_ip must be set in production \
+                             (NAT traversal cannot work without it)"
+                        .into(),
+                );
             } else {
                 warn!("turn.external_ip is empty — NAT traversal may not work");
             }
@@ -161,13 +174,17 @@ impl TurnaConfig {
         if self.signaling.turn_shared_secret == DEFAULT_SHARED_SECRET && prod {
             errors.push(
                 "signaling.turn_shared_secret is the placeholder default; \
-                 set TURNA_SHARED_SECRET or edit turn.toml".into()
+                 set TURNA_SHARED_SECRET or edit turn.toml"
+                    .into(),
             );
         }
 
         // Cluster / persistence validation (PR1).
         if let Err(persistence_errs) = self.cluster.persistence.validate() {
             errors.extend(persistence_errs);
+        }
+        if let Err(cluster_errs) = self.cluster.validate_redirect_mode(&self.turn) {
+            errors.extend(cluster_errs);
         }
 
         // gRPC TLS validation (PR6).
@@ -194,7 +211,9 @@ impl TurnaConfig {
     /// `TURNA_PRODUCTION=true` without consulting docs. Anything that
     /// isn't truthy is treated as false.
     pub fn is_production(&self) -> bool {
-        if self.production { return true; }
+        if self.production {
+            return true;
+        }
         match std::env::var("TURNA_PRODUCTION") {
             Ok(v) => {
                 let v = v.trim().to_ascii_lowercase();
@@ -222,6 +241,7 @@ impl Default for TurnaConfig {
             management: ManagementConfig::default(),
             recording: RecordingConfig::default(),
             grpc: GrpcConfigSection::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -235,12 +255,31 @@ impl Default for TurnaConfig {
 //   - unknown / mistyped fields are rejected at parse time.
 // ---------------------------------------------------------------------------
 
+/// Which network transport backend drives the TURN datapath.
+///
+/// Maps to `turna_transport::TransportPreference` in the node binary. The
+/// actual backend is chosen at startup by a runtime io_uring probe (see
+/// `turna-transport::select`); this only expresses the operator's preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportSelection {
+    /// Use io_uring when available at runtime, otherwise tokio. (default)
+    #[default]
+    Auto,
+    /// Force io_uring (Linux + `--features io-uring`); fails fast if not ready.
+    IoUring,
+    /// Force the tokio backend (epoll + recvmmsg/sendmmsg).
+    Tokio,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TurnConfig {
     pub listen: SocketAddr,
     pub external_ip: String,
     pub realm: String,
+    /// Transport backend preference (`auto` | `io_uring` | `tokio`).
+    pub transport: TransportSelection,
     pub auth: AuthConfig,
     pub relay: RelayConfig,
     pub observability: ObservabilityConfig,
@@ -252,6 +291,7 @@ impl Default for TurnConfig {
             listen: "0.0.0.0:3478".parse().unwrap(),
             external_ip: String::new(),
             realm: "turna".into(),
+            transport: TransportSelection::default(),
             auth: AuthConfig::default(),
             relay: RelayConfig::default(),
             observability: ObservabilityConfig::default(),
@@ -330,8 +370,8 @@ pub struct QuotaConfig {
 impl Default for QuotaConfig {
     fn default() -> Self {
         Self {
-            max_bytes_per_sec: 0,    // unlimited — matches session default
-            max_per_user:      100,
+            max_bytes_per_sec: 0, // unlimited — matches session default
+            max_per_user: 100,
         }
     }
 }
@@ -401,10 +441,40 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            otlp_endpoint:        String::new(), // disabled by default
-            trace_sample_rate:    0.01,           // 1%
-            json_logs:            false,
+            otlp_endpoint: String::new(), // disabled by default
+            trace_sample_rate: 0.01,      // 1%
+            json_logs: false,
             max_spans_per_second: 1000,
+        }
+    }
+}
+
+/// Failure-detection timing for the heartbeat / failover loop.
+///
+/// Defaults favour fast detection (~5s) while `suspicion_ticks` debounces a
+/// single missed heartbeat so it cannot trigger a false failover. Widen the
+/// window / interval on jittery WAN links; tighten on a reliable LAN.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FailureDetectionConfig {
+    /// How often this node publishes its heartbeat.
+    pub heartbeat_interval_secs: u64,
+    /// A peer is "stale" if its last heartbeat is older than this.
+    pub live_window_secs: u64,
+    /// How often the failover task scans for dead peers.
+    pub sweep_interval_secs: u64,
+    /// Consecutive sweeps a peer must stay stale before it is declared dead and
+    /// its allocations are claimed. `1` = claim on the first stale sweep.
+    pub suspicion_ticks: u32,
+}
+
+impl Default for FailureDetectionConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 1,
+            live_window_secs: 3,
+            sweep_interval_secs: 1,
+            suspicion_ticks: 2,
         }
     }
 }
@@ -413,8 +483,35 @@ impl Default for ObservabilityConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterConfig {
     pub node_id: String,
+    /// Enables gossip discovery and TURN 300 redirects for new clients.
+    pub cluster_mode: bool,
+    /// Legacy UDP gossip port kept for existing configs. Prefer `gossip_bind`.
     pub gossip_port: u16,
+    /// Legacy seed list kept for existing configs. Prefer `gossip_seeds`.
     pub seeds: Vec<String>,
+    pub gossip_bind: SocketAddr,
+    pub gossip_seeds: Vec<String>,
+    pub gossip_interval_secs: u64,
+    pub gossip_timeout_secs: u64,
+    /// Externally reachable TURN address advertised in ALTERNATE-SERVER.
+    /// `0.0.0.0:0` means derive it at startup from `turn.external_ip` and
+    /// `turn.listen.port()`.
+    pub turn_announce_addr: SocketAddr,
+    /// Cluster identity. Nodes only merge with peers sharing this name; a stray
+    /// staging node can't join a prod ring. Default `"turna"`.
+    pub cluster_name: String,
+    /// Address peers should use to reach this node's gossip endpoint.
+    /// `0.0.0.0:0` means "infer from packet source"; set explicitly behind
+    /// NAT / in Kubernetes (the NATS `cluster.advertise` analogue).
+    pub gossip_advertise_addr: SocketAddr,
+    /// Shared secret for gossip HMAC authentication. Empty = unauthenticated
+    /// (logs a warning). Set it so only trusted hosts can change the ring.
+    pub cluster_secret: String,
+    /// Lame-duck window: on shutdown the node announces it is leaving and keeps
+    /// redirecting new clients away for this many seconds before exiting, so a
+    /// rolling deploy doesn't drop new sessions. Existing sessions are never
+    /// interrupted. `0` = exit immediately.
+    pub drain_grace_secs: u64,
     pub backend: BackendConfigSection,
     /// Allocation persistence (PR1 scaffolding — task #3).
     ///
@@ -422,16 +519,77 @@ pub struct ClusterConfig {
     /// no writer task is spawned, no `WriteOp` events are emitted.
     /// See `docs/design/allocation-store-persistence.md`.
     pub persistence: PersistenceConfig,
+    /// Heartbeat / failover timing (detection speed vs. false-failover margin).
+    pub failure_detection: FailureDetectionConfig,
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             node_id: "node-1".into(),
+            cluster_mode: false,
             gossip_port: 7946,
             seeds: Vec::new(),
+            gossip_bind: "0.0.0.0:7946".parse().unwrap(),
+            gossip_seeds: Vec::new(),
+            gossip_interval_secs: 2,
+            gossip_timeout_secs: 30,
+            turn_announce_addr: "0.0.0.0:0".parse().unwrap(),
+            cluster_name: "turna".into(),
+            gossip_advertise_addr: "0.0.0.0:0".parse().unwrap(),
+            cluster_secret: String::new(),
+            drain_grace_secs: 5,
             backend: BackendConfigSection::default(),
             persistence: PersistenceConfig::default(),
+            failure_detection: FailureDetectionConfig::default(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    pub fn effective_gossip_bind(&self) -> SocketAddr {
+        let default_bind: SocketAddr = "0.0.0.0:7946".parse().unwrap();
+        if self.gossip_bind == default_bind && self.gossip_port != default_bind.port() {
+            SocketAddr::new(self.gossip_bind.ip(), self.gossip_port)
+        } else {
+            self.gossip_bind
+        }
+    }
+
+    pub fn effective_gossip_seeds(&self) -> Vec<String> {
+        if self.gossip_seeds.is_empty() {
+            self.seeds.clone()
+        } else {
+            self.gossip_seeds.clone()
+        }
+    }
+
+    fn validate_redirect_mode(&self, turn: &TurnConfig) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.cluster_mode {
+            if self.node_id.trim().is_empty() {
+                errors.push("cluster.node_id must be non-empty when cluster_mode = true".into());
+            }
+            if self.cluster_name.trim().is_empty() {
+                errors.push("cluster.cluster_name must be non-empty when cluster_mode = true".into());
+            }
+            if self.gossip_interval_secs == 0 {
+                errors.push("cluster.gossip_interval_secs must be > 0".into());
+            }
+            if self.gossip_timeout_secs == 0 {
+                errors.push("cluster.gossip_timeout_secs must be > 0".into());
+            }
+            if self.turn_announce_addr.ip().is_unspecified() && turn.external_ip.is_empty() {
+                errors.push(
+                    "cluster.turn_announce_addr is unspecified and turn.external_ip is empty"
+                        .into(),
+                );
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 }
@@ -445,7 +603,7 @@ pub struct BackendConfigSection {
     /// (acceptable only for local dev against a permissive Tarantool).
     /// Production: set via `${TURNA_BACKEND_USER}` and route the password
     /// through `${TURNA_BACKEND_PASSWORD}` or `file:///run/secrets/...`.
-    pub user:     String,
+    pub user: String,
     pub password: String,
     /// Number of parallel TCP connections to maintain per node.
     /// `0` means "use the library default" (currently 8).
@@ -455,11 +613,11 @@ pub struct BackendConfigSection {
 impl Default for BackendConfigSection {
     fn default() -> Self {
         Self {
-            r#type:    "memory".into(),
-            uri:       String::new(),
-            user:      String::new(),
-            password:  String::new(),
-            pool_size: 0,   // 0 → backend picks its DEFAULT_POOL_SIZE
+            r#type: "memory".into(),
+            uri: String::new(),
+            user: String::new(),
+            password: String::new(),
+            pool_size: 0, // 0 → backend picks its DEFAULT_POOL_SIZE
         }
     }
 }
@@ -519,7 +677,11 @@ impl PersistenceConfig {
         if self.batch_max_size == 0 {
             errors.push("cluster.persistence.batch_max_size must be > 0".into());
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -531,7 +693,49 @@ pub struct HealthConfig {
 
 impl Default for HealthConfig {
     fn default() -> Self {
-        Self { listen: "0.0.0.0:8080".parse().unwrap() }
+        Self {
+            listen: "0.0.0.0:8080".parse().unwrap(),
+        }
+    }
+}
+
+/// TURNS — TURN over TLS-over-TCP (RFC 5766/8656).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Enable the TURNS listener.
+    pub enabled: bool,
+    /// Listen address (default `0.0.0.0:5349`, the IANA TURNS port).
+    pub listen: SocketAddr,
+    /// PEM certificate chain.
+    pub cert_path: PathBuf,
+    /// PEM private key (PKCS#8 / PKCS#1 / SEC1).
+    pub key_path: PathBuf,
+    /// Max framed STUN/ChannelData message size, bytes.
+    pub max_frame_size: usize,
+    /// TLS handshake timeout, seconds.
+    pub handshake_timeout_secs: u64,
+    /// Per-connection idle read timeout, seconds.
+    pub read_timeout_secs: u64,
+    /// Max concurrent TURNS connections.
+    pub max_connections: usize,
+    /// Advertise ALPN (`stun.turn`).
+    pub enable_alpn: bool,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "0.0.0.0:5349".parse().unwrap(),
+            cert_path: PathBuf::from("/etc/turna/tls/cert.pem"),
+            key_path: PathBuf::from("/etc/turna/tls/key.pem"),
+            max_frame_size: 64 * 1024,
+            handshake_timeout_secs: 5,
+            read_timeout_secs: 300,
+            max_connections: 10_000,
+            enable_alpn: true,
+        }
     }
 }
 
@@ -592,8 +796,8 @@ impl Default for GrpcConfigSection {
         Self {
             tls_mode: "disabled".into(),
             tls_cert: String::new(),
-            tls_key:  String::new(),
-            tls_ca:   String::new(),
+            tls_key: String::new(),
+            tls_ca: String::new(),
         }
     }
 }
@@ -606,9 +810,9 @@ impl GrpcConfigSection {
     /// don't have to do the same normalisation in three places.
     pub fn normalised_mode(&self) -> &str {
         match self.tls_mode.trim().to_ascii_lowercase().as_str() {
-            "tls"  => "tls",
+            "tls" => "tls",
             "mtls" => "mtls",
-            _      => "disabled",
+            _ => "disabled",
         }
     }
 
@@ -656,7 +860,8 @@ impl GrpcConfigSection {
                 if self.tls_ca.is_empty() {
                     errs.push(
                         "grpc.tls_mode = \"mtls\" but grpc.tls_ca is empty \
-                         (CA file is required to verify client certificates)".into(),
+                         (CA file is required to verify client certificates)"
+                            .into(),
                     );
                 }
             }
@@ -710,7 +915,8 @@ fn expand_env_vars(input: &str) -> Result<String> {
 
     // Expand ${VAR} and ${VAR:-default}
     while let Some(start) = result.find("${") {
-        let end = result[start..].find('}')
+        let end = result[start..]
+            .find('}')
             .ok_or_else(|| ConfigError::ParseError("unclosed ${".into()))?
             + start;
         let expr = &result[start + 2..end];
@@ -720,8 +926,7 @@ fn expand_env_vars(input: &str) -> Result<String> {
             let default = &expr[sep + 2..];
             std::env::var(var_name).unwrap_or_else(|_| default.to_string())
         } else {
-            std::env::var(expr)
-                .map_err(|_| ConfigError::EnvVarNotSet(expr.into()))?
+            std::env::var(expr).map_err(|_| ConfigError::EnvVarNotSet(expr.into()))?
         };
 
         result = format!("{}{}{}", &result[..start], value, &result[end + 1..]);
@@ -734,7 +939,8 @@ fn expand_env_vars(input: &str) -> Result<String> {
             // Extract the file path from the value
             let before = &line[..pos];
             let path_start = pos + 7; // "file://" length
-            let path_end = line[path_start..].find('"')
+            let path_end = line[path_start..]
+                .find('"')
                 .map(|i| path_start + i)
                 .unwrap_or(line.len());
             let file_path = line[path_start..path_end].trim();
@@ -808,7 +1014,8 @@ enabled = true
 output_dir = "/var/lib/turna/recordings"
 enabled = false
 max_duration_secs = 7200
-"#.into()
+"#
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -818,11 +1025,33 @@ max_duration_secs = 7200
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn restore_turna_production(value: Option<OsString>) {
+        if let Some(value) = value {
+            std::env::set_var("TURNA_PRODUCTION", value);
+        } else {
+            std::env::remove_var("TURNA_PRODUCTION");
+        }
+    }
 
     #[test]
     fn default_config_valid() {
+        let _guard = production_env_lock();
+        let saved_turna_production = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
         let config = TurnaConfig::default();
-        config.validate().unwrap();
+        let result = config.validate();
+
+        restore_turna_production(saved_turna_production);
+        result.unwrap();
     }
 
     #[test]
@@ -830,6 +1059,7 @@ mod tests {
         let toml = r#"
 [turn]
 listen = "0.0.0.0:3478"
+external_ip = "127.0.0.1"
 
 [turn.auth]
 shared_secret = "test-secret"
@@ -916,8 +1146,8 @@ turn_shared_secret = "s"
         // not trigger env reads or file I/O. This caused two cycles of
         // false-positive errors when sanitising example_config() docs.
         let input = "# ${UNSET_VAR} and file:///nope/path\nkey = \"v\"";
-        let expanded = expand_env_vars(input)
-            .expect("env/file refs inside comments must not error");
+        let expanded =
+            expand_env_vars(input).expect("env/file refs inside comments must not error");
         assert!(
             expanded.contains("key = \"v\""),
             "non-comment content lost: {expanded:?}"
@@ -936,8 +1166,8 @@ turn_shared_secret = "s"
 [unknown_section]
 foo = "bar"
 "#;
-        let err = TurnaConfig::from_str(toml)
-            .expect_err("unknown top-level section must be rejected");
+        let err =
+            TurnaConfig::from_str(toml).expect_err("unknown top-level section must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("unknown") || msg.contains("unknown_section") || msg.contains("parse"),
@@ -954,8 +1184,8 @@ typo_field = "x"
 [signaling]
 turn_shared_secret = "s"
 "#;
-        let err = TurnaConfig::from_str(toml)
-            .expect_err("unknown field in [turn.auth] must be rejected");
+        let err =
+            TurnaConfig::from_str(toml).expect_err("unknown field in [turn.auth] must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("unknown") || msg.contains("typo_field") || msg.contains("parse"),
@@ -978,11 +1208,13 @@ shared_secret = "turna-secret"
 [signaling]
 turn_shared_secret = "s"
 "#;
-        let err = TurnaConfig::from_str(toml)
-            .expect_err("flat [auth] section must be rejected");
+        let err = TurnaConfig::from_str(toml).expect_err("flat [auth] section must be rejected");
         let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("unknown") || msg.contains("auth") || msg.contains("listen") || msg.contains("parse"),
+            msg.contains("unknown")
+                || msg.contains("auth")
+                || msg.contains("listen")
+                || msg.contains("parse"),
             "unexpected error: {err}"
         );
     }
@@ -1058,12 +1290,14 @@ turn_shared_secret = "another-not-placeholder"
 
     #[test]
     fn production_mode_validation_scenarios() {
+        let _guard = production_env_lock();
+        let saved_turna_production = std::env::var_os("TURNA_PRODUCTION");
+
         // Scenario 1: dev mode tolerates default secret (just warns).
         std::env::remove_var("TURNA_PRODUCTION");
         let cfg = TurnaConfig::from_str(dev_config_with_default_secret())
             .expect("dev mode tolerates default secret");
-        assert!(!cfg.is_production(),
-                "scenario 1: production must be false");
+        assert!(!cfg.is_production(), "scenario 1: production must be false");
 
         // Scenario 2: prod mode rejects placeholder secret loudly.
         let err = TurnaConfig::from_str(prod_config_with_default_secret())
@@ -1089,8 +1323,10 @@ turn_shared_secret = "another-not-placeholder"
             std::env::set_var("TURNA_PRODUCTION", val);
             let cfg = TurnaConfig::from_str(dev_config_with_default_secret())
                 .unwrap_or_else(|e| panic!("scenario 4 val={val:?}: {e}"));
-            assert!(!cfg.is_production(),
-                    "scenario 4: TURNA_PRODUCTION={val:?} must NOT enable prod");
+            assert!(
+                !cfg.is_production(),
+                "scenario 4: TURNA_PRODUCTION={val:?} must NOT enable prod"
+            );
         }
 
         // Scenario 5: external_ip required in production.
@@ -1098,16 +1334,17 @@ turn_shared_secret = "another-not-placeholder"
         let err = TurnaConfig::from_str(prod_config_no_external_ip())
             .expect_err("scenario 5: production requires external_ip");
         let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("external_ip"),
-                "scenario 5: expected external_ip error, got: {err}");
+        assert!(
+            msg.contains("external_ip"),
+            "scenario 5: expected external_ip error, got: {err}"
+        );
 
         // Scenario 6: real secrets in prod mode → all good.
         let cfg = TurnaConfig::from_str(prod_config_clean())
             .expect("scenario 6: clean prod config must validate");
         assert!(cfg.is_production());
 
-        // Cleanup so other tests (e.g. `example_config_parseable`) see a
-        // pristine env. `remove_var` is idempotent.
-        std::env::remove_var("TURNA_PRODUCTION");
+        // Restore the caller's environment instead of leaking test state.
+        restore_turna_production(saved_turna_production);
     }
 }

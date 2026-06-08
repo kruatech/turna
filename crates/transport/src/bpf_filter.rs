@@ -86,18 +86,18 @@ pub(crate) mod prog {
     /// ```
     pub fn build_stun_filter(max_size: u32) -> Vec<BpfInsn> {
         vec![
-            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),          // 0
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 9, 4),         // 1  A>=4 ? : DROP
-            insn(BPF_JMP | BPF_JGT | BPF_K, 8, 0, max_size),  // 2  A>max ? DROP :
-            insn(BPF_LD | BPF_H | BPF_ABS, 0, 0, 0),          // 3  A=u16[0]
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 1, CHANNEL_MIN), // 4 A>=0x4000 ? : STUN
-            insn(BPF_JMP | BPF_JGT | BPF_K, 0, 4, CHANNEL_MAX), // 5 A>0x7FFE ? STUN : ACCEPT
-            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),          // 6  A=len
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 3, 20),        // 7  A>=20 ? : DROP
-            insn(BPF_LD | BPF_W | BPF_ABS, 0, 0, 4),          // 8  A=u32[4]
+            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),                  // 0
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 9, 4),                 // 1  A>=4 ? : DROP
+            insn(BPF_JMP | BPF_JGT | BPF_K, 8, 0, max_size),          // 2  A>max ? DROP :
+            insn(BPF_LD | BPF_H | BPF_ABS, 0, 0, 0),                  // 3  A=u16[0]
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 1, CHANNEL_MIN),       // 4 A>=0x4000 ? : STUN
+            insn(BPF_JMP | BPF_JGT | BPF_K, 0, 4, CHANNEL_MAX),       // 5 A>0x7FFE ? STUN : ACCEPT
+            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),                  // 6  A=len
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 3, 20),                // 7  A>=20 ? : DROP
+            insn(BPF_LD | BPF_W | BPF_ABS, 0, 0, 4),                  // 8  A=u32[4]
             insn(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, STUN_MAGIC_COOKIE), // 9 ==MAGIC ? ACCEPT : DROP
-            insn(BPF_RET | BPF_K, 0, 0, ACCEPT),              // 10
-            insn(BPF_RET | BPF_K, 0, 0, DROP),                // 11
+            insn(BPF_RET | BPF_K, 0, 0, ACCEPT),                      // 10
+            insn(BPF_RET | BPF_K, 0, 0, DROP),                        // 11
         ]
     }
 
@@ -258,13 +258,21 @@ pub fn read_udp_drop_stats() -> FilterStats {
     FilterStats {
         packets_received: recv,
         packets_dropped: errors,
-        drop_rate: if recv > 0 { errors as f64 / recv as f64 } else { 0.0 },
+        drop_rate: if recv > 0 {
+            errors as f64 / recv as f64
+        } else {
+            0.0
+        },
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn read_udp_drop_stats() -> FilterStats {
-    FilterStats { packets_received: 0, packets_dropped: 0, drop_rate: 0.0 }
+    FilterStats {
+        packets_received: 0,
+        packets_dropped: 0,
+        drop_rate: 0.0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,8 +329,8 @@ mod tests {
     fn drops_short_and_oversize() {
         let f = build_stun_filter(1500);
         assert_eq!(simulate(&f, &[0x00, 0x01, 0x02]), DROP); // < 4
-        assert_eq!(simulate(&f, &stun(19)), DROP);           // STUN < 20
-        assert_eq!(simulate(&f, &vec![0u8; 2000]), DROP);    // > max_size
+        assert_eq!(simulate(&f, &stun(19)), DROP); // STUN < 20
+        assert_eq!(simulate(&f, &vec![0u8; 2000]), DROP); // > max_size
     }
 
     #[test]
@@ -332,7 +340,9 @@ mod tests {
         // ~25% of random traffic, intentionally passes BPF and is dropped
         // later in userspace at channel lookup.)
         let f = build_stun_filter(65535);
-        let garbage: Vec<u8> = (0..200u32).map(|i| (i.wrapping_mul(31) & 0x3F) as u8).collect();
+        let garbage: Vec<u8> = (0..200u32)
+            .map(|i| (i.wrapping_mul(31) & 0x3F) as u8)
+            .collect();
         // first byte forced < 0x40 ⇒ not channel-shaped, no magic ⇒ DROP
         assert_eq!(simulate(&f, &garbage), DROP);
     }
@@ -343,7 +353,10 @@ mod tests {
     fn filter_encodes_magic_and_channel_bounds() {
         let f = build_stun_filter(65535);
         assert!(f.iter().any(|i| i.k == 0x2112A442), "magic cookie present");
-        assert!(f.iter().any(|i| i.k == 0x4000), "channel lower bound present");
+        assert!(
+            f.iter().any(|i| i.k == 0x4000),
+            "channel lower bound present"
+        );
     }
 
     #[test]

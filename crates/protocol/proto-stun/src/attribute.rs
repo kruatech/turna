@@ -1,11 +1,13 @@
 //! STUN/TURN attribute types and parsing
 
-use std::net::SocketAddr;
 use crate::error::{Result, StunError};
 use crate::header::MAGIC_COOKIE;
+use std::net::SocketAddr;
 
 // Comprehension-required attributes
 pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+/// RFC 5389 §15.5: alternate server for 300 Try Alternate redirects.
+pub const ATTR_ALTERNATE_SERVER: u16 = 0x0003;
 pub const ATTR_USERNAME: u16 = 0x0006;
 pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
 pub const ATTR_ERROR_CODE: u16 = 0x0009;
@@ -51,6 +53,7 @@ pub const MAX_ATTRIBUTES_PER_MESSAGE: usize = 32;
 #[derive(Debug, Clone)]
 pub enum Attribute {
     MappedAddress(SocketAddr),
+    AlternateServer(SocketAddr),
     XorMappedAddress(SocketAddr),
     Username(String),
     MessageIntegrity([u8; 20]),
@@ -74,6 +77,7 @@ impl Attribute {
     pub fn attr_type(&self) -> u16 {
         match self {
             Self::MappedAddress(_) => ATTR_MAPPED_ADDRESS,
+            Self::AlternateServer(_) => ATTR_ALTERNATE_SERVER,
             Self::XorMappedAddress(_) => ATTR_XOR_MAPPED_ADDRESS,
             Self::Username(_) => ATTR_USERNAME,
             Self::MessageIntegrity(_) => ATTR_MESSAGE_INTEGRITY,
@@ -96,10 +100,15 @@ impl Attribute {
     /// Encode attribute value into buffer. Returns bytes written.
     pub fn encode_value(&self, buf: &mut [u8], transaction_id: &[u8; 12]) -> usize {
         match self {
-            Self::XorMappedAddress(addr) | Self::XorPeerAddress(addr) | Self::XorRelayedAddress(addr) => {
-                encode_xor_address(buf, addr, transaction_id)
+            Self::XorMappedAddress(addr)
+            | Self::XorPeerAddress(addr)
+            | Self::XorRelayedAddress(addr) => encode_xor_address(buf, addr, transaction_id),
+            // RFC 5389 §15.5: ALTERNATE-SERVER is encoded like MAPPED-ADDRESS
+            // (plain, NOT XOR). Encoding it as XOR breaks spec-compliant
+            // clients (pion, libnice) parsing the 300 Try Alternate redirect.
+            Self::MappedAddress(addr) | Self::AlternateServer(addr) => {
+                encode_address(buf, addr)
             }
-            Self::MappedAddress(addr) => encode_address(buf, addr),
             Self::Username(s) | Self::Realm(s) | Self::Nonce(s) | Self::Software(s) => {
                 let b = s.as_bytes();
                 buf[..b.len()].copy_from_slice(b);
@@ -171,7 +180,9 @@ pub fn decode_xor_address(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Socke
         }
         0x02 => {
             if buf.len() < 20 {
-                return Err(StunError::AttributeParse("ipv6 xor address too short".into()));
+                return Err(StunError::AttributeParse(
+                    "ipv6 xor address too short".into(),
+                ));
             }
             let mut xor_ip = [0u8; 16];
             xor_ip.copy_from_slice(&buf[4..20]);
@@ -184,7 +195,9 @@ pub fn decode_xor_address(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Socke
             let addr = std::net::Ipv6Addr::from(xor_ip);
             Ok(SocketAddr::new(addr.into(), port))
         }
-        _ => Err(StunError::AttributeParse(format!("unknown address family: {family}"))),
+        _ => Err(StunError::AttributeParse(format!(
+            "unknown address family: {family}"
+        ))),
     }
 }
 
@@ -253,7 +266,9 @@ pub fn decode_address(buf: &[u8]) -> Result<SocketAddr> {
             let ip = std::net::Ipv6Addr::from(octets);
             Ok(SocketAddr::new(ip.into(), port))
         }
-        _ => Err(StunError::AttributeParse(format!("unknown family: {family}"))),
+        _ => Err(StunError::AttributeParse(format!(
+            "unknown family: {family}"
+        ))),
     }
 }
 
@@ -296,13 +311,19 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
 
         let attr = match attr_type {
             ATTR_MAPPED_ADDRESS => Attribute::MappedAddress(decode_address(value)?),
-            ATTR_XOR_MAPPED_ADDRESS => Attribute::XorMappedAddress(decode_xor_address(value, transaction_id)?),
+            // RFC 5389 §15.5: ALTERNATE-SERVER uses the plain MAPPED-ADDRESS
+            // format, so it is decoded without XOR.
+            ATTR_ALTERNATE_SERVER => Attribute::AlternateServer(decode_address(value)?),
+            ATTR_XOR_MAPPED_ADDRESS => {
+                Attribute::XorMappedAddress(decode_xor_address(value, transaction_id)?)
+            }
             ATTR_USERNAME => Attribute::Username(String::from_utf8_lossy(value).into()),
             ATTR_MESSAGE_INTEGRITY => {
                 if value.len() != 20 {
-                    return Err(StunError::AttributeParse(
-                        format!("MESSAGE-INTEGRITY must be 20 bytes, got {}", value.len())
-                    ));
+                    return Err(StunError::AttributeParse(format!(
+                        "MESSAGE-INTEGRITY must be 20 bytes, got {}",
+                        value.len()
+                    )));
                 }
                 let mut hmac = [0u8; 20];
                 hmac.copy_from_slice(value);
@@ -310,17 +331,19 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
             }
             ATTR_FINGERPRINT => {
                 if value.len() != 4 {
-                    return Err(StunError::AttributeParse(
-                        format!("FINGERPRINT must be 4 bytes, got {}", value.len())
-                    ));
+                    return Err(StunError::AttributeParse(format!(
+                        "FINGERPRINT must be 4 bytes, got {}",
+                        value.len()
+                    )));
                 }
                 Attribute::Fingerprint(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
             ATTR_ERROR_CODE => {
                 if value.len() < 4 {
-                    return Err(StunError::AttributeParse(
-                        format!("ERROR-CODE must be at least 4 bytes, got {}", value.len())
-                    ));
+                    return Err(StunError::AttributeParse(format!(
+                        "ERROR-CODE must be at least 4 bytes, got {}",
+                        value.len()
+                    )));
                 }
                 let class = value[2] as u16;
                 let number = value[3] as u16;
@@ -333,25 +356,33 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
             ATTR_SOFTWARE => Attribute::Software(String::from_utf8_lossy(value).into()),
             ATTR_LIFETIME => {
                 if value.len() != 4 {
-                    return Err(StunError::AttributeParse(
-                        format!("LIFETIME must be 4 bytes, got {}", value.len())
-                    ));
+                    return Err(StunError::AttributeParse(format!(
+                        "LIFETIME must be 4 bytes, got {}",
+                        value.len()
+                    )));
                 }
                 Attribute::Lifetime(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
             ATTR_REQUESTED_TRANSPORT => {
                 if value.is_empty() {
-                    return Err(StunError::AttributeParse("REQUESTED-TRANSPORT empty".into()));
+                    return Err(StunError::AttributeParse(
+                        "REQUESTED-TRANSPORT empty".into(),
+                    ));
                 }
                 Attribute::RequestedTransport(value[0])
             }
-            ATTR_XOR_PEER_ADDRESS => Attribute::XorPeerAddress(decode_xor_address(value, transaction_id)?),
-            ATTR_XOR_RELAYED_ADDRESS => Attribute::XorRelayedAddress(decode_xor_address(value, transaction_id)?),
+            ATTR_XOR_PEER_ADDRESS => {
+                Attribute::XorPeerAddress(decode_xor_address(value, transaction_id)?)
+            }
+            ATTR_XOR_RELAYED_ADDRESS => {
+                Attribute::XorRelayedAddress(decode_xor_address(value, transaction_id)?)
+            }
             ATTR_CHANNEL_NUMBER => {
                 if value.len() < 2 {
-                    return Err(StunError::AttributeParse(
-                        format!("CHANNEL-NUMBER too short: {}", value.len())
-                    ));
+                    return Err(StunError::AttributeParse(format!(
+                        "CHANNEL-NUMBER too short: {}",
+                        value.len()
+                    )));
                 }
                 Attribute::ChannelNumber(u16::from_be_bytes([value[0], value[1]]))
             }
@@ -405,7 +436,11 @@ mod tests {
 
         let err = parse_attributes(&buf, &TID).unwrap_err();
         match err {
-            StunError::AttributeValueTooLong { attr_type, len, max } => {
+            StunError::AttributeValueTooLong {
+                attr_type,
+                len,
+                max,
+            } => {
                 assert_eq!(attr_type, ATTR_SOFTWARE);
                 assert_eq!(len, 2000);
                 assert_eq!(max, MAX_ATTRIBUTE_VALUE_LEN);
@@ -437,8 +472,7 @@ mod tests {
         let body = vec![b'x'; MAX_ATTRIBUTE_VALUE_LEN];
         let buf = build_attr(ATTR_SOFTWARE, &body);
 
-        let attrs = parse_attributes(&buf, &TID)
-            .expect("attr exactly at MAX must be accepted");
+        let attrs = parse_attributes(&buf, &TID).expect("attr exactly at MAX must be accepted");
         assert_eq!(attrs.len(), 1);
         match &attrs[0] {
             Attribute::Software(s) => assert_eq!(s.len(), MAX_ATTRIBUTE_VALUE_LEN),
@@ -493,5 +527,39 @@ mod tests {
 
         let attrs = parse_attributes(&buf, &TID).expect("normal message must parse");
         assert_eq!(attrs.len(), 6);
+    }
+
+    #[test]
+    fn alternate_server_plain_address_roundtrip_ipv4() {
+        let addr: SocketAddr = "192.0.2.10:3478".parse().unwrap();
+        let attr = Attribute::AlternateServer(addr);
+        let mut value = [0u8; 32];
+        let len = attr.encode_value(&mut value, &TID);
+        assert_eq!(len, 8);
+
+        // RFC 5389 §15.5: must be plain MAPPED-ADDRESS, i.e. NOT XOR'd.
+        assert_eq!(value[0], 0x00, "reserved byte");
+        assert_eq!(value[1], 0x01, "IPv4 family");
+        assert_eq!(u16::from_be_bytes([value[2], value[3]]), 3478, "plain port");
+        assert_eq!(&value[4..8], &[192, 0, 2, 10], "plain IPv4 address");
+
+        let buf = build_attr(ATTR_ALTERNATE_SERVER, &value[..len]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(attrs.as_slice(), [Attribute::AlternateServer(a)] if *a == addr));
+    }
+
+    #[test]
+    fn alternate_server_plain_address_roundtrip_ipv6() {
+        let addr: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
+        let attr = Attribute::AlternateServer(addr);
+        let mut value = [0u8; 32];
+        let len = attr.encode_value(&mut value, &TID);
+        assert_eq!(len, 20);
+        assert_eq!(value[1], 0x02, "IPv6 family");
+        assert_eq!(u16::from_be_bytes([value[2], value[3]]), 3478, "plain port");
+
+        let buf = build_attr(ATTR_ALTERNATE_SERVER, &value[..len]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(attrs.as_slice(), [Attribute::AlternateServer(a)] if *a == addr));
     }
 }

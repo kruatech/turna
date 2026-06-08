@@ -40,16 +40,31 @@ fn repo_root() -> PathBuf {
 fn clear_turna_env() {
     for k in [
         "TURNA_PRODUCTION",
-        "TURNA_LISTEN_ADDR", "TURNA_EXTERNAL_IP", "TURNA_REALM",
+        "TURNA_LISTEN_ADDR",
+        "TURNA_EXTERNAL_IP",
+        "TURNA_REALM",
         "TURNA_SHARED_SECRET",
         "TURNA_OTLP_ENDPOINT",
-        "TURNA_SIGNALING_ADDR", "TURNA_TURN_URL",
+        "TURNA_SIGNALING_ADDR",
+        "TURNA_TURN_URL",
         "TURNA_HEALTH_ADDR",
-        "TURNA_NODE_ID", "TURNA_BACKEND_TYPE", "TURNA_BACKEND_URI",
+        "TURNA_NODE_ID",
+        "TURNA_CLUSTER_MODE",
+        "TURNA_GOSSIP_BIND",
+        "TURNA_GOSSIP_SEEDS",
+        "TURNA_GOSSIP_INTERVAL_SECS",
+        "TURNA_GOSSIP_TIMEOUT_SECS",
+        "TURNA_TURN_ANNOUNCE_ADDR",
+        "TURNA_BACKEND_TYPE",
+        "TURNA_BACKEND_URI",
         "TURNA_PERSISTENCE_MODE",
         "TURNA_GRPC_ADDR",
-        "TURNA_GRPC_TLS_MODE", "TURNA_GRPC_TLS_CERT", "TURNA_GRPC_TLS_KEY", "TURNA_GRPC_TLS_CA",
-        "TURNA_USER_ALICE_PASSWORD", "TURNA_USER_BOB_PASSWORD",
+        "TURNA_GRPC_TLS_MODE",
+        "TURNA_GRPC_TLS_CERT",
+        "TURNA_GRPC_TLS_KEY",
+        "TURNA_GRPC_TLS_CA",
+        "TURNA_USER_ALICE_PASSWORD",
+        "TURNA_USER_BOB_PASSWORD",
     ] {
         std::env::remove_var(k);
     }
@@ -82,16 +97,16 @@ fn deploy_turn_toml_load_scenarios() {
     // ── Scenario 2: env override flows through ${VAR:-default} ─────────────
     let real_secret = "real-secret-deadbeef-0123456789abcdef";
     std::env::set_var("TURNA_SHARED_SECRET", real_secret);
-    std::env::set_var("TURNA_EXTERNAL_IP",   "203.0.113.10");
-    std::env::set_var("TURNA_REALM",         "prod.example.com");
+    std::env::set_var("TURNA_EXTERNAL_IP", "203.0.113.10");
+    std::env::set_var("TURNA_REALM", "prod.example.com");
 
     let config = TurnaConfig::load(path.to_str().unwrap())
         .expect("deploy/turn.toml with env overrides must still validate");
 
-    assert_eq!(config.turn.auth.shared_secret,      real_secret);
+    assert_eq!(config.turn.auth.shared_secret, real_secret);
     assert_eq!(config.signaling.turn_shared_secret, real_secret);
-    assert_eq!(config.turn.external_ip,             "203.0.113.10");
-    assert_eq!(config.turn.realm,                   "prod.example.com");
+    assert_eq!(config.turn.external_ip, "203.0.113.10");
+    assert_eq!(config.turn.realm, "prod.example.com");
 
     // ── Scenario 3: env-driven production mode rejects placeholder secret ──
     clear_turna_env();
@@ -109,14 +124,14 @@ fn deploy_turn_toml_load_scenarios() {
     clear_turna_env();
     std::env::set_var("TURNA_GRPC_TLS_MODE", "mtls");
     std::env::set_var("TURNA_GRPC_TLS_CERT", "/etc/turna/server.pem");
-    std::env::set_var("TURNA_GRPC_TLS_KEY",  "/etc/turna/server-key.pem");
-    std::env::set_var("TURNA_GRPC_TLS_CA",   "/etc/turna/ca.pem");
+    std::env::set_var("TURNA_GRPC_TLS_KEY", "/etc/turna/server-key.pem");
+    std::env::set_var("TURNA_GRPC_TLS_CA", "/etc/turna/ca.pem");
     let config = TurnaConfig::load(path.to_str().unwrap())
         .expect("grpc env overrides must validate cleanly");
     assert_eq!(config.grpc.tls_mode, "mtls");
     assert_eq!(config.grpc.tls_cert, "/etc/turna/server.pem");
-    assert_eq!(config.grpc.tls_key,  "/etc/turna/server-key.pem");
-    assert_eq!(config.grpc.tls_ca,   "/etc/turna/ca.pem");
+    assert_eq!(config.grpc.tls_key, "/etc/turna/server-key.pem");
+    assert_eq!(config.grpc.tls_ca, "/etc/turna/ca.pem");
     assert!(config.grpc.is_enabled());
     assert!(config.grpc.requires_client_ca());
 
@@ -124,7 +139,7 @@ fn deploy_turn_toml_load_scenarios() {
     clear_turna_env();
     std::env::set_var("TURNA_GRPC_TLS_MODE", "mtls");
     std::env::set_var("TURNA_GRPC_TLS_CERT", "/etc/turna/server.pem");
-    std::env::set_var("TURNA_GRPC_TLS_KEY",  "/etc/turna/server-key.pem");
+    std::env::set_var("TURNA_GRPC_TLS_KEY", "/etc/turna/server-key.pem");
     let err = TurnaConfig::load(path.to_str().unwrap())
         .expect_err("mtls with empty tls_ca must be rejected at validate()");
     let msg = err.to_string().to_lowercase();
@@ -178,9 +193,8 @@ shared_seret = "typo"
 listen = "0.0.0.0:9001"
 turn_shared_secret = "s"
 "#;
-    let err = TurnaConfig::from_str(bad).expect_err(
-        "expected parse error for typo `shared_seret`, but load succeeded",
-    );
+    let err = TurnaConfig::from_str(bad)
+        .expect_err("expected parse error for typo `shared_seret`, but load succeeded");
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("unknown") || msg.contains("seret") || msg.contains("parse"),

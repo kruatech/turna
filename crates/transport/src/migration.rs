@@ -185,16 +185,17 @@ impl MigrationManager {
         new_addr: SocketAddr,
         old_addr: SocketAddr,
     ) -> Option<String> {
-        let session_id = MigrationToken::validate(
-            token_bytes, &self.secret, self.token_ttl,
-        )?;
+        let session_id = MigrationToken::validate(token_bytes, &self.secret, self.token_ttl)?;
 
-        self.pending.insert(session_id.clone(), PendingMigration {
-            session_id: session_id.clone(),
-            old_addr,
-            new_addr,
-            started_at: Instant::now(),
-        });
+        self.pending.insert(
+            session_id.clone(),
+            PendingMigration {
+                session_id: session_id.clone(),
+                old_addr,
+                new_addr,
+                started_at: Instant::now(),
+            },
+        );
 
         info!(
             session = %session_id,
@@ -209,11 +210,14 @@ impl MigrationManager {
     pub fn complete_migration(&mut self, session_id: &str) {
         if let Some(pending) = self.pending.remove(session_id) {
             let elapsed = pending.started_at.elapsed();
-            self.completed.insert(session_id.to_string(), CompletedMigration {
-                old_addr: pending.old_addr,
-                new_addr: pending.new_addr,
-                completed_at: Instant::now(),
-            });
+            self.completed.insert(
+                session_id.to_string(),
+                CompletedMigration {
+                    old_addr: pending.old_addr,
+                    new_addr: pending.new_addr,
+                    completed_at: Instant::now(),
+                },
+            );
             info!(
                 session = session_id,
                 elapsed_ms = elapsed.as_millis(),
@@ -237,11 +241,14 @@ impl MigrationManager {
             %old_addr, %new_addr,
             "QUIC connection migrated"
         );
-        self.completed.insert(session_id.to_string(), CompletedMigration {
-            old_addr,
-            new_addr,
-            completed_at: Instant::now(),
-        });
+        self.completed.insert(
+            session_id.to_string(),
+            CompletedMigration {
+                old_addr,
+                new_addr,
+                completed_at: Instant::now(),
+            },
+        );
     }
 
     /// Cleanup timed-out pending migrations.
@@ -252,7 +259,8 @@ impl MigrationManager {
         let expired = before - self.pending.len();
 
         // Also clean old completed entries (> 5 min)
-        self.completed.retain(|_, m| m.completed_at.elapsed() < Duration::from_secs(300));
+        self.completed
+            .retain(|_, m| m.completed_at.elapsed() < Duration::from_secs(300));
 
         if expired > 0 {
             warn!(expired, "migration attempts timed out");
@@ -260,8 +268,12 @@ impl MigrationManager {
         expired
     }
 
-    pub fn pending_count(&self) -> usize { self.pending.len() }
-    pub fn completed_count(&self) -> usize { self.completed.len() }
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+    pub fn completed_count(&self) -> usize {
+        self.completed.len()
+    }
 }
 
 // ---------------------------------------------------------------------------

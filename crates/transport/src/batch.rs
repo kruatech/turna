@@ -111,10 +111,10 @@ pub fn sendmmsg_batch(fd: RawFd, packets: &[PendingPacket]) -> std::io::Result<u
     // so all .add(i) calls are in-bounds.
     unsafe {
         let iovecs_ptr = iovecs.as_mut_ptr();
-        let addrs_ptr  = addrs.as_mut_ptr();
+        let addrs_ptr = addrs.as_mut_ptr();
         for i in 0..count {
-            msgs[i].msg_hdr.msg_iov     = iovecs_ptr.add(i);
-            msgs[i].msg_hdr.msg_name    = addrs_ptr.add(i) as *mut libc::c_void;
+            msgs[i].msg_hdr.msg_iov = iovecs_ptr.add(i);
+            msgs[i].msg_hdr.msg_name = addrs_ptr.add(i) as *mut libc::c_void;
             msgs[i].msg_hdr.msg_namelen = addr_lens[i];
         }
     }
@@ -145,7 +145,10 @@ fn sockaddr_to_raw(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
             sin.sin_family = libc::AF_INET as libc::sa_family_t;
             sin.sin_port = v4.port().to_be();
             sin.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-            (storage, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
         }
         SocketAddr::V6(v6) => {
             let sin6: &mut libc::sockaddr_in6 =
@@ -155,7 +158,10 @@ fn sockaddr_to_raw(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
             sin6.sin6_addr.s6_addr = v6.ip().octets();
             sin6.sin6_flowinfo = v6.flowinfo();
             sin6.sin6_scope_id = v6.scope_id();
-            (storage, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
         }
     }
 }
@@ -224,12 +230,20 @@ impl SqeBatcher {
         false
     }
 
-    pub fn pending(&self) -> usize { self.pending_count }
-    pub fn is_enabled(&self) -> bool { self.batching_enabled }
+    pub fn pending(&self) -> usize {
+        self.pending_count
+    }
+    pub fn is_enabled(&self) -> bool {
+        self.batching_enabled
+    }
 
     pub fn current_pps(&self) -> u64 {
         let elapsed = self.window_start.elapsed().as_secs_f64();
-        if elapsed > 0.0 { (self.packets_in_window as f64 / elapsed) as u64 } else { 0 }
+        if elapsed > 0.0 {
+            (self.packets_in_window as f64 / elapsed) as u64
+        } else {
+            0
+        }
     }
 
     fn reset_batch(&mut self) {
@@ -244,7 +258,11 @@ impl SqeBatcher {
             let was = self.batching_enabled;
             self.batching_enabled = pps >= self.config.adaptive_threshold_pps;
             if self.batching_enabled != was {
-                debug!(pps, enabled = self.batching_enabled, "adaptive batching toggled");
+                debug!(
+                    pps,
+                    enabled = self.batching_enabled,
+                    "adaptive batching toggled"
+                );
             }
             self.packets_in_window = 0;
             self.window_start = Instant::now();

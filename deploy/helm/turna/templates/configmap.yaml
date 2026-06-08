@@ -15,6 +15,11 @@ data:
     relay_port_range = [{{ .Values.turn.relayPortRange.min }}, {{ .Values.turn.relayPortRange.max }}]
     max_allocations = {{ .Values.turn.maxAllocations }}
 
+    [health]
+    # Bind to all interfaces so kubelet liveness/readiness probes (and Prometheus)
+    # can reach it; the config default is loopback-only.
+    listen = "0.0.0.0:{{ .Values.turn.healthPort }}"
+
     [auth]
     shared_secret = {{ .Values.turn.auth.sharedSecret | quote }}
     {{- range .Values.turn.auth.staticUsers }}
@@ -22,4 +27,22 @@ data:
     [[auth.static_users]]
     username = {{ .username | quote }}
     password = {{ .password | quote }}
+    {{- end }}
+    {{- if .Values.cluster.enabled }}
+
+    [cluster]
+    cluster_mode = true
+    # node_id and gossip_advertise_addr are per-pod, injected via env by the
+    # StatefulSet (TURNA_NODE_ID = pod name, TURNA_GOSSIP_ADVERTISE = pod IP).
+    node_id = "${TURNA_NODE_ID}"
+    cluster_name = {{ .Values.cluster.name | quote }}
+    gossip_bind = "0.0.0.0:{{ .Values.cluster.gossipPort }}"
+    gossip_advertise_addr = "${TURNA_GOSSIP_ADVERTISE}"
+    # Bootstrap seed: ordinal-0 pod via the headless gossip service. New pods
+    # learn the rest of the mesh from it via anti-entropy gossip.
+    gossip_seeds = ["{{ .Release.Name }}-turn-0.{{ .Release.Name }}-gossip.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.cluster.gossipPort }}"]
+    gossip_interval_secs = {{ .Values.cluster.gossipIntervalSecs }}
+    gossip_timeout_secs = {{ .Values.cluster.gossipTimeoutSecs }}
+    cluster_secret = "${TURNA_CLUSTER_SECRET:-}"
+    drain_grace_secs = {{ .Values.cluster.drainGraceSecs }}
     {{- end }}

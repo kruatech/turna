@@ -6,14 +6,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::{rand_core::OsRng, SaltString};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use dashmap::DashMap;
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::jwt::{Claims, sign_jwt, verify_jwt};
+use crate::jwt::{sign_jwt, verify_jwt, Claims};
 use crate::user::{User, UserRole};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -66,7 +66,10 @@ impl UserStoreConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(86400);
-        Self { jwt_secret, token_ttl_secs }
+        Self {
+            jwt_secret,
+            token_ttl_secs,
+        }
     }
 }
 
@@ -108,20 +111,20 @@ impl TokenBlacklist {
 
 /// Thread-safe in-memory user store.
 pub struct UserStore {
-    users:       DashMap<String, User>,   // user_id → User
+    users: DashMap<String, User>,         // user_id → User
     by_username: DashMap<String, String>, // username → user_id
-    by_email:    DashMap<String, String>, // email → user_id
-    blacklist:   TokenBlacklist,
-    cfg:         UserStoreConfig,
+    by_email: DashMap<String, String>,    // email → user_id
+    blacklist: TokenBlacklist,
+    cfg: UserStoreConfig,
 }
 
 impl UserStore {
     pub fn new(cfg: UserStoreConfig) -> Arc<Self> {
         Arc::new(Self {
-            users:       DashMap::new(),
+            users: DashMap::new(),
             by_username: DashMap::new(),
-            by_email:    DashMap::new(),
-            blacklist:   TokenBlacklist::default(),
+            by_email: DashMap::new(),
+            blacklist: TokenBlacklist::default(),
             cfg,
         })
     }
@@ -130,9 +133,9 @@ impl UserStore {
 
     pub fn register(
         &self,
-        username:     &str,
-        email:        &str,
-        password:     &str,
+        username: &str,
+        email: &str,
+        password: &str,
         display_name: Option<String>,
     ) -> Result<User, UserAuthError> {
         if self.by_username.contains_key(username) {
@@ -143,12 +146,12 @@ impl UserStore {
         }
         if username.len() < 3 || username.len() > 32 {
             return Err(UserAuthError::PasswordError(
-                "username must be 3-32 characters".into()
+                "username must be 3-32 characters".into(),
             ));
         }
         if password.len() < 8 {
             return Err(UserAuthError::PasswordError(
-                "password must be at least 8 characters".into()
+                "password must be at least 8 characters".into(),
             ));
         }
 
@@ -193,13 +196,16 @@ impl UserStore {
         username_or_email: &str,
         password: &str,
     ) -> Result<(User, String), UserAuthError> {
-        let user_id = self.by_username
+        let user_id = self
+            .by_username
             .get(username_or_email)
             .map(|r| r.clone())
             .or_else(|| self.by_email.get(username_or_email).map(|r| r.clone()))
             .ok_or(UserAuthError::UserNotFound)?;
 
-        let user = self.users.get(&user_id)
+        let user = self
+            .users
+            .get(&user_id)
             .map(|r| r.clone())
             .ok_or(UserAuthError::UserNotFound)?;
 
@@ -270,7 +276,9 @@ impl UserStore {
     /// Вызывается для каждой записи полученной из Backend::load_active_revocations().
     pub fn warm_blacklist_entry(&self, jti: String, expires_at_ms: u64) {
         let now_ms = now_secs() * 1000;
-        if expires_at_ms <= now_ms { return; } // уже истёк — не добавляем
+        if expires_at_ms <= now_ms {
+            return;
+        } // уже истёк — не добавляем
         let remaining = std::time::Duration::from_millis(expires_at_ms - now_ms);
         let expires_at = std::time::Instant::now() + remaining;
         self.blacklist.insert(jti, expires_at);
@@ -279,7 +287,11 @@ impl UserStore {
     pub fn cleanup_blacklist(&self) -> usize {
         let removed = self.blacklist.cleanup();
         if removed > 0 {
-            info!(removed, remaining = self.blacklist.len(), "blacklist entries cleaned");
+            info!(
+                removed,
+                remaining = self.blacklist.len(),
+                "blacklist entries cleaned"
+            );
         }
         removed
     }
@@ -325,7 +337,14 @@ mod tests {
     #[test]
     fn register_and_login() {
         let s = store();
-        let user = s.register("alice", "alice@example.com", "password123", Some("Alice".into())).unwrap();
+        let user = s
+            .register(
+                "alice",
+                "alice@example.com",
+                "password123",
+                Some("Alice".into()),
+            )
+            .unwrap();
         assert_eq!(user.username, "alice");
         assert_eq!(user.role, UserRole::Admin);
 
@@ -337,7 +356,8 @@ mod tests {
     #[test]
     fn login_by_email() {
         let s = store();
-        s.register("bob", "bob@example.com", "pass12345", None).unwrap();
+        s.register("bob", "bob@example.com", "pass12345", None)
+            .unwrap();
         let (u, _) = s.login("bob@example.com", "pass12345").unwrap();
         assert_eq!(u.username, "bob");
     }
@@ -345,23 +365,30 @@ mod tests {
     #[test]
     fn duplicate_username_rejected() {
         let s = store();
-        s.register("carol", "carol@a.com", "pass12345", None).unwrap();
-        let err = s.register("carol", "carol2@a.com", "pass12345", None).unwrap_err();
+        s.register("carol", "carol@a.com", "pass12345", None)
+            .unwrap();
+        let err = s
+            .register("carol", "carol2@a.com", "pass12345", None)
+            .unwrap_err();
         assert!(matches!(err, UserAuthError::UsernameTaken));
     }
 
     #[test]
     fn duplicate_email_rejected() {
         let s = store();
-        s.register("dave", "shared@a.com", "pass12345", None).unwrap();
-        let err = s.register("eve", "shared@a.com", "pass12345", None).unwrap_err();
+        s.register("dave", "shared@a.com", "pass12345", None)
+            .unwrap();
+        let err = s
+            .register("eve", "shared@a.com", "pass12345", None)
+            .unwrap_err();
         assert!(matches!(err, UserAuthError::EmailTaken));
     }
 
     #[test]
     fn wrong_password_rejected() {
         let s = store();
-        s.register("frank", "frank@a.com", "correct-pass", None).unwrap();
+        s.register("frank", "frank@a.com", "correct-pass", None)
+            .unwrap();
         let err = s.login("frank", "wrong-pass").unwrap_err();
         assert!(matches!(err, UserAuthError::InvalidPassword));
     }
@@ -369,7 +396,8 @@ mod tests {
     #[test]
     fn token_verify_roundtrip() {
         let s = store();
-        s.register("grace", "grace@a.com", "pass12345", None).unwrap();
+        s.register("grace", "grace@a.com", "pass12345", None)
+            .unwrap();
         let (_, token) = s.login("grace", "pass12345").unwrap();
         let claims = s.verify_token(&token).unwrap();
         assert_eq!(claims.username, "grace");
@@ -380,7 +408,8 @@ mod tests {
     #[test]
     fn revoked_token_rejected() {
         let s = store();
-        s.register("henry", "henry@a.com", "pass12345", None).unwrap();
+        s.register("henry", "henry@a.com", "pass12345", None)
+            .unwrap();
         let (_, token) = s.login("henry", "pass12345").unwrap();
 
         // Токен валиден до revoke
@@ -395,7 +424,8 @@ mod tests {
     #[test]
     fn two_logins_independent_revocation() {
         let s = store();
-        s.register("irene", "irene@a.com", "pass12345", None).unwrap();
+        s.register("irene", "irene@a.com", "pass12345", None)
+            .unwrap();
         let (_, token1) = s.login("irene", "pass12345").unwrap();
         let (_, token2) = s.login("irene", "pass12345").unwrap();
 
@@ -406,7 +436,10 @@ mod tests {
 
         // Отзываем только первый
         s.revoke_token(&token1).unwrap();
-        assert!(matches!(s.verify_token(&token1).unwrap_err(), UserAuthError::TokenRevoked));
+        assert!(matches!(
+            s.verify_token(&token1).unwrap_err(),
+            UserAuthError::TokenRevoked
+        ));
         assert!(s.verify_token(&token2).is_ok());
     }
 

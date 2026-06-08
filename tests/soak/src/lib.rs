@@ -18,8 +18,8 @@
 //! The soak job in .github/workflows/ci.yml runs these with a 10-minute timeout.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use turna_auth::AuthMode;
@@ -31,7 +31,9 @@ use turna_transport::buffer::{BytesPool, MAX_UDP_PACKET};
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn client_addr(i: u16) -> SocketAddr {
-    format!("10.0.{}.{}:5000", i / 256, i % 256).parse().unwrap()
+    format!("10.0.{}.{}:5000", i / 256, i % 256)
+        .parse()
+        .unwrap()
 }
 
 fn relay_addr(port: u16) -> SocketAddr {
@@ -51,9 +53,12 @@ fn channel_data_frame(channel: u16) -> Vec<u8> {
 /// Build a minimal STUN Binding Request (20 bytes, no attributes).
 fn stun_binding_request() -> Vec<u8> {
     let mut pkt = vec![0u8; 20];
-    pkt[0] = 0x00; pkt[1] = 0x01;           // Binding Request
-    pkt[4] = 0x21; pkt[5] = 0x12;           // Magic cookie
-    pkt[6] = 0xA4; pkt[7] = 0x42;
+    pkt[0] = 0x00;
+    pkt[1] = 0x01; // Binding Request
+    pkt[4] = 0x21;
+    pkt[5] = 0x12; // Magic cookie
+    pkt[6] = 0xA4;
+    pkt[7] = 0x42;
     pkt
 }
 
@@ -65,7 +70,7 @@ fn stun_binding_request() -> Vec<u8> {
 #[test]
 fn bytes_pool_no_leak_under_load() {
     const ITERATIONS: usize = 1_000_000;
-    const POOL_SIZE:  usize = 256;
+    const POOL_SIZE: usize = 256;
 
     let pool = BytesPool::new(POOL_SIZE, MAX_UDP_PACKET);
 
@@ -84,7 +89,11 @@ fn bytes_pool_no_leak_under_load() {
         let clone_a = frozen.clone();
         let clone_b = frozen.clone();
 
-        assert_eq!(clone_a.as_ptr(), clone_b.as_ptr(), "clones must share memory");
+        assert_eq!(
+            clone_a.as_ptr(),
+            clone_b.as_ptr(),
+            "clones must share memory"
+        );
 
         // All Bytes drop here → refcount → 0 → backing memory released to OS.
         // The pool does NOT reclaim frozen Bytes (only unfrozen BytesMut).
@@ -130,8 +139,8 @@ fn bytes_clone_is_zero_copy_and_drops_cleanly() {
 
     drop(clones); // refcount → 1 (only `frozen`)
     drop(frozen); // refcount → 0 → memory freed
-    // No assertion needed — absence of leak sanitizer error IS the assertion.
-    // Under ASan / Valgrind this test will fail if there is a leak.
+                  // No assertion needed — absence of leak sanitizer error IS the assertion.
+                  // Under ASan / Valgrind this test will fail if there is a leak.
 }
 
 // ── PacketProcessor + AllocationStore Arc count ───────────────────────────────
@@ -144,28 +153,24 @@ fn bytes_clone_is_zero_copy_and_drops_cleanly() {
 /// alive (a classic reference-cycle or forgotten handle).
 #[test]
 fn allocation_store_arc_no_leak() {
-    const N_ALLOCS:  u16   = 200;
+    const N_ALLOCS: u16 = 200;
     const N_PACKETS: usize = 50_000;
 
-    let store   = Arc::new(AllocationStore::new(49152, 65535, 1000));
+    let store = Arc::new(AllocationStore::new(49152, 65535, 1000));
     let metrics = Arc::new(Metrics::new());
-    let auth    = Arc::new(AuthMode::SharedSecret {
-        realm:  "turna-soak".into(),
+    let auth = Arc::new(AuthMode::SharedSecret {
+        realm: "turna-soak".into(),
         secret: b"soak-test-secret".to_vec(),
     });
 
     // ── Create allocations ───────────────────────────────────────────────────
     for i in 0..N_ALLOCS {
-        let port   = 49152 + i;
+        let port = 49152 + i;
         let client = client_addr(i);
-        let relay  = relay_addr(port);
-        store.create(
-            client,
-            relay,
-            format!("user-{i}"),
-            b"key".to_vec(),
-            600,
-        ).expect("allocation create");
+        let relay = relay_addr(port);
+        store
+            .create(client, relay, format!("user-{i}"), b"key".to_vec(), 600)
+            .expect("allocation create");
     }
 
     assert_eq!(store.len(), N_ALLOCS as usize);
@@ -179,18 +184,26 @@ fn allocation_store_arc_no_leak() {
     );
 
     // strong_count: outer `store` + processor's internal clone = 2
-    assert_eq!(Arc::strong_count(&store), 2, "expected store count = 2 after processor creation");
+    assert_eq!(
+        Arc::strong_count(&store),
+        2,
+        "expected store count = 2 after processor creation"
+    );
 
     // ── Process packets ───────────────────────────────────────────────────────
     // Mix of ChannelData (needs lookup → exercises DashMap reads) and STUN
     // Binding Requests (exercises parsing path).  Most will return empty
     // Action vec since channels aren't bound, but the hot paths still run.
     let src: SocketAddr = "1.2.3.4:9000".parse().unwrap();
-    let channel_frame   = channel_data_frame(0x4001);
-    let stun_frame      = stun_binding_request();
+    let channel_frame = channel_data_frame(0x4001);
+    let stun_frame = stun_binding_request();
 
     for i in 0..N_PACKETS {
-        let raw = if i % 3 == 0 { &channel_frame } else { &stun_frame };
+        let raw = if i % 3 == 0 {
+            &channel_frame
+        } else {
+            &stun_frame
+        };
         let actions = processor.process_slice(raw, src);
         // Actions hold Bytes — drop immediately, refcount must return to pool.
         drop(actions);
@@ -202,7 +215,7 @@ fn allocation_store_arc_no_leak() {
     // ── Remove all allocations ───────────────────────────────────────────────
     for i in 0..N_ALLOCS {
         let client = client_addr(i);
-        let relay  = relay_addr(49152 + i);
+        let relay = relay_addr(49152 + i);
         store.remove(&client, relay).ok();
     }
 
@@ -229,10 +242,10 @@ fn allocation_store_arc_no_leak() {
 /// the processor is actually doing work and not short-circuiting.
 #[test]
 fn processor_actually_processes_packets() {
-    let store   = Arc::new(AllocationStore::new(49152, 65535, 10));
+    let store = Arc::new(AllocationStore::new(49152, 65535, 10));
     let metrics = Arc::new(Metrics::new());
-    let auth    = Arc::new(AuthMode::SharedSecret {
-        realm:  "turna-soak".into(),
+    let auth = Arc::new(AuthMode::SharedSecret {
+        realm: "turna-soak".into(),
         secret: b"key".to_vec(),
     });
 
@@ -243,7 +256,7 @@ fn processor_actually_processes_packets() {
         Arc::clone(&metrics),
     );
 
-    let src   = "5.6.7.8:1234".parse().unwrap();
+    let src = "5.6.7.8:1234".parse().unwrap();
     let frame = stun_binding_request();
 
     let before = metrics.packets_received.load(Ordering::Relaxed);
@@ -261,22 +274,23 @@ fn processor_actually_processes_packets() {
 #[test]
 #[ignore] // Run explicitly: cargo test -p turna-soak -- --ignored --nocapture
 fn full_soak_10k_allocs_1m_packets() {
-    const N_ALLOCS:  u16   = 10_000;
+    const N_ALLOCS: u16 = 10_000;
     const N_PACKETS: usize = 1_000_000;
-    const BATCH:     usize = 10_000;
+    const BATCH: usize = 10_000;
 
-    let store   = Arc::new(AllocationStore::new(39152, 65535, N_ALLOCS as usize + 100));
+    let store = Arc::new(AllocationStore::new(39152, 65535, N_ALLOCS as usize + 100));
     let metrics = Arc::new(Metrics::new());
-    let auth    = Arc::new(AuthMode::SharedSecret {
-        realm:  "turna-soak".into(),
+    let auth = Arc::new(AuthMode::SharedSecret {
+        realm: "turna-soak".into(),
         secret: b"soak-secret".to_vec(),
     });
 
     for i in 0..N_ALLOCS {
-        let port   = 39152 + i;
+        let port = 39152 + i;
         let client = client_addr(i);
-        let relay  = relay_addr(port);
-        store.create(client, relay, format!("u{i}"), b"k".to_vec(), 600)
+        let relay = relay_addr(port);
+        store
+            .create(client, relay, format!("u{i}"), b"k".to_vec(), 600)
             .expect("create");
     }
 
@@ -287,7 +301,7 @@ fn full_soak_10k_allocs_1m_packets() {
         Arc::clone(&metrics),
     );
 
-    let src   = "2.2.2.2:9999".parse().unwrap();
+    let src = "2.2.2.2:9999".parse().unwrap();
     let frame = stun_binding_request();
 
     for batch_start in (0..N_PACKETS).step_by(BATCH) {
@@ -295,12 +309,15 @@ fn full_soak_10k_allocs_1m_packets() {
             drop(processor.process_slice(&frame, src));
         }
         let received = metrics.packets_received.load(Ordering::Relaxed);
-        println!("  processed {}/{N_PACKETS} packets, received={received}", batch_start + BATCH);
+        println!(
+            "  processed {}/{N_PACKETS} packets, received={received}",
+            batch_start + BATCH
+        );
     }
 
     for i in 0..N_ALLOCS {
         let client = client_addr(i);
-        let relay  = relay_addr(39152 + i);
+        let relay = relay_addr(39152 + i);
         store.remove(&client, relay).ok();
     }
 

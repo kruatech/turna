@@ -7,6 +7,7 @@ edition.workspace = true
 [features]
 default = []
 io-uring = ["turna-transport/io-uring"]
+tls = ["turna-transport/tls"]
 
 [dependencies]
 libc = "0.2"
@@ -20,6 +21,7 @@ turna-proto-stun.workspace = true
 turna-proto-turn.workspace = true
 turna-proto-rtp.workspace = true
 turna-transport.workspace = true
+turna-cluster.workspace = true
 turna-session.workspace = true
 turna-auth.workspace = true
 turna-qos.workspace = true

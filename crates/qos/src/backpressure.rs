@@ -110,9 +110,9 @@ fn classify_rtp(data: &[u8]) -> Priority {
     // 0 = PCMU, 8 = PCMA, 9 = G722, 111 = Opus (dynamic, most common)
     // 96-127 = dynamic, but Opus is almost always 111
     match pt {
-        0 | 8 | 9 => Priority::Audio,                // Static audio PTs
-        111 => Priority::Audio,                        // Opus (conventional)
-        96..=110 | 112..=127 => Priority::Data,       // Likely video (VP8/VP9/H264)
+        0 | 8 | 9 => Priority::Audio,           // Static audio PTs
+        111 => Priority::Audio,                 // Opus (conventional)
+        96..=110 | 112..=127 => Priority::Data, // Likely video (VP8/VP9/H264)
         _ => Priority::Data,
     }
 }
@@ -294,7 +294,9 @@ impl PriorityQueue {
         }
 
         if expired > 0 {
-            self.stats.expired_dropped.fetch_add(expired, Ordering::Relaxed);
+            self.stats
+                .expired_dropped
+                .fetch_add(expired, Ordering::Relaxed);
             trace!(expired, "cleaned up expired packets");
         }
     }
@@ -375,7 +377,11 @@ impl CongestionDetector {
 
         if self.congested != was {
             if self.congested {
-                warn!(avg = self.avg_queue_size, threshold = self.threshold, "congestion detected");
+                warn!(
+                    avg = self.avg_queue_size,
+                    threshold = self.threshold,
+                    "congestion detected"
+                );
             } else {
                 debug!(avg = self.avg_queue_size, "congestion cleared");
             }
@@ -403,31 +409,37 @@ mod tests {
 
     fn make_stun_packet() -> Vec<u8> {
         let mut p = vec![0u8; 20];
-        p[0] = 0x00; p[1] = 0x01; // Binding Request
-        p[4] = 0x21; p[5] = 0x12; p[6] = 0xA4; p[7] = 0x42; // magic
+        p[0] = 0x00;
+        p[1] = 0x01; // Binding Request
+        p[4] = 0x21;
+        p[5] = 0x12;
+        p[6] = 0xA4;
+        p[7] = 0x42; // magic
         p
     }
 
     fn make_audio_rtp() -> Vec<u8> {
         let mut p = vec![0u8; 172]; // typical Opus packet
         p[0] = 0x80; // V=2
-        p[1] = 111;  // PT=111 (Opus)
+        p[1] = 111; // PT=111 (Opus)
         p
     }
 
     fn make_video_rtp() -> Vec<u8> {
         let mut p = vec![0u8; 1200];
         p[0] = 0x80; // V=2
-        p[1] = 96;   // PT=96 (VP8)
+        p[1] = 96; // PT=96 (VP8)
         p
     }
 
     fn make_channel_data_audio() -> Vec<u8> {
         let mut p = vec![0u8; 176];
-        p[0] = 0x40; p[1] = 0x01; // Channel 0x4001
-        p[2] = 0x00; p[3] = 0xAC; // Length 172
+        p[0] = 0x40;
+        p[1] = 0x01; // Channel 0x4001
+        p[2] = 0x00;
+        p[3] = 0xAC; // Length 172
         p[4] = 0x80; // RTP V=2
-        p[5] = 111;  // PT=111 Opus
+        p[5] = 111; // PT=111 Opus
         p
     }
 
@@ -448,16 +460,19 @@ mod tests {
 
     #[test]
     fn classify_channel_data_audio() {
-        assert_eq!(Priority::classify(&make_channel_data_audio()), Priority::Audio);
+        assert_eq!(
+            Priority::classify(&make_channel_data_audio()),
+            Priority::Audio
+        );
     }
 
     #[test]
     fn enqueue_dequeue_priority() {
         let mut q = PriorityQueue::new(BackpressureConfig::default());
 
-        q.enqueue(make_video_rtp());   // Data
+        q.enqueue(make_video_rtp()); // Data
         q.enqueue(make_stun_packet()); // Control
-        q.enqueue(make_audio_rtp());   // Audio
+        q.enqueue(make_audio_rtp()); // Audio
 
         // Dequeue order: Audio → Control → Data
         let p1 = q.dequeue().unwrap();
@@ -486,7 +501,10 @@ mod tests {
         }
 
         // 6th should be dropped
-        assert_eq!(q.enqueue(make_video_rtp()), EnqueueResult::DroppedBackpressure);
+        assert_eq!(
+            q.enqueue(make_video_rtp()),
+            EnqueueResult::DroppedBackpressure
+        );
 
         // Audio still accepted
         assert_eq!(q.enqueue(make_audio_rtp()), EnqueueResult::Accepted);
@@ -526,8 +544,12 @@ mod tests {
     #[test]
     fn batch_dequeue() {
         let mut q = PriorityQueue::new(BackpressureConfig::default());
-        for _ in 0..5 { q.enqueue(make_audio_rtp()); }
-        for _ in 0..3 { q.enqueue(make_video_rtp()); }
+        for _ in 0..5 {
+            q.enqueue(make_audio_rtp());
+        }
+        for _ in 0..3 {
+            q.enqueue(make_video_rtp());
+        }
 
         let batch = q.dequeue_batch(4);
         assert_eq!(batch.len(), 4);
@@ -538,10 +560,14 @@ mod tests {
         let mut cd = CongestionDetector::new(50.0);
         assert!(!cd.is_congested());
 
-        for _ in 0..100 { cd.update(200); }
+        for _ in 0..100 {
+            cd.update(200);
+        }
         assert!(cd.is_congested());
 
-        for _ in 0..100 { cd.update(0); }
+        for _ in 0..100 {
+            cd.update(0);
+        }
         assert!(!cd.is_congested());
     }
 

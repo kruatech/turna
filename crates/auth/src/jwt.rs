@@ -1,8 +1,8 @@
 //! JWT tokens for platform authentication.
 
 use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-    errors::Error as JwtError,
+    decode, encode, errors::Error as JwtError, Algorithm, DecodingKey, EncodingKey, Header,
+    Validation,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -75,11 +75,7 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
     validation.validate_exp = true;
     validation.leeway = 0;
 
-    let data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret),
-        &validation,
-    )?;
+    let data = decode::<Claims>(token, &DecodingKey::from_secret(secret), &validation)?;
     Ok(data.claims)
 }
 
@@ -159,7 +155,8 @@ mod tests {
             &Header::new(Algorithm::HS256),
             &claims,
             &EncodingKey::from_secret(secret),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(verify_jwt(&token, secret).is_err());
     }
 }

@@ -88,7 +88,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 use crate::*;
 
@@ -109,7 +109,7 @@ use crate::*;
 /// directives in `docs/DEPLOY.md`).
 #[derive(Debug, Clone)]
 struct Creds {
-    user:     Option<String>,
+    user: Option<String>,
     password: Option<String>,
 }
 
@@ -118,15 +118,15 @@ pub struct TarantoolBackend {
     /// own Mutex. Slot selection is round-robin via `next_slot`. On
     /// connection error a slot temporarily holds `None` until the next
     /// caller (or the eval-time reconnect path) restores it.
-    pool:       Vec<Mutex<Option<TcpStream>>>,
+    pool: Vec<Mutex<Option<TcpStream>>>,
     /// Per-slot state for the pool gauge. Updated inside eval_once/eval
     /// while the slot mutex is held (or just after reconnect).
     /// Values: 0 = idle, 1 = busy, 2 = broken.
     slot_state: Vec<AtomicU8>,
-    next_slot:  AtomicUsize,
-    uri:        String,
-    creds:      Creds,
-    next_id:    AtomicU64,
+    next_slot: AtomicUsize,
+    uri: String,
+    creds: Creds,
+    next_id: AtomicU64,
 }
 
 impl TarantoolBackend {
@@ -138,24 +138,23 @@ impl TarantoolBackend {
     /// useful for a quick local smoke test against an unsecured
     /// Tarantool, but unsuitable for any deployment.
     pub async fn connect_pool(
-        uri:       &str,
-        user:      Option<&str>,
-        password:  Option<&str>,
+        uri: &str,
+        user: Option<&str>,
+        password: Option<&str>,
         pool_size: usize,
     ) -> Result<Self> {
         let pool_size = pool_size.max(1);
         let creds = Creds {
-            user:     user.map(str::to_owned),
+            user: user.map(str::to_owned),
             password: password.map(str::to_owned),
         };
 
-        let mut pool:       Vec<Mutex<Option<TcpStream>>> = Vec::with_capacity(pool_size);
-        let mut slot_state: Vec<AtomicU8>                 = Vec::with_capacity(pool_size);
+        let mut pool: Vec<Mutex<Option<TcpStream>>> = Vec::with_capacity(pool_size);
+        let mut slot_state: Vec<AtomicU8> = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
-            let stream = tcp_connect_and_auth(uri, &creds).await
-                .map_err(|e| BackendError::Connection(
-                    format!("slot {i}/{pool_size}: {e}")
-                ))?;
+            let stream = tcp_connect_and_auth(uri, &creds)
+                .await
+                .map_err(|e| BackendError::Connection(format!("slot {i}/{pool_size}: {e}")))?;
             pool.push(Mutex::new(Some(stream)));
             slot_state.push(AtomicU8::new(0)); // starts idle
         }
@@ -168,9 +167,9 @@ impl TarantoolBackend {
             pool,
             slot_state,
             next_slot: AtomicUsize::new(0),
-            uri:       uri.to_string(),
+            uri: uri.to_string(),
             creds,
-            next_id:   AtomicU64::new(1),
+            next_id: AtomicU64::new(1),
         })
     }
 
@@ -198,16 +197,17 @@ impl TarantoolBackend {
     // ── Allocation CRUD ───────────────────────────────────────────────────────
 
     pub async fn store_allocation(&self, alloc: &StoredAllocation) -> Result<()> {
-        let json    = ser(alloc)?;
-        let port    = alloc.relay_port.to_string();
-        let user    = alloc.user_id.clone();
-        let node    = alloc.node_id.clone();
+        let json = ser(alloc)?;
+        let port = alloc.relay_port.to_string();
+        let user = alloc.user_id.clone();
+        let node = alloc.node_id.clone();
         let expires = alloc.expires_at_ms.to_string();
 
         self.call(
             "turna_store_allocation",
             &[&port, &user, &node, &expires, &json],
-        ).await?;
+        )
+        .await?;
         debug!(relay_port = alloc.relay_port, user = %alloc.user_id, "allocation stored");
         Ok(())
     }
@@ -242,7 +242,11 @@ impl TarantoolBackend {
         call_list(&resp)
     }
 
-    pub async fn list_allocations(&self, offset: usize, limit: usize) -> Result<Vec<StoredAllocation>> {
+    pub async fn list_allocations(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<StoredAllocation>> {
         let off = offset.to_string();
         let lim = limit.to_string();
         let resp = self.call("turna_list_allocations", &[&off, &lim]).await?;
@@ -258,15 +262,18 @@ impl TarantoolBackend {
     pub async fn update_bandwidth(
         &self,
         relay_port: u16,
-        bytes_in: u64, bytes_out: u64,
-        packets_in: u64, packets_out: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+        packets_in: u64,
+        packets_out: u64,
     ) -> Result<()> {
         let port = relay_port.to_string();
-        let bi   = bytes_in.to_string();
-        let bo   = bytes_out.to_string();
-        let pi   = packets_in.to_string();
-        let po   = packets_out.to_string();
-        self.call("turna_update_bandwidth", &[&port, &bi, &bo, &pi, &po]).await?;
+        let bi = bytes_in.to_string();
+        let bo = bytes_out.to_string();
+        let pi = packets_in.to_string();
+        let po = packets_out.to_string();
+        self.call("turna_update_bandwidth", &[&port, &bi, &bo, &pi, &po])
+            .await?;
         Ok(())
     }
 
@@ -274,7 +281,8 @@ impl TarantoolBackend {
 
     pub async fn heartbeat(&self, hb: &NodeHeartbeat) -> Result<()> {
         let json = ser(hb)?;
-        self.call("turna_store_heartbeat", &[&hb.node_id, &json]).await?;
+        self.call("turna_store_heartbeat", &[&hb.node_id, &json])
+            .await?;
         debug!(node = %hb.node_id, "heartbeat stored");
         Ok(())
     }
@@ -289,7 +297,8 @@ impl TarantoolBackend {
 
     pub async fn store_room(&self, room: &StoredRoom) -> Result<()> {
         let json = ser(room)?;
-        self.call("turna_store_room", &[&room.room_id, &json]).await?;
+        self.call("turna_store_room", &[&room.room_id, &json])
+            .await?;
         Ok(())
     }
 
@@ -305,9 +314,23 @@ impl TarantoolBackend {
 
     // ── Health ────────────────────────────────────────────────────────────────
 
-
-    pub async fn revoke_token(&self, jti: &str, sub: &str, revoked_at_ms: u64, expires_at_ms: u64) -> Result<()> {
-        self.call("turna_revoke_token", &[jti, sub, &revoked_at_ms.to_string(), &expires_at_ms.to_string()]).await?;
+    pub async fn revoke_token(
+        &self,
+        jti: &str,
+        sub: &str,
+        revoked_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<()> {
+        self.call(
+            "turna_revoke_token",
+            &[
+                jti,
+                sub,
+                &revoked_at_ms.to_string(),
+                &expires_at_ms.to_string(),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -317,21 +340,32 @@ impl TarantoolBackend {
     }
 
     pub async fn cleanup_revoked_tokens(&self, before_ms: u64) -> Result<u64> {
-        let raw = self.call("turna_cleanup_revoked_tokens", &[&before_ms.to_string()]).await?;
-        if raw.len() >= 2 && raw[0] == 0x91 { return Ok(raw[1] as u64); }
+        let raw = self
+            .call("turna_cleanup_revoked_tokens", &[&before_ms.to_string()])
+            .await?;
+        if raw.len() >= 2 && raw[0] == 0x91 {
+            return Ok(raw[1] as u64);
+        }
         Ok(0)
     }
 
     pub async fn load_active_revocations(&self, after_ms: u64) -> Result<Vec<(String, u64)>> {
-        let raw = self.call("turna_load_active_revocations", &[&after_ms.to_string()]).await?;
-        if raw.is_empty() { return Ok(vec![]); }
+        let raw = self
+            .call("turna_load_active_revocations", &[&after_ms.to_string()])
+            .await?;
+        if raw.is_empty() {
+            return Ok(vec![]);
+        }
         let decoded: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
-        Ok(decoded.into_iter().filter_map(|s| {
-            let mut p = s.splitn(2, ':');
-            let jti = p.next()?.to_string();
-            let exp: u64 = p.next()?.parse().ok()?;
-            Some((jti, exp))
-        }).collect())
+        Ok(decoded
+            .into_iter()
+            .filter_map(|s| {
+                let mut p = s.splitn(2, ':');
+                let jti = p.next()?.to_string();
+                let exp: u64 = p.next()?.parse().ok()?;
+                Some((jti, exp))
+            })
+            .collect())
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -361,9 +395,9 @@ impl TarantoolBackend {
     /// (it does — see `init_schema`). No additional schema work needed.
     pub async fn claim_allocation(
         &self,
-        relay_port:        u16,
-        expected_node_id:  &str,
-        new_node_id:       &str,
+        relay_port: u16,
+        expected_node_id: &str,
+        new_node_id: &str,
     ) -> Result<bool> {
         let port = relay_port.to_string();
         // Index of `node_id` inside the tuple stored by `store_allocation`:
@@ -371,10 +405,12 @@ impl TarantoolBackend {
         // node_id is field #3 (1-indexed in Lua, so position 3).
         // We additionally update the embedded JSON's `node_id` field so
         // future `get_allocation` returns the new owner consistently.
-        let resp = self.call(
-            "turna_claim_allocation",
-            &[&port, expected_node_id, new_node_id],
-        ).await?;
+        let resp = self
+            .call(
+                "turna_claim_allocation",
+                &[&port, expected_node_id, new_node_id],
+            )
+            .await?;
         call_bool(&resp)
     }
 
@@ -414,46 +450,62 @@ impl TarantoolBackend {
         encode_uint(&mut header, 0x01); // IPROTO_SYNC
         encode_uint64(&mut header, request_id);
 
-        let mut body = Vec::with_capacity(64 + func.len() +
-            args.iter().map(|a| a.len()).sum::<usize>());
+        let mut body =
+            Vec::with_capacity(64 + func.len() + args.iter().map(|a| a.len()).sum::<usize>());
         encode_map_header(&mut body, 2);
         encode_uint(&mut body, 0x22); // IPROTO_FUNCTION_NAME
         encode_str(&mut body, func);
         encode_uint(&mut body, 0x21); // IPROTO_TUPLE
         encode_array_header(&mut body, args.len() as u32);
-        for arg in args { encode_str(&mut body, arg); }
+        for arg in args {
+            encode_str(&mut body, arg);
+        }
 
         let total = header.len() + body.len();
 
         let mut conn_guard = self.pool[slot_idx].lock().await;
         self.slot_state[slot_idx].store(1, Ordering::Relaxed);
-        let conn = conn_guard.as_mut()
-            .ok_or_else(|| {
+        let conn = conn_guard.as_mut().ok_or_else(|| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection("no connection in slot".into())
+        })?;
+
+        conn.write_all(&[0xce]).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
+        conn.write_all(&(total as u32).to_be_bytes())
+            .await
+            .map_err(|e| {
                 self.slot_state[slot_idx].store(2, Ordering::Relaxed);
-                BackendError::Connection("no connection in slot".into())
+                BackendError::Connection(e.to_string())
             })?;
+        conn.write_all(&header).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
+        conn.write_all(&body).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
 
-        conn.write_all(&[0xce]).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-        conn.write_all(&(total as u32).to_be_bytes()).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-        conn.write_all(&header).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-        conn.write_all(&body).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-
-        let resp_size = read_msgpack_uint(conn).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); e })?;
+        let resp_size = read_msgpack_uint(conn).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            e
+        })?;
         if resp_size > 16 * 1024 * 1024 {
             *conn_guard = None;
             self.slot_state[slot_idx].store(2, Ordering::Relaxed);
-            return Err(BackendError::Connection(
-                format!("response too large: {resp_size} bytes")));
+            return Err(BackendError::Connection(format!(
+                "response too large: {resp_size} bytes"
+            )));
         }
 
         let mut resp = vec![0u8; resp_size];
-        conn.read_exact(&mut resp).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
+        conn.read_exact(&mut resp).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
 
         self.slot_state[slot_idx].store(0, Ordering::Relaxed);
         Ok(resp)
@@ -473,9 +525,9 @@ impl TarantoolBackend {
         let (mut idle, mut busy, mut broken) = (0u64, 0u64, 0u64);
         for s in &self.slot_state {
             match s.load(Ordering::Relaxed) {
-                1 => busy   += 1,
+                1 => busy += 1,
                 2 => broken += 1,
-                _ => idle   += 1,
+                _ => idle += 1,
             }
         }
         (idle, busy, broken)
@@ -529,53 +581,71 @@ impl TarantoolBackend {
         encode_uint(&mut header, 0x01); // IPROTO_SYNC
         encode_uint64(&mut header, request_id);
 
-        let mut body = Vec::with_capacity(64 + lua.len() + args.iter().map(|a| a.len()).sum::<usize>());
+        let mut body =
+            Vec::with_capacity(64 + lua.len() + args.iter().map(|a| a.len()).sum::<usize>());
         encode_map_header(&mut body, 2);
         encode_uint(&mut body, 0x27); // IPROTO_EXPR
         encode_str(&mut body, lua);
         encode_uint(&mut body, 0x21); // IPROTO_TUPLE
         encode_array_header(&mut body, args.len() as u32);
-        for arg in args { encode_str(&mut body, arg); }
+        for arg in args {
+            encode_str(&mut body, arg);
+        }
 
         let total = header.len() + body.len();
 
         let mut conn_guard = self.pool[slot_idx].lock().await;
         // Mark slot busy while holding the mutex.
         self.slot_state[slot_idx].store(1, Ordering::Relaxed);
-        let conn = conn_guard.as_mut()
-            .ok_or_else(|| {
-                self.slot_state[slot_idx].store(2, Ordering::Relaxed);
-                BackendError::Connection("no connection in slot".into())
-            })?;
+        let conn = conn_guard.as_mut().ok_or_else(|| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection("no connection in slot".into())
+        })?;
 
         // Size prefix: always encode as uint32 (0xce + 4 bytes).
         // Tarantool accepts any valid msgpack uint here.
-        conn.write_all(&[0xce]).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-        conn.write_all(&(total as u32).to_be_bytes()).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-        conn.write_all(&header).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
-        conn.write_all(&body).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
+        conn.write_all(&[0xce]).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
+        conn.write_all(&(total as u32).to_be_bytes())
+            .await
+            .map_err(|e| {
+                self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+                BackendError::Connection(e.to_string())
+            })?;
+        conn.write_all(&header).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
+        conn.write_all(&body).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
 
         // ── Read response ────────────────────────────────────────────────────
         //
         // Tarantool sends: [size: msgpack_uint][header_map][body_map]
         // The size encodes the combined byte length of header_map + body_map.
 
-        let resp_size = read_msgpack_uint(conn).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); e })?;
+        let resp_size = read_msgpack_uint(conn).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            e
+        })?;
         if resp_size > 16 * 1024 * 1024 {
             // Drop the connection — we have no way to skip the body.
             *conn_guard = None;
             self.slot_state[slot_idx].store(2, Ordering::Relaxed);
-            return Err(BackendError::Connection(format!("response too large: {resp_size} bytes")));
+            return Err(BackendError::Connection(format!(
+                "response too large: {resp_size} bytes"
+            )));
         }
 
         let mut resp = vec![0u8; resp_size];
-        conn.read_exact(&mut resp).await
-            .map_err(|e| { self.slot_state[slot_idx].store(2, Ordering::Relaxed); BackendError::Connection(e.to_string()) })?;
+        conn.read_exact(&mut resp).await.map_err(|e| {
+            self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+            BackendError::Connection(e.to_string())
+        })?;
 
         // Success — slot is back to idle.
         self.slot_state[slot_idx].store(0, Ordering::Relaxed);
@@ -615,15 +685,16 @@ fn parse_iproto_data(resp: &[u8]) -> Result<Vec<rmpv::Value>> {
                                 if bk == Value::Integer(0x31.into()) {
                                     if let Value::String(s) = bv {
                                         return Err(BackendError::Other(
-                                            s.into_str().unwrap_or_else(|| "tarantool error".into())
+                                            s.into_str()
+                                                .unwrap_or_else(|| "tarantool error".into()),
                                         ));
                                     }
                                 }
                             }
                         }
-                        return Err(BackendError::Other(
-                            format!("tarantool error code {code:#x}")
-                        ));
+                        return Err(BackendError::Other(format!(
+                            "tarantool error code {code:#x}"
+                        )));
                     }
                 }
             }
@@ -652,40 +723,39 @@ fn parse_call_data(resp: &[u8]) -> Result<Vec<rmpv::Value>> {
     let outer = parse_iproto_data(resp)?;
     match outer.into_iter().next() {
         Some(rmpv::Value::Array(inner)) => Ok(inner),
-        Some(v) => Ok(vec![v]),  // unexpected shape — be lenient
+        Some(v) => Ok(vec![v]), // unexpected shape — be lenient
         None => Ok(vec![]),
     }
 }
 
 // ── Typed decode helpers (shared logic) ───────────────────────────────────────
 
-fn data_to_optional<T: serde::de::DeserializeOwned>(
-    data: Vec<rmpv::Value>,
-) -> Result<Option<T>> {
+fn data_to_optional<T: serde::de::DeserializeOwned>(data: Vec<rmpv::Value>) -> Result<Option<T>> {
     match data.into_iter().next() {
         Some(rmpv::Value::String(s)) => {
             let json = s.into_str().unwrap_or_default();
-            if json.is_empty() { return Ok(None); }
+            if json.is_empty() {
+                return Ok(None);
+            }
             let v = serde_json::from_str(&json)
                 .map_err(|e| BackendError::Serialization(e.to_string()))?;
             Ok(Some(v))
         }
         Some(rmpv::Value::Nil) | None => Ok(None),
-        Some(other) => Err(BackendError::Serialization(
-            format!("expected string, got: {:?}", other)
-        )),
+        Some(other) => Err(BackendError::Serialization(format!(
+            "expected string, got: {:?}",
+            other
+        ))),
     }
 }
 
-fn data_to_list<T: serde::de::DeserializeOwned>(
-    data: Vec<rmpv::Value>,
-) -> Result<Vec<T>> {
+fn data_to_list<T: serde::de::DeserializeOwned>(data: Vec<rmpv::Value>) -> Result<Vec<T>> {
     let mut result = Vec::with_capacity(data.len());
     for val in data {
         if let rmpv::Value::String(s) = val {
             if let Some(json) = s.as_str() {
                 match serde_json::from_str::<T>(json) {
-                    Ok(v)  => result.push(v),
+                    Ok(v) => result.push(v),
                     Err(e) => warn!(%e, "failed to deserialise Tarantool row, skipping"),
                 }
             }
@@ -724,14 +794,14 @@ fn call_bool(resp: &[u8]) -> Result<bool> {
     match data.first() {
         Some(rmpv::Value::Boolean(b)) => Ok(*b),
         Some(rmpv::Value::Nil) | None => Ok(false),
-        Some(other) => Err(BackendError::Serialization(
-            format!("expected boolean, got: {:?}", other)
-        )),
+        Some(other) => Err(BackendError::Serialization(format!(
+            "expected boolean, got: {:?}",
+            other
+        ))),
     }
 }
 
 // ── EVAL response parsers (kept for backwards compat / tests) ─────────────────
-
 
 // iproto response decoders kept as a complete typed set alongside the ones in
 // active use (data_to_*); these two shapes aren't decoded by current callers.
@@ -752,45 +822,45 @@ fn parse_u64(resp: &[u8]) -> Option<u64> {
 /// AUTH handshake. The returned `TcpStream` is ready for `EVAL` /
 /// `SELECT` / etc.
 async fn tcp_connect_and_auth(uri: &str, creds: &Creds) -> Result<TcpStream> {
-    let addr: std::net::SocketAddr = uri.parse()
+    let addr: std::net::SocketAddr = uri
+        .parse()
         .map_err(|e| BackendError::Connection(format!("invalid uri '{uri}': {e}")))?;
 
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(addr),
-    ).await
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+        .await
         .map_err(|_| BackendError::Timeout)?
         .map_err(|e| BackendError::Connection(e.to_string()))?;
 
     // Disable Nagle — iproto is request/response, latency matters more
     // than throughput.
-    stream.set_nodelay(true)
+    stream
+        .set_nodelay(true)
         .map_err(|e| BackendError::Connection(e.to_string()))?;
 
     // Read the 128-byte greeting. Bytes 64..107 are 44 base64-encoded
     // characters that decode to 32 bytes of salt; we only need the
     // first 20 bytes for chap-sha1.
     let mut greeting = [0u8; 128];
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        stream.read_exact(&mut greeting),
-    ).await
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut greeting))
+        .await
         .map_err(|_| BackendError::Timeout)?
         .map_err(|e| BackendError::Connection(format!("greeting: {e}")))?;
 
     match (&creds.user, &creds.password) {
         (Some(user), Some(password)) => {
             let salt_b64 = std::str::from_utf8(&greeting[64..108])
-                .map_err(|_| BackendError::Connection(
-                    "greeting salt is not ASCII — Tarantool protocol mismatch?".into()
-                ))?
+                .map_err(|_| {
+                    BackendError::Connection(
+                        "greeting salt is not ASCII — Tarantool protocol mismatch?".into(),
+                    )
+                })?
                 .trim_end();
             do_auth(&mut stream, user, password, salt_b64).await?;
             debug!(user = %user, "Tarantool auth successful");
         }
         (Some(_), None) => {
             return Err(BackendError::Connection(
-                "Tarantool user set but password is empty".into()
+                "Tarantool user set but password is empty".into(),
             ));
         }
         (None, _) => {
@@ -809,12 +879,7 @@ async fn tcp_connect_and_auth(uri: &str, creds: &Creds) -> Result<TcpStream> {
 /// Wire layout follows the Tarantool documentation
 /// (<https://www.tarantool.io/en/doc/latest/dev_guide/internals/iproto/authentication/>)
 /// and the reference C connector. See also the module-level doc.
-async fn do_auth(
-    stream:    &mut TcpStream,
-    user:      &str,
-    password:  &str,
-    salt_b64:  &str,
-) -> Result<()> {
+async fn do_auth(stream: &mut TcpStream, user: &str, password: &str, salt_b64: &str) -> Result<()> {
     let scramble = build_chap_sha1_scramble(password, salt_b64)?;
 
     // Build AUTH body:
@@ -832,9 +897,9 @@ async fn do_auth(
     encode_uint(&mut header, 0x00); // IPROTO_REQUEST_TYPE
     encode_uint(&mut header, 0x07); // AUTH
     encode_uint(&mut header, 0x01); // IPROTO_SYNC
-    encode_uint(&mut header, 0);    // sync 0 — no concurrency at AUTH time
+    encode_uint(&mut header, 0); // sync 0 — no concurrency at AUTH time
     encode_uint(&mut header, 0x05); // IPROTO_SCHEMA_ID
-    encode_uint(&mut header, 0);    // schema_id = 0 (don't care; matches pytarantool)
+    encode_uint(&mut header, 0); // schema_id = 0 (don't care; matches pytarantool)
 
     let mut body = Vec::with_capacity(32 + user.len() + scramble.len());
     encode_map_header(&mut body, 2);
@@ -847,25 +912,35 @@ async fn do_auth(
 
     let total = header.len() + body.len();
     // Size: uint32 prefix (0xce + 4 BE bytes).
-    stream.write_all(&[0xce]).await
+    stream
+        .write_all(&[0xce])
+        .await
         .map_err(|e| BackendError::Connection(e.to_string()))?;
-    stream.write_all(&(total as u32).to_be_bytes()).await
+    stream
+        .write_all(&(total as u32).to_be_bytes())
+        .await
         .map_err(|e| BackendError::Connection(e.to_string()))?;
-    stream.write_all(&header).await
+    stream
+        .write_all(&header)
+        .await
         .map_err(|e| BackendError::Connection(e.to_string()))?;
-    stream.write_all(&body).await
+    stream
+        .write_all(&body)
+        .await
         .map_err(|e| BackendError::Connection(e.to_string()))?;
 
     // Read response: size, then header+body. We only care about the
     // response code — non-zero (>= 0x8000) means auth failed.
     let resp_size = read_msgpack_uint(stream).await?;
     if resp_size > 4096 {
-        return Err(BackendError::Connection(
-            format!("auth response unexpectedly large: {resp_size} bytes")
-        ));
+        return Err(BackendError::Connection(format!(
+            "auth response unexpectedly large: {resp_size} bytes"
+        )));
     }
     let mut resp = vec![0u8; resp_size];
-    stream.read_exact(&mut resp).await
+    stream
+        .read_exact(&mut resp)
+        .await
         .map_err(|e| BackendError::Connection(e.to_string()))?;
 
     // Parse the response code. `parse_iproto_data` handles error mapping
@@ -875,8 +950,9 @@ async fn do_auth(
         Ok(_) => Ok(()),
         Err(BackendError::Other(msg))
             if msg.to_lowercase().contains("password")
-            || msg.to_lowercase().contains("mismatch")
-            || msg.to_lowercase().contains("denied") => {
+                || msg.to_lowercase().contains("mismatch")
+                || msg.to_lowercase().contains("denied") =>
+        {
             Err(BackendError::Connection(format!("auth failed: {msg}")))
         }
         Err(e) => Err(BackendError::Connection(format!("auth failed: {e}"))),
@@ -898,9 +974,10 @@ fn build_chap_sha1_scramble(password: &str, salt_b64: &str) -> Result<[u8; 20]> 
         .decode(salt_b64.trim())
         .map_err(|e| BackendError::Connection(format!("bad salt base64: {e}")))?;
     if salt.len() < 20 {
-        return Err(BackendError::Connection(
-            format!("salt too short: {} bytes (need ≥20)", salt.len())
-        ));
+        return Err(BackendError::Connection(format!(
+            "salt too short: {} bytes (need ≥20)",
+            salt.len()
+        )));
     }
 
     // Reference: tarantool-c src/tnt/tnt_auth.c::tnt_encode_chap_sha1,
@@ -950,7 +1027,8 @@ fn encode_bin(out: &mut Vec<u8>, data: &[u8]) {
 /// Handles all msgpack uint formats: fixuint, uint8, uint16, uint32, uint64.
 async fn read_msgpack_uint(conn: &mut TcpStream) -> Result<usize> {
     let mut tag = [0u8; 1];
-    conn.read_exact(&mut tag).await
+    conn.read_exact(&mut tag)
+        .await
         .map_err(|e| BackendError::Connection(e.to_string()))?;
     match tag[0] {
         // fixuint: 0x00–0x7f → direct value
@@ -958,30 +1036,38 @@ async fn read_msgpack_uint(conn: &mut TcpStream) -> Result<usize> {
         // uint 8
         0xcc => {
             let mut b = [0u8; 1];
-            conn.read_exact(&mut b).await.map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.read_exact(&mut b)
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
             Ok(b[0] as usize)
         }
         // uint 16
         0xcd => {
             let mut b = [0u8; 2];
-            conn.read_exact(&mut b).await.map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.read_exact(&mut b)
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
             Ok(u16::from_be_bytes(b) as usize)
         }
         // uint 32
         0xce => {
             let mut b = [0u8; 4];
-            conn.read_exact(&mut b).await.map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.read_exact(&mut b)
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
             Ok(u32::from_be_bytes(b) as usize)
         }
         // uint 64
         0xcf => {
             let mut b = [0u8; 8];
-            conn.read_exact(&mut b).await.map_err(|e| BackendError::Connection(e.to_string()))?;
+            conn.read_exact(&mut b)
+                .await
+                .map_err(|e| BackendError::Connection(e.to_string()))?;
             Ok(u64::from_be_bytes(b) as usize)
         }
-        b => Err(BackendError::Serialization(
-            format!("unexpected msgpack tag in size prefix: {b:#x}")
-        )),
+        b => Err(BackendError::Serialization(format!(
+            "unexpected msgpack tag in size prefix: {b:#x}"
+        ))),
     }
 }
 
@@ -1024,7 +1110,7 @@ fn encode_uint64(buf: &mut Vec<u8>, val: u64) {
 
 fn encode_str(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
-    let len   = bytes.len();
+    let len = bytes.len();
     if len < 32 {
         buf.push(0xa0 | len as u8);
     } else if len < 256 {
@@ -1081,12 +1167,21 @@ mod tests {
     #[test]
     fn serialise_allocation() {
         let alloc = StoredAllocation {
-            id: "test".into(), relay_port: 12345,
-            client_addr: "1.2.3.4:5000".into(), relay_addr: "5.6.7.8:12345".into(),
-            user_id: "user1".into(), realm: "turna".into(), node_id: "node1".into(),
-            created_at_ms: 1000, expires_at_ms: 61000,
-            bytes_in: 0, bytes_out: 0, packets_in: 0, packets_out: 0,
-            permissions: vec![], channels: vec![],
+            id: "test".into(),
+            relay_port: 12345,
+            client_addr: "1.2.3.4:5000".into(),
+            relay_addr: "5.6.7.8:12345".into(),
+            user_id: "user1".into(),
+            realm: "turna".into(),
+            node_id: "node1".into(),
+            created_at_ms: 1000,
+            expires_at_ms: 61000,
+            bytes_in: 0,
+            bytes_out: 0,
+            packets_in: 0,
+            packets_out: 0,
+            permissions: vec![],
+            channels: vec![],
         };
         let json = ser(&alloc).unwrap();
         let back: StoredAllocation = serde_json::from_str(&json).unwrap();
@@ -1124,7 +1219,9 @@ mod tests {
         h.update(h2);
         let mix: [u8; 20] = h.finalize().into();
         let mut expected = [0u8; 20];
-        for i in 0..20 { expected[i] = h1[i] ^ mix[i]; }
+        for i in 0..20 {
+            expected[i] = h1[i] ^ mix[i];
+        }
 
         let got = build_chap_sha1_scramble(pw, &salt_b64).unwrap();
         assert_eq!(got, expected, "scramble must match the reference SHA-1 XOR");
@@ -1164,11 +1261,11 @@ mod tests {
             Err(_) => return, // skip if Tarantool not available
         };
         let user = std::env::var("TARANTOOL_USER").ok();
-        let pw   = std::env::var("TARANTOOL_PASSWORD").ok();
+        let pw = std::env::var("TARANTOOL_PASSWORD").ok();
 
-        let backend = TarantoolBackend::connect_pool(
-            &uri, user.as_deref(), pw.as_deref(), 4
-        ).await.unwrap();
+        let backend = TarantoolBackend::connect_pool(&uri, user.as_deref(), pw.as_deref(), 4)
+            .await
+            .unwrap();
         backend.init_schema().await.unwrap();
 
         // ping
@@ -1176,12 +1273,21 @@ mod tests {
 
         // store + get
         let alloc = StoredAllocation {
-            id: "t1".into(), relay_port: 19999,
-            client_addr: "1.2.3.4:5000".into(), relay_addr: "5.6.7.8:19999".into(),
-            user_id: "testuser".into(), realm: "turna".into(), node_id: "node1".into(),
-            created_at_ms: now_ms(), expires_at_ms: now_ms() + 600_000,
-            bytes_in: 0, bytes_out: 0, packets_in: 0, packets_out: 0,
-            permissions: vec![], channels: vec![],
+            id: "t1".into(),
+            relay_port: 19999,
+            client_addr: "1.2.3.4:5000".into(),
+            relay_addr: "5.6.7.8:19999".into(),
+            user_id: "testuser".into(),
+            realm: "turna".into(),
+            node_id: "node1".into(),
+            created_at_ms: now_ms(),
+            expires_at_ms: now_ms() + 600_000,
+            bytes_in: 0,
+            bytes_out: 0,
+            packets_in: 0,
+            packets_out: 0,
+            permissions: vec![],
+            channels: vec![],
         };
 
         backend.store_allocation(&alloc).await.unwrap();
@@ -1199,9 +1305,12 @@ mod tests {
         assert!(count >= 1);
 
         // update bandwidth
-        backend.update_bandwidth(19999, 1000, 2000, 10, 20).await.unwrap();
+        backend
+            .update_bandwidth(19999, 1000, 2000, 10, 20)
+            .await
+            .unwrap();
         let updated = backend.get_allocation(19999).await.unwrap().unwrap();
-        assert_eq!(updated.bytes_in,  1000);
+        assert_eq!(updated.bytes_in, 1000);
         assert_eq!(updated.bytes_out, 2000);
 
         // remove

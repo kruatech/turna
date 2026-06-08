@@ -11,7 +11,9 @@ fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
 fn allows_up_to_burst_then_denies() {
     let mut rl = RateLimiter::new(5, 1);
     let addr = ip(1, 2, 3, 4);
-    for _ in 0..5 { assert!(rl.check(addr)); }
+    for _ in 0..5 {
+        assert!(rl.check(addr));
+    }
     assert!(!rl.check(addr));
 }
 
@@ -20,8 +22,12 @@ fn different_ips_independent() {
     let mut rl = RateLimiter::new(2, 1);
     let a = ip(10, 0, 0, 1);
     let b = ip(10, 0, 0, 2);
-    assert!(rl.check(a)); assert!(rl.check(a)); assert!(!rl.check(a));
-    assert!(rl.check(b)); assert!(rl.check(b)); assert!(!rl.check(b));
+    assert!(rl.check(a));
+    assert!(rl.check(a));
+    assert!(!rl.check(a));
+    assert!(rl.check(b));
+    assert!(rl.check(b));
+    assert!(!rl.check(b));
 }
 
 #[test]
@@ -29,10 +35,14 @@ fn entry_count_never_exceeds_max_entries() {
     let max = 10usize;
     let mut rl = RateLimiter::with_max_entries(100, 100, max);
     let mut allowed = 0usize;
-    let mut denied  = 0usize;
+    let mut denied = 0usize;
     for i in 0..(max * 3) as u32 {
         let addr = IpAddr::V4(Ipv4Addr::from(0x0A000000 + i));
-        if rl.check(addr) { allowed += 1; } else { denied += 1; }
+        if rl.check(addr) {
+            allowed += 1;
+        } else {
+            denied += 1;
+        }
     }
     assert_eq!(allowed, max);
     assert_eq!(denied, max * 2);

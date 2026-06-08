@@ -107,7 +107,9 @@ fn is_forbidden_v6(v6: Ipv6Addr) -> bool {
 mod tests {
     use super::*;
 
-    fn ip(s: &str) -> IpAddr { s.parse().unwrap() }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn normalizes_mapped_v4() {
@@ -126,15 +128,15 @@ mod tests {
         assert!(is_forbidden_peer(ip("169.254.169.254"))); // cloud metadata
         assert!(is_forbidden_peer(ip("0.0.0.0")));
         assert!(is_forbidden_peer(ip("255.255.255.255")));
-        assert!(is_forbidden_peer(ip("224.0.0.1")));        // multicast
-        assert!(is_forbidden_peer(ip("fe80::1")));          // link-local v6
-        assert!(is_forbidden_peer(ip("::")));               // unspecified
+        assert!(is_forbidden_peer(ip("224.0.0.1"))); // multicast
+        assert!(is_forbidden_peer(ip("fe80::1"))); // link-local v6
+        assert!(is_forbidden_peer(ip("::"))); // unspecified
     }
 
     #[test]
     fn allows_normal_peers() {
         assert!(!is_forbidden_peer(ip("8.8.8.8")));
-        assert!(!is_forbidden_peer(ip("10.0.0.5")));        // private LAN: allowed
+        assert!(!is_forbidden_peer(ip("10.0.0.5"))); // private LAN: allowed
         assert!(!is_forbidden_peer(ip("2001:db8::1")));
     }
 }

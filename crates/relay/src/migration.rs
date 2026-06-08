@@ -131,7 +131,12 @@ impl MigrationCoordinator {
             },
         );
 
-        info!(alloc = allocation_id, target = target_node, ?reason, "migration started");
+        info!(
+            alloc = allocation_id,
+            target = target_node,
+            ?reason,
+            "migration started"
+        );
         Ok(())
     }
 
@@ -139,7 +144,11 @@ impl MigrationCoordinator {
         if let Some(status) = self.in_progress.remove(allocation_id) {
             let ms = status.started_at.elapsed().as_millis();
             if success {
-                info!(alloc = allocation_id, elapsed_ms = ms, "migration completed");
+                info!(
+                    alloc = allocation_id,
+                    elapsed_ms = ms,
+                    "migration completed"
+                );
             } else {
                 warn!(alloc = allocation_id, elapsed_ms = ms, "migration failed");
             }
@@ -163,8 +172,12 @@ impl MigrationCoordinator {
         timed_out
     }
 
-    pub fn in_progress_count(&self) -> usize { self.in_progress.len() }
-    pub fn is_migrating(&self, allocation_id: &str) -> bool { self.in_progress.contains_key(allocation_id) }
+    pub fn in_progress_count(&self) -> usize {
+        self.in_progress.len()
+    }
+    pub fn is_migrating(&self, allocation_id: &str) -> bool {
+        self.in_progress.contains_key(allocation_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +229,8 @@ impl DrainManager {
         if success {
             self.completed.push(allocation_id.to_string());
         } else {
-            self.failed.push((allocation_id.to_string(), error.unwrap_or_default()));
+            self.failed
+                .push((allocation_id.to_string(), error.unwrap_or_default()));
         }
     }
 
@@ -226,7 +240,9 @@ impl DrainManager {
 
     pub fn progress(&self) -> DrainProgress {
         DrainProgress {
-            total: self.pending.len() + self.completed.len() + self.failed.len()
+            total: self.pending.len()
+                + self.completed.len()
+                + self.failed.len()
                 + self.coordinator.in_progress_count(),
             pending: self.pending.len(),
             in_progress: self.coordinator.in_progress_count(),
@@ -297,7 +313,9 @@ mod tests {
         let next = dm.next_to_migrate().unwrap();
         assert_eq!(next, "a1");
 
-        dm.coordinator_mut().start("a1", "n2", MigrationReason::Drain).unwrap();
+        dm.coordinator_mut()
+            .start("a1", "n2", MigrationReason::Drain)
+            .unwrap();
         dm.on_result("a1", true, None);
 
         let p = dm.progress();
@@ -311,7 +329,9 @@ mod tests {
         dm.start_drain(vec!["a1".into()]);
 
         let id = dm.next_to_migrate().unwrap();
-        dm.coordinator_mut().start(&id, "n2", MigrationReason::Drain).unwrap();
+        dm.coordinator_mut()
+            .start(&id, "n2", MigrationReason::Drain)
+            .unwrap();
         dm.on_result(&id, true, None);
 
         assert!(dm.is_complete());

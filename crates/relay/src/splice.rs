@@ -11,8 +11,8 @@
 
 #![cfg(target_os = "linux")]
 
-use std::os::fd::RawFd;
 use std::io;
+use std::os::fd::RawFd;
 
 use tracing::info;
 
@@ -71,11 +71,7 @@ impl Drop for SplicePipe {
 
 /// Splice from src_fd to pipe, then from pipe to dst_fd.
 /// Returns bytes transferred, or 0 for EOF, or error.
-fn splice_one_direction(
-    src_fd: RawFd,
-    pipe: &SplicePipe,
-    dst_fd: RawFd,
-) -> io::Result<usize> {
+fn splice_one_direction(src_fd: RawFd, pipe: &SplicePipe, dst_fd: RawFd) -> io::Result<usize> {
     let flags = libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE;
 
     // src → pipe
@@ -152,10 +148,7 @@ pub struct SpliceStats {
 ///
 /// For tokio integration: call from spawn_blocking or use epoll to detect
 /// readability before each splice call.
-pub async fn splice_relay(
-    client_fd: RawFd,
-    peer_fd: RawFd,
-) -> io::Result<SpliceStats> {
+pub async fn splice_relay(client_fd: RawFd, peer_fd: RawFd) -> io::Result<SpliceStats> {
     let pipe_c2p = SplicePipe::new()?;
     let pipe_p2c = SplicePipe::new()?;
 
@@ -243,13 +236,8 @@ pub async fn splice_relay(
 }
 
 fn add_epoll(epfd: RawFd, fd: RawFd, events: u32, data: u64) -> io::Result<()> {
-    let mut ev = libc::epoll_event {
-        events,
-        u64: data,
-    };
-    let ret = unsafe {
-        libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev)
-    };
+    let mut ev = libc::epoll_event { events, u64: data };
+    let ret = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {

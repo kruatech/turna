@@ -19,10 +19,10 @@
 //!
 //! See `crates/transport/src/bpf_filter.rs` for the filter itself.
 
+use crate::{Result, Transport};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use crate::{Result, Transport};
 
 /// Largest STUN/TURN message we accept at all. RFC 8489 caps STUN at
 /// 64 KiB minus headers; in practice no real client sends anything
@@ -54,11 +54,15 @@ impl TokioTransport {
         // instead of in the kernel.
         Self::try_attach_bpf_filter(&socket);
 
-        Ok(Self { socket: Arc::new(socket) })
+        Ok(Self {
+            socket: Arc::new(socket),
+        })
     }
 
     pub fn from_socket(socket: UdpSocket) -> Self {
-        Self { socket: Arc::new(socket) }
+        Self {
+            socket: Arc::new(socket),
+        }
     }
 
     /// Bind с SO_REUSEPORT, выставленным ДО bind (только Unix).
@@ -70,7 +74,7 @@ impl TokioTransport {
     pub async fn recv_mmsg(
         &self,
         bufs: &mut [&mut [u8]],
-        out:  &mut [(usize, SocketAddr)],
+        out: &mut [(usize, SocketAddr)],
     ) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd;
         debug_assert!(out.len() >= bufs.len() && !bufs.is_empty());
@@ -79,31 +83,44 @@ impl TokioTransport {
             self.socket.readable().await?;
             let res = self.socket.try_io(tokio::io::Interest::READABLE, || {
                 let n = bufs.len();
-                let mut addrs: Vec<libc::sockaddr_storage> =
-                    vec![unsafe { std::mem::zeroed() }; n];
-                let mut iovecs: Vec<libc::iovec> = bufs.iter_mut()
-                    .map(|b| libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: b.len() })
+                let mut addrs: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; n];
+                let mut iovecs: Vec<libc::iovec> = bufs
+                    .iter_mut()
+                    .map(|b| libc::iovec {
+                        iov_base: b.as_mut_ptr().cast(),
+                        iov_len: b.len(),
+                    })
                     .collect();
-                let mut hdrs: Vec<libc::mmsghdr> = (0..n).map(|k| {
-                    let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                    h.msg_hdr.msg_iov     = &mut iovecs[k];
-                    h.msg_hdr.msg_iovlen  = 1;
-                    h.msg_hdr.msg_name    = (&mut addrs[k] as *mut libc::sockaddr_storage).cast();
-                    h.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                    h
-                }).collect();
+                let mut hdrs: Vec<libc::mmsghdr> = (0..n)
+                    .map(|k| {
+                        let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                        h.msg_hdr.msg_iov = &mut iovecs[k];
+                        h.msg_hdr.msg_iovlen = 1;
+                        h.msg_hdr.msg_name = (&mut addrs[k] as *mut libc::sockaddr_storage).cast();
+                        h.msg_hdr.msg_namelen =
+                            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                        h
+                    })
+                    .collect();
                 let r = unsafe {
-                    libc::recvmmsg(fd, hdrs.as_mut_ptr(), n as libc::c_uint,
-                                   libc::MSG_DONTWAIT, std::ptr::null_mut())
+                    libc::recvmmsg(
+                        fd,
+                        hdrs.as_mut_ptr(),
+                        n as libc::c_uint,
+                        libc::MSG_DONTWAIT,
+                        std::ptr::null_mut(),
+                    )
                 };
-                if r < 0 { return Err(std::io::Error::last_os_error()); }
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 let r = r as usize;
                 for k in 0..r {
-                    let sa = unsafe {
-                        socket2::SockAddr::new(addrs[k], hdrs[k].msg_hdr.msg_namelen)
-                    };
-                    let src = sa.as_socket().ok_or_else(|| std::io::Error::new(
-                        std::io::ErrorKind::InvalidData, "non-IP source addr"))?;
+                    let sa =
+                        unsafe { socket2::SockAddr::new(addrs[k], hdrs[k].msg_hdr.msg_namelen) };
+                    let src = sa.as_socket().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "non-IP source addr")
+                    })?;
                     out[k] = (hdrs[k].msg_len as usize, src);
                 }
                 Ok(r)
@@ -121,7 +138,7 @@ impl TokioTransport {
     pub async fn recv_mmsg(
         &self,
         bufs: &mut [&mut [u8]],
-        out:  &mut [(usize, SocketAddr)],
+        out: &mut [(usize, SocketAddr)],
     ) -> std::io::Result<usize> {
         let (n, src) = self.socket.recv_from(bufs[0]).await?;
         out[0] = (n, src);
@@ -132,7 +149,9 @@ impl TokioTransport {
     #[cfg(target_os = "linux")]
     pub async fn send_mmsg(&self, pkts: &[(bytes::Bytes, SocketAddr)]) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
-        if pkts.is_empty() { return Ok(()); }
+        if pkts.is_empty() {
+            return Ok(());
+        }
         let fd = self.socket.as_raw_fd();
         let mut sent = 0usize;
         while sent < pkts.len() {
@@ -140,23 +159,33 @@ impl TokioTransport {
             let res = self.socket.try_io(tokio::io::Interest::WRITABLE, || {
                 let batch = &pkts[sent..];
                 let n = batch.len();
-                let addrs: Vec<socket2::SockAddr> =
-                    batch.iter().map(|(_, a)| socket2::SockAddr::from(*a)).collect();
-                let mut iovecs: Vec<libc::iovec> = batch.iter()
-                    .map(|(d, _)| libc::iovec { iov_base: d.as_ptr() as *mut _, iov_len: d.len() })
+                let addrs: Vec<socket2::SockAddr> = batch
+                    .iter()
+                    .map(|(_, a)| socket2::SockAddr::from(*a))
                     .collect();
-                let mut hdrs: Vec<libc::mmsghdr> = (0..n).map(|k| {
-                    let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                    h.msg_hdr.msg_iov     = &mut iovecs[k];
-                    h.msg_hdr.msg_iovlen  = 1;
-                    h.msg_hdr.msg_name    = addrs[k].as_ptr() as *mut _;
-                    h.msg_hdr.msg_namelen = addrs[k].len();
-                    h
-                }).collect();
+                let mut iovecs: Vec<libc::iovec> = batch
+                    .iter()
+                    .map(|(d, _)| libc::iovec {
+                        iov_base: d.as_ptr() as *mut _,
+                        iov_len: d.len(),
+                    })
+                    .collect();
+                let mut hdrs: Vec<libc::mmsghdr> = (0..n)
+                    .map(|k| {
+                        let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                        h.msg_hdr.msg_iov = &mut iovecs[k];
+                        h.msg_hdr.msg_iovlen = 1;
+                        h.msg_hdr.msg_name = addrs[k].as_ptr() as *mut _;
+                        h.msg_hdr.msg_namelen = addrs[k].len();
+                        h
+                    })
+                    .collect();
                 let r = unsafe {
                     libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as libc::c_uint, libc::MSG_DONTWAIT)
                 };
-                if r < 0 { return Err(std::io::Error::last_os_error()); }
+                if r < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(r as usize)
             });
             match res {
@@ -181,7 +210,11 @@ impl TokioTransport {
         #[cfg(unix)]
         {
             use socket2::{Domain, Protocol, Socket, Type};
-            let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+            let domain = if addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
             let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
             sock.set_reuse_port(true)?;
             sock.set_nonblocking(true)?;
@@ -189,7 +222,9 @@ impl TokioTransport {
             let socket = UdpSocket::from_std(sock.into())?;
             tracing::info!(%addr, "UDP socket bound (tokio, SO_REUSEPORT)");
             Self::try_attach_bpf_filter(&socket);
-            Ok(Self { socket: Arc::new(socket) })
+            Ok(Self {
+                socket: Arc::new(socket),
+            })
         }
         #[cfg(not(unix))]
         {
@@ -219,8 +254,11 @@ impl TokioTransport {
             let fd = socket.as_raw_fd();
             match crate::bpf_filter::attach_stun_filter(fd, MAX_PACKET_SIZE) {
                 Ok(()) => {
-                    tracing::info!(fd, max_size = MAX_PACKET_SIZE,
-                                   "BPF STUN/ChannelData filter attached");
+                    tracing::info!(
+                        fd,
+                        max_size = MAX_PACKET_SIZE,
+                        "BPF STUN/ChannelData filter attached"
+                    );
                 }
                 Err(e) => {
                     // EPERM is the typical case without CAP_NET_RAW. Other
@@ -249,7 +287,7 @@ impl TokioTransport {
 fn bpf_enabled() -> bool {
     match std::env::var("TURNA_BPF_FILTER") {
         Err(_) => true,
-        Ok(v)  => !matches!(
+        Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off" | "disabled"
         ),
@@ -284,8 +322,10 @@ mod tests {
     async fn bpf_env_and_bind_scenarios() {
         // Scenario 1: unset env → default is enabled.
         std::env::remove_var("TURNA_BPF_FILTER");
-        assert!(bpf_enabled(),
-                "unset env must mean attach (the safer / production default)");
+        assert!(
+            bpf_enabled(),
+            "unset env must mean attach (the safer / production default)"
+        );
 
         // Scenario 2: every truthy spelling enables.
         for v in ["1", "true", "yes", "on", "TRUE", "On"] {
@@ -302,7 +342,8 @@ mod tests {
         // Scenario 4: bind() works with the filter disabled (so the
         // setsockopt path is bypassed, no permission issues).
         std::env::set_var("TURNA_BPF_FILTER", "0");
-        let t = TokioTransport::bind("127.0.0.1:0".parse().unwrap()).await
+        let t = TokioTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
             .expect("bind must work with TURNA_BPF_FILTER=0");
         let addr = t.local_addr().expect("local_addr after bind must succeed");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
@@ -314,7 +355,8 @@ mod tests {
         // setsockopt returns EPERM; on macOS the attach path is a
         // no-op; either way bind() must succeed.
         std::env::remove_var("TURNA_BPF_FILTER");
-        let t = TokioTransport::bind("127.0.0.1:0".parse().unwrap()).await
+        let t = TokioTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
             .expect("bind to loopback must succeed regardless of filter outcome");
         let _ = t.local_addr().unwrap();
         drop(t);

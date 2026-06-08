@@ -116,7 +116,9 @@ async fn stun_flood(config: &BenchConfig) -> BenchResult {
                     continue;
                 }
 
-                match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf)).await {
+                match tokio::time::timeout(Duration::from_millis(500), socket.recv_from(&mut buf))
+                    .await
+                {
                     Ok(Ok((n, _))) if n > 0 => {
                         let elapsed = start.elapsed().as_micros() as u64;
                         local_latencies.push(elapsed);
@@ -149,7 +151,9 @@ async fn stun_flood(config: &BenchConfig) -> BenchResult {
         total_bytes: total * stun_request.len() as u64,
         errors: errors.load(Ordering::Relaxed),
         rps: total as f64 / duration.as_secs_f64(),
-        throughput_mbps: (total * stun_request.len() as u64 * 8) as f64 / duration.as_secs_f64() / 1_000_000.0,
+        throughput_mbps: (total * stun_request.len() as u64 * 8) as f64
+            / duration.as_secs_f64()
+            / 1_000_000.0,
         latency_p50_us: percentile(&latencies, 50),
         latency_p99_us: percentile(&latencies, 99),
         latency_min_us: latencies.first().copied().unwrap_or(0),
@@ -172,10 +176,15 @@ async fn allocate_storm(config: &BenchConfig) -> BenchResult {
 fn build_stun_binding_request() -> Vec<u8> {
     let mut pkt = vec![0u8; 20];
     // STUN header: Binding Request
-    pkt[0] = 0x00; pkt[1] = 0x01; // Type: Binding Request
-    pkt[2] = 0x00; pkt[3] = 0x00; // Length: 0
-    // Magic cookie
-    pkt[4] = 0x21; pkt[5] = 0x12; pkt[6] = 0xA4; pkt[7] = 0x42;
+    pkt[0] = 0x00;
+    pkt[1] = 0x01; // Type: Binding Request
+    pkt[2] = 0x00;
+    pkt[3] = 0x00; // Length: 0
+                   // Magic cookie
+    pkt[4] = 0x21;
+    pkt[5] = 0x12;
+    pkt[6] = 0xA4;
+    pkt[7] = 0x42;
     // Transaction ID (random)
     for i in 8..20 {
         pkt[i] = rand::random();
@@ -184,7 +193,9 @@ fn build_stun_binding_request() -> Vec<u8> {
 }
 
 fn percentile(sorted: &[u64], pct: usize) -> u64 {
-    if sorted.is_empty() { return 0; }
+    if sorted.is_empty() {
+        return 0;
+    }
     let idx = (sorted.len() * pct / 100).min(sorted.len() - 1);
     sorted[idx]
 }
@@ -202,11 +213,26 @@ async fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--target" => { i += 1; config.target = args[i].parse().expect("invalid target"); }
-            "--scenario" => { i += 1; config.scenario = args[i].clone(); }
-            "--duration" => { i += 1; config.duration_secs = args[i].parse().expect("invalid duration"); }
-            "--concurrency" => { i += 1; config.concurrency = args[i].parse().expect("invalid concurrency"); }
-            "--report" => { i += 1; config.report_file = Some(args[i].clone()); }
+            "--target" => {
+                i += 1;
+                config.target = args[i].parse().expect("invalid target");
+            }
+            "--scenario" => {
+                i += 1;
+                config.scenario = args[i].clone();
+            }
+            "--duration" => {
+                i += 1;
+                config.duration_secs = args[i].parse().expect("invalid duration");
+            }
+            "--concurrency" => {
+                i += 1;
+                config.concurrency = args[i].parse().expect("invalid concurrency");
+            }
+            "--report" => {
+                i += 1;
+                config.report_file = Some(args[i].clone());
+            }
             "--help" => {
                 println!("turna-benchmark --target HOST:PORT --scenario SCENARIO --duration SECS --concurrency N");
                 println!("Scenarios: stun-flood, allocate-storm, all");
@@ -226,10 +252,7 @@ async fn main() {
     let results = match config.scenario.as_str() {
         "stun-flood" => vec![stun_flood(&config).await],
         "allocate-storm" => vec![allocate_storm(&config).await],
-        "all" => vec![
-            stun_flood(&config).await,
-            allocate_storm(&config).await,
-        ],
+        "all" => vec![stun_flood(&config).await, allocate_storm(&config).await],
         other => {
             eprintln!("Unknown scenario: {other}");
             return;

@@ -33,7 +33,11 @@ impl NumaTopology {
         let nodes = parse_numa_topology();
         let node_count = nodes.len().max(1);
         let total_cores: usize = nodes.values().map(|v| v.len()).sum();
-        info!(nodes = node_count, cores = total_cores, "NUMA topology detected");
+        info!(
+            nodes = node_count,
+            cores = total_cores,
+            "NUMA topology detected"
+        );
         for (node, cpus) in &nodes {
             debug!(node, cpus = ?cpus, "NUMA node");
         }
@@ -85,11 +89,7 @@ impl WorkerPlacement {
     /// Strategy: round-robin workers across NUMA nodes,
     /// then pin to specific CPUs within each node.
     /// Port ranges split evenly across workers.
-    pub fn plan(
-        topology: &NumaTopology,
-        num_workers: usize,
-        port_range: (u16, u16),
-    ) -> Self {
+    pub fn plan(topology: &NumaTopology, num_workers: usize, port_range: (u16, u16)) -> Self {
         let total_ports = (port_range.1 - port_range.0) as usize;
         let ports_per_worker = total_ports / num_workers.max(1);
 
@@ -187,11 +187,7 @@ pub fn pin_to_cpu(cpu: u32) -> bool {
     unsafe {
         let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu as usize, &mut cpuset);
-        let ret = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &cpuset,
-        );
+        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
         if ret == 0 {
             debug!(cpu, "pinned to CPU");
             true

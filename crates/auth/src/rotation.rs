@@ -153,12 +153,7 @@ impl CredentialRotationManager {
     }
 
     /// Регистрирует аллокацию с начальными credentials.
-    pub fn register(
-        &self,
-        allocation_id: &str,
-        base_username: &str,
-        credentials: CredentialEntry,
-    ) {
+    pub fn register(&self, allocation_id: &str, base_username: &str, credentials: CredentialEntry) {
         let mut allocs = self.allocations.write().unwrap();
         allocs.insert(
             allocation_id.to_string(),
@@ -168,7 +163,11 @@ impl CredentialRotationManager {
                 credentials,
             ),
         );
-        debug!(alloc = allocation_id, user = base_username, "credentials registered");
+        debug!(
+            alloc = allocation_id,
+            user = base_username,
+            "credentials registered"
+        );
     }
 
     /// Ротация: добавляет новые credentials, старые остаются в grace period.
@@ -185,11 +184,7 @@ impl CredentialRotationManager {
     }
 
     /// Проверяет credentials. Пробует все активные (новые → старые).
-    pub fn validate(
-        &self,
-        allocation_id: &str,
-        check: impl Fn(&[u8]) -> bool,
-    ) -> ValidateResult {
+    pub fn validate(&self, allocation_id: &str, check: impl Fn(&[u8]) -> bool) -> ValidateResult {
         let allocs = self.allocations.read().unwrap();
         let state = match allocs.get(allocation_id) {
             Some(s) => s,
@@ -203,9 +198,14 @@ impl CredentialRotationManager {
             if check(&entry.integrity_key) {
                 let in_grace = entry.is_expired_hard();
                 if in_grace {
-                    debug!(alloc = allocation_id, "validated with grace-period credentials");
+                    debug!(
+                        alloc = allocation_id,
+                        "validated with grace-period credentials"
+                    );
                 }
-                return ValidateResult::Valid { in_grace_period: in_grace };
+                return ValidateResult::Valid {
+                    in_grace_period: in_grace,
+                };
             }
         }
 
@@ -319,29 +319,53 @@ mod tests {
         let key = cred.integrity_key.clone();
 
         mgr.register("a1", "alice", cred);
-        assert_eq!(mgr.validate("a1", |k| k == &key), ValidateResult::Valid { in_grace_period: false });
+        assert_eq!(
+            mgr.validate("a1", |k| k == &key),
+            ValidateResult::Valid {
+                in_grace_period: false
+            }
+        );
     }
 
     #[test]
     fn rotation_both_work() {
         let mgr = CredentialRotationManager::new(RotationConfig::default());
 
-        let old = CredentialEntry { integrity_key: vec![1, 1, 1], ..make_cred(CredentialKind::TimeLimited, Some(Duration::from_secs(300))) };
+        let old = CredentialEntry {
+            integrity_key: vec![1, 1, 1],
+            ..make_cred(CredentialKind::TimeLimited, Some(Duration::from_secs(300)))
+        };
         let old_key = old.integrity_key.clone();
         mgr.register("a1", "alice", old);
 
-        let new = CredentialEntry { integrity_key: vec![2, 2, 2], ..make_cred(CredentialKind::TimeLimited, Some(Duration::from_secs(600))) };
+        let new = CredentialEntry {
+            integrity_key: vec![2, 2, 2],
+            ..make_cred(CredentialKind::TimeLimited, Some(Duration::from_secs(600)))
+        };
         let new_key = new.integrity_key.clone();
         mgr.rotate("a1", new);
 
-        assert_eq!(mgr.validate("a1", |k| k == &old_key), ValidateResult::Valid { in_grace_period: false });
-        assert_eq!(mgr.validate("a1", |k| k == &new_key), ValidateResult::Valid { in_grace_period: false });
+        assert_eq!(
+            mgr.validate("a1", |k| k == &old_key),
+            ValidateResult::Valid {
+                in_grace_period: false
+            }
+        );
+        assert_eq!(
+            mgr.validate("a1", |k| k == &new_key),
+            ValidateResult::Valid {
+                in_grace_period: false
+            }
+        );
     }
 
     #[test]
     fn unknown_allocation() {
         let mgr = CredentialRotationManager::new(RotationConfig::default());
-        assert_eq!(mgr.validate("nope", |_| true), ValidateResult::AllocationNotFound);
+        assert_eq!(
+            mgr.validate("nope", |_| true),
+            ValidateResult::AllocationNotFound
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@
 //! ```
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,20 +38,32 @@ pub trait StoreHandler: Send + Sync {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagementResponse {
-    pub ok:    bool,
-    pub data:  Option<serde_json::Value>,
+    pub ok: bool,
+    pub data: Option<serde_json::Value>,
     pub error: Option<String>,
 }
 
 impl ManagementResponse {
     pub fn ok(data: serde_json::Value) -> Self {
-        Self { ok: true, data: Some(data), error: None }
+        Self {
+            ok: true,
+            data: Some(data),
+            error: None,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, data: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            data: None,
+            error: Some(msg.into()),
+        }
     }
     pub fn empty() -> Self {
-        Self { ok: true, data: None, error: None }
+        Self {
+            ok: true,
+            data: None,
+            error: None,
+        }
     }
 }
 
@@ -62,7 +74,9 @@ pub struct ManagementClient {
 }
 
 impl ManagementClient {
-    pub fn new(addr: SocketAddr) -> Self { Self { addr } }
+    pub fn new(addr: SocketAddr) -> Self {
+        Self { addr }
+    }
 
     pub async fn send(
         &self,
@@ -73,12 +87,14 @@ impl ManagementClient {
             // These work against the plain health server on 9090.
             "ping" => {
                 let body = self.get("/health").await?;
-                Ok(ManagementResponse::ok(serde_json::json!({"status": body.trim()})))
+                Ok(ManagementResponse::ok(
+                    serde_json::json!({"status": body.trim()}),
+                ))
             }
             "node.status" => {
                 let body = self.get("/status").await?;
-                let v: serde_json::Value = serde_json::from_str(&body)
-                    .map_err(|e| format!("parse /status: {e}"))?;
+                let v: serde_json::Value =
+                    serde_json::from_str(&body).map_err(|e| format!("parse /status: {e}"))?;
                 Ok(ManagementResponse::ok(v))
             }
             "allocations.count" => {
@@ -86,23 +102,33 @@ impl ManagementClient {
                 let n = parse_prom_gauge(&body, "turna_active_allocations").unwrap_or(0);
                 Ok(ManagementResponse::ok(serde_json::json!({"count": n})))
             }
+            "cluster.nodes" => {
+                let body = self.get("/cluster").await?;
+                let v: serde_json::Value =
+                    serde_json::from_str(&body).map_err(|e| format!("parse /cluster: {e}"))?;
+                Ok(ManagementResponse::ok(v))
+            }
             // Everything else → POST /manage (needs management server on 9091).
             _ => {
                 let req = serde_json::to_string(
-                    &serde_json::json!({"command": command, "params": params})
-                ).unwrap();
+                    &serde_json::json!({"command": command, "params": params}),
+                )
+                .unwrap();
                 let resp = self.post("/manage", &req).await?;
-                serde_json::from_str(&resp)
-                    .map_err(|e| format!("parse response: {e}"))
+                serde_json::from_str(&resp).map_err(|e| format!("parse response: {e}"))
             }
         }
     }
 
     async fn get(&self, path: &str) -> Result<String, String> {
-        http_get(self.addr, path).await.map_err(|e| format!("GET {path}: {e}"))
+        http_get(self.addr, path)
+            .await
+            .map_err(|e| format!("GET {path}: {e}"))
     }
     async fn post(&self, path: &str, body: &str) -> Result<String, String> {
-        http_post(self.addr, path, body).await.map_err(|e| format!("POST {path}: {e}"))
+        http_post(self.addr, path, body)
+            .await
+            .map_err(|e| format!("POST {path}: {e}"))
     }
 }
 
@@ -138,9 +164,11 @@ async fn handle_conn(
     let first = request.lines().next().unwrap_or("");
     let mut parts_iter = first.split_whitespace();
     let method = parts_iter.next().unwrap_or("GET");
-    let path   = parts_iter.next().unwrap_or("/");
+    let path = parts_iter.next().unwrap_or("/");
 
-    let body_off = request.find("\r\n\r\n").map(|i| i + 4)
+    let body_off = request
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
         .or_else(|| request.find("\n\n").map(|i| i + 2))
         .unwrap_or(n);
     let body = request[body_off.min(request.len())..].to_string();
@@ -154,12 +182,14 @@ async fn handle_conn(
             };
             (c, "text/plain", s.to_string())
         }
-        ("GET", "/status") => {
-            ("200 OK", "application/json", status_json(&metrics))
-        }
+        ("GET", "/status") => ("200 OK", "application/json", status_json(&metrics)),
         ("POST", "/manage") => {
             let r = dispatch(&body, &metrics, handler.as_deref()).await;
-            ("200 OK", "application/json", serde_json::to_string(&r).unwrap())
+            (
+                "200 OK",
+                "application/json",
+                serde_json::to_string(&r).unwrap(),
+            )
         }
         _ => ("404 Not Found", "text/plain", "not found".into()),
     };
@@ -192,9 +222,9 @@ async fn dispatch(
     match req.command.as_str() {
         "ping" => ManagementResponse::ok(serde_json::json!({"status":"ok"})),
 
-        "node.status" => ManagementResponse::ok(
-            serde_json::from_str(&status_json(metrics)).unwrap()
-        ),
+        "node.status" => {
+            ManagementResponse::ok(serde_json::from_str(&status_json(metrics)).unwrap())
+        }
 
         "node.drain" => {
             metrics.set_draining(true);
@@ -276,7 +306,8 @@ fn status_json(m: &Metrics) -> String {
         "bytes_received":     m.bytes_received.load(Ordering::Relaxed),
         "bytes_sent":         m.bytes_sent.load(Ordering::Relaxed),
         "auth_failures":      m.auth_failures.load(Ordering::Relaxed),
-    }).to_string()
+    })
+    .to_string()
 }
 
 // ── Prometheus helper ─────────────────────────────────────────────────────────
@@ -293,8 +324,9 @@ pub fn parse_prom_gauge(text: &str, name: &str) -> Option<u64> {
 async fn http_get(addr: SocketAddr, path: &str) -> std::io::Result<String> {
     let mut s = TcpStream::connect(addr).await?;
     s.write_all(
-        format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()
-    ).await?;
+        format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await?;
     let mut r = String::new();
     s.read_to_string(&mut r).await?;
     Ok(r.split("\r\n\r\n").nth(1).unwrap_or("").to_string())

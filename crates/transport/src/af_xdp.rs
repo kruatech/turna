@@ -102,19 +102,57 @@ pub struct Umem {
     free_frames: Vec<u64>,
 }
 
+// SAFETY (Send): `Umem` exclusively owns its mmap region (`area`); moving the
+// value to another thread transfers that sole ownership, and `Drop` munmaps on
+// whichever thread holds it. No shared state crosses the move, so `Send` is sound.
 unsafe impl Send for Umem {}
-// NEEDS-REVIEW: Sync via &Umem.frame_slice returns &[u8] over an
-// mmap region that the kernel concurrently writes (RX DMA). Under
-// the Rust memory model this is data race / UB. AF_XDP semantics
-// are 'kernel writes before the descriptor is dequeued from RX
-// ring; userspace reads only after dequeue' — but nothing in this
-// type enforces that. Consider removing Sync or wrapping access in
-// a typestate that proves dequeue-before-read.
+// SAFETY (USF-003, Sync): `&Umem` hands out `&[u8]` (via `frame_slice`) over an
+// mmap region into which the kernel performs RX DMA. Sharing `&Umem` across
+// threads is sound ONLY under the AF_XDP frame-ownership protocol, which callers
+// MUST uphold:
+//
+//   1. Frame ownership is exclusive and ring-mediated. A frame is kernel-owned
+//      while its descriptor sits in the FILL ring; it transfers to userspace
+//      ownership only once its descriptor has been dequeued from the RX ring
+//      (an acquire load paired with the kernel's release store on the ring head).
+//   2. `frame_slice(addr, ..)` MUST only be called for an `addr` whose RX
+//      descriptor has already been dequeued, and BEFORE that frame's address is
+//      handed back to the kernel via the FILL ring. Within that window no kernel
+//      write to the frame can occur, so the `&[u8]` read does not race.
+//   3. A given frame address is never concurrently aliased: at most one thread
+//      holds the post-dequeue / pre-refill window for it at a time.
+//
+// These obligations are NOT enforced by the type system — they are a reviewed
+// invariant of the RX-ring driver loop. If the loop is ever restructured to read
+// a frame before its RX dequeue, or to refill before dropping the slice, this
+// `impl` becomes unsound and must be revisited (or replaced by a dequeue-proving
+// typestate). NOTE: `Umem` is currently owned by value inside a single socket and
+// is not shared as `&Umem` across threads; if that remains true, this `Sync` impl
+// can simply be removed instead of relied upon.
 unsafe impl Sync for Umem {}
 
 impl Umem {
     pub fn new(frame_count: u32, frame_size: u32) -> Result<Self> {
-        let size = (frame_count as usize) * (frame_size as usize);
+        // FIX (USF-008): `frame_count * frame_size` can overflow `usize` for
+        // large or untrusted configs. An overflowed (wrapped) `size` would be
+        // smaller than the real geometry, so every later `frame_slice` bounds
+        // check would validate against a too-small region — re-introducing the
+        // OOB that USF-002/#2 closed. Reject overflow and degenerate geometry
+        // up front, before the mmap.
+        if frame_count == 0 || frame_size == 0 {
+            return Err(AfXdpError::Umem(format!(
+                "invalid UMEM geometry: frame_count={frame_count}, frame_size={frame_size} \
+                 (both must be non-zero)"
+            )));
+        }
+        let size = (frame_count as usize)
+            .checked_mul(frame_size as usize)
+            .ok_or_else(|| {
+                AfXdpError::Umem(format!(
+                    "UMEM size overflow: frame_count={frame_count} * frame_size={frame_size} \
+                     exceeds usize::MAX"
+                ))
+            })?;
 
         let area = unsafe {
             libc::mmap(

@@ -6,18 +6,28 @@
 //!
 //! Enable io_uring with `--features io-uring`.
 
-pub mod tokio_transport;
-pub mod buffer;
 pub mod batch;
-pub mod hugepages;
 pub mod bpf_filter;
-pub mod quic;
+pub mod buffer;
+pub mod hugepages;
 pub mod migration;
+pub mod probe;
+pub mod quic;
+pub mod select;
+pub mod tokio_transport;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod worker;
+
+#[cfg(feature = "tls")]
+pub mod tcp_tls;
+#[cfg(feature = "tls")]
+pub use tcp_tls::{
+    TcpConnectionId, TcpSendCommand, TcpTransportEvent, TlsError, TlsTransportConfig,
+    TlsTransportServer,
+};
 
 use std::net::SocketAddr;
 use thiserror::Error;
@@ -53,9 +63,14 @@ pub trait Transport: Send + Sync {
 // Re-export the default transport
 pub use tokio_transport::TokioTransport;
 
+// Re-export transport selection (config preference + runtime io_uring probe).
+pub use probe::{probe_io_uring, IoUringProbe};
+pub use select::{resolve, TransportBackend, TransportDecision, TransportPreference};
+
 /// Convenience: bind with best available backend.
 pub async fn bind(addr: SocketAddr) -> Result<TokioTransport> {
     TokioTransport::bind(addr).await
 }
 pub mod gso;
-#[cfg(target_os = "linux")] pub mod numa;
+#[cfg(target_os = "linux")]
+pub mod numa;

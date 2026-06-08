@@ -54,10 +54,10 @@ pub enum WriteOp {
     /// after a restart, *except* the cryptographic key (see design doc §9
     /// question 4 — failover with ephemeral credentials is deferred).
     Create {
-        relay_port:    u16,
-        client_addr:   SocketAddr,
-        relay_addr:    SocketAddr,
-        username:      String,
+        relay_port: u16,
+        client_addr: SocketAddr,
+        relay_addr: SocketAddr,
+        username: String,
         created_at_ms: u64,
         expires_at_ms: u64,
     },
@@ -65,29 +65,24 @@ pub enum WriteOp {
     /// Allocation lifetime was extended (or it expired naturally if
     /// `expires_at_ms` is in the past — though in practice we send
     /// `Remove` for the zero-lifetime case).
-    Refresh {
-        relay_port:    u16,
-        expires_at_ms: u64,
-    },
+    Refresh { relay_port: u16, expires_at_ms: u64 },
 
     /// Allocation was removed (Refresh with lifetime=0, explicit cleanup,
     /// or expiry sweep).
-    Remove {
-        relay_port: u16,
-    },
+    Remove { relay_port: u16 },
 
     /// A peer-address permission was added or refreshed.
     Permission {
-        relay_port:    u16,
-        peer_ip:       IpAddr,
+        relay_port: u16,
+        peer_ip: IpAddr,
         expires_at_ms: u64,
     },
 
     /// A channel binding was added or refreshed.
     Channel {
-        relay_port:    u16,
-        number:        u16,
-        peer_addr:     SocketAddr,
+        relay_port: u16,
+        number: u16,
+        peer_addr: SocketAddr,
         expires_at_ms: u64,
     },
 }
@@ -98,11 +93,11 @@ impl WriteOp {
     /// entry (see design doc §4 D4).
     pub fn relay_port(&self) -> u16 {
         match self {
-            WriteOp::Create     { relay_port, .. }
-          | WriteOp::Refresh    { relay_port, .. }
-          | WriteOp::Remove     { relay_port,    }
-          | WriteOp::Permission { relay_port, .. }
-          | WriteOp::Channel    { relay_port, .. } => *relay_port,
+            WriteOp::Create { relay_port, .. }
+            | WriteOp::Refresh { relay_port, .. }
+            | WriteOp::Remove { relay_port }
+            | WriteOp::Permission { relay_port, .. }
+            | WriteOp::Channel { relay_port, .. } => *relay_port,
         }
     }
 }

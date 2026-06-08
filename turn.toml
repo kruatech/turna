@@ -1,0 +1,29 @@
+# turna node — minimal local config with TURNS (TLS-over-TCP) enabled.
+# Strict schema: only known fields are accepted (deny_unknown_fields).
+
+production = false
+
+[turn]
+listen    = "0.0.0.0:3478"     # UDP/TCP STUN/TURN
+realm     = "turna"
+transport = "tokio"            # TURNS bridge runs on the tokio datapath
+
+# Long-term (static) credentials — simplest for manual testing.
+# Use: username "testuser", password "testpass".
+[[turn.auth.static_users]]
+username = "testuser"
+password = "testpass"
+
+[turn.relay]
+min_port = 49152
+max_port = 49500
+
+[health]
+listen = "127.0.0.1:9091"
+
+# ── TURNS: TURN over TLS-over-TCP (RFC 5766/8656), port 5349 ──────────────────
+[tls]
+enabled   = true
+listen    = "0.0.0.0:5349"
+cert_path = "/tmp/turna-tls/cert.pem"
+key_path  = "/tmp/turna-tls/key.pem"

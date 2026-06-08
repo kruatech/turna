@@ -4,8 +4,8 @@
   "scope": "crates/{transport,relay}/src/",
   "summary": {
     "total": 99,
-    "safety_justified": 75,
-    "needs_review": 15,
+    "safety_justified": 76,
+    "needs_review": 14,
     "suspect_fixed": 9
   },
   "entries": [
@@ -55,7 +55,7 @@
         "frame_slice_mut requires &mut self — exclusive access"
       ],
       "review_status": "FIXED",
-      "notes": "SUSPECT #2 fixed: added checked_add + assert for OOB detection. NEEDS-REVIEW remains on Sync impl: concurrent kernel DMA write vs userspace read is safe only with RX ring dequeue ordering, not enforced by type system.",
+      "notes": "SUSPECT #2 (OOB) fixed: checked_add + assert in frame_slice/_mut. Sync soundness (kernel RX-DMA vs userspace read) is now a documented, reviewed invariant on `unsafe impl Sync for Umem` (frame ownership is RX-ring-mediated: read only post-dequeue, pre-refill, no aliasing). Umem is owned by value in a single socket and not shared as &Umem across threads, so Sync may alternatively be removed.",
       "remaining_concern": "NEEDS-REVIEW: Sync impl allows shared refs across threads; AF_XDP ordering is semantic, not structural"
     },
     {
@@ -115,8 +115,9 @@
         "PROT_READ|PROT_WRITE on anonymous mapping is always valid",
         "size computed as frame_count * frame_size without overflow (u32 * u32 fits usize on 64-bit)"
       ],
-      "review_status": "NEEDS_REVIEW",
-      "notes": "frame_count * frame_size overflow not checked for large configs. Max: 65535 * 65535 = ~4GB which exceeds u32 but fits usize on 64-bit. Add overflow check for configs from untrusted sources."
+      "review_status": "FIXED",
+      "notes": "frame_count * frame_size overflow now rejected in Umem::new via checked_mul + non-zero guard, before mmap. Prevents a wrapped (too-small) size from defeating the frame_slice bounds check (USF-002).",
+      "fix_commit": "unsafe-audit P0 (USF-008)"
     },
     {
       "id": "USF-009",

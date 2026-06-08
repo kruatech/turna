@@ -52,19 +52,23 @@ async fn main() -> Result<(), AnyError> {
 
     // ── Load configuration ────────────────────────────────────────────────────
     // Resolution order: CLI arg → TURNA_CONFIG env → no file (env-only mode).
-    let cfg_path: Option<String> = std::env::args().nth(1)
+    let cfg_path: Option<String> = std::env::args()
+        .nth(1)
         .or_else(|| std::env::var("TURNA_CONFIG").ok());
 
     let file_cfg = match cfg_path.as_deref() {
         Some(p) => {
             info!(path = %p, "loading control-plane config from file");
-            Some(TurnaConfig::load(p).map_err(|e| -> AnyError {
-                format!("failed to load {p}: {e}").into()
-            })?)
+            Some(
+                TurnaConfig::load(p)
+                    .map_err(|e| -> AnyError { format!("failed to load {p}: {e}").into() })?,
+            )
         }
         None => {
-            warn!("no config file given (pass a path as the first argument or set \
-                   TURNA_CONFIG); falling back to env-only mode with defaults");
+            warn!(
+                "no config file given (pass a path as the first argument or set \
+                   TURNA_CONFIG); falling back to env-only mode with defaults"
+            );
             None
         }
     };
@@ -76,25 +80,31 @@ async fn main() -> Result<(), AnyError> {
 
     let tls_state = match tls.as_ref() {
         Some(_) => "enabled",
-        None    => "disabled",
+        None => "disabled",
     };
     info!(%grpc_addr, %external_ip, tls = tls_state,
           "turna control plane starting");
 
     // ── Wire dependencies ────────────────────────────────────────────────────
-    let store   = Arc::new(turna_session::AllocationStore::new(49152, 65535, 10000));
+    let store = Arc::new(turna_session::AllocationStore::new(49152, 65535, 10000));
     let metrics = Arc::new(turna_health::Metrics::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let core = Arc::new(
-        TurnCoreImpl::new(Arc::clone(&store), Arc::clone(&metrics), shutdown_tx.clone())
-            .with_config(
-                "turna",
-                external_ip,
-                vec!["0.0.0.0:3478".into()],
-                49152, 65535,
-                600, 3600,
-            )
+        TurnCoreImpl::new(
+            Arc::clone(&store),
+            Arc::clone(&metrics),
+            shutdown_tx.clone(),
+        )
+        .with_config(
+            "turna",
+            external_ip,
+            vec!["0.0.0.0:3478".into()],
+            49152,
+            65535,
+            600,
+            3600,
+        ),
     );
 
     // ── Signal handler ────────────────────────────────────────────────────────
@@ -104,8 +114,8 @@ async fn main() -> Result<(), AnyError> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
             tokio::select! {
                 _ = ctrl_c           => info!("SIGINT received — shutting down"),
                 _ = sigterm.recv()   => info!("SIGTERM received — shutting down"),
@@ -187,36 +197,50 @@ fn resolve_external_ip(file_cfg: &Option<TurnaConfig>) -> String {
 /// drivers).
 fn resolve_tls(file_cfg: &Option<TurnaConfig>) -> Result<Option<GrpcTlsConfig>, AnyError> {
     // Start with whatever the file says (or all-defaults if no file).
-    let mut base = file_cfg.as_ref()
+    let mut base = file_cfg
+        .as_ref()
         .map(|c| c.grpc.clone())
         .unwrap_or_default();
 
     // Layer env overrides where the env value is non-empty.
     if let Ok(v) = std::env::var("TURNA_GRPC_TLS_MODE") {
-        if !v.is_empty() { base.tls_mode = v; }
+        if !v.is_empty() {
+            base.tls_mode = v;
+        }
     }
     if let Ok(v) = std::env::var("TURNA_GRPC_TLS_CERT") {
-        if !v.is_empty() { base.tls_cert = v; }
+        if !v.is_empty() {
+            base.tls_cert = v;
+        }
     }
     if let Ok(v) = std::env::var("TURNA_GRPC_TLS_KEY") {
-        if !v.is_empty() { base.tls_key = v; }
+        if !v.is_empty() {
+            base.tls_key = v;
+        }
     }
     if let Ok(v) = std::env::var("TURNA_GRPC_TLS_CA") {
-        if !v.is_empty() { base.tls_ca = v; }
+        if !v.is_empty() {
+            base.tls_ca = v;
+        }
     }
 
     match base.normalised_mode() {
         "disabled" => {
-            warn!("gRPC TLS is disabled — only safe when management.listen is bound \
+            warn!(
+                "gRPC TLS is disabled — only safe when management.listen is bound \
                    to 127.0.0.1 / ::1. Set tls_mode = \"tls\" or \"mtls\" before exposing \
-                   the control plane beyond localhost.");
+                   the control plane beyond localhost."
+            );
             // If the operator wrote a typo (e.g. "Tls" with a capital), surface it.
-            if !matches!(base.tls_mode.trim().to_ascii_lowercase().as_str(),
-                         "" | "disabled" | "tls" | "mtls") {
+            if !matches!(
+                base.tls_mode.trim().to_ascii_lowercase().as_str(),
+                "" | "disabled" | "tls" | "mtls"
+            ) {
                 return Err(format!(
                     "grpc.tls_mode = {:?} is invalid; use \"disabled\", \"tls\", or \"mtls\"",
                     base.tls_mode
-                ).into());
+                )
+                .into());
             }
             Ok(None)
         }
@@ -225,19 +249,22 @@ fn resolve_tls(file_cfg: &Option<TurnaConfig>) -> Result<Option<GrpcTlsConfig>, 
                 return Err(format!(
                     "grpc.tls_mode = {mode:?} but tls_cert is empty; set TURNA_GRPC_TLS_CERT \
                      or grpc.tls_cert in turn.toml"
-                ).into());
+                )
+                .into());
             }
             if base.tls_key.is_empty() {
                 return Err(format!(
                     "grpc.tls_mode = {mode:?} but tls_key is empty; set TURNA_GRPC_TLS_KEY \
                      or grpc.tls_key in turn.toml"
-                ).into());
+                )
+                .into());
             }
             if mode == "mtls" && base.tls_ca.is_empty() {
                 return Err(
                     "grpc.tls_mode = \"mtls\" but tls_ca is empty; mTLS requires a CA \
                      file to verify client certificates. Set TURNA_GRPC_TLS_CA or \
-                     grpc.tls_ca in turn.toml".into()
+                     grpc.tls_ca in turn.toml"
+                        .into(),
                 );
             }
             info!(mode,
@@ -248,25 +275,24 @@ fn resolve_tls(file_cfg: &Option<TurnaConfig>) -> Result<Option<GrpcTlsConfig>, 
 
             // Sanity-check that the files exist now, not at first connection.
             // Better error story: fail at startup, not on the first client.
-            for (name, path) in [
-                ("tls_cert", &base.tls_cert),
-                ("tls_key",  &base.tls_key),
-            ] {
+            for (name, path) in [("tls_cert", &base.tls_cert), ("tls_key", &base.tls_key)] {
                 if !std::path::Path::new(path).exists() {
-                    return Err(format!(
-                        "grpc.{name} = {path:?} but the file does not exist"
-                    ).into());
+                    return Err(
+                        format!("grpc.{name} = {path:?} but the file does not exist").into(),
+                    );
                 }
             }
             if mode == "mtls" && !std::path::Path::new(&base.tls_ca).exists() {
                 return Err(format!(
-                    "grpc.tls_ca = {:?} but the file does not exist", base.tls_ca
-                ).into());
+                    "grpc.tls_ca = {:?} but the file does not exist",
+                    base.tls_ca
+                )
+                .into());
             }
 
             Ok(Some(GrpcTlsConfig {
-                server_cert:    PathBuf::from(&base.tls_cert),
-                server_key:     PathBuf::from(&base.tls_key),
+                server_cert: PathBuf::from(&base.tls_cert),
+                server_key: PathBuf::from(&base.tls_key),
                 client_ca_cert: PathBuf::from(&base.tls_ca),
             }))
         }

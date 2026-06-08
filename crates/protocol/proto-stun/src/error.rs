@@ -26,13 +26,16 @@ pub enum StunError {
     FingerprintMismatch,
 
     // ── DoS / abuse guards ────────────────────────────────────────────────
-
     /// A single attribute's declared value length exceeds our cap. STUN's wire
     /// format allows up to 65535 bytes per attribute (u16 length field); we
     /// cap much lower because real attributes (USERNAME, REALM, NONCE,
     /// SOFTWARE, DATA, etc.) are all far below MTU in normal use.
     #[error("attribute value too long: type=0x{attr_type:04x} len={len} max={max}")]
-    AttributeValueTooLong { attr_type: u16, len: usize, max: usize },
+    AttributeValueTooLong {
+        attr_type: u16,
+        len: usize,
+        max: usize,
+    },
 
     /// A message contains more attributes than we accept. Real STUN/TURN
     /// messages have a handful (typically 3–8); a huge count is either a

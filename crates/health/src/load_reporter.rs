@@ -88,9 +88,15 @@ impl AtomicMetrics {
 }
 
 impl MetricsSource for AtomicMetrics {
-    fn active_allocations(&self) -> u32 { self.allocations.load(Ordering::Relaxed) }
-    fn used_relay_ports(&self) -> u32 { self.relay_ports.load(Ordering::Relaxed) }
-    fn bandwidth_bytes_per_sec(&self) -> u64 { self.bandwidth_bps.load(Ordering::Relaxed) }
+    fn active_allocations(&self) -> u32 {
+        self.allocations.load(Ordering::Relaxed)
+    }
+    fn used_relay_ports(&self) -> u32 {
+        self.relay_ports.load(Ordering::Relaxed)
+    }
+    fn bandwidth_bytes_per_sec(&self) -> u64 {
+        self.bandwidth_bps.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +112,8 @@ pub struct LoadReporter {
 
 impl LoadReporter {
     pub fn new(config: LoadReporterConfig, source: Arc<dyn MetricsSource>) -> Self {
-        let ports_total = (config.relay_port_range.1 as u32).saturating_sub(config.relay_port_range.0 as u32);
+        let ports_total =
+            (config.relay_port_range.1 as u32).saturating_sub(config.relay_port_range.0 as u32);
 
         let initial = NodeLoad {
             load_percent: 0,
@@ -124,7 +131,12 @@ impl LoadReporter {
         };
 
         let (tx, rx) = watch::channel(initial);
-        Self { config, source, tx, rx }
+        Self {
+            config,
+            source,
+            tx,
+            rx,
+        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<NodeLoad> {
@@ -152,15 +164,21 @@ impl LoadReporter {
 
             let alloc_pct = if self.config.max_allocations > 0 {
                 allocs as f64 / self.config.max_allocations as f64 * 100.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             let bw_pct = if self.config.max_bandwidth_bps > 0 {
                 bw_bps as f64 / self.config.max_bandwidth_bps as f64 * 100.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             let port_pct = if ports_total > 0 {
                 ports as f64 / ports_total as f64 * 100.0
-            } else { 0.0 };
+            } else {
+                0.0
+            };
 
             let load_pct = NodeLoad::compute_load_percent(alloc_pct, bw_pct, cpu, port_pct);
 
@@ -227,14 +245,18 @@ fn read_cpu_usage() -> f64 {
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let ncpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         return (load1 / ncpu as f64).clamp(0.0, 1.0);
     }
     0.0
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_cpu_usage() -> f64 { 0.0 }
+fn read_cpu_usage() -> f64 {
+    0.0
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -251,7 +273,10 @@ mod tests {
 
     #[test]
     fn load_full() {
-        assert_eq!(NodeLoad::compute_load_percent(100.0, 100.0, 1.0, 100.0), 100);
+        assert_eq!(
+            NodeLoad::compute_load_percent(100.0, 100.0, 1.0, 100.0),
+            100
+        );
     }
 
     #[test]

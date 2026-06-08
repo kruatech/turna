@@ -20,10 +20,9 @@ use clap::Parser;
 use serde::Serialize;
 use tokio::net::UdpSocket;
 
-
 use turna_proto_stun::attribute::Attribute;
 use turna_proto_stun::header::{MessageClass, MAGIC_COOKIE};
-use turna_proto_stun::message::{StunMessage, encode_channel_data};
+use turna_proto_stun::message::{encode_channel_data, StunMessage};
 use turna_proto_stun::method::Method;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -53,7 +52,10 @@ struct Cli {
 #[derive(Debug, Clone, Serialize)]
 enum Response {
     /// Got a response: response class + STUN error code if present
-    Stun { class: String, error_code: Option<u16> },
+    Stun {
+        class: String,
+        error_code: Option<u16>,
+    },
     /// Got raw bytes that don't parse as STUN
     Raw { len: usize },
     /// No response within timeout
@@ -64,27 +66,27 @@ enum Response {
 
 #[derive(Debug, Clone, Serialize)]
 struct TestResult {
-    name:        String,
+    name: String,
     description: String,
-    turna:         Response,
-    coturn:      Response,
+    turna: Response,
+    coturn: Response,
     discrepancy: bool,
-    note:        Option<String>,
+    note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct Report {
-    total:         usize,
+    total: usize,
     discrepancies: usize,
-    results:       Vec<TestResult>,
+    results: Vec<TestResult>,
 }
 
 // ── UDP send/recv ─────────────────────────────────────────────────────────────
 
 async fn send_recv(
-    sock:       &UdpSocket,
-    target:     SocketAddr,
-    packet:     &[u8],
+    sock: &UdpSocket,
+    target: SocketAddr,
+    packet: &[u8],
     timeout_ms: u64,
 ) -> Response {
     if let Err(e) = sock.send_to(packet, target).await {
@@ -92,25 +94,20 @@ async fn send_recv(
     }
 
     let mut buf = [0u8; 4096];
-    match tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        sock.recv_from(&mut buf),
-    ).await {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf)).await {
         Err(_) => Response::Timeout,
         Ok(Err(e)) => Response::Error { msg: e.to_string() },
-        Ok(Ok((n, _))) => {
-            match StunMessage::decode(&buf[..n]) {
-                Ok(msg) => {
-                    let class = format!("{:?}", msg.class);
-                    let error_code = msg.attributes.iter().find_map(|a| match a {
-                        Attribute::ErrorCode { code, .. } => Some(*code),
-                        _ => None,
-                    });
-                    Response::Stun { class, error_code }
-                }
-                Err(_) => Response::Raw { len: n },
+        Ok(Ok((n, _))) => match StunMessage::decode(&buf[..n]) {
+            Ok(msg) => {
+                let class = format!("{:?}", msg.class);
+                let error_code = msg.attributes.iter().find_map(|a| match a {
+                    Attribute::ErrorCode { code, .. } => Some(*code),
+                    _ => None,
+                });
+                Response::Stun { class, error_code }
             }
-        }
+            Err(_) => Response::Raw { len: n },
+        },
     }
 }
 
@@ -126,7 +123,7 @@ fn is_discrepancy(turna: &Response, coturn: &Response) -> (bool, Option<String>)
         // Both respond → compare accept vs reject.
         // ErrorResponse and Timeout are both "reject" — different ways to say no.
         (Response::Stun { class: vc, .. }, Response::Stun { class: cc, .. }) => {
-            let turna_ok    = vc == "SuccessResponse";
+            let turna_ok = vc == "SuccessResponse";
             let coturn_ok = cc == "SuccessResponse";
             if turna_ok != coturn_ok {
                 (true, Some(format!("turna={vc} coturn={cc}")))
@@ -136,22 +133,28 @@ fn is_discrepancy(turna: &Response, coturn: &Response) -> (bool, Option<String>)
         }
 
         // One ErrorResponse, one Timeout → both reject, consistent.
-        (Response::Stun { class: vc, .. }, Response::Timeout) |
-        (Response::Timeout, Response::Stun { class: vc, .. })
-            if vc == "ErrorResponse" => (false, Some("both reject (ErrorResponse vs Timeout)".into())),
+        (Response::Stun { class: vc, .. }, Response::Timeout)
+        | (Response::Timeout, Response::Stun { class: vc, .. })
+            if vc == "ErrorResponse" =>
+        {
+            (false, Some("both reject (ErrorResponse vs Timeout)".into()))
+        }
 
         // Both return non-STUN → likely both rejecting at IP level
         (Response::Raw { .. }, Response::Raw { .. }) => (false, None),
 
         // One responds, one doesn't → discrepancy
-        (Response::Timeout, Response::Stun { class, .. }) =>
-            (true, Some(format!("turna=Timeout coturn={class}"))),
-        (Response::Stun { class, .. }, Response::Timeout) =>
-            (true, Some(format!("turna={class} coturn=Timeout"))),
+        (Response::Timeout, Response::Stun { class, .. }) => {
+            (true, Some(format!("turna=Timeout coturn={class}")))
+        }
+        (Response::Stun { class, .. }, Response::Timeout) => {
+            (true, Some(format!("turna={class} coturn=Timeout")))
+        }
 
         // One errors → not a discrepancy (network issue)
-        (Response::Error { .. }, _) | (_, Response::Error { .. }) =>
-            (false, Some("send/recv error — skipped".into())),
+        (Response::Error { .. }, _) | (_, Response::Error { .. }) => {
+            (false, Some("send/recv error — skipped".into()))
+        }
 
         _ => (false, None),
     }
@@ -160,9 +163,9 @@ fn is_discrepancy(turna: &Response, coturn: &Response) -> (bool, Option<String>)
 // ── Test cases ────────────────────────────────────────────────────────────────
 
 struct TestCase {
-    name:        &'static str,
+    name: &'static str,
     description: &'static str,
-    packet:      Vec<u8>,
+    packet: Vec<u8>,
 }
 
 fn build_tests() -> Vec<TestCase> {
@@ -203,9 +206,14 @@ fn build_tests() -> Vec<TestCase> {
         description: "Valid header structure but wrong magic cookie — must reject",
         packet: {
             let mut buf = [0u8; 20];
-            buf[0] = 0x00; buf[1] = 0x01; // Binding Request
-            buf[2] = 0x00; buf[3] = 0x00; // length = 0
-            buf[4] = 0xDE; buf[5] = 0xAD; buf[6] = 0xBE; buf[7] = 0xEF; // wrong cookie
+            buf[0] = 0x00;
+            buf[1] = 0x01; // Binding Request
+            buf[2] = 0x00;
+            buf[3] = 0x00; // length = 0
+            buf[4] = 0xDE;
+            buf[5] = 0xAD;
+            buf[6] = 0xBE;
+            buf[7] = 0xEF; // wrong cookie
             buf.to_vec()
         },
     });
@@ -215,8 +223,10 @@ fn build_tests() -> Vec<TestCase> {
         description: "Length field not 4-byte aligned — RFC violation",
         packet: {
             let mut buf = [0u8; 20];
-            buf[0] = 0x00; buf[1] = 0x01;
-            buf[2] = 0x00; buf[3] = 0x03; // length = 3 (not aligned)
+            buf[0] = 0x00;
+            buf[1] = 0x01;
+            buf[2] = 0x00;
+            buf[3] = 0x03; // length = 3 (not aligned)
             buf[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
             buf.to_vec()
         },
@@ -227,8 +237,10 @@ fn build_tests() -> Vec<TestCase> {
         description: "Header claims 4000 bytes but packet is only 20 bytes",
         packet: {
             let mut buf = [0u8; 20];
-            buf[0] = 0x00; buf[1] = 0x01;
-            buf[2] = 0x0F; buf[3] = 0xA0; // length = 4000
+            buf[0] = 0x00;
+            buf[1] = 0x01;
+            buf[2] = 0x0F;
+            buf[3] = 0xA0; // length = 4000
             buf[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
             buf.to_vec()
         },
@@ -241,8 +253,10 @@ fn build_tests() -> Vec<TestCase> {
         description: "Valid STUN framing but unknown method 0x999",
         packet: {
             let mut buf = [0u8; 20];
-            buf[0] = 0x09; buf[1] = 0x99; // unknown method
-            buf[2] = 0x00; buf[3] = 0x00;
+            buf[0] = 0x09;
+            buf[1] = 0x99; // unknown method
+            buf[2] = 0x00;
+            buf[3] = 0x00;
             buf[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
             buf.to_vec()
         },
@@ -300,8 +314,10 @@ fn build_tests() -> Vec<TestCase> {
 
     // Invalid channel number (below 0x4000)
     let mut ch_buf2 = vec![0u8; 8];
-    ch_buf2[0] = 0x00; ch_buf2[1] = 0x01; // channel 0x0001 — invalid range
-    ch_buf2[2] = 0x00; ch_buf2[3] = 0x04; // length = 4
+    ch_buf2[0] = 0x00;
+    ch_buf2[1] = 0x01; // channel 0x0001 — invalid range
+    ch_buf2[2] = 0x00;
+    ch_buf2[3] = 0x04; // length = 4
     ch_buf2[4..8].copy_from_slice(b"data");
     tests.push(TestCase {
         name: "channel_data_invalid_channel",
@@ -353,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Two sockets — one per server to avoid response routing issues
-    let turna_sock    = UdpSocket::bind("0.0.0.0:0").await?;
+    let turna_sock = UdpSocket::bind("0.0.0.0:0").await?;
     let coturn_sock = UdpSocket::bind("0.0.0.0:0").await?;
 
     // Warm-up ping to both servers
@@ -371,10 +387,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if !turna_up {
-        eprintln!("WARNING: turna at {} is not responding to Binding Request", cli.turna);
+        eprintln!(
+            "WARNING: turna at {} is not responding to Binding Request",
+            cli.turna
+        );
     }
     if !coturn_up {
-        eprintln!("WARNING: coturn at {} is not responding to Binding Request", cli.coturn);
+        eprintln!(
+            "WARNING: coturn at {} is not responding to Binding Request",
+            cli.coturn
+        );
     }
 
     let tests = build_tests();
@@ -389,10 +411,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (disc, note) = is_discrepancy(&turna_resp, &coturn_resp);
 
         results.push(TestResult {
-            name:        test.name.to_string(),
+            name: test.name.to_string(),
             description: test.description.to_string(),
-            turna:         turna_resp,
-            coturn:      coturn_resp,
+            turna: turna_resp,
+            coturn: coturn_resp,
             discrepancy: disc,
             note,
         });
@@ -410,13 +432,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("\n## Differential Test Results\n");
         println!("Servers: turna={} coturn={}\n", cli.turna, cli.coturn);
-        println!("{:<40} {:<20} {:<20} {}", "Test", "turna", "coturn", "Status");
+        println!(
+            "{:<40} {:<20} {:<20} {}",
+            "Test", "turna", "coturn", "Status"
+        );
         println!("{}", "─".repeat(100));
 
         for r in &report.results {
-            let turna_s    = format_resp(&r.turna);
+            let turna_s = format_resp(&r.turna);
             let coturn_s = format_resp(&r.coturn);
-            let status   = if r.discrepancy {
+            let status = if r.discrepancy {
                 format!("⚠ DISCREPANCY: {}", r.note.as_deref().unwrap_or(""))
             } else {
                 "✓".into()
@@ -424,7 +449,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{:<40} {:<20} {:<20} {}", r.name, turna_s, coturn_s, status);
         }
 
-        println!("\nTotal: {} tests, {} discrepancies", report.total, report.discrepancies);
+        println!(
+            "\nTotal: {} tests, {} discrepancies",
+            report.total, report.discrepancies
+        );
 
         if discrepancies > 0 {
             println!("\n=== DISCREPANCIES ===");
@@ -444,7 +472,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn format_resp(r: &Response) -> String {
     match r {
-        Response::Stun { class, error_code: Some(c) } => format!("{class}({c})"),
+        Response::Stun {
+            class,
+            error_code: Some(c),
+        } => format!("{class}({c})"),
         Response::Stun { class, .. } => class.clone(),
         Response::Raw { len } => format!("Raw({len}b)"),
         Response::Timeout => "Timeout".into(),

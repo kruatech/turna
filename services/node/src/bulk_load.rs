@@ -20,10 +20,10 @@ use turna_state_backend::{Backend, StoredAllocation};
 /// and for tests; nothing in the live path consumes them.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BulkLoadStats {
-    pub fetched:        usize,
-    pub rehydrated:     usize,
+    pub fetched: usize,
+    pub rehydrated: usize,
     pub skipped_expired: usize,
-    pub skipped_error:  usize,
+    pub skipped_error: usize,
 }
 
 /// Fetch this node's allocations from the backend and replay them into
@@ -34,9 +34,9 @@ pub struct BulkLoadStats {
 /// return an empty result. The node still starts; new allocations will
 /// be created from scratch as clients reconnect.
 pub async fn bulk_load(
-    backend:  &Arc<Backend>,
-    store:    &Arc<AllocationStore>,
-    node_id:  &str,
+    backend: &Arc<Backend>,
+    store: &Arc<AllocationStore>,
+    node_id: &str,
 ) -> BulkLoadStats {
     let mut stats = BulkLoadStats::default();
 
@@ -49,11 +49,15 @@ pub async fn bulk_load(
         }
     };
     stats.fetched = records.len();
-    info!(node_id, count = stats.fetched, "bulk-load: fetched records from backend");
+    info!(
+        node_id,
+        count = stats.fetched,
+        "bulk-load: fetched records from backend"
+    );
 
     for stored in records {
         match apply_one(store, &stored) {
-            Ok(true)  => stats.rehydrated     += 1,
+            Ok(true) => stats.rehydrated += 1,
             Ok(false) => stats.skipped_expired += 1,
             Err(reason) => {
                 stats.skipped_error += 1;
@@ -66,10 +70,10 @@ pub async fn bulk_load(
     }
 
     info!(
-        fetched         = stats.fetched,
-        rehydrated      = stats.rehydrated,
+        fetched = stats.fetched,
+        rehydrated = stats.rehydrated,
         skipped_expired = stats.skipped_expired,
-        skipped_error   = stats.skipped_error,
+        skipped_error = stats.skipped_error,
         "bulk-load: complete"
     );
     stats
@@ -86,10 +90,9 @@ pub(crate) fn apply_one(
     store: &Arc<AllocationStore>,
     stored: &StoredAllocation,
 ) -> Result<bool, &'static str> {
-    let client_addr = SocketAddr::from_str(&stored.client_addr)
-        .map_err(|_| "invalid client_addr")?;
-    let relay_addr  = SocketAddr::from_str(&stored.relay_addr)
-        .map_err(|_| "invalid relay_addr")?;
+    let client_addr =
+        SocketAddr::from_str(&stored.client_addr).map_err(|_| "invalid client_addr")?;
+    let relay_addr = SocketAddr::from_str(&stored.relay_addr).map_err(|_| "invalid relay_addr")?;
 
     // Permissions: the stored schema is `Vec<String>` of IPs without
     // explicit expiry (see design doc §4 D5 known-limitation). We assume
@@ -97,24 +100,28 @@ pub(crate) fn apply_one(
     // through normal CreatePermission flow before it matters.
     let perm_default_expiry = turna_session::epoch_ms() + 300_000; // 5 min
     let permissions = stored.permissions.iter().filter_map(|s| {
-        s.parse::<std::net::IpAddr>().ok().map(|ip| (ip, perm_default_expiry))
+        s.parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| (ip, perm_default_expiry))
     });
 
     let channels = stored.channels.iter().filter_map(|c| {
-        SocketAddr::from_str(&c.peer_addr).ok().map(|addr| {
-            (c.number, addr, c.expires_at_ms)
-        })
+        SocketAddr::from_str(&c.peer_addr)
+            .ok()
+            .map(|addr| (c.number, addr, c.expires_at_ms))
     });
 
-    store.rehydrate(
-        client_addr,
-        relay_addr,
-        stored.user_id.clone(),
-        stored.created_at_ms,
-        stored.expires_at_ms,
-        permissions,
-        channels,
-    ).map_err(|_| "rehydrate refused (quota? port taken?)")
+    store
+        .rehydrate(
+            client_addr,
+            relay_addr,
+            stored.user_id.clone(),
+            stored.created_at_ms,
+            stored.expires_at_ms,
+            permissions,
+            channels,
+        )
+        .map_err(|_| "rehydrate refused (quota? port taken?)")
 }
 
 #[cfg(test)]
@@ -130,14 +137,16 @@ mod tests {
             id: format!("{node}:{port}"),
             relay_port: port,
             client_addr: format!("127.0.0.1:{client_port}"),
-            relay_addr:  format!("10.0.0.1:{port}"),
-            user_id:     user.into(),
-            realm:       "turna".into(),
-            node_id:     node.into(),
+            relay_addr: format!("10.0.0.1:{port}"),
+            user_id: user.into(),
+            realm: "turna".into(),
+            node_id: node.into(),
             created_at_ms: turna_session::epoch_ms().saturating_sub(60_000),
             expires_at_ms,
-            bytes_in: 0, bytes_out: 0,
-            packets_in: 0, packets_out: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            packets_in: 0,
+            packets_out: 0,
             permissions: vec!["10.0.0.2".into()],
             channels: vec![StoredChannel {
                 number: 0x4000,
@@ -161,22 +170,26 @@ mod tests {
         let now = turna_session::epoch_ms();
 
         for port in [40010, 40011, 40012] {
-            backend.store_allocation(&alloc_for("node-A", port, "alice", now + 600_000))
-                .await.unwrap();
+            backend
+                .store_allocation(&alloc_for("node-A", port, "alice", now + 600_000))
+                .await
+                .unwrap();
         }
 
         let (_, fresh_store) = fresh().await;
         let stats = bulk_load(&backend, &fresh_store, "node-A").await;
 
-        assert_eq!(stats.fetched,    3);
+        assert_eq!(stats.fetched, 3);
         assert_eq!(stats.rehydrated, 3);
         assert_eq!(stats.skipped_expired, 0);
-        assert_eq!(stats.skipped_error,   0);
+        assert_eq!(stats.skipped_error, 0);
         // Allocations should now be queryable.
         // Relay-port 40010 → client-port mapping is 20000 + 40010 = 60010.
         let key: SocketAddr = "127.0.0.1:60010".parse().unwrap();
-        assert!(fresh_store.get(&key).is_some(),
-                "expected client 127.0.0.1:60010 in store");
+        assert!(
+            fresh_store.get(&key).is_some(),
+            "expected client 127.0.0.1:60010 in store"
+        );
     }
 
     /// Expired records are skipped, not rehydrated.
@@ -185,15 +198,24 @@ mod tests {
         let (backend, _) = fresh().await;
         let now = turna_session::epoch_ms();
 
-        backend.store_allocation(&alloc_for("node-A", 40020, "u1", now + 600_000))
-            .await.unwrap();
-        backend.store_allocation(&alloc_for("node-A", 40021, "u2", now.saturating_sub(60_000)))
-            .await.unwrap();
+        backend
+            .store_allocation(&alloc_for("node-A", 40020, "u1", now + 600_000))
+            .await
+            .unwrap();
+        backend
+            .store_allocation(&alloc_for(
+                "node-A",
+                40021,
+                "u2",
+                now.saturating_sub(60_000),
+            ))
+            .await
+            .unwrap();
 
         let (_, store) = fresh().await;
         let stats = bulk_load(&backend, &store, "node-A").await;
-        assert_eq!(stats.fetched,         2);
-        assert_eq!(stats.rehydrated,      1);
+        assert_eq!(stats.fetched, 2);
+        assert_eq!(stats.rehydrated, 1);
         assert_eq!(stats.skipped_expired, 1);
     }
 
@@ -203,10 +225,14 @@ mod tests {
         let (backend, _) = fresh().await;
         let now = turna_session::epoch_ms();
 
-        backend.store_allocation(&alloc_for("node-A", 40030, "u1", now + 600_000))
-            .await.unwrap();
-        backend.store_allocation(&alloc_for("node-B", 40031, "u2", now + 600_000))
-            .await.unwrap();
+        backend
+            .store_allocation(&alloc_for("node-A", 40030, "u1", now + 600_000))
+            .await
+            .unwrap();
+        backend
+            .store_allocation(&alloc_for("node-B", 40031, "u2", now + 600_000))
+            .await
+            .unwrap();
 
         let (_, store) = fresh().await;
         let stats = bulk_load(&backend, &store, "node-A").await;
@@ -229,8 +255,8 @@ mod tests {
 
         let (_, store) = fresh().await;
         let stats = bulk_load(&backend, &store, "node-A").await;
-        assert_eq!(stats.fetched,       2);
-        assert_eq!(stats.rehydrated,    1);
+        assert_eq!(stats.fetched, 2);
+        assert_eq!(stats.rehydrated, 1);
         assert_eq!(stats.skipped_error, 1);
     }
 
@@ -240,13 +266,15 @@ mod tests {
     async fn double_bulk_load_is_safe() {
         let (backend, _) = fresh().await;
         let now = turna_session::epoch_ms();
-        backend.store_allocation(&alloc_for("node-A", 40050, "u", now + 600_000))
-            .await.unwrap();
+        backend
+            .store_allocation(&alloc_for("node-A", 40050, "u", now + 600_000))
+            .await
+            .unwrap();
 
         let (_, store) = fresh().await;
         let s1 = bulk_load(&backend, &store, "node-A").await;
         let s2 = bulk_load(&backend, &store, "node-A").await;
-        assert_eq!(s1.rehydrated,    1);
+        assert_eq!(s1.rehydrated, 1);
         assert_eq!(s2.skipped_error, 1, "second pass should refuse same port");
     }
 
@@ -258,8 +286,10 @@ mod tests {
         use tokio::sync::mpsc;
         let (backend, _) = fresh().await;
         let now = turna_session::epoch_ms();
-        backend.store_allocation(&alloc_for("node-A", 40060, "u", now + 600_000))
-            .await.unwrap();
+        backend
+            .store_allocation(&alloc_for("node-A", 40060, "u", now + 600_000))
+            .await
+            .unwrap();
 
         let (_, store) = fresh().await;
         let (tx, mut rx) = mpsc::channel(16);
@@ -267,7 +297,9 @@ mod tests {
         store.attach_writer(tx);
 
         let _stats = bulk_load(&backend, &store, "node-A").await;
-        assert!(rx.try_recv().is_err(),
-                "rehydrate must not emit any WriteOp");
+        assert!(
+            rx.try_recv().is_err(),
+            "rehydrate must not emit any WriteOp"
+        );
     }
 }

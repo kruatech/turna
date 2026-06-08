@@ -2416,6 +2416,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "turna-cluster"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "turna-common"
 version = "0.1.0"
 dependencies = [
@@ -2562,10 +2575,12 @@ name = "turna-node"
 version = "0.1.0"
 dependencies = [
  "hostname",
+ "parking_lot",
  "sysinfo",
  "tokio",
  "tracing",
  "turna-auth",
+ "turna-cluster",
  "turna-config",
  "turna-health",
  "turna-observability",
@@ -2646,6 +2661,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turna-auth",
+ "turna-cluster",
  "turna-crypto",
  "turna-health",
  "turna-proto-rtp",
@@ -3158,6 +3174,12 @@ dependencies = [
  "unicode-xid",
  "wasmparser",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "zerocopy"

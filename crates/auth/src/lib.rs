@@ -9,10 +9,10 @@
 //! [`user::User`]       — platform user model.
 //! [`jwt::Claims`]      — JWT token claims.
 
-pub mod rotation;
-pub mod user;
 pub mod jwt;
+pub mod rotation;
 pub mod store;
+pub mod user;
 
 use thiserror::Error;
 use turna_proto_stun::message::StunMessage;
@@ -36,7 +36,10 @@ pub enum AuthError {
 /// TURN authentication mode.
 pub enum AuthMode {
     /// Long-term credentials with static users.
-    LongTerm { realm: String, users: Vec<(String, String)> },
+    LongTerm {
+        realm: String,
+        users: Vec<(String, String)>,
+    },
     /// Time-limited credentials with shared secret.
     SharedSecret { realm: String, secret: Vec<u8> },
 }
@@ -109,6 +112,6 @@ impl AuthMode {
 }
 
 // suppress unused import warnings for deps used only in inline blocks
+use base64 as _;
 use hmac as _;
 use sha1 as _;
-use base64 as _;

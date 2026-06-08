@@ -15,29 +15,29 @@
 
 #![cfg(all(target_os = "linux", feature = "io-uring"))]
 
+use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use bytes::Bytes;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::uring::{UringEngine, CompletionEvent};
+use crate::uring::{CompletionEvent, UringEngine};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 pub struct WorkerPoolConfig {
-    pub listen_addr:       SocketAddr,
-    pub num_workers:       usize,
+    pub listen_addr: SocketAddr,
+    pub num_workers: usize,
     pub buffers_per_worker: u16,
-    pub external_ip:       std::net::IpAddr,
+    pub external_ip: std::net::IpAddr,
 }
 
 impl Default for WorkerPoolConfig {
     fn default() -> Self {
         Self {
-            listen_addr:        "0.0.0.0:3478".parse().unwrap(),
-            num_workers:        num_cpus(),
+            listen_addr: "0.0.0.0:3478".parse().unwrap(),
+            num_workers: num_cpus(),
             buffers_per_worker: 2048,
-            external_ip:        "127.0.0.1".parse().unwrap(),
+            external_ip: "127.0.0.1".parse().unwrap(),
         }
     }
 }
@@ -46,7 +46,12 @@ impl Default for WorkerPoolConfig {
 
 pub trait PacketHandler: Send + 'static {
     fn handle_packet(&mut self, data: &[u8], source: SocketAddr) -> ForwardAction;
-    fn handle_relay_packet(&mut self, data: &[u8], source: SocketAddr, relay_port: u16) -> ForwardAction;
+    fn handle_relay_packet(
+        &mut self,
+        data: &[u8],
+        source: SocketAddr,
+        relay_port: u16,
+    ) -> ForwardAction;
 }
 
 // ── ForwardAction ─────────────────────────────────────────────────────────────
@@ -62,13 +67,27 @@ pub trait PacketHandler: Send + 'static {
 pub enum ForwardAction {
     None,
     /// Send via main socket. `Bytes` is Arc — no copy into the channel.
-    Send { data: Bytes, target: SocketAddr },
+    Send {
+        data: Bytes,
+        target: SocketAddr,
+    },
     /// Send via relay socket.
-    SendViaRelay { data: Bytes, target: SocketAddr, relay_port: u16 },
+    SendViaRelay {
+        data: Bytes,
+        target: SocketAddr,
+        relay_port: u16,
+    },
     /// Zero-copy forward via relay socket (kernel-buffer path).
-    ZeroCopyViaRelay { offset: usize, len: usize, target: SocketAddr, relay_port: u16 },
+    ZeroCopyViaRelay {
+        offset: usize,
+        len: usize,
+        target: SocketAddr,
+        relay_port: u16,
+    },
     /// Create a relay socket on this port.
-    CreateRelay { port: u16 },
+    CreateRelay {
+        port: u16,
+    },
     /// Multiple actions (e.g. CreateRelay + Send).
     Multi(Vec<ForwardAction>),
 }
@@ -76,7 +95,7 @@ pub enum ForwardAction {
 // ── Worker pool ───────────────────────────────────────────────────────────────
 
 pub fn spawn_worker_pool<H, F>(
-    config:          WorkerPoolConfig,
+    config: WorkerPoolConfig,
     handler_factory: F,
 ) -> Vec<std::thread::JoinHandle<()>>
 where
@@ -87,8 +106,8 @@ where
     let mut handles = Vec::with_capacity(config.num_workers);
 
     for worker_id in 0..config.num_workers {
-        let addr    = config.listen_addr;
-        let bufs    = config.buffers_per_worker;
+        let addr = config.listen_addr;
+        let bufs = config.buffers_per_worker;
         let factory = factory.clone();
 
         let handle = std::thread::Builder::new()
@@ -112,66 +131,101 @@ where
 
 fn run_worker<H: PacketHandler>(
     worker_id: usize,
-    addr:      SocketAddr,
+    addr: SocketAddr,
     buf_count: u16,
     mut handler: H,
 ) {
     let mut engine = match UringEngine::new(addr, true, buf_count) {
-        Ok(e)  => e,
-        Err(e) => { error!(worker_id, %e, "failed to create engine"); return; }
+        Ok(e) => e,
+        Err(e) => {
+            error!(worker_id, %e, "failed to create engine");
+            return;
+        }
     };
 
     if let Err(e) = engine.submit_initial_recvs() {
-        error!(worker_id, %e, "failed to submit initial recvs"); return;
+        error!(worker_id, %e, "failed to submit initial recvs");
+        return;
     }
 
-    let mut send_slot:       u16 = 0;
-    let mut relay_send_slot: u16 = 0;
     let mut stats = Stats::default();
 
     info!(worker_id, addr = %engine.local_addr(), "worker started");
 
     loop {
         if let Err(e) = engine.submit_and_wait() {
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
-            error!(worker_id, %e, "submit_and_wait failed"); break;
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            error!(worker_id, %e, "submit_and_wait failed");
+            break;
         }
 
         // Bytes-typed send queues: clones are AtomicAdd, not memcpy.
-        let mut main_sends:     Vec<(Bytes, SocketAddr)>        = Vec::new();
-        let mut relay_sends:    Vec<(u16, Bytes, SocketAddr)>   = Vec::new();
+        let mut main_sends: Vec<(Bytes, SocketAddr)> = Vec::new();
+        let mut relay_sends: Vec<(u16, Bytes, SocketAddr)> = Vec::new();
         let mut zc_relay_sends: Vec<(u16, u16, usize, usize, SocketAddr)> = Vec::new();
-        let mut resubmit_main:  Vec<(u16, u16)>                 = Vec::new();
-        let mut resubmit_relay: Vec<(u16, u16, u16)>            = Vec::new();
-        let mut new_relays:     Vec<u16>                         = Vec::new();
+        let mut resubmit_main: Vec<(u16, u16)> = Vec::new();
+        let mut resubmit_relay: Vec<(u16, u16, u16)> = Vec::new();
+        let mut new_relays: Vec<u16> = Vec::new();
 
         let events = engine.collect_completions();
         for event in events {
             match event {
-                CompletionEvent::MainRecv { buf_idx, msghdr_idx, len, source } => {
+                CompletionEvent::MainRecv {
+                    buf_idx,
+                    msghdr_idx,
+                    len,
+                    source,
+                } => {
                     stats.recv += 1;
-                    let data   = engine.buffer_data(buf_idx, len);
+                    let data = engine.buffer_data(buf_idx, len);
                     let action = handler.handle_packet(data, source);
                     process_action(
-                        action, buf_idx, msghdr_idx, true,
-                        &mut main_sends, &mut relay_sends, &mut zc_relay_sends,
-                        &mut resubmit_main, &mut new_relays, &mut stats,
+                        action,
+                        buf_idx,
+                        msghdr_idx,
+                        true,
+                        &mut main_sends,
+                        &mut relay_sends,
+                        &mut zc_relay_sends,
+                        &mut resubmit_main,
+                        &mut new_relays,
+                        &mut stats,
                     );
                 }
-                CompletionEvent::RelayRecv { relay_port, buf_idx, msghdr_idx, len, source } => {
+                CompletionEvent::RelayRecv {
+                    relay_port,
+                    buf_idx,
+                    msghdr_idx,
+                    len,
+                    source,
+                } => {
                     stats.relay_recv += 1;
-                    let data   = engine.buffer_data(buf_idx, len);
+                    let data = engine.buffer_data(buf_idx, len);
                     let action = handler.handle_relay_packet(data, source, relay_port);
                     process_relay_response(
-                        action, buf_idx, msghdr_idx, relay_port,
-                        &mut main_sends, &mut resubmit_relay,
+                        action,
+                        buf_idx,
+                        msghdr_idx,
+                        relay_port,
+                        &mut main_sends,
+                        &mut resubmit_relay,
                     );
                 }
-                CompletionEvent::MainSend  { result, .. } => {
-                    if result >= 0 { stats.sent   += 1; } else { stats.errors += 1; }
+                CompletionEvent::MainSend { result, .. } => {
+                    if result >= 0 {
+                        stats.sent += 1;
+                    } else {
+                        stats.errors += 1;
+                    }
                 }
                 CompletionEvent::RelaySend { result, .. } => {
-                    if result >= 0 { stats.relay_sent += 1; } else { stats.errors += 1; }
+                    if result >= 0 {
+                        stats.relay_sent += 1;
+                    } else {
+                        stats.errors += 1;
+                    }
                 }
             }
         }
@@ -185,25 +239,32 @@ fn run_worker<H: PacketHandler>(
             }
         }
 
-        // Submit main sends. Bytes derefs to &[u8] — no extra copy.
+        // Submit main sends. The engine now allocates an in-flight-safe send
+        // slot internally and releases it on completion. On exhaustion the send
+        // is dropped (acceptable for UDP) and counted; the next
+        // submit_and_wait frees slots as completions arrive.
         for (data, target) in &main_sends {
-            let slot = send_slot; send_slot = (send_slot + 1) % 64;
-            let _ = engine.submit_main_send(&data, *target, slot);
+            if engine.submit_main_send(&data, *target).is_err() {
+                stats.errors += 1;
+            }
         }
 
         // Submit relay sends.
         for (port, data, target) in &relay_sends {
-            let slot = relay_send_slot; relay_send_slot = (relay_send_slot + 1) % 4;
-            let _ = engine.submit_relay_send(*port, &data, *target, slot);
+            if engine.submit_relay_send(*port, &data, *target).is_err() {
+                stats.errors += 1;
+            }
         }
 
-        // Zero-copy relay sends: copy from kernel-registered buffer into send slot.
-        // This is the io_uring path — buffer is pinned in kernel memory, cannot be
-        // wrapped in Bytes without a custom allocator, so one copy is unavoidable here.
+        // Zero-copy relay sends: copy from the kernel-registered recv buffer
+        // into the send slot, then release the recv buffer.
+        // NOTE: this still double-copies (buffer → Vec → send_buf); collapsing
+        // it requires registered send buffers (tracked in ADR-0002).
         for (buf_idx, port, offset, len, target) in &zc_relay_sends {
             let data = engine.buffer_data(*buf_idx, offset + len)[*offset..*offset + *len].to_vec();
-            let slot = relay_send_slot; relay_send_slot = (relay_send_slot + 1) % 4;
-            let _ = engine.submit_relay_send(*port, &data, *target, slot);
+            if engine.submit_relay_send(*port, &data, *target).is_err() {
+                stats.errors += 1;
+            }
             engine.release_buffer(*buf_idx);
         }
 
@@ -220,9 +281,12 @@ fn run_worker<H: PacketHandler>(
         if stats.recv % 100_000 == 0 && stats.recv > 0 {
             info!(
                 worker_id,
-                recv = stats.recv, sent = stats.sent,
-                relay_recv = stats.relay_recv, relay_sent = stats.relay_sent,
-                zc = stats.zc, errors = stats.errors,
+                recv = stats.recv,
+                sent = stats.sent,
+                relay_recv = stats.relay_recv,
+                relay_sent = stats.relay_sent,
+                zc = stats.zc,
+                errors = stats.errors,
                 bufs = engine.buffers_available(),
                 "stats"
             );
@@ -233,67 +297,92 @@ fn run_worker<H: PacketHandler>(
 // ── Action dispatch ───────────────────────────────────────────────────────────
 
 fn process_action(
-    action:         ForwardAction,
-    buf_idx:        u16,
-    msghdr_idx:     u16,
-    is_main:        bool,
-    main_sends:     &mut Vec<(Bytes, SocketAddr)>,
-    relay_sends:    &mut Vec<(u16, Bytes, SocketAddr)>,
+    action: ForwardAction,
+    buf_idx: u16,
+    msghdr_idx: u16,
+    is_main: bool,
+    main_sends: &mut Vec<(Bytes, SocketAddr)>,
+    relay_sends: &mut Vec<(u16, Bytes, SocketAddr)>,
     zc_relay_sends: &mut Vec<(u16, u16, usize, usize, SocketAddr)>,
-    resubmit_main:  &mut Vec<(u16, u16)>,
-    new_relays:     &mut Vec<u16>,
-    stats:          &mut Stats,
+    resubmit_main: &mut Vec<(u16, u16)>,
+    new_relays: &mut Vec<u16>,
+    stats: &mut Stats,
 ) {
     match action {
         ForwardAction::None => {
-            if is_main { resubmit_main.push((msghdr_idx, buf_idx)); }
+            if is_main {
+                resubmit_main.push((msghdr_idx, buf_idx));
+            }
         }
         ForwardAction::Send { data, target } => {
             main_sends.push((data, target));
-            if is_main { resubmit_main.push((msghdr_idx, buf_idx)); }
+            if is_main {
+                resubmit_main.push((msghdr_idx, buf_idx));
+            }
         }
-        ForwardAction::SendViaRelay { data, target, relay_port } => {
+        ForwardAction::SendViaRelay {
+            data,
+            target,
+            relay_port,
+        } => {
             relay_sends.push((relay_port, data, target));
-            if is_main { resubmit_main.push((msghdr_idx, buf_idx)); }
+            if is_main {
+                resubmit_main.push((msghdr_idx, buf_idx));
+            }
         }
-        ForwardAction::ZeroCopyViaRelay { offset, len, target, relay_port } => {
+        ForwardAction::ZeroCopyViaRelay {
+            offset,
+            len,
+            target,
+            relay_port,
+        } => {
             stats.zc += 1;
             zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
             // Don't resubmit — buffer is held until the send completes.
         }
         ForwardAction::CreateRelay { port } => {
             new_relays.push(port);
-            if is_main { resubmit_main.push((msghdr_idx, buf_idx)); }
+            if is_main {
+                resubmit_main.push((msghdr_idx, buf_idx));
+            }
         }
         ForwardAction::Multi(actions) => {
             let mut has_zc = false;
             for a in actions {
                 match a {
-                    ForwardAction::Send { data, target } =>
-                        main_sends.push((data, target)),
-                    ForwardAction::SendViaRelay { data, target, relay_port } =>
-                        relay_sends.push((relay_port, data, target)),
-                    ForwardAction::ZeroCopyViaRelay { offset, len, target, relay_port } => {
+                    ForwardAction::Send { data, target } => main_sends.push((data, target)),
+                    ForwardAction::SendViaRelay {
+                        data,
+                        target,
+                        relay_port,
+                    } => relay_sends.push((relay_port, data, target)),
+                    ForwardAction::ZeroCopyViaRelay {
+                        offset,
+                        len,
+                        target,
+                        relay_port,
+                    } => {
                         stats.zc += 1;
                         has_zc = true;
                         zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
                     }
-                    ForwardAction::CreateRelay { port } =>
-                        new_relays.push(port),
+                    ForwardAction::CreateRelay { port } => new_relays.push(port),
                     _ => {}
                 }
             }
-            if is_main && !has_zc { resubmit_main.push((msghdr_idx, buf_idx)); }
+            if is_main && !has_zc {
+                resubmit_main.push((msghdr_idx, buf_idx));
+            }
         }
     }
 }
 
 fn process_relay_response(
-    action:         ForwardAction,
-    buf_idx:        u16,
-    msghdr_idx:     u16,
-    relay_port:     u16,
-    main_sends:     &mut Vec<(Bytes, SocketAddr)>,
+    action: ForwardAction,
+    buf_idx: u16,
+    msghdr_idx: u16,
+    relay_port: u16,
+    main_sends: &mut Vec<(Bytes, SocketAddr)>,
     resubmit_relay: &mut Vec<(u16, u16, u16)>,
 ) {
     match action {
@@ -319,9 +408,12 @@ fn process_relay_response(
 
 #[derive(Default)]
 struct Stats {
-    recv: u64, sent: u64,
-    relay_recv: u64, relay_sent: u64,
-    zc: u64, errors: u64,
+    recv: u64,
+    sent: u64,
+    relay_recv: u64,
+    relay_sent: u64,
+    zc: u64,
+    errors: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -333,11 +425,16 @@ fn pin_to_core(core_id: usize) {
         let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(core_id, &mut cpuset);
         let ret = libc::sched_setaffinity(0, std::mem::size_of_val(&cpuset), &cpuset);
-        if ret == 0 { info!(core_id, "pinned to core"); }
-        else        { warn!(core_id, "pin failed"); }
+        if ret == 0 {
+            info!(core_id, "pinned to core");
+        } else {
+            warn!(core_id, "pin failed");
+        }
     }
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }

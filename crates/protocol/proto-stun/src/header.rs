@@ -108,8 +108,7 @@ impl MessageHeader {
         }
 
         let raw_method = extract_method(msg_type);
-        let method = Method::from_raw(raw_method)
-            .ok_or(StunError::UnknownAttribute(raw_method))?;
+        let method = Method::from_raw(raw_method).ok_or(StunError::UnknownAttribute(raw_method))?;
         let class = MessageClass::from_raw(msg_type);
 
         let mut transaction_id = [0u8; 12];

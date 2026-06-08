@@ -44,7 +44,8 @@ pub fn build_allocate_response(
     mapped_addr: SocketAddr,
     lifetime: u32,
 ) -> StunMessage {
-    let mut msg = StunMessage::with_transaction_id(Method::Allocate, MessageClass::SuccessResponse, tid);
+    let mut msg =
+        StunMessage::with_transaction_id(Method::Allocate, MessageClass::SuccessResponse, tid);
     msg.add(Attribute::XorRelayedAddress(relayed_addr));
     msg.add(Attribute::XorMappedAddress(mapped_addr));
     msg.add(Attribute::Lifetime(lifetime));
@@ -98,8 +99,30 @@ pub fn build_error_response(method: Method, tid: [u8; 12], code: u16, reason: &s
     msg
 }
 
+/// Build a 300 Try Alternate redirect response.
+///
+/// The response keeps the original request method, per STUN message-type
+/// encoding rules, and carries the alternate TURN endpoint in
+/// ALTERNATE-SERVER. The `src` argument is accepted for call-site symmetry
+/// with packet processors; the wire encoding only needs the transaction id.
+pub fn build_redirect_response(
+    method: Method,
+    tid: [u8; 12],
+    alternate_addr: SocketAddr,
+    _src: SocketAddr,
+) -> StunMessage {
+    let mut msg = build_error_response(method, tid, 300, "Try Alternate");
+    msg.add(Attribute::AlternateServer(alternate_addr));
+    msg
+}
+
 /// Build a 401 Unauthorized response with REALM and NONCE (for auth challenge).
-pub fn build_auth_challenge(method: Method, tid: [u8; 12], realm: &str, nonce: &str) -> StunMessage {
+pub fn build_auth_challenge(
+    method: Method,
+    tid: [u8; 12],
+    realm: &str,
+    nonce: &str,
+) -> StunMessage {
     let mut msg = build_error_response(method, tid, 401, "Unauthorized");
     msg.add(Attribute::Realm(realm.to_string()));
     msg.add(Attribute::Nonce(nonce.to_string()));

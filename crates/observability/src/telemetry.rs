@@ -18,9 +18,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::trace::{SamplingDecision, SamplingResult, TraceId};
 use opentelemetry::KeyValue;
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::{Sampler, ShouldSample};
 use thiserror::Error;
 use tracing::info;
@@ -44,41 +44,41 @@ pub type Result<T> = std::result::Result<T, TelemetryError>;
 
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
-    pub service_name:    String,
+    pub service_name: String,
     pub service_version: String,
-    pub instance_id:     String,
+    pub instance_id: String,
     /// OTLP gRPC endpoint, e.g. "http://localhost:4317".
     /// Empty string → tracing disabled (only logs).
-    pub otlp_endpoint:   String,
-    pub sampling:        SamplingConfig,
+    pub otlp_endpoint: String,
+    pub sampling: SamplingConfig,
     pub prometheus_addr: String,
-    pub log_filter:      String,
-    pub json_logs:       bool,
+    pub log_filter: String,
+    pub json_logs: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SamplingConfig {
-    pub base_ratio:            f64,
-    pub always_sample_errors:  bool,
-    pub latency_threshold_us:  u64,
+    pub base_ratio: f64,
+    pub always_sample_errors: bool,
+    pub latency_threshold_us: u64,
     pub always_sample_methods: Vec<String>,
-    pub max_spans_per_second:  u32,
+    pub max_spans_per_second: u32,
 }
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            service_name:    "turna".into(),
+            service_name: "turna".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            instance_id:     hostname::get()
+            instance_id: hostname::get()
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "unknown".into()),
-            otlp_endpoint:   String::new(),
-            sampling:        SamplingConfig::default(),
+            otlp_endpoint: String::new(),
+            sampling: SamplingConfig::default(),
             prometheus_addr: "0.0.0.0:9090".into(),
-            log_filter:      "info,turna=debug".into(),
-            json_logs:       false,
+            log_filter: "info,turna=debug".into(),
+            json_logs: false,
         }
     }
 }
@@ -86,11 +86,11 @@ impl Default for TelemetryConfig {
 impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
-            base_ratio:            0.01,
-            always_sample_errors:  true,
-            latency_threshold_us:  10_000,
+            base_ratio: 0.01,
+            always_sample_errors: true,
+            latency_threshold_us: 10_000,
             always_sample_methods: vec!["Allocate".into(), "Refresh".into()],
-            max_spans_per_second:  1000,
+            max_spans_per_second: 1000,
         }
     }
 }
@@ -102,8 +102,8 @@ impl Default for SamplingConfig {
 // FIX: added #[derive(Debug)] — required because TurnaSampler derives Debug
 #[derive(Debug)]
 struct TokenBucket {
-    max:         u32,
-    tokens:      std::sync::atomic::AtomicU32,
+    max: u32,
+    tokens: std::sync::atomic::AtomicU32,
     last_refill: std::sync::Mutex<std::time::Instant>,
 }
 
@@ -111,7 +111,7 @@ impl TokenBucket {
     fn new(max: u32) -> Self {
         Self {
             max,
-            tokens:      std::sync::atomic::AtomicU32::new(max),
+            tokens: std::sync::atomic::AtomicU32::new(max),
             last_refill: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
@@ -120,71 +120,89 @@ impl TokenBucket {
         {
             let mut t = self.last_refill.lock().unwrap();
             if t.elapsed() >= Duration::from_secs(1) {
-                self.tokens.store(self.max, std::sync::atomic::Ordering::Relaxed);
+                self.tokens
+                    .store(self.max, std::sync::atomic::Ordering::Relaxed);
                 *t = std::time::Instant::now();
             }
         }
         loop {
             let c = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
-            if c == 0 { return false; }
-            if self.tokens.compare_exchange_weak(
-                c, c - 1,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ).is_ok() { return true; }
+            if c == 0 {
+                return false;
+            }
+            if self
+                .tokens
+                .compare_exchange_weak(
+                    c,
+                    c - 1,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return true;
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TurnaSampler {
-    config:  SamplingConfig,
-    inner:   Sampler,
+    config: SamplingConfig,
+    inner: Sampler,
     limiter: Arc<TokenBucket>,
 }
 
 impl TurnaSampler {
     pub fn new(config: SamplingConfig) -> Self {
-        let inner   = Sampler::TraceIdRatioBased(config.base_ratio);
+        let inner = Sampler::TraceIdRatioBased(config.base_ratio);
         let limiter = Arc::new(TokenBucket::new(config.max_spans_per_second));
-        Self { config, inner, limiter }
+        Self {
+            config,
+            inner,
+            limiter,
+        }
     }
 }
 
 impl ShouldSample for TurnaSampler {
     fn should_sample(
         &self,
-        parent:   Option<&opentelemetry::Context>,
+        parent: Option<&opentelemetry::Context>,
         trace_id: TraceId,
-        name:     &str,
-        kind:     &opentelemetry::trace::SpanKind,
-        attrs:    &[KeyValue],
-        links:    &[opentelemetry::trace::Link],
+        name: &str,
+        kind: &opentelemetry::trace::SpanKind,
+        attrs: &[KeyValue],
+        links: &[opentelemetry::trace::Link],
     ) -> SamplingResult {
         if !self.limiter.try_acquire() {
             return SamplingResult {
-                decision:    SamplingDecision::Drop,
-                attributes:  vec![],
+                decision: SamplingDecision::Drop,
+                attributes: vec![],
                 trace_state: Default::default(),
             };
         }
-        if self.config.always_sample_errors
-            && attrs.iter().any(|kv| kv.key.as_str() == "error")
+        if self.config.always_sample_errors && attrs.iter().any(|kv| kv.key.as_str() == "error") {
+            return SamplingResult {
+                decision: SamplingDecision::RecordAndSample,
+                attributes: vec![KeyValue::new("sampling.reason", "error")],
+                trace_state: Default::default(),
+            };
+        }
+        if self
+            .config
+            .always_sample_methods
+            .iter()
+            .any(|m| name.contains(m.as_str()))
         {
             return SamplingResult {
-                decision:    SamplingDecision::RecordAndSample,
-                attributes:  vec![KeyValue::new("sampling.reason", "error")],
+                decision: SamplingDecision::RecordAndSample,
+                attributes: vec![KeyValue::new("sampling.reason", "critical")],
                 trace_state: Default::default(),
             };
         }
-        if self.config.always_sample_methods.iter().any(|m| name.contains(m.as_str())) {
-            return SamplingResult {
-                decision:    SamplingDecision::RecordAndSample,
-                attributes:  vec![KeyValue::new("sampling.reason", "critical")],
-                trace_state: Default::default(),
-            };
-        }
-        self.inner.should_sample(parent, trace_id, name, kind, attrs, links)
+        self.inner
+            .should_sample(parent, trace_id, name, kind, attrs, links)
     }
 }
 
@@ -194,9 +212,8 @@ impl ShouldSample for TurnaSampler {
 
 pub mod buckets {
     pub const PROCESSING_LATENCY: &[f64] = &[
-        0.000_005, 0.000_010, 0.000_025, 0.000_050,
-        0.000_100, 0.000_250, 0.000_500,
-        0.001, 0.005, 0.010, 0.050, 0.100,
+        0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.005,
+        0.010, 0.050, 0.100,
     ];
     pub const PACKET_SIZE: &[f64] = &[
         64.0, 128.0, 256.0, 512.0, 1024.0, 1280.0, 1500.0, 4096.0, 8192.0, 65535.0,
@@ -229,8 +246,8 @@ impl Drop for TelemetryGuard {
 /// EnvFilter first changes S from `Registry` to `Layered<EnvFilter, Registry>`,
 /// which no longer satisfies the trait bound.
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log_filter));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_filter));
 
     // Build OTel layer first (needs bare Registry as subscriber type).
     // Wrap in Option so we can choose whether to include it.
@@ -257,9 +274,7 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
     if otlp_enabled {
         let otel_layer = build_otel_layer(&config)?;
         // Registry → OTel → EnvFilter → fmt
-        let base = tracing_subscriber::registry()
-            .with(otel_layer)
-            .with(filter);
+        let base = tracing_subscriber::registry().with(otel_layer).with(filter);
         try_init_with_fmt!(base)?;
     } else {
         info!("OTLP endpoint not configured — distributed tracing disabled");
@@ -286,15 +301,17 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
 /// applied BEFORE any other layers in the subscriber chain.
 fn build_otel_layer(
     config: &TelemetryConfig,
-) -> Result<tracing_opentelemetry::OpenTelemetryLayer<
-    tracing_subscriber::Registry,
-    opentelemetry_sdk::trace::Tracer,
->> {
+) -> Result<
+    tracing_opentelemetry::OpenTelemetryLayer<
+        tracing_subscriber::Registry,
+        opentelemetry_sdk::trace::Tracer,
+    >,
+> {
     use opentelemetry_otlp::WithExportConfig;
 
     let resource = opentelemetry_sdk::Resource::new(vec![
-        KeyValue::new("service.name",        config.service_name.clone()),
-        KeyValue::new("service.version",     config.service_version.clone()),
+        KeyValue::new("service.name", config.service_name.clone()),
+        KeyValue::new("service.version", config.service_version.clone()),
         KeyValue::new("service.instance.id", config.instance_id.clone()),
         KeyValue::new(
             "deployment.environment",
@@ -382,8 +399,8 @@ mod tests {
     #[test]
     fn turna_sampler_always_samples_errors() {
         let sampler = TurnaSampler::new(SamplingConfig {
-            base_ratio:            0.0,
-            always_sample_errors:  true,
+            base_ratio: 0.0,
+            always_sample_errors: true,
             always_sample_methods: vec![],
             ..Default::default()
         });
@@ -402,8 +419,8 @@ mod tests {
     #[test]
     fn turna_sampler_always_samples_allocate() {
         let sampler = TurnaSampler::new(SamplingConfig {
-            base_ratio:            0.0,
-            always_sample_errors:  false,
+            base_ratio: 0.0,
+            always_sample_errors: false,
             always_sample_methods: vec!["Allocate".into()],
             ..Default::default()
         });

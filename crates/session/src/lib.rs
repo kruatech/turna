@@ -10,7 +10,7 @@
 //!   module and `docs/design/allocation-store-persistence.md`)
 
 pub mod write_op;
-pub use write_op::{WriteOp, now_ms as epoch_ms};
+pub use write_op::{now_ms as epoch_ms, WriteOp};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -142,15 +142,12 @@ impl Allocation {
     }
 
     pub fn get_peer_channel(&self, peer: &SocketAddr) -> Option<u16> {
-        self.channels_reverse
-            .get(peer)
-            .copied()
-            .filter(|ch| {
-                self.channel_bindings
-                    .get(ch)
-                    .map(|b| !b.is_expired())
-                    .unwrap_or(false)
-            })
+        self.channels_reverse.get(peer).copied().filter(|ch| {
+            self.channel_bindings
+                .get(ch)
+                .map(|b| !b.is_expired())
+                .unwrap_or(false)
+        })
     }
 
     pub fn add_bytes(&self, n: u64) {
@@ -188,7 +185,8 @@ impl Allocation {
         let perms_removed = perm_before - self.permissions.len();
 
         let chan_before = self.channel_bindings.len();
-        let expired_channels: Vec<u16> = self.channel_bindings
+        let expired_channels: Vec<u16> = self
+            .channel_bindings
             .iter()
             .filter(|(_, b)| b.is_expired())
             .map(|(ch, _)| *ch)
@@ -213,13 +211,13 @@ impl Allocation {
         self.permissions.len()
     }
 
-
     pub fn permission_ips(&self) -> Vec<String> {
         self.permissions.keys().map(|ip| ip.to_string()).collect()
     }
 
     pub fn channel_list(&self) -> Vec<(u16, std::net::SocketAddr, std::time::Instant)> {
-        self.channel_bindings.iter()
+        self.channel_bindings
+            .iter()
             .map(|(&ch, b)| (ch, b.peer_addr, b.expires_at))
             .collect()
     }
@@ -256,10 +254,18 @@ impl PortAllocator {
             if !used.contains(&*next) {
                 let port = *next;
                 used.insert(port);
-                *next = if *next >= self.max_port { self.min_port } else { *next + 1 };
+                *next = if *next >= self.max_port {
+                    self.min_port
+                } else {
+                    *next + 1
+                };
                 return Ok(port);
             }
-            *next = if *next >= self.max_port { self.min_port } else { *next + 1 };
+            *next = if *next >= self.max_port {
+                self.min_port
+            } else {
+                *next + 1
+            };
             if *next == start {
                 return Err(SessionError::NoPortsAvailable);
             }
@@ -331,8 +337,8 @@ pub struct BandwidthQuota {
 impl Default for BandwidthQuota {
     fn default() -> Self {
         Self {
-            max_bytes_per_sec: 0,        // unlimited
-            max_per_user: 100,           // 100 allocations per user
+            max_bytes_per_sec: 0, // unlimited
+            max_per_user: 100,    // 100 allocations per user
         }
     }
 }
@@ -413,7 +419,9 @@ impl AllocationStore {
     ///   normal during shutdown).
     #[inline]
     fn emit_write(&self, op: WriteOp) {
-        let Some(tx) = self.write_tx.get() else { return; };
+        let Some(tx) = self.write_tx.get() else {
+            return;
+        };
         match tx.try_send(op) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -449,7 +457,8 @@ impl AllocationStore {
 
         // Check per-user limit
         if self.quota.max_per_user > 0 {
-            let count = self.user_allocations
+            let count = self
+                .user_allocations
                 .get(&username)
                 .map(|v| v.len())
                 .unwrap_or(0);
@@ -488,10 +497,10 @@ impl AllocationStore {
         // fully consistent (design doc §9 question 5).
         let now_epoch = epoch_ms();
         self.emit_write(WriteOp::Create {
-            relay_port:    relay_addr.port(),
+            relay_port: relay_addr.port(),
             client_addr,
             relay_addr,
-            username:      username.clone(),
+            username: username.clone(),
             created_at_ms: now_epoch,
             expires_at_ms: now_epoch + (lifetime as u64) * 1000,
         });
@@ -540,7 +549,7 @@ impl AllocationStore {
         created_at_ms: u64,
         expires_at_ms: u64,
         permissions: impl IntoIterator<Item = (std::net::IpAddr, u64)>,
-        channels:    impl IntoIterator<Item = (u16, SocketAddr, u64)>,
+        channels: impl IntoIterator<Item = (u16, SocketAddr, u64)>,
     ) -> Result<bool, SessionError> {
         let now_epoch = epoch_ms();
         if expires_at_ms <= now_epoch {
@@ -553,8 +562,11 @@ impl AllocationStore {
             return Err(SessionError::MaxAllocations);
         }
         if self.quota.max_per_user > 0 {
-            let count = self.user_allocations.get(&username)
-                .map(|v| v.len()).unwrap_or(0);
+            let count = self
+                .user_allocations
+                .get(&username)
+                .map(|v| v.len())
+                .unwrap_or(0);
             if count >= self.quota.max_per_user {
                 return Err(SessionError::MaxAllocationsPerUser);
             }
@@ -569,9 +581,9 @@ impl AllocationStore {
         // original moment of creation, but `created_at` is only used for
         // observability — not correctness. `expires_at` is correctness-
         // critical and is reconstructed by adding the remaining lifetime.
-        let now_inst   = Instant::now();
-        let remaining  = Duration::from_millis(expires_at_ms - now_epoch);
-        let age        = Duration::from_millis(now_epoch.saturating_sub(created_at_ms));
+        let now_inst = Instant::now();
+        let remaining = Duration::from_millis(expires_at_ms - now_epoch);
+        let age = Duration::from_millis(now_epoch.saturating_sub(created_at_ms));
         let created_at = now_inst.checked_sub(age).unwrap_or(now_inst);
         let expires_at = now_inst + remaining;
 
@@ -580,24 +592,34 @@ impl AllocationStore {
         // permissions without re-issuing CreatePermission immediately.
         let mut perms_map: HashMap<std::net::IpAddr, Permission> = HashMap::new();
         for (peer_ip, perm_expires) in permissions {
-            if perm_expires <= now_epoch { continue; }
+            if perm_expires <= now_epoch {
+                continue;
+            }
             let perm_remaining = Duration::from_millis(perm_expires - now_epoch);
-            perms_map.insert(peer_ip, Permission {
-                _peer_ip:   peer_ip,
-                expires_at: now_inst + perm_remaining,
-            });
+            perms_map.insert(
+                peer_ip,
+                Permission {
+                    _peer_ip: peer_ip,
+                    expires_at: now_inst + perm_remaining,
+                },
+            );
         }
 
         let mut chan_map: HashMap<u16, ChannelBinding> = HashMap::new();
         let mut chans_reverse: HashMap<SocketAddr, u16> = HashMap::new();
         for (number, peer_addr, chan_expires) in channels {
-            if chan_expires <= now_epoch { continue; }
+            if chan_expires <= now_epoch {
+                continue;
+            }
             let chan_remaining = Duration::from_millis(chan_expires - now_epoch);
-            chan_map.insert(number, ChannelBinding {
-                _channel:   number,
-                peer_addr,
-                expires_at: now_inst + chan_remaining,
-            });
+            chan_map.insert(
+                number,
+                ChannelBinding {
+                    _channel: number,
+                    peer_addr,
+                    expires_at: now_inst + chan_remaining,
+                },
+            );
             chans_reverse.insert(peer_addr, number);
         }
 
@@ -607,13 +629,13 @@ impl AllocationStore {
             username: username.clone(),
             // See doc comment above — recomputed on first auth.
             key: Vec::new(),
-            permissions:      perms_map,
+            permissions: perms_map,
             channel_bindings: chan_map,
             channels_reverse: chans_reverse,
             expires_at,
             created_at,
-            bytes_relayed:        AtomicU64::new(0),
-            packets_relayed:      AtomicU64::new(0),
+            bytes_relayed: AtomicU64::new(0),
+            packets_relayed: AtomicU64::new(0),
             bandwidth_window_bytes: AtomicU64::new(0),
             bandwidth_window_start: Mutex::new(now_inst),
         };
@@ -621,7 +643,8 @@ impl AllocationStore {
         // Reverse indices: relay→client, (relay_port, channel)→client.
         self.relay_to_client.insert(relay_addr, client_addr);
         for (&number, _) in alloc.channel_bindings.iter() {
-            self.channel_to_client.insert((relay_addr.port(), number), client_addr);
+            self.channel_to_client
+                .insert((relay_addr.port(), number), client_addr);
         }
         self.allocations.insert(client_addr, alloc);
         self.user_allocations
@@ -636,11 +659,17 @@ impl AllocationStore {
         Ok(true)
     }
 
-    pub fn get(&self, client_addr: &SocketAddr) -> Option<dashmap::mapref::one::Ref<'_, SocketAddr, Allocation>> {
+    pub fn get(
+        &self,
+        client_addr: &SocketAddr,
+    ) -> Option<dashmap::mapref::one::Ref<'_, SocketAddr, Allocation>> {
         self.allocations.get(client_addr)
     }
 
-    pub fn get_mut(&self, client_addr: &SocketAddr) -> Option<dashmap::mapref::one::RefMut<'_, SocketAddr, Allocation>> {
+    pub fn get_mut(
+        &self,
+        client_addr: &SocketAddr,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, SocketAddr, Allocation>> {
         self.allocations.get_mut(client_addr)
     }
 
@@ -649,13 +678,22 @@ impl AllocationStore {
     }
 
     pub fn get_by_channel(&self, relay_port: u16, channel: u16) -> Option<SocketAddr> {
-        self.channel_to_client.get(&(relay_port, channel)).map(|r| *r.value())
+        self.channel_to_client
+            .get(&(relay_port, channel))
+            .map(|r| *r.value())
     }
 
     /// Add or refresh a permission (5 min lifetime per RFC).
-    pub fn add_permission(&self, client_addr: &SocketAddr, peer_ip: std::net::IpAddr) -> Result<(), SessionError> {
+    pub fn add_permission(
+        &self,
+        client_addr: &SocketAddr,
+        peer_ip: std::net::IpAddr,
+    ) -> Result<(), SessionError> {
         let relay_port = {
-            let mut alloc = self.allocations.get_mut(client_addr).ok_or(SessionError::NotFound)?;
+            let mut alloc = self
+                .allocations
+                .get_mut(client_addr)
+                .ok_or(SessionError::NotFound)?;
             if let Some(perm) = alloc.permissions.get_mut(&peer_ip) {
                 perm.refresh();
                 tracing::debug!(%client_addr, %peer_ip, "permission refreshed");
@@ -678,28 +716,41 @@ impl AllocationStore {
     }
 
     /// Add or refresh a channel binding (10 min lifetime per RFC).
-    pub fn add_channel(&self, client_addr: &SocketAddr, channel: u16, peer_addr: SocketAddr) -> Result<(), SessionError> {
-        let mut alloc = self.allocations.get_mut(client_addr).ok_or(SessionError::NotFound)?;
+    pub fn add_channel(
+        &self,
+        client_addr: &SocketAddr,
+        channel: u16,
+        peer_addr: SocketAddr,
+    ) -> Result<(), SessionError> {
+        let mut alloc = self
+            .allocations
+            .get_mut(client_addr)
+            .ok_or(SessionError::NotFound)?;
 
         // Also add/refresh permission for this peer
         if let Some(perm) = alloc.permissions.get_mut(&peer_addr.ip()) {
             perm.refresh();
         } else {
-            alloc.permissions.insert(peer_addr.ip(), Permission::new(peer_addr.ip()));
+            alloc
+                .permissions
+                .insert(peer_addr.ip(), Permission::new(peer_addr.ip()));
         }
 
         if let Some(binding) = alloc.channel_bindings.get_mut(&channel) {
             binding.refresh();
             tracing::debug!(%client_addr, channel, %peer_addr, "channel refreshed");
         } else {
-            alloc.channel_bindings.insert(channel, ChannelBinding::new(channel, peer_addr));
+            alloc
+                .channel_bindings
+                .insert(channel, ChannelBinding::new(channel, peer_addr));
             alloc.channels_reverse.insert(peer_addr, channel);
             tracing::debug!(%client_addr, channel, %peer_addr, "channel bound");
         }
 
         let relay_port = alloc.relay_addr.port();
         drop(alloc);
-        self.channel_to_client.insert((relay_port, channel), *client_addr);
+        self.channel_to_client
+            .insert((relay_port, channel), *client_addr);
 
         // Emit *two* events: ChannelBind implicitly refreshes a permission
         // (per RFC 8656 §11.2), and the persisted record tracks them
@@ -707,12 +758,12 @@ impl AllocationStore {
         let now_epoch = epoch_ms();
         self.emit_write(WriteOp::Permission {
             relay_port,
-            peer_ip:       peer_addr.ip(),
+            peer_ip: peer_addr.ip(),
             expires_at_ms: now_epoch + PERMISSION_LIFETIME.as_millis() as u64,
         });
         self.emit_write(WriteOp::Channel {
             relay_port,
-            number:        channel,
+            number: channel,
             peer_addr,
             expires_at_ms: now_epoch + CHANNEL_LIFETIME.as_millis() as u64,
         });
@@ -724,7 +775,10 @@ impl AllocationStore {
         if self.quota.max_bytes_per_sec == 0 {
             return Ok(()); // No limit
         }
-        let alloc = self.allocations.get(client_addr).ok_or(SessionError::NotFound)?;
+        let alloc = self
+            .allocations
+            .get(client_addr)
+            .ok_or(SessionError::NotFound)?;
         match alloc.check_bandwidth(self.quota.max_bytes_per_sec) {
             Ok(_) => Ok(()),
             Err(()) => {
@@ -736,7 +790,10 @@ impl AllocationStore {
 
     pub fn refresh(&self, client_addr: &SocketAddr, lifetime: u32) -> Result<(), SessionError> {
         let (relay_port, expires_at_ms) = {
-            let mut alloc = self.allocations.get_mut(client_addr).ok_or(SessionError::NotFound)?;
+            let mut alloc = self
+                .allocations
+                .get_mut(client_addr)
+                .ok_or(SessionError::NotFound)?;
             if lifetime == 0 {
                 let relay_addr = alloc.relay_addr;
                 drop(alloc);
@@ -744,15 +801,24 @@ impl AllocationStore {
                 return self.remove(client_addr, relay_addr);
             }
             alloc.expires_at = Instant::now() + Duration::from_secs(lifetime as u64);
-            (alloc.relay_addr.port(),
-             epoch_ms() + (lifetime as u64) * 1000)
+            (
+                alloc.relay_addr.port(),
+                epoch_ms() + (lifetime as u64) * 1000,
+            )
         };
 
-        self.emit_write(WriteOp::Refresh { relay_port, expires_at_ms });
+        self.emit_write(WriteOp::Refresh {
+            relay_port,
+            expires_at_ms,
+        });
         Ok(())
     }
 
-    pub fn remove(&self, client_addr: &SocketAddr, relay_addr: SocketAddr) -> Result<(), SessionError> {
+    pub fn remove(
+        &self,
+        client_addr: &SocketAddr,
+        relay_addr: SocketAddr,
+    ) -> Result<(), SessionError> {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
             for (&ch, _) in &alloc.channel_bindings {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
@@ -767,7 +833,9 @@ impl AllocationStore {
 
             // Emit only when we actually removed something — a no-op
             // `remove()` shouldn't generate a backend round-trip.
-            self.emit_write(WriteOp::Remove { relay_port: relay_addr.port() });
+            self.emit_write(WriteOp::Remove {
+                relay_port: relay_addr.port(),
+            });
 
             tracing::info!(%client_addr, %relay_addr, username = %alloc.username, "allocation removed");
         }
@@ -782,7 +850,9 @@ impl AllocationStore {
         }
 
         // Remove fully expired allocations
-        let expired: Vec<(SocketAddr, SocketAddr)> = self.allocations.iter()
+        let expired: Vec<(SocketAddr, SocketAddr)> = self
+            .allocations
+            .iter()
             .filter(|r| r.value().is_expired())
             .map(|r| (*r.key(), r.value().relay_addr))
             .collect();
@@ -810,7 +880,6 @@ impl AllocationStore {
         self.allocations.len()
     }
 
-
     pub fn iter_all(&self) -> dashmap::iter::Iter<'_, std::net::SocketAddr, Allocation> {
         self.allocations.iter()
     }
@@ -819,7 +888,8 @@ impl AllocationStore {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
             self.relay_to_client.remove(&alloc.relay_addr);
             for (&ch, _) in &alloc.channel_bindings {
-                self.channel_to_client.remove(&(alloc.relay_addr.port(), ch));
+                self.channel_to_client
+                    .remove(&(alloc.relay_addr.port(), ch));
             }
             let relay_port = alloc.relay_addr.port();
             self.ports.release(relay_port);
@@ -830,7 +900,9 @@ impl AllocationStore {
         }
     }
 
-    pub fn allocated_port_count(&self) -> usize { self.ports.used.lock().len() }
+    pub fn allocated_port_count(&self) -> usize {
+        self.ports.used.lock().len()
+    }
 
     pub fn available_port_count(&self) -> usize {
         let total = (self.ports.max_port - self.ports.min_port + 1) as usize;
@@ -872,12 +944,18 @@ mod tests_write_behind {
         // We can't observe absence directly, but we can check that
         // operations succeed without anybody listening — i.e., the
         // `OnceLock::get()` short-circuit works.
-        store.create(client(1000), relay(40000), "alice".into(), vec![], 600)
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
             .expect("create succeeded");
-        store.refresh(&client(1000), 600).expect("refresh succeeded");
-        store.add_permission(&client(1000), "1.2.3.4".parse().unwrap())
+        store
+            .refresh(&client(1000), 600)
+            .expect("refresh succeeded");
+        store
+            .add_permission(&client(1000), "1.2.3.4".parse().unwrap())
             .expect("add_permission succeeded");
-        store.remove(&client(1000), relay(40000)).expect("remove succeeded");
+        store
+            .remove(&client(1000), relay(40000))
+            .expect("remove succeeded");
         assert_eq!(store.len(), 0);
     }
 
@@ -888,11 +966,16 @@ mod tests_write_behind {
         let (tx, mut rx) = mpsc::channel(64);
         store.attach_writer(tx);
 
-        store.create(client(1000), relay(40000), "alice".into(), vec![], 600)
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
             .expect("create");
 
         match rx.try_recv() {
-            Ok(WriteOp::Create { relay_port, username, .. }) => {
+            Ok(WriteOp::Create {
+                relay_port,
+                username,
+                ..
+            }) => {
                 assert_eq!(relay_port, 40000);
                 assert_eq!(username, "alice");
             }
@@ -916,17 +999,19 @@ mod tests_write_behind {
 
         store.create(c, r, "bob".into(), vec![], 600).unwrap();
         store.refresh(&c, 300).unwrap();
-        store.add_permission(&c, "1.2.3.4".parse().unwrap()).unwrap();
+        store
+            .add_permission(&c, "1.2.3.4".parse().unwrap())
+            .unwrap();
         store.add_channel(&c, 0x4000, peer).unwrap();
         store.remove(&c, r).unwrap();
 
         fn name(op: &WriteOp) -> &'static str {
             match op {
-                WriteOp::Create     { .. } => "Create",
-                WriteOp::Refresh    { .. } => "Refresh",
-                WriteOp::Remove     { .. } => "Remove",
+                WriteOp::Create { .. } => "Create",
+                WriteOp::Refresh { .. } => "Refresh",
+                WriteOp::Remove { .. } => "Remove",
                 WriteOp::Permission { .. } => "Permission",
-                WriteOp::Channel    { .. } => "Channel",
+                WriteOp::Channel { .. } => "Channel",
             }
         }
 
@@ -936,7 +1021,14 @@ mod tests_write_behind {
         }
         // add_channel emits Permission then Channel — that's why
         // Permission appears twice (once standalone, once implicit).
-        let expected = ["Create", "Refresh", "Permission", "Permission", "Channel", "Remove"];
+        let expected = [
+            "Create",
+            "Refresh",
+            "Permission",
+            "Permission",
+            "Channel",
+            "Remove",
+        ];
         assert_eq!(seen, expected, "event sequence mismatch");
     }
 
@@ -982,7 +1074,9 @@ mod tests_write_behind {
         store.attach_writer(tx1);
         store.attach_writer(tx2); // ignored
 
-        store.create(client(1003), relay(40003), "dave".into(), vec![], 600).unwrap();
+        store
+            .create(client(1003), relay(40003), "dave".into(), vec![], 600)
+            .unwrap();
 
         // The first sender should have received the event.
         assert!(rx1.try_recv().is_ok());
@@ -1000,7 +1094,9 @@ mod tests_write_behind {
         drop(rx);
 
         // Should not panic, should not fail.
-        store.create(client(1004), relay(40004), "eve".into(), vec![], 600).unwrap();
+        store
+            .create(client(1004), relay(40004), "eve".into(), vec![], 600)
+            .unwrap();
         store.remove(&client(1004), relay(40004)).unwrap();
         assert_eq!(store.len(), 0);
     }
@@ -1019,15 +1115,19 @@ mod tests_write_behind {
         for i in 0..10u16 {
             // Use distinct ports so create() itself succeeds (port allocator)
             // — what we're testing is the writer drop path, not allocation.
-            store.create(client(2000 + i), relay(40000 + i),
-                         "x".into(), vec![], 600).unwrap();
+            store
+                .create(client(2000 + i), relay(40000 + i), "x".into(), vec![], 600)
+                .unwrap();
         }
 
         // 10 emits, capacity 1 → at least 9 must have been dropped.
         // (We can't pin the exact number because the channel might have
         //  buffered one before the receiver fell behind.)
-        assert!(store.dropped_writes_count() >= 9,
-                "expected >= 9 dropped, got {}", store.dropped_writes_count());
+        assert!(
+            store.dropped_writes_count() >= 9,
+            "expected >= 9 dropped, got {}",
+            store.dropped_writes_count()
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1039,14 +1139,17 @@ mod tests_write_behind {
         let store = make_store();
         let now = epoch_ms();
 
-        let ok = store.rehydrate(
-            client(3000), relay(40050),
-            "alice".into(),
-            now.saturating_sub(10_000),
-            now + 600_000,
-            std::iter::empty(),
-            std::iter::empty(),
-        ).unwrap();
+        let ok = store
+            .rehydrate(
+                client(3000),
+                relay(40050),
+                "alice".into(),
+                now.saturating_sub(10_000),
+                now + 600_000,
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .unwrap();
         assert!(ok, "fresh expiry should rehydrate");
         assert_eq!(store.len(), 1);
         assert!(store.get(&client(3000)).is_some());
@@ -1059,17 +1162,22 @@ mod tests_write_behind {
         let (tx, mut rx) = mpsc::channel(16);
         store.attach_writer(tx);
 
-        store.rehydrate(
-            client(3001), relay(40051),
-            "bob".into(),
-            epoch_ms().saturating_sub(10_000),
-            epoch_ms() + 600_000,
-            std::iter::empty(),
-            std::iter::empty(),
-        ).unwrap();
+        store
+            .rehydrate(
+                client(3001),
+                relay(40051),
+                "bob".into(),
+                epoch_ms().saturating_sub(10_000),
+                epoch_ms() + 600_000,
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .unwrap();
 
-        assert!(rx.try_recv().is_err(),
-                "rehydrate must not emit any WriteOp event");
+        assert!(
+            rx.try_recv().is_err(),
+            "rehydrate must not emit any WriteOp event"
+        );
     }
 
     /// Expired record → Ok(false), no state change, port not reserved.
@@ -1077,20 +1185,26 @@ mod tests_write_behind {
     async fn rehydrate_expired_returns_false() {
         let store = make_store();
         let now = epoch_ms();
-        let ok = store.rehydrate(
-            client(3002), relay(40052),
-            "carol".into(),
-            now.saturating_sub(120_000),
-            now.saturating_sub(60_000), // already expired
-            std::iter::empty(), std::iter::empty(),
-        ).unwrap();
+        let ok = store
+            .rehydrate(
+                client(3002),
+                relay(40052),
+                "carol".into(),
+                now.saturating_sub(120_000),
+                now.saturating_sub(60_000), // already expired
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .unwrap();
         assert!(!ok, "expired record should be skipped");
         assert_eq!(store.len(), 0);
         // Port must remain free — a subsequent create() should be able to
         // claim it via the normal allocator (we don't pin the exact port
         // returned by allocate(), so just confirm no conflict).
-        assert!(store.ports.reserve(40052).is_ok(),
-                "expired rehydrate must not have reserved the port");
+        assert!(
+            store.ports.reserve(40052).is_ok(),
+            "expired rehydrate must not have reserved the port"
+        );
     }
 
     /// Rehydrating the same port twice fails on the second attempt
@@ -1099,16 +1213,26 @@ mod tests_write_behind {
     async fn rehydrate_double_port_conflict() {
         let store = make_store();
         let now = epoch_ms();
-        store.rehydrate(
-            client(3003), relay(40053), "dave".into(),
-            now.saturating_sub(10_000), now + 600_000,
-            std::iter::empty(), std::iter::empty(),
-        ).unwrap();
+        store
+            .rehydrate(
+                client(3003),
+                relay(40053),
+                "dave".into(),
+                now.saturating_sub(10_000),
+                now + 600_000,
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+            .unwrap();
 
         let err = store.rehydrate(
-            client(3004), relay(40053), "eve".into(),
-            now.saturating_sub(10_000), now + 600_000,
-            std::iter::empty(), std::iter::empty(),
+            client(3004),
+            relay(40053),
+            "eve".into(),
+            now.saturating_sub(10_000),
+            now + 600_000,
+            std::iter::empty(),
+            std::iter::empty(),
         );
         assert!(err.is_err(), "second rehydrate on same port must fail");
         assert_eq!(store.len(), 1, "first rehydrate must still be present");
@@ -1120,26 +1244,36 @@ mod tests_write_behind {
     async fn rehydrate_filters_expired_sub_records() {
         let store = make_store();
         let now = epoch_ms();
-        let peer_ok:  std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let peer_ok: std::net::IpAddr = "10.0.0.5".parse().unwrap();
         let peer_old: std::net::IpAddr = "10.0.0.6".parse().unwrap();
         let chan_peer = SocketAddr::new("10.0.0.5".parse().unwrap(), 9000);
 
-        let ok = store.rehydrate(
-            client(3005), relay(40054), "frank".into(),
-            now.saturating_sub(10_000), now + 600_000,
-            // peer_ok has fresh expiry, peer_old already expired
-            vec![(peer_ok, now + 60_000), (peer_old, now - 1)].into_iter(),
-            vec![
-                (0x4000, chan_peer, now + 60_000), // fresh channel
-                (0x4001, chan_peer, now - 1),      // expired channel
-            ].into_iter(),
-        ).unwrap();
+        let ok = store
+            .rehydrate(
+                client(3005),
+                relay(40054),
+                "frank".into(),
+                now.saturating_sub(10_000),
+                now + 600_000,
+                // peer_ok has fresh expiry, peer_old already expired
+                vec![(peer_ok, now + 60_000), (peer_old, now - 1)].into_iter(),
+                vec![
+                    (0x4000, chan_peer, now + 60_000), // fresh channel
+                    (0x4001, chan_peer, now - 1),      // expired channel
+                ]
+                .into_iter(),
+            )
+            .unwrap();
         assert!(ok);
 
         // Channel 0x4000 must be reachable, 0x4001 must not.
-        assert!(store.get_by_channel(40054, 0x4000).is_some(),
-                "fresh channel should be present");
-        assert!(store.get_by_channel(40054, 0x4001).is_none(),
-                "expired channel must not be present");
+        assert!(
+            store.get_by_channel(40054, 0x4000).is_some(),
+            "fresh channel should be present"
+        );
+        assert!(
+            store.get_by_channel(40054, 0x4001).is_none(),
+            "expired channel must not be present"
+        );
     }
 }

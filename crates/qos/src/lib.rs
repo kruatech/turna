@@ -78,9 +78,8 @@ impl RateLimiter {
     /// Clean up old entries (call periodically).
     pub fn cleanup(&mut self, max_age_secs: f64) {
         let now = Instant::now();
-        self.buckets.retain(|_, b| {
-            now.duration_since(b.last_refill).as_secs_f64() < max_age_secs
-        });
+        self.buckets
+            .retain(|_, b| now.duration_since(b.last_refill).as_secs_f64() < max_age_secs);
     }
 }
 
@@ -91,8 +90,8 @@ impl RateLimiter {
 // Для 16 шардов: 16 потоков могут проверять rate limit одновременно.
 
 use parking_lot::Mutex;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 const DEFAULT_SHARDS: usize = 16;
 
@@ -108,9 +107,13 @@ impl ShardedRateLimiter {
     pub fn with_shards(max_tokens: u32, refill_rate: u32, n_shards: usize) -> Self {
         let per_shard_entries = 65536 / n_shards;
         let shards = (0..n_shards)
-            .map(|_| Mutex::new(RateLimiter::with_max_entries(
-                max_tokens, refill_rate, per_shard_entries
-            )))
+            .map(|_| {
+                Mutex::new(RateLimiter::with_max_entries(
+                    max_tokens,
+                    refill_rate,
+                    per_shard_entries,
+                ))
+            })
             .collect();
         Self { shards }
     }
@@ -143,7 +146,6 @@ impl ShardedRateLimiter {
         self.shards.len()
     }
 }
-
 
 // ── Tiered rate limiting (M1) ─────────────────────────────────────────────────
 //
@@ -178,45 +180,48 @@ pub fn aggregation_prefix(ip: IpAddr) -> IpAddr {
 /// Tunable limits for [`TieredRateLimiter`]. Rates are (burst, refill/sec).
 #[derive(Clone, Copy, Debug)]
 pub struct TieredLimits {
-    pub per_ip:            (u32, u32),
-    pub per_prefix:        (u32, u32),
-    pub allocate:          (u32, u32),
+    pub per_ip: (u32, u32),
+    pub per_prefix: (u32, u32),
+    pub allocate: (u32, u32),
     pub create_permission: (u32, u32),
-    pub channel_bind:      (u32, u32),
+    pub channel_bind: (u32, u32),
 }
 
 impl Default for TieredLimits {
     fn default() -> Self {
         Self {
             // Cheap data-plane gate: generous.
-            per_ip:            (10_000, 50_000),
+            per_ip: (10_000, 50_000),
             // A /24 or /48 as a whole gets a higher aggregate ceiling.
-            per_prefix:        (40_000, 200_000),
+            per_prefix: (40_000, 200_000),
             // Expensive control-plane methods: strict, per source IP.
-            allocate:          (32, 16),
+            allocate: (32, 16),
             create_permission: (128, 64),
-            channel_bind:      (128, 64),
+            channel_bind: (128, 64),
         }
     }
 }
 
 /// Per-IP + per-prefix + per-method rate limiting.
 pub struct TieredRateLimiter {
-    per_ip:            ShardedRateLimiter,
-    per_prefix:        ShardedRateLimiter,
-    allocate:          ShardedRateLimiter,
+    per_ip: ShardedRateLimiter,
+    per_prefix: ShardedRateLimiter,
+    allocate: ShardedRateLimiter,
     create_permission: ShardedRateLimiter,
-    channel_bind:      ShardedRateLimiter,
+    channel_bind: ShardedRateLimiter,
 }
 
 impl TieredRateLimiter {
     pub fn new(limits: TieredLimits) -> Self {
         Self {
-            per_ip:            ShardedRateLimiter::new(limits.per_ip.0, limits.per_ip.1),
-            per_prefix:        ShardedRateLimiter::new(limits.per_prefix.0, limits.per_prefix.1),
-            allocate:          ShardedRateLimiter::new(limits.allocate.0, limits.allocate.1),
-            create_permission: ShardedRateLimiter::new(limits.create_permission.0, limits.create_permission.1),
-            channel_bind:      ShardedRateLimiter::new(limits.channel_bind.0, limits.channel_bind.1),
+            per_ip: ShardedRateLimiter::new(limits.per_ip.0, limits.per_ip.1),
+            per_prefix: ShardedRateLimiter::new(limits.per_prefix.0, limits.per_prefix.1),
+            allocate: ShardedRateLimiter::new(limits.allocate.0, limits.allocate.1),
+            create_permission: ShardedRateLimiter::new(
+                limits.create_permission.0,
+                limits.create_permission.1,
+            ),
+            channel_bind: ShardedRateLimiter::new(limits.channel_bind.0, limits.channel_bind.1),
         }
     }
 
@@ -234,15 +239,21 @@ impl TieredRateLimiter {
 
     /// Per-source-IP gate for the (expensive) Allocate method.
     #[inline]
-    pub fn check_allocate(&self, ip: IpAddr) -> bool { self.allocate.check(ip) }
+    pub fn check_allocate(&self, ip: IpAddr) -> bool {
+        self.allocate.check(ip)
+    }
 
     /// Per-source-IP gate for CreatePermission.
     #[inline]
-    pub fn check_create_permission(&self, ip: IpAddr) -> bool { self.create_permission.check(ip) }
+    pub fn check_create_permission(&self, ip: IpAddr) -> bool {
+        self.create_permission.check(ip)
+    }
 
     /// Per-source-IP gate for ChannelBind.
     #[inline]
-    pub fn check_channel_bind(&self, ip: IpAddr) -> bool { self.channel_bind.check(ip) }
+    pub fn check_channel_bind(&self, ip: IpAddr) -> bool {
+        self.channel_bind.check(ip)
+    }
 
     /// Cleanup all tiers (call periodically from a maintenance task).
     pub fn cleanup(&self, max_age_secs: f64) {
@@ -258,12 +269,17 @@ impl TieredRateLimiter {
 mod tiered_tests {
     use super::*;
 
-    fn ip(s: &str) -> IpAddr { s.parse().unwrap() }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn prefix_masks_correctly() {
         assert_eq!(aggregation_prefix(ip("203.0.113.45")), ip("203.0.113.0"));
-        assert_eq!(aggregation_prefix(ip("2001:db8:abcd:1234::1")), ip("2001:db8:abcd::"));
+        assert_eq!(
+            aggregation_prefix(ip("2001:db8:abcd:1234::1")),
+            ip("2001:db8:abcd::")
+        );
     }
 
     #[test]
@@ -286,12 +302,15 @@ mod tiered_tests {
         // Tiny prefix budget; per-IP budget large. Distinct IPs in one /24
         // must still trip the prefix limiter.
         let rl = TieredRateLimiter::new(TieredLimits {
-            per_ip:     (1_000, 0),
+            per_ip: (1_000, 0),
             per_prefix: (2, 0),
             ..Default::default()
         });
         assert!(rl.check_ingress(ip("203.0.113.1")));
         assert!(rl.check_ingress(ip("203.0.113.2")));
-        assert!(!rl.check_ingress(ip("203.0.113.3")), "prefix budget exhausted");
+        assert!(
+            !rl.check_ingress(ip("203.0.113.3")),
+            "prefix budget exhausted"
+        );
     }
 }

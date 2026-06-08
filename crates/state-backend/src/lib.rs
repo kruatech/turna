@@ -32,8 +32,8 @@ pub mod memory;
 #[cfg(feature = "tarantool")]
 pub mod tarantool;
 
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -60,56 +60,56 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredAllocation {
-    pub id:             String,
-    pub relay_port:     u16,
-    pub client_addr:    String,
-    pub relay_addr:     String,
-    pub user_id:        String,
-    pub realm:          String,
-    pub node_id:        String,
-    pub created_at_ms:  u64,
-    pub expires_at_ms:  u64,
-    pub bytes_in:       u64,
-    pub bytes_out:      u64,
-    pub packets_in:     u64,
-    pub packets_out:    u64,
-    pub permissions:    Vec<String>,
-    pub channels:       Vec<StoredChannel>,
+    pub id: String,
+    pub relay_port: u16,
+    pub client_addr: String,
+    pub relay_addr: String,
+    pub user_id: String,
+    pub realm: String,
+    pub node_id: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub packets_in: u64,
+    pub packets_out: u64,
+    pub permissions: Vec<String>,
+    pub channels: Vec<StoredChannel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredChannel {
-    pub number:       u16,
-    pub peer_addr:    String,
+    pub number: u16,
+    pub peer_addr: String,
     pub expires_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeHeartbeat {
-    pub node_id:             String,
-    pub addr:                String,
-    pub active_allocations:  u64,
+    pub node_id: String,
+    pub addr: String,
+    pub active_allocations: u64,
     pub total_bandwidth_bps: u64,
-    pub cpu_usage_pct:       f32,
-    pub memory_usage_pct:    f32,
-    pub uptime_secs:         u64,
-    pub version:             String,
-    pub last_seen_ms:        u64,
-    pub draining:            bool,
+    pub cpu_usage_pct: f32,
+    pub memory_usage_pct: f32,
+    pub uptime_secs: u64,
+    pub version: String,
+    pub last_seen_ms: u64,
+    pub draining: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredRoom {
-    pub room_id:       String,
-    pub participants:  Vec<StoredParticipant>,
+    pub room_id: String,
+    pub participants: Vec<StoredParticipant>,
     pub created_at_ms: u64,
-    pub recording:     bool,
+    pub recording: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredParticipant {
-    pub peer_id:      String,
-    pub node_id:      String,
+    pub peer_id: String,
+    pub node_id: String,
     pub display_name: Option<String>,
     pub joined_at_ms: u64,
 }
@@ -151,18 +151,33 @@ impl Backend {
     pub async fn find_expired(&self, before_ms: u64) -> Result<Vec<StoredAllocation>> {
         dispatch!(self, find_expired, before_ms)
     }
-    pub async fn list_allocations(&self, offset: usize, limit: usize) -> Result<Vec<StoredAllocation>> {
+    pub async fn list_allocations(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<StoredAllocation>> {
         dispatch!(self, list_allocations, offset, limit)
     }
     pub async fn count_allocations(&self) -> Result<u64> {
         dispatch!(self, count_allocations)
     }
     pub async fn update_bandwidth(
-        &self, relay_port: u16,
-        bytes_in: u64, bytes_out: u64,
-        packets_in: u64, packets_out: u64,
+        &self,
+        relay_port: u16,
+        bytes_in: u64,
+        bytes_out: u64,
+        packets_in: u64,
+        packets_out: u64,
     ) -> Result<()> {
-        dispatch!(self, update_bandwidth, relay_port, bytes_in, bytes_out, packets_in, packets_out)
+        dispatch!(
+            self,
+            update_bandwidth,
+            relay_port,
+            bytes_in,
+            bytes_out,
+            packets_in,
+            packets_out
+        )
     }
     pub async fn heartbeat(&self, hb: &NodeHeartbeat) -> Result<()> {
         dispatch!(self, heartbeat, hb)
@@ -180,31 +195,37 @@ impl Backend {
         dispatch!(self, remove_room, room_id)
     }
 
-    pub async fn revoke_token(&self, jti: &str, sub: &str, revoked_at_ms: u64, expires_at_ms: u64) -> Result<()> {
+    pub async fn revoke_token(
+        &self,
+        jti: &str,
+        sub: &str,
+        revoked_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<()> {
         match self {
             Backend::Tarantool(b) => b.revoke_token(jti, sub, revoked_at_ms, expires_at_ms).await,
-            Backend::Memory(_)    => Ok(()),
+            Backend::Memory(_) => Ok(()),
         }
     }
 
     pub async fn is_token_revoked(&self, jti: &str) -> Result<bool> {
         match self {
             Backend::Tarantool(b) => b.is_token_revoked(jti).await,
-            Backend::Memory(_)    => Ok(false),
+            Backend::Memory(_) => Ok(false),
         }
     }
 
     pub async fn cleanup_revoked_tokens(&self, before_ms: u64) -> Result<u64> {
         match self {
             Backend::Tarantool(b) => b.cleanup_revoked_tokens(before_ms).await,
-            Backend::Memory(_)    => Ok(0),
+            Backend::Memory(_) => Ok(0),
         }
     }
 
     pub async fn load_active_revocations(&self, after_ms: u64) -> Result<Vec<(String, u64)>> {
         match self {
             Backend::Tarantool(b) => b.load_active_revocations(after_ms).await,
-            Backend::Memory(_)    => Ok(vec![]),
+            Backend::Memory(_) => Ok(vec![]),
         }
     }
 
@@ -231,11 +252,17 @@ impl Backend {
     /// on without disturbing the state.
     pub async fn claim_allocation(
         &self,
-        relay_port:        u16,
-        expected_node_id:  &str,
-        new_node_id:       &str,
+        relay_port: u16,
+        expected_node_id: &str,
+        new_node_id: &str,
     ) -> Result<bool> {
-        dispatch!(self, claim_allocation, relay_port, expected_node_id, new_node_id)
+        dispatch!(
+            self,
+            claim_allocation,
+            relay_port,
+            expected_node_id,
+            new_node_id
+        )
     }
 }
 
@@ -283,7 +310,9 @@ pub enum BackendConfig {
 pub const DEFAULT_POOL_SIZE: usize = 8;
 
 impl Default for BackendConfig {
-    fn default() -> Self { Self::Memory }
+    fn default() -> Self {
+        Self::Memory
+    }
 }
 
 pub async fn create_backend(config: &BackendConfig) -> Result<Backend> {

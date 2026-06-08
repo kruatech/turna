@@ -52,17 +52,23 @@ fn allocations_freed_after_cleanup() {
 
     // Заполняем полностью
     for i in 0..5u16 {
-        store.create(client(2000 + i), relay(49200 + i), "u".into(), vec![], 0)
+        store
+            .create(client(2000 + i), relay(49200 + i), "u".into(), vec![], 0)
             .unwrap();
     }
     assert_eq!(store.len(), 5);
 
     // lifetime=0 → сразу expired
     store.cleanup_expired();
-    assert_eq!(store.len(), 0, "all zero-lifetime allocations should be cleaned");
+    assert_eq!(
+        store.len(),
+        0,
+        "all zero-lifetime allocations should be cleaned"
+    );
 
     // Теперь можем создать снова
-    store.create(client(3000), relay(49200), "u2".into(), vec![], 600)
+    store
+        .create(client(3000), relay(49200), "u2".into(), vec![], 600)
         .expect("should succeed after cleanup");
     assert_eq!(store.len(), 1);
 }
@@ -78,7 +84,14 @@ fn per_user_limit_enforced() {
 
     // 3 аллокации от одного пользователя — ок
     for i in 0..3u16 {
-        store.create(client(4000 + i), relay(49300 + i), "alice".into(), vec![], 600)
+        store
+            .create(
+                client(4000 + i),
+                relay(49300 + i),
+                "alice".into(),
+                vec![],
+                600,
+            )
             .expect("first 3 must succeed");
     }
 
@@ -87,7 +100,8 @@ fn per_user_limit_enforced() {
     assert!(err.is_err(), "4th allocation for same user must fail");
 
     // Другой пользователь — может
-    store.create(client(5000), relay(49304), "bob".into(), vec![], 600)
+    store
+        .create(client(5000), relay(49304), "bob".into(), vec![], 600)
         .expect("different user must succeed");
 
     assert_eq!(store.user_allocation_count("alice"), 3);
@@ -102,7 +116,9 @@ fn port_allocator_never_exceeds_range() {
     for i in 0..10u16 {
         let port = store.ports.allocate().expect("port must be available");
         assert!(port >= 50000 && port <= 50009, "port {port} out of range");
-        store.create(client(6000 + i), relay(port), "u".into(), vec![], 600).unwrap();
+        store
+            .create(client(6000 + i), relay(port), "u".into(), vec![], 600)
+            .unwrap();
     }
     assert_eq!(store.available_port_count(), 0);
     assert!(store.ports.allocate().is_err(), "must fail when exhausted");
@@ -116,13 +132,17 @@ fn port_allocator_recycles_after_release() {
         let port = store.ports.allocate().unwrap();
         let r = relay(port);
         relays.push(r);
-        store.create(client(8000 + i), r, "u".into(), vec![], 600).unwrap();
+        store
+            .create(client(8000 + i), r, "u".into(), vec![], 600)
+            .unwrap();
     }
     assert_eq!(store.available_port_count(), 0);
     store.remove(&client(8000), relays[0]).unwrap();
     assert_eq!(store.available_port_count(), 1);
     let port = store.ports.allocate().unwrap();
-    store.create(client(9000), relay(port), "u".into(), vec![], 600).unwrap();
+    store
+        .create(client(9000), relay(port), "u".into(), vec![], 600)
+        .unwrap();
     assert_eq!(store.available_port_count(), 0);
 }
 
@@ -135,7 +155,9 @@ fn bandwidth_quota_enforced() {
         max_per_user: 0,
     });
 
-    store.create(client(9000), relay(52000), "u".into(), vec![], 600).unwrap();
+    store
+        .create(client(9000), relay(52000), "u".into(), vec![], 600)
+        .unwrap();
 
     let alloc = store.get(&client(9000)).unwrap();
 
@@ -145,8 +167,10 @@ fn bandwidth_quota_enforced() {
 
     // Добавляем ещё 600 — превышаем 1000
     alloc.add_bytes(600);
-    assert!(alloc.check_bandwidth(1000).is_err(),
-        "must reject when bytes in window exceed quota");
+    assert!(
+        alloc.check_bandwidth(1000).is_err(),
+        "must reject when bytes in window exceed quota"
+    );
 }
 
 // ── Write-behind channel backpressure ─────────────────────────────────────────
@@ -170,5 +194,8 @@ async fn dropped_writes_bounded_counter() {
 
     // Счётчик не должен уменьшаться
     let dropped2 = store.dropped_writes_count();
-    assert!(dropped2 >= dropped, "drop counter must be monotonically non-decreasing");
+    assert!(
+        dropped2 >= dropped,
+        "drop counter must be monotonically non-decreasing"
+    );
 }

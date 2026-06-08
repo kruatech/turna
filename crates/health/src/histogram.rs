@@ -25,8 +25,8 @@ pub struct Histogram {
     help: String,
     buckets: Vec<f64>,
     counts: Vec<AtomicU64>,
-    sum: AtomicU64,     // sum in nanoseconds
-    count: AtomicU64,   // total observations
+    sum: AtomicU64,   // sum in nanoseconds
+    count: AtomicU64, // total observations
 }
 
 impl Histogram {
@@ -47,7 +47,8 @@ impl Histogram {
     pub fn observe(&self, value: Duration) {
         let secs = value.as_secs_f64();
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(value.as_nanos() as u64, Ordering::Relaxed);
+        self.sum
+            .fetch_add(value.as_nanos() as u64, Ordering::Relaxed);
 
         // Increment all buckets where value <= boundary
         for (i, &boundary) in self.buckets.iter().enumerate() {
@@ -74,10 +75,7 @@ impl Histogram {
         }
 
         let total = self.counts[self.buckets.len()].load(Ordering::Relaxed);
-        out.push_str(&format!(
-            "{}_bucket{{le=\"+Inf\"}} {}\n",
-            self.name, total
-        ));
+        out.push_str(&format!("{}_bucket{{le=\"+Inf\"}} {}\n", self.name, total));
 
         let sum_ns = self.sum.load(Ordering::Relaxed);
         out.push_str(&format!(
@@ -104,7 +102,11 @@ impl Histogram {
 
     pub fn avg_seconds(&self) -> f64 {
         let c = self.count.load(Ordering::Relaxed);
-        if c == 0 { 0.0 } else { self.sum_seconds() / c as f64 }
+        if c == 0 {
+            0.0
+        } else {
+            self.sum_seconds() / c as f64
+        }
     }
 }
 
@@ -261,8 +263,8 @@ mod tests {
     fn observe_and_count() {
         let h = Histogram::new("test", "help", vec![0.001, 0.01, 0.1]);
         h.observe(Duration::from_micros(500)); // 0.0005s → bucket 0.001
-        h.observe(Duration::from_millis(5));   // 0.005s → bucket 0.01
-        h.observe(Duration::from_millis(50));  // 0.05s → bucket 0.1
+        h.observe(Duration::from_millis(5)); // 0.005s → bucket 0.01
+        h.observe(Duration::from_millis(50)); // 0.05s → bucket 0.1
 
         assert_eq!(h.total_count(), 3);
     }
@@ -292,8 +294,14 @@ mod tests {
     #[test]
     fn registry_observe_render() {
         let reg = HistogramRegistry::new();
-        reg.observe("turna_stun_request_duration_seconds", Duration::from_micros(100));
-        reg.observe("turna_stun_request_duration_seconds", Duration::from_millis(1));
+        reg.observe(
+            "turna_stun_request_duration_seconds",
+            Duration::from_micros(100),
+        );
+        reg.observe(
+            "turna_stun_request_duration_seconds",
+            Duration::from_millis(1),
+        );
 
         let output = reg.render_prometheus();
         assert!(output.contains("turna_stun_request_duration_seconds_count 2"));

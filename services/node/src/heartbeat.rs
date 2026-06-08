@@ -24,8 +24,8 @@
 //!   peers immediately know we're going away rather than waiting for
 //!   our heartbeat to age out — important for fast failover.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
@@ -40,39 +40,40 @@ use turna_state_backend::{Backend, NodeHeartbeat};
 /// Configuration for the heartbeat task.
 #[derive(Debug, Clone)]
 pub struct HeartbeatConfig {
-    pub node_id:  String,
+    pub node_id: String,
     /// Address other nodes should use to reach us. Typically
     /// `external_ip:turn_port`. Used by PR 5 failover to know where the
     /// (now-dead) node's clients were routed.
-    pub addr:     String,
-    pub version:  String,
+    pub addr: String,
+    pub version: String,
     pub interval: Duration,
 }
 
-/// Default tick interval. 5s gives ~6 misses per 30s `max_age` window
-/// before a peer concludes we're dead — comfortable margin for network
-/// hiccups and Tarantool transient errors.
-pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+/// Default tick interval — 1s. Paired with the failover live window (default
+/// 3s) and the suspicion debounce, this gives ~5s failover detection while
+/// tolerating a dropped beat. Overridable via `[cluster.failure_detection]`.
+#[allow(dead_code)]
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 
 fn build_heartbeat(
-    cfg:      &HeartbeatConfig,
-    metrics:  &Metrics,
+    cfg: &HeartbeatConfig,
+    metrics: &Metrics,
     draining: bool,
-    cpu_pct:  f32,
-    mem_pct:  f32,
-    bw_bps:   u64,
+    cpu_pct: f32,
+    mem_pct: f32,
+    bw_bps: u64,
 ) -> NodeHeartbeat {
     NodeHeartbeat {
-        node_id:    cfg.node_id.clone(),
-        addr:       cfg.addr.clone(),
-        active_allocations:  metrics.active_allocations.load(Ordering::Relaxed),
+        node_id: cfg.node_id.clone(),
+        addr: cfg.addr.clone(),
+        active_allocations: metrics.active_allocations.load(Ordering::Relaxed),
         total_bandwidth_bps: bw_bps,
-        cpu_usage_pct:       cpu_pct,
-        memory_usage_pct:    mem_pct,
-        uptime_secs:         metrics.start_time.elapsed().as_secs(),
-        version:             cfg.version.clone(),
-        last_seen_ms:        epoch_ms(),
-        draining:            draining || metrics.is_draining(),
+        cpu_usage_pct: cpu_pct,
+        memory_usage_pct: mem_pct,
+        uptime_secs: metrics.start_time.elapsed().as_secs(),
+        version: cfg.version.clone(),
+        last_seen_ms: epoch_ms(),
+        draining: draining || metrics.is_draining(),
     }
 }
 
@@ -100,9 +101,9 @@ fn sample_resources() -> (f32, f32) {
 /// if the backend has been failing recently — best-effort, but we still
 /// try.
 pub async fn run_heartbeat(
-    backend:        Arc<Backend>,
-    metrics:        Arc<Metrics>,
-    cfg:            HeartbeatConfig,
+    backend: Arc<Backend>,
+    metrics: Arc<Metrics>,
+    cfg: HeartbeatConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     info!(
@@ -199,7 +200,7 @@ mod tests {
     fn make_cfg() -> HeartbeatConfig {
         HeartbeatConfig {
             node_id: "test-node".into(),
-            addr:    "127.0.0.1:3478".into(),
+            addr: "127.0.0.1:3478".into(),
             version: "0.1.0-test".into(),
             interval: Duration::from_millis(30),
         }
@@ -226,12 +227,15 @@ mod tests {
         // Wait long enough for at least 2 ticks (30ms each).
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let live = backend.get_live_nodes(Duration::from_secs(10)).await.unwrap();
+        let live = backend
+            .get_live_nodes(Duration::from_secs(10))
+            .await
+            .unwrap();
         assert_eq!(live.len(), 1, "exactly one node should be live");
         assert_eq!(live[0].node_id, "test-node");
-        assert_eq!(live[0].addr,    "127.0.0.1:3478");
+        assert_eq!(live[0].addr, "127.0.0.1:3478");
         assert_eq!(live[0].version, "0.1.0-test");
-        assert!(!live[0].draining,  "live node must not be draining");
+        assert!(!live[0].draining, "live node must not be draining");
 
         sd_tx.send(true).unwrap();
         handle.await.unwrap();
@@ -261,10 +265,15 @@ mod tests {
         sd_tx.send(true).unwrap();
         handle.await.unwrap();
 
-        let live = backend.get_live_nodes(Duration::from_secs(10)).await.unwrap();
+        let live = backend
+            .get_live_nodes(Duration::from_secs(10))
+            .await
+            .unwrap();
         assert_eq!(live.len(), 1, "shutdown should still produce a record");
-        assert!(live[0].draining,
-                "final heartbeat must mark the node as draining");
+        assert!(
+            live[0].draining,
+            "final heartbeat must mark the node as draining"
+        );
     }
 
     /// `active_allocations` reflects the live `Metrics` value at the
@@ -284,15 +293,23 @@ mod tests {
 
         // Let one heartbeat go through with 0 allocations.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let first = backend.get_live_nodes(Duration::from_secs(10)).await.unwrap();
+        let first = backend
+            .get_live_nodes(Duration::from_secs(10))
+            .await
+            .unwrap();
         assert_eq!(first[0].active_allocations, 0);
 
         // Bump the gauge, wait for the next tick.
         metrics.active_allocations.store(42, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let second = backend.get_live_nodes(Duration::from_secs(10)).await.unwrap();
-        assert_eq!(second[0].active_allocations, 42,
-                   "tick must read current metric value, not startup snapshot");
+        let second = backend
+            .get_live_nodes(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            second[0].active_allocations, 42,
+            "tick must read current metric value, not startup snapshot"
+        );
 
         sd_tx.send(true).unwrap();
         handle.await.unwrap();
@@ -314,14 +331,22 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_millis(40)).await;
-        let before = backend.get_live_nodes(Duration::from_secs(10)).await.unwrap();
+        let before = backend
+            .get_live_nodes(Duration::from_secs(10))
+            .await
+            .unwrap();
         assert!(!before[0].draining);
 
         metrics.set_draining(true);
         tokio::time::sleep(Duration::from_millis(60)).await;
-        let after = backend.get_live_nodes(Duration::from_secs(10)).await.unwrap();
-        assert!(after[0].draining,
-                "Metrics::set_draining must show up in subsequent heartbeats");
+        let after = backend
+            .get_live_nodes(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            after[0].draining,
+            "Metrics::set_draining must show up in subsequent heartbeats"
+        );
 
         sd_tx.send(true).unwrap();
         handle.await.unwrap();

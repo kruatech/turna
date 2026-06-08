@@ -75,3 +75,20 @@ sysctls:
       value: "8388608"
     - name: net.core.wmem_max
       value: "8388608"
+
+# Multi-node cluster (gossip discovery + TURN-redirect load balancing).
+# When enabled, the TURN workload is deployed as a StatefulSet (stable per-pod
+# node_id) with a headless Service for gossip, instead of a Deployment.
+cluster:
+  enabled: false
+  name: "turna"            # cluster identity; MUST match across all pods
+  replicas: 3
+  gossipPort: 7946
+  gossipIntervalSecs: 2
+  gossipTimeoutSecs: 30
+  drainGraceSecs: 5
+  # Shared HMAC secret for gossip authentication. Strongly recommended in any
+  # shared network. Prefer `existingSecret` (a Secret containing key
+  # `cluster-secret`) over the inline `secret`.
+  secret: ""
+  existingSecret: ""

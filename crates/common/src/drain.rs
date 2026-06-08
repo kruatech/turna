@@ -111,7 +111,11 @@ impl DrainOrchestrator {
         let deadline = tokio::time::Instant::now() + self.config.timeout;
         let mut last_count = get_allocation_count();
 
-        info!(allocations = last_count, timeout_secs = self.config.timeout.as_secs(), "waiting for allocations to close");
+        info!(
+            allocations = last_count,
+            timeout_secs = self.config.timeout.as_secs(),
+            "waiting for allocations to close"
+        );
 
         loop {
             tokio::time::sleep(self.config.poll_interval).await;
@@ -128,7 +132,10 @@ impl DrainOrchestrator {
             }
 
             if tokio::time::Instant::now() >= deadline {
-                warn!(remaining = count, "drain timeout, force-closing remaining allocations");
+                warn!(
+                    remaining = count,
+                    "drain timeout, force-closing remaining allocations"
+                );
                 break;
             }
         }
@@ -177,7 +184,9 @@ impl DrainOrchestrator {
                      Content-Type: application/json\r\n\
                      Content-Length: {}\r\n\
                      Connection: close\r\n\r\n{}",
-                    url, body.len(), body,
+                    url,
+                    body.len(),
+                    body,
                 );
                 let _ = stream.write_all(request.as_bytes()).await;
                 info!("signaling notified successfully");

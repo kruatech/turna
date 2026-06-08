@@ -11,17 +11,19 @@
 
 | Категория | Кол-во блоков | Что это значит |
 |---|---|---|
-| ✓ **SAFETY** (обоснован) | ~75 | Инварианты ясны из контекста; задокументированы прямо в коде через `// SAFETY: ...`. |
-| ⚠ **NEEDS-REVIEW** | 15 | Корректность зависит от инвариантов, которые из исходника не видны. Нужен экспертный взгляд или дополнительные тесты. |
-| ✗ **SUSPECT** | 9 | Виден конкретный риск UB / data race / unbounded behaviour. Перед production-деплоем чинить. |
+| ✓ **SAFETY** (обоснован) | ~76 | Инварианты ясны из контекста; задокументированы прямо в коде через `// SAFETY: ...`. |
+| ⚠ **NEEDS-REVIEW** | 14 | Корректность зависит от инвариантов, которые из исходника не видны. Нужен экспертный взгляд или дополнительные тесты. |
+| ✓ **SUSPECT (исправлены)** | 9 | Виден был конкретный риск UB / data race. **Все 9 исправлены** до P0 (`summary.suspect_fixed = 9` в `unsafe-inventory.json`); этот раздел — историческая запись находок, а не открытый список. |
 
-**Топ-3 находки, требующие немедленного внимания:**
+> Статус на момент P0: 9 SUSPECT закрыты (см. ниже), USF-008 (overflow в `Umem::new`) исправлен, инвариант `Sync` у `Umem` задокументирован. Открытыми остаются NEEDS-REVIEW, не дающие прямого UB.
 
-1. **ABA race в `HugePagePool` Treiber stack** (`hugepages.rs:130, 137, 160`) — классический use-after-free под нагрузкой.
-2. **`Umem::frame_slice/frame_slice_mut` без bounds-чека** (`af_xdp.rs:167-174`) — OOB чтение/запись из mmap'd региона.
-3. **Self-referential `MsgHdrStorage` без гарантии стабильности места** (`uring.rs:65-100`) — работает только потому, что `Vec` пред-аллоцирован один раз; невидимый инвариант.
+**Топ-3 находки (все ИСПРАВЛЕНЫ — историческая запись):**
 
-Остальные SUSPECT-находки описаны ниже.
+1. ✓ **ABA race в `HugePagePool` Treiber stack** (`hugepages.rs`) — *исправлено (USF-001)*: Treiber CAS-стек заменён на `Mutex<Vec<usize>>`, `Drop` ассертит отсутствие активных буферов перед `munmap`.
+2. ✓ **`Umem::frame_slice/frame_slice_mut` без bounds-чека** (`af_xdp.rs`) — *исправлено (USF-002/#2)*: `checked_add` + `assert` на границы перед доступом.
+3. ✓ **Self-referential `MsgHdrStorage` без гарантии стабильности места** (`uring.rs`) — *исправлено (USF-003/#3)*: `Vec<MsgHdrStorage>` → `Box<[MsgHdrStorage]>`, адреса стабильны на всё время жизни `UringEngine`.
+
+Полный список SUSPECT и их статус — в `unsafe-inventory.json` (`suspect_fixed = 9`).
 
 ---
 
@@ -261,7 +263,7 @@ pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
 | 1 | `uring.rs:213,229,275,302` | `submission().push(&entry)` | Корректность зависит от того, живёт ли `msghdr` (на который указывает entry) до завершения операции. В коде это держится через `Vec` + slot-индекс, но нет механизма «slot busy». Если slot переиспользовать до completion — UB. |
 | 2 | `splice.rs:155-237` | `splice_relay` через `spawn_blocking` | `client_fd` / `peer_fd` передаются в blocking-task. Если в это время родительский async-таск уронит сокет — fd валиден до конца blocking, но семантика «owner» неясна. |
 | 3 | `graceful.rs:169,180` | `File::from_raw_fd(fd)` + `mem::forget(f)` | Идиома для «передать fd обратно вызывающему». Корректна, но `mem::forget` блокирует RAII — если позже забыть закрыть fd, leak. |
-| 5 | `af_xdp.rs:105-106` | `unsafe impl Send/Sync for Umem` | Send OK (raw ptr принадлежит структуре). Sync через `&Umem.frame_slice` отдаёт `&[u8]` на mmap-область, которая параллельно может модифицироваться kernel'ом (DMA). По модели Rust это нарушение Sync. NEEDS-REVIEW: возможно нужно вообще убрать Sync. |
+| 5 | `af_xdp.rs` | `unsafe impl Send/Sync for Umem` | **RESOLVED (P0):** `Send` обоснован (структура единолично владеет mmap-областью). `Sync` теперь снабжён строгим SAFETY-инвариантом (доступ к кадру только после dequeue из RX-ring и до refill, без алиасинга — протокол владения кадрами AF_XDP). Плюс `Umem` владеется по значению одним сокетом и не шарится как `&Umem` между потоками, так что `Sync` при желании можно вообще убрать. Также исправлен USF-008 (overflow в `Umem::new`). |
 | 6 | `worker.rs:329-335` | `pin_to_core` через `sched_setaffinity` | Стандартный pattern, но `CPU_SET` — macro libc, в Rust обёртка делает write через `set_bit`. Если cpuset не достаточен (на машине больше CPU, чем размер `cpu_set_t`) — silent truncation. На современных Linux это >1024 CPU, маловероятно. |
 | 7 | `hugepages.rs:71-72` | `unsafe impl Send/Sync for HugePagePool` | Если ABA-проблема (см. SUSPECT #1) реальна, lock-free свойство неверно — Sync impl становится ложным. |
 
@@ -290,7 +292,7 @@ pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
 | Файл | Строки | unsafe-блоков | SAFETY | NEEDS-REVIEW | SUSPECT |
 |---|---|---|---|---|---|
 | transport/hugepages.rs | 421 | 18 | 13 | 1 | **4** |
-| transport/af_xdp.rs | 533 | 17 | 13 | 2 | 2 |
+| transport/af_xdp.rs | 533 | 17 | 14 | 1 | 2 |
 | relay/splice.rs | 288 | 15 | 14 | 1 | 0 |
 | transport/uring.rs | 354 | 9 | 7 | 1 | 1 |
 | transport/gso.rs | 295 | 7 | 6 | 0 | 1 |
@@ -304,7 +306,7 @@ pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
 | relay/processor.rs | 577 | 1 | 1 (doc only) | 0 | 0 |
 | xdp/lib.rs | 228 | 1 | 1 | 0 | 0 |
 | xdp/program.rs | 137 | 1 | 1 | 0 | 0 |
-| **Итого** | **5337** | **99** | **~75** | **15** | **9** |
+| **Итого** | **5337** | **99** | **~76** | **14** | **9 (исправлены)** |
 
 (Распределение приблизительное — multi-line блоки иногда содержат несколько отдельных unsafe-операций; точные числа в коде через комментарии `// SAFETY/NEEDS-REVIEW/SUSPECT:`.)
 

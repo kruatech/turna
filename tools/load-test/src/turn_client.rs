@@ -50,7 +50,11 @@ pub enum Creds {
     /// password = base64(HMAC-SHA1(secret, username)).
     /// Understood by turna (SharedSecret), coturn (use-auth-secret) and
     /// eturnal (secret), and by our bench pion server's auth handler.
-    Rest { secret: String, uid: String, ttl_s: u64 },
+    Rest {
+        secret: String,
+        uid: String,
+        ttl_s: u64,
+    },
 }
 
 impl Creds {
@@ -84,12 +88,24 @@ fn base64_std(data: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         out.push(TBL[(n >> 18) as usize & 63] as char);
         out.push(TBL[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TBL[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TBL[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TBL[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TBL[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -126,7 +142,8 @@ impl Msg {
 
     pub fn add(&mut self, typ: u16, val: &[u8]) {
         self.buf.extend_from_slice(&typ.to_be_bytes());
-        self.buf.extend_from_slice(&(val.len() as u16).to_be_bytes());
+        self.buf
+            .extend_from_slice(&(val.len() as u16).to_be_bytes());
         self.buf.extend_from_slice(val);
         while self.buf.len() % 4 != 0 {
             self.buf.push(0);
@@ -170,7 +187,8 @@ impl Msg {
         let mut mac = Hmac::<Sha1>::new_from_slice(key).unwrap();
         mac.update(&self.buf);
         let tag = mac.finalize().into_bytes();
-        self.buf.extend_from_slice(&A_MESSAGE_INTEGRITY.to_be_bytes());
+        self.buf
+            .extend_from_slice(&A_MESSAGE_INTEGRITY.to_be_bytes());
         self.buf.extend_from_slice(&20u16.to_be_bytes());
         self.buf.extend_from_slice(&tag);
         self.buf
@@ -216,12 +234,8 @@ fn xor_addr_decode(val: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
     match family {
         0x01 => {
             let m = MAGIC.to_be_bytes();
-            let ip = std::net::Ipv4Addr::new(
-                val[4] ^ m[0],
-                val[5] ^ m[1],
-                val[6] ^ m[2],
-                val[7] ^ m[3],
-            );
+            let ip =
+                std::net::Ipv4Addr::new(val[4] ^ m[0], val[5] ^ m[1], val[6] ^ m[2], val[7] ^ m[3]);
             Some(SocketAddr::new(IpAddr::V4(ip), port))
         }
         0x02 if val.len() >= 20 => {
@@ -358,9 +372,7 @@ pub async fn allocate(
     creds: &Creds,
     rtt_ms: u64,
 ) -> Result<Session, &'static str> {
-    let sock = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .map_err(|_| "bind")?;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.map_err(|_| "bind")?;
 
     // 1. Unauthenticated Allocate → expect 401 challenge (or success on
     //    a no-auth server).
@@ -409,8 +421,7 @@ pub async fn allocate(
             .await
             .ok_or("alloc: no response to authed request")?;
         if is_success(&resp) {
-            let relayed =
-                get_relayed_addr(&resp, &txid).ok_or("alloc: no relayed addr")?;
+            let relayed = get_relayed_addr(&resp, &txid).ok_or("alloc: no relayed addr")?;
             return Ok(Session {
                 sock,
                 server,
@@ -498,8 +509,6 @@ impl Session {
     /// Refresh with lifetime 0 releases the allocation server-side so
     /// repeated bench runs don't exhaust the relay port range.
     pub async fn release(&mut self) {
-        let _ = self
-            .auth_request(M_REFRESH, |m| m.add_lifetime(0))
-            .await;
+        let _ = self.auth_request(M_REFRESH, |m| m.add_lifetime(0)).await;
     }
 }

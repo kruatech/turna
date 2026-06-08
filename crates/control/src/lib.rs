@@ -24,9 +24,7 @@ pub mod grpc;
 pub mod turn_core_impl;
 
 pub use grpc::{
-    start_grpc_server,
-    AllocationEvent, AllocationInfo, ChannelInfo, ConfigUpdate,
-    CoreError, CurrentConfig, EventType, GrpcConfig, GrpcTlsConfig,
-    ServerStatsInfo, TopTalkerInfo, TurnCore,
+    start_grpc_server, AllocationEvent, AllocationInfo, ChannelInfo, ConfigUpdate, CoreError,
+    CurrentConfig, EventType, GrpcConfig, GrpcTlsConfig, ServerStatsInfo, TopTalkerInfo, TurnCore,
 };
 pub use turn_core_impl::TurnCoreImpl;

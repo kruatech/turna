@@ -1,7 +1,13 @@
-//! TLS/TCP Transport (TURNS — RFC 5766 over TLS, порт 5349/443)
+//! TLS/TCP Transport (TURNS — RFC 5766/8656 over TLS, порт 5349/443)
 //!
 //! - TLS acceptor на rustls с ALPN "stun.turn"
-//! - STUN-over-TCP framing (RFC 4571: 2-byte length prefix)
+//! - STUN/TURN-over-TCP framing: сообщения самоописываются.
+//!   * STUN — длина в заголовке (байты 2..4) + 20-байтовый заголовок
+//!     (RFC 5389/8489 §7.2.2 / §6.2.2; тело уже кратно 4).
+//!   * ChannelData — длина (байты 2..4) + 4-байтовый заголовок, с паддингом
+//!     до кратности 4 поверх TCP/TLS (RFC 5766/8656 §11.5).
+//!   НЕ RFC 4571 (тот — про RTP-over-TCP): стандартные TURN-клиенты
+//!   (браузерный WebRTC, coturn) не добавляют 2-байтовый префикс длины.
 //! - Certificate hot-reload по mtime
 //! - Connection limit, idle timeout
 //! - События совместимы с UDP-транспортом (PacketProcessor не знает о типе)
@@ -13,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use thiserror::Error;
@@ -22,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -42,6 +48,8 @@ pub enum TlsError {
     NoKey(PathBuf),
     #[error("frame too large: {size} (max {max})")]
     FrameTooLarge { size: usize, max: usize },
+    #[error("invalid TURN-over-TCP framing: leading byte 0x{0:02x}")]
+    InvalidFraming(u8),
     #[error("connection closed")]
     Closed,
     #[error("TLS handshake timeout ({0:?})")]
@@ -82,7 +90,15 @@ impl Default for TlsTransportConfig {
 }
 
 // ---------------------------------------------------------------------------
-// STUN-over-TCP Frame Codec (RFC 4571: 2-byte length prefix)
+// STUN/TURN-over-TCP Frame Codec
+//
+// Messages are self-delimiting; there is NO 2-byte length prefix. The first
+// two bits select the demultiplexing type (RFC 5389 §7.2.2):
+//   * 0b00 → STUN message: total length = 20-byte header + length@[2..4]
+//            (the length field already excludes the header and is a multiple of 4).
+//   * 0b01 → ChannelData: total length = 4-byte header + length@[2..4], padded
+//            up to a multiple of 4 over TCP/TLS (RFC 5766/8656 §11.5).
+// Anything else is not valid TURN-over-TCP and is treated as a framing error.
 // ---------------------------------------------------------------------------
 
 pub struct TcpFrameCodec {
@@ -94,28 +110,63 @@ impl TcpFrameCodec {
         Self { max_frame_size }
     }
 
-    pub fn decode(&self, buf: &mut BytesMut) -> Result<Option<BytesMut>> {
-        if buf.len() < 2 {
+    /// Compute the total on-wire length of the message starting at `buf`, or
+    /// `None` if fewer than 4 bytes are buffered (need the length field first).
+    fn frame_len(&self, buf: &[u8]) -> Result<Option<usize>> {
+        if buf.len() < 4 {
             return Ok(None);
         }
-        let length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if length > self.max_frame_size {
-            return Err(TlsError::FrameTooLarge { size: length, max: self.max_frame_size });
+        let body_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        let total = match buf[0] & 0xC0 {
+            // STUN: 20-byte header + body (body already padded to 4 by sender).
+            0x00 => 20 + body_len,
+            // ChannelData: 4-byte header + data, padded to a multiple of 4 over TCP.
+            0x40 => 4 + ((body_len + 3) & !3),
+            // 0b10 / 0b11 are not STUN nor ChannelData — not valid TURN framing.
+            _ => return Err(TlsError::InvalidFraming(buf[0])),
+        };
+        if total > self.max_frame_size {
+            return Err(TlsError::FrameTooLarge {
+                size: total,
+                max: self.max_frame_size,
+            });
         }
-        if buf.len() < 2 + length {
-            return Ok(None);
-        }
-        buf.advance(2);
-        Ok(Some(buf.split_to(length)))
+        Ok(Some(total))
     }
 
+    /// Try to split one complete message off the front of `buf`. Returns
+    /// `Ok(None)` if the buffer does not yet hold a full message.
+    pub fn decode(&self, buf: &mut BytesMut) -> Result<Option<BytesMut>> {
+        let total = match self.frame_len(buf)? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        if buf.len() < total {
+            return Ok(None);
+        }
+        Ok(Some(buf.split_to(total)))
+    }
+
+    /// Append `payload` to `buf` for sending. The payload is already a complete,
+    /// self-framed STUN or ChannelData message, so it is written verbatim — no
+    /// length prefix. ChannelData is padded up to a multiple of 4 (TCP/TLS only).
     pub fn encode(&self, payload: &[u8], buf: &mut BytesMut) -> Result<()> {
         if payload.len() > self.max_frame_size {
-            return Err(TlsError::FrameTooLarge { size: payload.len(), max: self.max_frame_size });
+            return Err(TlsError::FrameTooLarge {
+                size: payload.len(),
+                max: self.max_frame_size,
+            });
         }
-        buf.reserve(2 + payload.len());
-        buf.put_u16(payload.len() as u16);
+        let pad = if !payload.is_empty() && (payload[0] & 0xC0) == 0x40 {
+            (4 - (payload.len() & 3)) & 3
+        } else {
+            0
+        };
+        buf.reserve(payload.len() + pad);
         buf.put_slice(payload);
+        for _ in 0..pad {
+            buf.put_u8(0);
+        }
         Ok(())
     }
 }
@@ -280,10 +331,28 @@ async fn handle_conn(
 // TLS Helpers
 // ---------------------------------------------------------------------------
 
+/// Build a `ServerConfig` pinned to the `ring` crypto provider.
+///
+/// rustls 0.23's `ServerConfig::builder()` derives the crypto provider from the
+/// process-level default and panics if it cannot pick one — which happens when
+/// both `ring` and `aws-lc-rs` end up in the dependency graph via feature
+/// unification. Selecting the provider explicitly removes that ambiguity and
+/// needs no process-global `install_default()`.
+fn ring_server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Ok(ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?)
+}
+
 fn build_tls_config(cfg: &TlsTransportConfig) -> Result<ServerConfig> {
     let certs = load_certs(&cfg.cert_path)?;
     let key = load_key(&cfg.key_path)?;
-    let mut tls = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
+    let mut tls = ring_server_config(certs, key)?;
     if cfg.enable_alpn {
         tls.alpn_protocols = vec![b"stun.turn".to_vec(), b"stun.nat-discovery".to_vec()];
     }
@@ -357,7 +426,7 @@ impl CertReloader {
     fn reload(&self) -> Result<ServerConfig> {
         let certs = load_certs(&self.cert_path)?;
         let key = load_key(&self.key_path)?;
-        let mut tls = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
+        let mut tls = ring_server_config(certs, key)?;
         if self.enable_alpn {
             tls.alpn_protocols = vec![b"stun.turn".to_vec(), b"stun.nat-discovery".to_vec()];
         }
@@ -377,37 +446,125 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn codec_roundtrip() {
-        let codec = TcpFrameCodec::new(65535);
-        let mut buf = BytesMut::new();
-        codec.encode(b"hello STUN", &mut buf).unwrap();
-        let frame = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(&frame[..], b"hello STUN");
+    // Minimal STUN message: type(2) + length(2) + magic cookie(4) + txid(12) = 20
+    // header bytes, plus `body` bytes (body must already be 4-aligned).
+    fn stun_msg(body: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(20 + body.len());
+        m.extend_from_slice(&0x0001u16.to_be_bytes()); // Binding request (top 2 bits = 00)
+        m.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        m.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // magic cookie
+        m.extend_from_slice(&[0u8; 12]); // txid
+        m.extend_from_slice(body);
+        m
+    }
+
+    // ChannelData: channel(2, 0x4000..=0x7FFF) + length(2) + data + pad-to-4.
+    fn channel_data(channel: u16, data: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(4 + data.len());
+        m.extend_from_slice(&channel.to_be_bytes());
+        m.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        m.extend_from_slice(data);
+        while m.len() % 4 != 0 {
+            m.push(0);
+        }
+        m
     }
 
     #[test]
-    fn codec_partial() {
+    fn stun_roundtrip_no_prefix() {
         let codec = TcpFrameCodec::new(65535);
-        let mut buf = BytesMut::from(&[0x00, 0x0A][..]);
+        let msg = stun_msg(&[]); // 20-byte header, empty body
+        let mut buf = BytesMut::new();
+        codec.encode(&msg, &mut buf).unwrap();
+        assert_eq!(buf.len(), 20, "no length prefix must be added");
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(&frame[..], &msg[..]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn stun_with_body() {
+        let codec = TcpFrameCodec::new(65535);
+        let msg = stun_msg(&[1, 2, 3, 4]); // 24 bytes total
+        let mut buf = BytesMut::from(&msg[..]);
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.len(), 24);
+    }
+
+    #[test]
+    fn channeldata_padded() {
+        let codec = TcpFrameCodec::new(65535);
+        // 3 data bytes → padded to 4 → total 8.
+        let cd = channel_data(0x4000, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(cd.len(), 8);
+        let mut buf = BytesMut::from(&cd[..]);
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.len(), 8);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn channeldata_encode_pads() {
+        let codec = TcpFrameCodec::new(65535);
+        // Unpadded ChannelData (as produced for UDP): 4 hdr + 3 data = 7 bytes.
+        let mut unpadded = vec![0x40, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+        assert_eq!(unpadded.len(), 7);
+        let mut buf = BytesMut::new();
+        codec.encode(&unpadded, &mut buf).unwrap();
+        assert_eq!(buf.len(), 8, "ChannelData must be padded to 4 over TCP");
+        unpadded.clear();
+    }
+
+    #[test]
+    fn partial_header_returns_none() {
+        let codec = TcpFrameCodec::new(65535);
+        // Only the channel number, no length yet.
+        let mut buf = BytesMut::from(&[0x40, 0x00][..]);
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 
     #[test]
-    fn codec_too_large() {
-        let codec = TcpFrameCodec::new(100);
+    fn partial_body_returns_none() {
+        let codec = TcpFrameCodec::new(65535);
+        // STUN header claims 8-byte body but only 4 present.
         let mut buf = BytesMut::new();
-        assert!(codec.encode(&vec![0u8; 200], &mut buf).is_err());
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x08, 0x21, 0x12, 0xA4, 0x42]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 
     #[test]
-    fn codec_multi_frame() {
+    fn frame_too_large() {
+        let codec = TcpFrameCodec::new(64); // max 64 bytes
+        // STUN claiming a 1000-byte body.
+        let mut buf =
+            BytesMut::from(&[0x00, 0x01, 0x03, 0xE8, 0x21, 0x12, 0xA4, 0x42][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(TlsError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_leading_bits_rejected() {
         let codec = TcpFrameCodec::new(65535);
+        // 0b11xxxxxx leading byte is neither STUN nor ChannelData.
+        let mut buf = BytesMut::from(&[0xC0, 0x00, 0x00, 0x00][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(TlsError::InvalidFraming(0xC0))
+        ));
+    }
+
+    #[test]
+    fn multi_frame_back_to_back() {
+        let codec = TcpFrameCodec::new(65535);
+        let a = stun_msg(&[]); // 20
+        let b = channel_data(0x4001, &[1, 2, 3, 4]); // 8
         let mut buf = BytesMut::new();
-        codec.encode(b"AAA", &mut buf).unwrap();
-        codec.encode(b"BBB", &mut buf).unwrap();
-        assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"AAA");
-        assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"BBB");
+        buf.extend_from_slice(&a);
+        buf.extend_from_slice(&b);
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().len(), 20);
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().len(), 8);
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
 }

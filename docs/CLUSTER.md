@@ -37,6 +37,62 @@ ownership and rehydrates it locally.
 
 Detailed design is in `docs/design/allocation-store-persistence.md`.
 
+
+
+## Redirect-based horizontal scaling without an external LB
+
+`cluster_mode = true` enables the lightweight gossip + TURN redirect path for
+new clients:
+
+1. Every node announces itself **and its known-peer table** over UDP gossip
+   (anti-entropy), so nodes learn peers transitively even with incomplete seed
+   lists. Liveness is driven by a per-node `seq`: a live node's sequence keeps
+   advancing and propagates, refreshing `last_seen` cluster-wide; a dead node's
+   `seq` freezes everywhere and ages out after `gossip_timeout_secs`.
+2. Each node builds the same `HashRing` from live nodes. A **clean shutdown
+   broadcasts a `leaving` message** so peers drop the node immediately (like a
+   NATS route close); a node that *crashes* is removed after
+   `gossip_timeout_secs` once its `seq` stops advancing.
+3. For a STUN request from a client without a local allocation, the processor
+   hashes `client_ip:client_port` and picks the owner via **rendezvous (HRW)
+   hashing** — `argmax over nodes of xxh64(node_id || key)`. HRW remaps only
+   ~1/N of keys when a node joins/leaves, regardless of the node's id, so adding
+   a node never reshuffles unrelated clients.
+4. If the selected node is remote, the local node returns STUN/TURN error
+   `300 Try Alternate` with `ALTERNATE-SERVER` (plain MAPPED-ADDRESS format,
+   RFC 5389 §15.5) pointing at the selected node.
+5. Clients with an existing local allocation are never redirected, even if the
+   ring changes.
+
+Minimal two-node example:
+
+```toml
+[cluster]
+node_id = "node-a"
+cluster_mode = true
+cluster_name = "prod"                 # nodes only merge with the same name
+gossip_bind = "0.0.0.0:7946"
+gossip_seeds = ["10.0.0.12:7946"]
+gossip_advertise_addr = "10.0.0.11:7946"  # set behind NAT/k8s; else inferred
+gossip_interval_secs = 2
+gossip_timeout_secs = 30
+turn_announce_addr = "10.0.0.11:3478"
+cluster_secret = "change-me-shared-across-nodes"  # HMAC auth for gossip
+drain_grace_secs = 5                  # lame-duck window on shutdown
+```
+
+The same `cluster_name` and `cluster_secret` must be set on every node. An
+empty `cluster_secret` leaves gossip unauthenticated (a warning is logged); set
+it before exposing the gossip port to any untrusted network, otherwise a host
+that can reach the port can inject a node and redirect clients to it.
+
+On the second node, use a different `node_id`, swap the seed, and set
+`turn_announce_addr` to that node's externally reachable TURN address.
+
+This mode is independent of allocation persistence: you can use redirects for
+load distribution with the in-memory backend, and enable Tarantool persistence
+separately when you also need failover/rehydration.
+
 ## Architecture decisions worth knowing
 
 - **Write-behind, not write-through.** A failed Tarantool write doesn't
@@ -251,6 +307,39 @@ preemptively claim — no 30-second wait.
    Not strictly necessary — it just keeps `turna_nodes` tidy.
 
 ## Limitations
+
+- **`node_id` must be unique per host.** Identical ids are deduplicated into a
+  single ring entry, so every node would serve locally and balancing silently
+  does nothing. Cluster mode logs a warning if `node_id` is left at the default
+  `"node-1"`. Set `TURNA_NODE_ID` per host.
+
+- **Redirects are loop-free only once rings converge.** With anti-entropy
+  gossip and HRW, every node computes the same owner, so a client reaches its
+  owner in exactly one redirect. During the brief convergence window after a
+  topology change (a few `gossip_interval_secs`), two nodes can momentarily
+  disagree and a client may be redirected a second time. This is bounded by the
+  convergence window and by client-side redirect caps (pion/libnice/webrtc-rs
+  all cap redirects), costing at most a couple of extra RTTs.
+
+- **Old sessions are not migrated.** HRW only places *new* clients; existing
+  allocations stay on their node until they expire (they are pinned and never
+  redirected). This is intentional for TURN, where sessions are short-lived.
+
+- **STUN clients without 300 support stay on their first node.** WebRTC stacks
+  honour `300 Try Alternate`; a plain STUN client that ignores it keeps using
+  the node it first contacted. Correctness is unaffected, balancing is just
+  coarser for those clients.
+
+- **Lame-duck drain.** On SIGTERM/SIGINT a node sets a draining flag, keeps
+  redirecting *new* clients to other nodes for `drain_grace_secs`, broadcasts a
+  `leaving` message, then exits. Existing sessions are never interrupted — they
+  run until they expire. Good for rolling deploys.
+
+- **Membership observability is wired on the server side only.** `HashRing`
+  exposes a `snapshot()` and `ClusterRouting::members()` returns the current
+  live nodes. Surfacing it as a `turnactl cluster nodes` command or a
+  management `/cluster` endpoint still needs wiring in the `turnactl` /
+  `management` crates.
 
 - **Permission expiry is approximate.** `StoredAllocation::permissions`
   doesn't carry per-IP timestamps; on failover the new owner assumes a

@@ -48,24 +48,42 @@ use tokio::net::UdpSocket;
 fn target_addr() -> SocketAddr {
     std::env::var("TURNA_TEST_TARGET")
         .unwrap_or_else(|_| "127.0.0.1:3478".into())
-        .parse().expect("invalid TURNA_TEST_TARGET")
+        .parse()
+        .expect("invalid TURNA_TEST_TARGET")
 }
 
-fn test_user()   -> String         { std::env::var("TURNA_TEST_USER").unwrap_or_else(|_| "testuser".into()) }
-fn test_pass()   -> String         { std::env::var("TURNA_TEST_PASS").unwrap_or_else(|_| "testpass".into()) }
-fn test_secret() -> Option<String> { std::env::var("TURNA_TEST_SECRET").ok() }
-fn test_debug()  -> bool           { std::env::var("TURNA_TEST_DEBUG").is_ok() }
+fn test_user() -> String {
+    std::env::var("TURNA_TEST_USER").unwrap_or_else(|_| "testuser".into())
+}
+fn test_pass() -> String {
+    std::env::var("TURNA_TEST_PASS").unwrap_or_else(|_| "testpass".into())
+}
+fn test_secret() -> Option<String> {
+    std::env::var("TURNA_TEST_SECRET").ok()
+}
+fn test_debug() -> bool {
+    std::env::var("TURNA_TEST_DEBUG").is_ok()
+}
 
 // ── Debug helpers ─────────────────────────────────────────────────────────────
 
 /// Print a labelled hex dump of `data` if TURNA_TEST_DEBUG is set.
 fn dump_hex(label: &str, data: &[u8]) {
-    if !test_debug() { return; }
+    if !test_debug() {
+        return;
+    }
     eprintln!("[DEBUG] {label} ({} bytes):", data.len());
     for (i, chunk) in data.chunks(16).enumerate() {
         let hex: String = chunk.iter().map(|b| format!("{b:02x} ")).collect();
-        let ascii: String = chunk.iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         eprintln!("  {:04x}  {:<48}  {}", i * 16, hex, ascii);
     }
@@ -74,15 +92,23 @@ fn dump_hex(label: &str, data: &[u8]) {
 // ── UDP helpers ───────────────────────────────────────────────────────────────
 
 async fn send_recv(
-    socket:     &UdpSocket,
-    target:     SocketAddr,
-    data:       &[u8],
+    socket: &UdpSocket,
+    target: SocketAddr,
+    data: &[u8],
     timeout_ms: u64,
 ) -> Option<(Vec<u8>, SocketAddr)> {
     socket.send_to(data, target).await.ok()?;
     let mut buf = vec![0u8; 4096];
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), socket.recv_from(&mut buf)).await {
-        Ok(Ok((n, addr))) => { buf.truncate(n); Some((buf, addr)) }
+    match tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok((n, addr))) => {
+            buf.truncate(n);
+            Some((buf, addr))
+        }
         _ => None,
     }
 }
@@ -112,21 +138,31 @@ const MAGIC_COOKIE: u32 = 0x2112A442;
 
 /// Low-level TURN message builder.
 struct TurnMsg {
-    method:         u16,
-    class:          u16,
+    method: u16,
+    class: u16,
     transaction_id: [u8; 12],
-    attrs:          Vec<u8>,
+    attrs: Vec<u8>,
 }
 
 impl TurnMsg {
     /// Create a new Request message.
     fn request(method: u16) -> Self {
         let mut tid = [0u8; 12];
-        for b in &mut tid { *b = rand::random(); }
-        Self { method, class: 0x0000, transaction_id: tid, attrs: Vec::new() }
+        for b in &mut tid {
+            *b = rand::random();
+        }
+        Self {
+            method,
+            class: 0x0000,
+            transaction_id: tid,
+            attrs: Vec::new(),
+        }
     }
 
-    fn with_tid(mut self, tid: [u8; 12]) -> Self { self.transaction_id = tid; self }
+    fn with_tid(mut self, tid: [u8; 12]) -> Self {
+        self.transaction_id = tid;
+        self
+    }
 
     // ── Attribute helpers ─────────────────────────────────────────────────────
 
@@ -137,7 +173,9 @@ impl TurnMsg {
         self.attrs.extend_from_slice(value);
         // Pad to 4-byte boundary
         let pad = (4 - (value.len() % 4)) % 4;
-        for _ in 0..pad { self.attrs.push(0); }
+        for _ in 0..pad {
+            self.attrs.push(0);
+        }
     }
 
     fn add_requested_transport(&mut self) {
@@ -202,7 +240,7 @@ impl TurnMsg {
         use sha1::Sha1;
 
         let mi_attr_size = 4 + 20; // type(2) + len(2) + SHA1(20)
-        let len_with_mi  = (self.attrs.len() + mi_attr_size) as u16;
+        let len_with_mi = (self.attrs.len() + mi_attr_size) as u16;
 
         let header = self.make_header(len_with_mi);
 
@@ -215,7 +253,10 @@ impl TurnMsg {
             let mut hmac_input = Vec::with_capacity(header.len() + self.attrs.len());
             hmac_input.extend_from_slice(&header);
             hmac_input.extend_from_slice(&self.attrs);
-            dump_hex("HMAC input  (header[20] with adjusted Length + attrs)", &hmac_input);
+            dump_hex(
+                "HMAC input  (header[20] with adjusted Length + attrs)",
+                &hmac_input,
+            );
             dump_hex("HMAC key", key);
             dump_hex("HMAC output (MESSAGE-INTEGRITY)", hmac_bytes.as_slice());
         }
@@ -255,74 +296,143 @@ impl TurnMsg {
 // ── STUN response parsers ─────────────────────────────────────────────────────
 
 fn msg_class(data: &[u8]) -> u16 {
-    if data.len() < 2 { return 0xFFFF; }
+    if data.len() < 2 {
+        return 0xFFFF;
+    }
     // Class bits: bit 8 and bit 4 of the type field
     let t = u16::from_be_bytes([data[0], data[1]]);
     ((t >> 7) & 0x02) | ((t >> 4) & 0x01)
 }
 
-fn is_success(data: &[u8]) -> bool { msg_class(data) == 0x02 }
-fn is_error(data: &[u8])   -> bool { msg_class(data) == 0x03 }
+fn is_success(data: &[u8]) -> bool {
+    msg_class(data) == 0x02
+}
+fn is_error(data: &[u8]) -> bool {
+    msg_class(data) == 0x03
+}
 
 fn transaction_id(data: &[u8]) -> &[u8] {
-    if data.len() >= 20 { &data[8..20] } else { &[] }
+    if data.len() >= 20 {
+        &data[8..20]
+    } else {
+        &[]
+    }
 }
 
 /// Iterate attributes: yields (type, value_slice) for each attribute.
 fn iter_attrs(data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
-    struct AttrIter<'a> { data: &'a [u8], off: usize }
+    struct AttrIter<'a> {
+        data: &'a [u8],
+        off: usize,
+    }
     impl<'a> Iterator for AttrIter<'a> {
         type Item = (u16, &'a [u8]);
         fn next(&mut self) -> Option<Self::Item> {
-            if self.off + 4 > self.data.len() { return None; }
+            if self.off + 4 > self.data.len() {
+                return None;
+            }
             let typ = u16::from_be_bytes([self.data[self.off], self.data[self.off + 1]]);
-            let len = u16::from_be_bytes([self.data[self.off + 2], self.data[self.off + 3]]) as usize;
+            let len =
+                u16::from_be_bytes([self.data[self.off + 2], self.data[self.off + 3]]) as usize;
             self.off += 4;
-            if self.off + len > self.data.len() { return None; }
+            if self.off + len > self.data.len() {
+                return None;
+            }
             let val = &self.data[self.off..self.off + len];
             self.off += len + (4 - len % 4) % 4;
             Some((typ, val))
         }
     }
-    AttrIter { data: if data.len() >= 20 { &data[20..] } else { &[] }, off: 0 }
+    AttrIter {
+        data: if data.len() >= 20 { &data[20..] } else { &[] },
+        off: 0,
+    }
 }
 
 fn extract_string_attr(data: &[u8], typ: u16) -> Option<String> {
-    iter_attrs(data).find(|(t, _)| *t == typ)
+    iter_attrs(data)
+        .find(|(t, _)| *t == typ)
         .and_then(|(_, v)| std::str::from_utf8(v).ok().map(|s| s.to_string()))
 }
 
 fn extract_error_code(data: &[u8]) -> Option<(u16, String)> {
-    iter_attrs(data).find(|(t, _)| *t == 0x0009).and_then(|(_, v)| {
-        if v.len() < 4 { return None; }
-        let class  = (v[2] & 0x07) as u16 * 100;
-        let number = v[3] as u16;
-        let code   = class + number;
-        let reason = std::str::from_utf8(&v[4..]).unwrap_or("").to_string();
-        Some((code, reason))
+    iter_attrs(data)
+        .find(|(t, _)| *t == 0x0009)
+        .and_then(|(_, v)| {
+            if v.len() < 4 {
+                return None;
+            }
+            let class = (v[2] & 0x07) as u16 * 100;
+            let number = v[3] as u16;
+            let code = class + number;
+            let reason = std::str::from_utf8(&v[4..]).unwrap_or("").to_string();
+            Some((code, reason))
+        })
+}
+
+/// Parse ALTERNATE-SERVER (0x0003), encoded as a plain MAPPED-ADDRESS
+/// (RFC 5389 §15.5 — NOT XOR'd). Returns None if absent or malformed.
+fn extract_alternate_server(data: &[u8]) -> Option<SocketAddr> {
+    iter_attrs(data).find(|(t, _)| *t == 0x0003).and_then(|(_, v)| {
+        if v.len() < 8 {
+            return None;
+        }
+        let family = v[1];
+        let port = u16::from_be_bytes([v[2], v[3]]);
+        match family {
+            0x01 => {
+                let ip = std::net::Ipv4Addr::new(v[4], v[5], v[6], v[7]);
+                Some(SocketAddr::new(ip.into(), port))
+            }
+            0x02 if v.len() >= 20 => {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&v[4..20]);
+                Some(SocketAddr::new(std::net::Ipv6Addr::from(o).into(), port))
+            }
+            _ => None,
+        }
     })
 }
 
-fn extract_realm(data: &[u8]) -> Option<String> { extract_string_attr(data, 0x0014) }
-fn extract_nonce(data: &[u8]) -> Option<String> { extract_string_attr(data, 0x0015) }
+fn extract_realm(data: &[u8]) -> Option<String> {
+    extract_string_attr(data, 0x0014)
+}
+fn extract_nonce(data: &[u8]) -> Option<String> {
+    extract_string_attr(data, 0x0015)
+}
 
 fn extract_lifetime(data: &[u8]) -> Option<u32> {
-    iter_attrs(data).find(|(t, _)| *t == 0x000D)
-        .and_then(|(_, v)| if v.len() == 4 { Some(u32::from_be_bytes([v[0],v[1],v[2],v[3]])) } else { None })
+    iter_attrs(data)
+        .find(|(t, _)| *t == 0x000D)
+        .and_then(|(_, v)| {
+            if v.len() == 4 {
+                Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+            } else {
+                None
+            }
+        })
 }
 
 fn extract_xor_addr(data: &[u8], typ: u16) -> Option<SocketAddr> {
-    iter_attrs(data).find(|(t, _)| *t == typ).and_then(|(_, v)| {
-        if v.len() < 8 || v[1] != 0x01 { return None; } // IPv4 only
-        let port = u16::from_be_bytes([v[2], v[3]]) ^ (MAGIC_COOKIE >> 16) as u16;
-        let m    = MAGIC_COOKIE.to_be_bytes();
-        let ip   = std::net::Ipv4Addr::new(v[4] ^ m[0], v[5] ^ m[1], v[6] ^ m[2], v[7] ^ m[3]);
-        Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
-    })
+    iter_attrs(data)
+        .find(|(t, _)| *t == typ)
+        .and_then(|(_, v)| {
+            if v.len() < 8 || v[1] != 0x01 {
+                return None;
+            } // IPv4 only
+            let port = u16::from_be_bytes([v[2], v[3]]) ^ (MAGIC_COOKIE >> 16) as u16;
+            let m = MAGIC_COOKIE.to_be_bytes();
+            let ip = std::net::Ipv4Addr::new(v[4] ^ m[0], v[5] ^ m[1], v[6] ^ m[2], v[7] ^ m[3]);
+            Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        })
 }
 
-fn extract_xor_mapped_address(data: &[u8])  -> Option<SocketAddr> { extract_xor_addr(data, 0x0020) }
-fn extract_xor_relayed_address(data: &[u8]) -> Option<SocketAddr> { extract_xor_addr(data, 0x0016) }
+fn extract_xor_mapped_address(data: &[u8]) -> Option<SocketAddr> {
+    extract_xor_addr(data, 0x0020)
+}
+fn extract_xor_relayed_address(data: &[u8]) -> Option<SocketAddr> {
+    extract_xor_addr(data, 0x0016)
+}
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -336,7 +446,8 @@ fn time_limited_credentials(user: &str, secret: &str) -> (String, String) {
     let expires = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() + 3600; // valid for 1 hour
+        .as_secs()
+        + 3600; // valid for 1 hour
     let username = format!("{expires}:{user}");
     let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC key");
     mac.update(username.as_bytes());
@@ -391,11 +502,11 @@ fn effective_credentials() -> (String, String) {
 /// 1. Send unauthenticated → expect 401 with REALM + NONCE
 /// 2. Re-send with credentials → return final response.
 async fn turn_authenticated_request(
-    socket:   &UdpSocket,
-    target:   SocketAddr,
+    socket: &UdpSocket,
+    target: SocketAddr,
     username: &str,
     password: &str,
-    build:    impl Fn(&str, &str) -> TurnMsg, // (realm, nonce) → TurnMsg
+    build: impl Fn(&str, &str) -> TurnMsg, // (realm, nonce) → TurnMsg
 ) -> Option<Vec<u8>> {
     // Step 1: unauthenticated probe
     let probe = {
@@ -405,10 +516,14 @@ async fn turn_authenticated_request(
     };
     let (resp, _) = send_recv(socket, target, &probe, 2000).await?;
 
-    if !is_error(&resp) { return Some(resp); } // shouldn't happen but handle it
+    if !is_error(&resp) {
+        return Some(resp);
+    } // shouldn't happen but handle it
 
     let (code, _) = extract_error_code(&resp)?;
-    if code != 401 { return Some(resp); }
+    if code != 401 {
+        return Some(resp);
+    }
 
     let realm = extract_realm(&resp)?;
     let nonce = extract_nonce(&resp)?;
@@ -428,8 +543,12 @@ fn build_binding_request() -> Vec<u8> {
     m.encode()
 }
 
-fn is_stun_success(data: &[u8]) -> bool { data.len() >= 2 && data[0] == 0x01 && data[1] == 0x01 }
-fn is_stun_error(data: &[u8])   -> bool { data.len() >= 2 && data[0] == 0x01 && data[1] == 0x11 }
+fn is_stun_success(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0x01 && data[1] == 0x01
+}
+fn is_stun_error(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0x01 && data[1] == 0x11
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -441,15 +560,23 @@ mod tests {
 
     #[tokio::test]
     async fn stun_binding() {
-        let socket  = bind_socket().await;
-        let target  = target_addr();
+        let socket = bind_socket().await;
+        let target = target_addr();
         let request = build_binding_request();
-        let result  = send_recv(&socket, target, &request, 2000).await;
+        let result = send_recv(&socket, target, &request, 2000).await;
         let (response, _) = skip_if_no_server!(result, target);
 
-        assert!(is_stun_success(&response),
-            "expected Binding Success, got {:02x} {:02x}", response[0], response[1]);
-        assert_eq!(&response[4..8], &[0x21, 0x12, 0xA4, 0x42], "magic cookie mismatch");
+        assert!(
+            is_stun_success(&response),
+            "expected Binding Success, got {:02x} {:02x}",
+            response[0],
+            response[1]
+        );
+        assert_eq!(
+            &response[4..8],
+            &[0x21, 0x12, 0xA4, 0x42],
+            "magic cookie mismatch"
+        );
         assert_eq!(&response[8..20], &request[8..20], "transaction ID mismatch");
         let mapped = extract_xor_mapped_address(&response);
         assert!(mapped.is_some(), "missing XOR-MAPPED-ADDRESS");
@@ -460,19 +587,27 @@ mod tests {
         let socket = bind_socket().await;
         let result = send_recv(&socket, target_addr(), &[0xFF; 10], 500).await;
         if let Some((resp, _)) = result {
-            assert!(!is_stun_success(&resp), "garbage should not produce success");
+            assert!(
+                !is_stun_success(&resp),
+                "garbage should not produce success"
+            );
         }
     }
 
     #[tokio::test]
     async fn concurrent_bindings() {
-        let target  = target_addr();
-        let handles = (0..10).map(|_| tokio::spawn(async move {
-            let s = bind_socket().await;
-            send_recv(&s, target, &build_binding_request(), 2000).await
-        })).collect::<Vec<_>>();
+        let target = target_addr();
+        let handles = (0..10)
+            .map(|_| {
+                tokio::spawn(async move {
+                    let s = bind_socket().await;
+                    send_recv(&s, target, &build_binding_request(), 2000).await
+                })
+            })
+            .collect::<Vec<_>>();
 
-        let mut success = 0; let mut skipped = 0;
+        let mut success = 0;
+        let mut skipped = 0;
         for h in handles {
             match h.await.unwrap() {
                 Some((r, _)) if is_stun_success(&r) => success += 1,
@@ -480,8 +615,14 @@ mod tests {
                 _ => {}
             }
         }
-        if skipped == 10 { eprintln!("SKIP: turna-node not running"); return; }
-        assert!(success >= 8, "at least 80% should succeed, got {success}/10");
+        if skipped == 10 {
+            eprintln!("SKIP: turna-node not running");
+            return;
+        }
+        assert!(
+            success >= 8,
+            "at least 80% should succeed, got {success}/10"
+        );
     }
 
     // ── TURN: Allocate ────────────────────────────────────────────────────────
@@ -521,7 +662,8 @@ mod tests {
         alloc.add_nonce(&nonce);
         let alloc_bytes = alloc.encode_with_integrity(&key);
 
-        let (mut resp, _) = send_recv(&socket, target, &alloc_bytes, 2000).await
+        let (mut resp, _) = send_recv(&socket, target, &alloc_bytes, 2000)
+            .await
             .expect("no response to authenticated allocate");
         // Retry once if nonce was rotated between probe and request
         if is_error(&resp) {
@@ -537,17 +679,25 @@ mod tests {
                 alloc2.add_username(&username);
                 alloc2.add_realm(&realm);
                 alloc2.add_nonce(&new_nonce);
-                if let Some((r, _)) = send_recv(&socket, target, &alloc2.encode_with_integrity(&key), 2000).await {
+                if let Some((r, _)) =
+                    send_recv(&socket, target, &alloc2.encode_with_integrity(&key), 2000).await
+                {
                     resp = r;
                 }
             }
         }
 
-        assert!(is_success(&resp),
-            "expected Allocate success; error: {:?}", extract_error_code(&resp));
+        assert!(
+            is_success(&resp),
+            "expected Allocate success; error: {:?}",
+            extract_error_code(&resp)
+        );
 
         let relayed = extract_xor_relayed_address(&resp);
-        assert!(relayed.is_some(), "missing XOR-RELAYED-ADDRESS in Allocate response");
+        assert!(
+            relayed.is_some(),
+            "missing XOR-RELAYED-ADDRESS in Allocate response"
+        );
         let relay_port = relayed.unwrap().port();
         assert!(relay_port > 0, "relay port should be > 0");
 
@@ -555,7 +705,11 @@ mod tests {
         assert!(lifetime.is_some(), "missing LIFETIME in Allocate response");
         assert!(lifetime.unwrap() > 0, "lifetime should be > 0");
 
-        eprintln!("✓ Allocate: relay={}, lifetime={}s", relayed.unwrap(), lifetime.unwrap());
+        eprintln!(
+            "✓ Allocate: relay={}, lifetime={}s",
+            relayed.unwrap(),
+            lifetime.unwrap()
+        );
     }
 
     /// Allocate with invalid credentials → expect 401.
@@ -570,9 +724,17 @@ mod tests {
         let result = send_recv(&socket, target, &probe.encode(), 2000).await;
         let (resp401, _) = skip_if_no_server!(result, target);
 
-        if !is_error(&resp401) { return; }
-        let realm = match extract_realm(&resp401) { Some(r) => r, None => return };
-        let nonce = match extract_nonce(&resp401)  { Some(n) => n, None => return };
+        if !is_error(&resp401) {
+            return;
+        }
+        let realm = match extract_realm(&resp401) {
+            Some(r) => r,
+            None => return,
+        };
+        let nonce = match extract_nonce(&resp401) {
+            Some(n) => n,
+            None => return,
+        };
 
         // Use a correctly-shaped username so we exercise the integrity check,
         // not the username-not-found path. In SharedSecret mode the server
@@ -589,11 +751,18 @@ mod tests {
         alloc.add_nonce(&nonce);
         let bytes = alloc.encode_with_integrity(&key);
 
-        let (resp, _) = send_recv(&socket, target, &bytes, 2000).await
+        let (resp, _) = send_recv(&socket, target, &bytes, 2000)
+            .await
             .expect("no response to bad-credential allocate");
 
-        assert!(is_error(&resp), "wrong password should produce error response");
-        eprintln!("✓ Wrong password correctly rejected: {:?}", extract_error_code(&resp));
+        assert!(
+            is_error(&resp),
+            "wrong password should produce error response"
+        );
+        eprintln!(
+            "✓ Wrong password correctly rejected: {:?}",
+            extract_error_code(&resp)
+        );
     }
 
     // ── TURN: Refresh ─────────────────────────────────────────────────────────
@@ -607,7 +776,10 @@ mod tests {
         // Allocate first
         let (realm, nonce) = match get_realm_nonce(&socket, target).await {
             Some(v) => v,
-            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+            None => {
+                eprintln!("SKIP: turna-node not running on {target}");
+                return;
+            }
         };
 
         let (username, password) = effective_credentials();
@@ -619,11 +791,15 @@ mod tests {
         alloc.add_username(&username);
         alloc.add_realm(&realm);
         alloc.add_nonce(&nonce);
-        let (resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000).await
+        let (resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
             .expect("no allocate response");
 
         if !is_success(&resp) {
-            eprintln!("SKIP: Allocate failed (no test credentials configured?): {:?}", extract_error_code(&resp));
+            eprintln!(
+                "SKIP: Allocate failed (no test credentials configured?): {:?}",
+                extract_error_code(&resp)
+            );
             return;
         }
 
@@ -635,11 +811,15 @@ mod tests {
         refresh.add_username(&username);
         refresh.add_realm(&realm);
         refresh.add_nonce(&nonce2);
-        let (resp2, _) = send_recv(&socket, target, &refresh.encode_with_integrity(&key), 2000).await
+        let (resp2, _) = send_recv(&socket, target, &refresh.encode_with_integrity(&key), 2000)
+            .await
             .expect("no refresh response");
 
-        assert!(is_success(&resp2),
-            "Refresh failed: {:?}", extract_error_code(&resp2));
+        assert!(
+            is_success(&resp2),
+            "Refresh failed: {:?}",
+            extract_error_code(&resp2)
+        );
 
         let lifetime = extract_lifetime(&resp2).unwrap_or(0);
         assert!(lifetime > 0, "Refresh response should include LIFETIME");
@@ -652,11 +832,15 @@ mod tests {
         del.add_username(&username);
         del.add_realm(&realm);
         del.add_nonce(&nonce3);
-        let (resp3, _) = send_recv(&socket, target, &del.encode_with_integrity(&key), 2000).await
+        let (resp3, _) = send_recv(&socket, target, &del.encode_with_integrity(&key), 2000)
+            .await
             .expect("no delete response");
 
-        assert!(is_success(&resp3),
-            "Delete (Refresh lifetime=0) failed: {:?}", extract_error_code(&resp3));
+        assert!(
+            is_success(&resp3),
+            "Delete (Refresh lifetime=0) failed: {:?}",
+            extract_error_code(&resp3)
+        );
         let del_lifetime = extract_lifetime(&resp3).unwrap_or(1);
         assert_eq!(del_lifetime, 0, "Delete response should have LIFETIME=0");
         eprintln!("✓ Delete (Refresh lifetime=0): ok");
@@ -672,7 +856,10 @@ mod tests {
 
         let (realm, nonce) = match get_realm_nonce(&socket, target).await {
             Some(v) => v,
-            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+            None => {
+                eprintln!("SKIP: turna-node not running on {target}");
+                return;
+            }
         };
 
         let (username, password) = effective_credentials();
@@ -685,11 +872,15 @@ mod tests {
         alloc.add_username(&username);
         alloc.add_realm(&realm);
         alloc.add_nonce(&nonce);
-        let (alloc_resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000).await
+        let (alloc_resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
             .expect("no allocate response");
 
         if !is_success(&alloc_resp) {
-            eprintln!("SKIP: Allocate failed: {:?}", extract_error_code(&alloc_resp));
+            eprintln!(
+                "SKIP: Allocate failed: {:?}",
+                extract_error_code(&alloc_resp)
+            );
             return;
         }
 
@@ -702,11 +893,15 @@ mod tests {
         perm.add_username(&username);
         perm.add_realm(&realm);
         perm.add_nonce(&nonce2);
-        let (perm_resp, _) = send_recv(&socket, target, &perm.encode_with_integrity(&key), 2000).await
+        let (perm_resp, _) = send_recv(&socket, target, &perm.encode_with_integrity(&key), 2000)
+            .await
             .expect("no CreatePermission response");
 
-        assert!(is_success(&perm_resp),
-            "CreatePermission failed: {:?}", extract_error_code(&perm_resp));
+        assert!(
+            is_success(&perm_resp),
+            "CreatePermission failed: {:?}",
+            extract_error_code(&perm_resp)
+        );
         eprintln!("✓ CreatePermission for {peer}: ok");
 
         // Cleanup
@@ -729,7 +924,10 @@ mod tests {
 
         let (realm, nonce) = match get_realm_nonce(&socket, target).await {
             Some(v) => v,
-            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+            None => {
+                eprintln!("SKIP: turna-node not running on {target}");
+                return;
+            }
         };
 
         let (username, password) = effective_credentials();
@@ -742,11 +940,15 @@ mod tests {
         alloc.add_username(&username);
         alloc.add_realm(&realm);
         alloc.add_nonce(&nonce);
-        let (alloc_resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000).await
+        let (alloc_resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
             .expect("no allocate response");
 
         if !is_success(&alloc_resp) {
-            eprintln!("SKIP: Allocate failed: {:?}", extract_error_code(&alloc_resp));
+            eprintln!(
+                "SKIP: Allocate failed: {:?}",
+                extract_error_code(&alloc_resp)
+            );
             return;
         }
 
@@ -759,11 +961,15 @@ mod tests {
         perm.add_username(&username);
         perm.add_realm(&realm);
         perm.add_nonce(&nonce2);
-        let (perm_resp, _) = send_recv(&socket, target, &perm.encode_with_integrity(&key), 2000).await
+        let (perm_resp, _) = send_recv(&socket, target, &perm.encode_with_integrity(&key), 2000)
+            .await
             .expect("no CreatePermission response");
 
         if !is_success(&perm_resp) {
-            eprintln!("SKIP: CreatePermission failed: {:?}", extract_error_code(&perm_resp));
+            eprintln!(
+                "SKIP: CreatePermission failed: {:?}",
+                extract_error_code(&perm_resp)
+            );
             return;
         }
 
@@ -777,11 +983,15 @@ mod tests {
         bind.add_username(&username);
         bind.add_realm(&realm);
         bind.add_nonce(&nonce3);
-        let (bind_resp, _) = send_recv(&socket, target, &bind.encode_with_integrity(&key), 2000).await
+        let (bind_resp, _) = send_recv(&socket, target, &bind.encode_with_integrity(&key), 2000)
+            .await
             .expect("no ChannelBind response");
 
-        assert!(is_success(&bind_resp),
-            "ChannelBind failed: {:?}", extract_error_code(&bind_resp));
+        assert!(
+            is_success(&bind_resp),
+            "ChannelBind failed: {:?}",
+            extract_error_code(&bind_resp)
+        );
         eprintln!("✓ ChannelBind channel={channel:#06x} peer={peer}: ok");
 
         // Cleanup
@@ -800,14 +1010,17 @@ mod tests {
     #[tokio::test]
     async fn turn_channel_data_relay() {
         let client = bind_socket().await;
-        let peer   = bind_socket().await;
+        let peer = bind_socket().await;
         let target = target_addr();
 
         let peer_addr = peer.local_addr().unwrap();
 
         let (realm, nonce) = match get_realm_nonce(&client, target).await {
             Some(v) => v,
-            None    => { eprintln!("SKIP: turna-node not running on {target}"); return; }
+            None => {
+                eprintln!("SKIP: turna-node not running on {target}");
+                return;
+            }
         };
 
         let (username, password) = effective_credentials();
@@ -820,16 +1033,19 @@ mod tests {
         alloc.add_username(&username);
         alloc.add_realm(&realm);
         alloc.add_nonce(&nonce);
-        let (alloc_resp, _) = send_recv(&client, target, &alloc.encode_with_integrity(&key), 2000).await
+        let (alloc_resp, _) = send_recv(&client, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
             .expect("no allocate response");
 
         if !is_success(&alloc_resp) {
-            eprintln!("SKIP: Allocate failed: {:?}", extract_error_code(&alloc_resp));
+            eprintln!(
+                "SKIP: Allocate failed: {:?}",
+                extract_error_code(&alloc_resp)
+            );
             return;
         }
 
-        let relay_addr = extract_xor_relayed_address(&alloc_resp)
-            .expect("missing relay address");
+        let relay_addr = extract_xor_relayed_address(&alloc_resp).expect("missing relay address");
         let nonce2 = extract_nonce(&alloc_resp).unwrap_or(nonce);
 
         // CreatePermission for peer's IP
@@ -838,11 +1054,15 @@ mod tests {
         perm.add_username(&username);
         perm.add_realm(&realm);
         perm.add_nonce(&nonce2);
-        let (perm_resp, _) = send_recv(&client, target, &perm.encode_with_integrity(&key), 2000).await
+        let (perm_resp, _) = send_recv(&client, target, &perm.encode_with_integrity(&key), 2000)
+            .await
             .expect("no CreatePermission response");
 
         if !is_success(&perm_resp) {
-            eprintln!("SKIP: CreatePermission failed: {:?}", extract_error_code(&perm_resp));
+            eprintln!(
+                "SKIP: CreatePermission failed: {:?}",
+                extract_error_code(&perm_resp)
+            );
             return;
         }
 
@@ -856,11 +1076,15 @@ mod tests {
         bind.add_username(&username);
         bind.add_realm(&realm);
         bind.add_nonce(&nonce3);
-        let (bind_resp, _) = send_recv(&client, target, &bind.encode_with_integrity(&key), 2000).await
+        let (bind_resp, _) = send_recv(&client, target, &bind.encode_with_integrity(&key), 2000)
+            .await
             .expect("no ChannelBind response");
 
         if !is_success(&bind_resp) {
-            eprintln!("SKIP: ChannelBind failed: {:?}", extract_error_code(&bind_resp));
+            eprintln!(
+                "SKIP: ChannelBind failed: {:?}",
+                extract_error_code(&bind_resp)
+            );
             return;
         }
 
@@ -874,12 +1098,17 @@ mod tests {
         match tokio::time::timeout(Duration::from_millis(1000), peer.recv_from(&mut buf)).await {
             Ok(Ok((n, src))) => {
                 let received = &buf[..n];
-                assert_eq!(received, payload,
-                    "peer received wrong data: {:?}", received);
+                assert_eq!(
+                    received, payload,
+                    "peer received wrong data: {:?}",
+                    received
+                );
                 eprintln!("✓ ChannelData relay: {} bytes from {src}", n);
             }
             _ => {
-                eprintln!("NOTE: ChannelData relay timeout — peer may need to be on relay's network");
+                eprintln!(
+                    "NOTE: ChannelData relay timeout — peer may need to be on relay's network"
+                );
             }
         }
 
@@ -906,16 +1135,23 @@ mod tests {
     #[test]
     fn xor_mapped_address_parsing() {
         let mut resp = vec![0u8; 36];
-        resp[0] = 0x01; resp[1] = 0x01;
-        resp[2] = 0x00; resp[3] = 0x10;
+        resp[0] = 0x01;
+        resp[1] = 0x01;
+        resp[2] = 0x00;
+        resp[3] = 0x10;
         resp[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]);
-        resp[20] = 0x00; resp[21] = 0x20;
-        resp[22] = 0x00; resp[23] = 0x08;
-        resp[24] = 0x00; resp[25] = 0x01;
+        resp[20] = 0x00;
+        resp[21] = 0x20;
+        resp[22] = 0x00;
+        resp[23] = 0x08;
+        resp[24] = 0x00;
+        resp[25] = 0x01;
         let xport = 3478u16 ^ 0x2112u16;
         resp[26..28].copy_from_slice(&xport.to_be_bytes());
-        resp[28] = 192 ^ 0x21; resp[29] = 168 ^ 0x12;
-        resp[30] = 1 ^ 0xA4;  resp[31] = 1 ^ 0x42;
+        resp[28] = 192 ^ 0x21;
+        resp[29] = 168 ^ 0x12;
+        resp[30] = 1 ^ 0xA4;
+        resp[31] = 1 ^ 0x42;
 
         let addr = extract_xor_mapped_address(&resp).unwrap();
         assert_eq!(addr.port(), 3478);
@@ -928,8 +1164,13 @@ mod tests {
         // MD5("user:realm:pass") = 0x8493fbc53ba582fb4c044c456bdc40eb
         let key = long_term_key("user", "realm", "pass");
         assert_eq!(key.len(), 16);
-        assert_eq!(key, vec![0x84, 0x93, 0xfb, 0xc5, 0x3b, 0xa5, 0x82, 0xfb,
-                              0x4c, 0x04, 0x4c, 0x45, 0x6b, 0xdc, 0x40, 0xeb]);
+        assert_eq!(
+            key,
+            vec![
+                0x84, 0x93, 0xfb, 0xc5, 0x3b, 0xa5, 0x82, 0xfb, 0x4c, 0x04, 0x4c, 0x45, 0x6b, 0xdc,
+                0x40, 0xeb
+            ]
+        );
     }
 
     #[test]
@@ -959,11 +1200,14 @@ mod tests {
         // Build a fake 401 error
         let mut data = vec![0u8; 20 + 4 + 4];
         // ERROR-CODE attr at offset 20: type=0x0009, len=4
-        data[20] = 0x00; data[21] = 0x09; // type
-        data[22] = 0x00; data[23] = 0x04; // len=4
-        data[24] = 0x00; data[25] = 0x00; // reserved
-        data[26] = 4;                      // class=4 → 400s
-        data[27] = 1;                      // number=1 → 401
+        data[20] = 0x00;
+        data[21] = 0x09; // type
+        data[22] = 0x00;
+        data[23] = 0x04; // len=4
+        data[24] = 0x00;
+        data[25] = 0x00; // reserved
+        data[26] = 4; // class=4 → 400s
+        data[27] = 1; // number=1 → 401
 
         let (code, _) = extract_error_code(&data).unwrap();
         assert_eq!(code, 401);
@@ -975,10 +1219,17 @@ mod tests {
         // username must be "{unix_ts}:{user}" — first segment parses as u64
         let parts: Vec<&str> = user.splitn(2, ':').collect();
         assert_eq!(parts.len(), 2);
-        assert!(parts[0].parse::<u64>().is_ok(), "username prefix not a timestamp: {user:?}");
+        assert!(
+            parts[0].parse::<u64>().is_ok(),
+            "username prefix not a timestamp: {user:?}"
+        );
         assert_eq!(parts[1], "alice");
         // password is base64(20-byte HMAC-SHA1) → 28 chars with padding
-        assert_eq!(pass.len(), 28, "expected 28-char base64 password, got {pass:?}");
+        assert_eq!(
+            pass.len(),
+            28,
+            "expected 28-char base64 password, got {pass:?}"
+        );
     }
 }
 
@@ -989,7 +1240,9 @@ async fn get_realm_nonce(socket: &UdpSocket, target: SocketAddr) -> Option<(Stri
     let mut probe = TurnMsg::request(0x0003);
     probe.add_requested_transport();
     let (resp, _) = send_recv(socket, target, &probe.encode(), 2000).await?;
-    if !is_error(&resp) { return None; }
+    if !is_error(&resp) {
+        return None;
+    }
     let realm = extract_realm(&resp)?;
     let nonce = extract_nonce(&resp)?;
     Some((realm, nonce))
@@ -1002,6 +1255,120 @@ fn build_channel_data(channel: u16, payload: &[u8]) -> Vec<u8> {
     pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     pkt.extend_from_slice(payload);
     let pad = (4 - payload.len() % 4) % 4;
-    for _ in 0..pad { pkt.push(0); }
+    for _ in 0..pad {
+        pkt.push(0);
+    }
     pkt
+}
+
+// ── §6: cluster redirect / distribution tests ────────────────────────────────
+//
+// These run against a LIVE multi-node cluster and are opt-in: set
+// TURNA_TEST_CLUSTER=1 (otherwise they skip). Point TURNA_TEST_TARGET at any
+// one cluster node — new clients (varying source ports) should be spread across
+// nodes via `300 Try Alternate` redirects.
+//
+//   # bring up 2 nodes sharing cluster_name/secret + a common seed, then:
+//   TURNA_TEST_CLUSTER=1 TURNA_TEST_TARGET=10.0.0.11:3478 \
+//     cargo test -p turna-integration-tests cluster_ -- --nocapture
+#[cfg(test)]
+mod cluster_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn cluster_enabled() -> bool {
+        std::env::var("TURNA_TEST_CLUSTER").is_ok()
+    }
+
+    /// New clients are distributed across the cluster: some are served locally,
+    /// some get a 300 Try Alternate redirect to another node, and every redirect
+    /// carries a valid (plain, non-XOR) ALTERNATE-SERVER.
+    #[tokio::test]
+    async fn cluster_redirect_distribution() {
+        if !cluster_enabled() {
+            eprintln!("SKIP: set TURNA_TEST_CLUSTER=1 to run cluster redirect tests");
+            return;
+        }
+        let target = target_addr();
+        const N: usize = 64;
+        let mut local = 0usize;
+        let mut redirected = 0usize;
+        let mut targets: HashMap<SocketAddr, usize> = HashMap::new();
+
+        for _ in 0..N {
+            // A fresh ephemeral source port = a different consistent-hash key.
+            let socket = bind_socket().await;
+            let resp = match send_recv(&socket, target, &build_binding_request(), 2000).await {
+                Some((r, _)) => r,
+                None => {
+                    eprintln!("SKIP: cluster node not reachable on {target}");
+                    return;
+                }
+            };
+
+            if is_error(&resp) {
+                let (code, _) = extract_error_code(&resp).unwrap_or((0, String::new()));
+                assert_eq!(code, 300, "unexpected error code {code} for a brand-new client");
+                let alt = extract_alternate_server(&resp)
+                    .expect("300 Try Alternate must carry a parseable ALTERNATE-SERVER");
+                assert!(
+                    alt.port() != 0 && !alt.ip().is_unspecified(),
+                    "ALTERNATE-SERVER looks unset/garbled (XOR encoding?): {alt}"
+                );
+                *targets.entry(alt).or_default() += 1;
+                redirected += 1;
+            } else if is_success(&resp) {
+                local += 1;
+            } else {
+                panic!("unexpected response class for Binding: {:02x} {:02x}", resp[0], resp[1]);
+            }
+        }
+
+        eprintln!(
+            "cluster distribution over {N} new clients: {local} local, {redirected} redirected; \
+             alternate targets = {targets:?}"
+        );
+        assert!(
+            redirected > 0,
+            "no client was redirected — is TURNA_TEST_TARGET a single-node deployment?"
+        );
+        assert!(
+            local > 0,
+            "every client was redirected — does the contacted node own any keys?"
+        );
+    }
+
+    /// Focused check: a redirect is class=error, code=300, with a plain
+    /// (non-XOR) ALTERNATE-SERVER that parses to a sane address.
+    #[tokio::test]
+    async fn cluster_redirect_is_plain_alternate_server() {
+        if !cluster_enabled() {
+            eprintln!("SKIP: set TURNA_TEST_CLUSTER=1 to run cluster redirect tests");
+            return;
+        }
+        let target = target_addr();
+        for _ in 0..128 {
+            let socket = bind_socket().await;
+            let resp = match send_recv(&socket, target, &build_binding_request(), 2000).await {
+                Some((r, _)) => r,
+                None => {
+                    eprintln!("SKIP: cluster node not reachable on {target}");
+                    return;
+                }
+            };
+            if is_error(&resp) {
+                let (code, _) = extract_error_code(&resp).unwrap_or((0, String::new()));
+                assert_eq!(code, 300, "error response was not 300 Try Alternate");
+                let alt = extract_alternate_server(&resp)
+                    .expect("ALTERNATE-SERVER must be present and plain-parseable");
+                assert!(
+                    alt.port() != 0 && !alt.ip().is_unspecified(),
+                    "garbled ALTERNATE-SERVER {alt} (server XOR-encoded it?)"
+                );
+                eprintln!("observed redirect → {alt}");
+                return;
+            }
+        }
+        eprintln!("WARN: no redirect seen in 128 probes (single node, or all keys local)");
+    }
 }

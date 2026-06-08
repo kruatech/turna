@@ -14,24 +14,25 @@
 //! STUN responses (auth challenges, errors, binding) are built fresh and are
 //! small (~100-500 bytes); one allocation per STUN handshake is acceptable.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::RwLock;
-use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
-use tracing::{info, warn, debug};
+use parking_lot::RwLock;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
+use turna_auth::AuthMode;
+use turna_cluster::HashRing;
+use turna_health::Metrics;
 use turna_proto_stun::attribute::Attribute;
 use turna_proto_stun::header::MessageClass;
 use turna_proto_stun::message::{self, StunMessage};
 use turna_proto_stun::method::Method;
 use turna_proto_turn as turn;
-use turna_session::AllocationStore;
-use turna_auth::AuthMode;
-use turna_qos::{TieredRateLimiter, TieredLimits};
-use turna_health::Metrics;
+use turna_qos::{TieredLimits, TieredRateLimiter};
 use turna_rtp_analyzer::RtpAnalyzer;
+use turna_session::AllocationStore;
 
 use crate::peer_filter::{is_forbidden_peer, normalize_addr, normalize_ip};
 
@@ -49,15 +50,27 @@ pub enum Action {
     /// Replaces the old `ZeroCopyForward { offset, len }` pair.
     /// `data` is a `Bytes::slice()` of the original recv buffer —
     /// literally just a pointer + length, no copy.
-    Forward { data: Bytes, target: SocketAddr, relay_port: u16 },
+    Forward {
+        data: Bytes,
+        target: SocketAddr,
+        relay_port: u16,
+    },
 
     /// Send via a relay socket (Send Indication path).
-    SendViaRelay { data: Bytes, target: SocketAddr, relay_port: u16 },
+    SendViaRelay {
+        data: Bytes,
+        target: SocketAddr,
+        relay_port: u16,
+    },
 
     /// Register an already-bound relay socket for this port. The socket is
     /// bound synchronously in `handle_allocate` *before* the Allocate
     /// success is emitted, so registration cannot fail (transactional).
-    RegisterRelay { port: u16, socket: std::net::UdpSocket, client_addr: SocketAddr },
+    RegisterRelay {
+        port: u16,
+        socket: std::net::UdpSocket,
+        client_addr: SocketAddr,
+    },
 
     /// Close and unregister the relay socket for this port (on release), so
     /// its fd is freed and the port can be safely reused.
@@ -70,33 +83,35 @@ pub enum Action {
 // ── Nonce manager ────────────────────────────────────────────────────────────
 
 struct NonceManager {
-    current:           RwLock<String>,
-    previous:          RwLock<Option<String>>,
-    start:             Instant,
+    current: RwLock<String>,
+    previous: RwLock<Option<String>>,
+    start: Instant,
     /// Elapsed-ms (from `start`) at the last rotation. Atomic so the common
     /// "not due yet" path takes no lock at all.
-    last_rotation_ms:  AtomicU64,
+    last_rotation_ms: AtomicU64,
     /// Elapsed-ms when `previous` was last set — bounds the grace window.
-    rotation_time_ms:  AtomicU64,
+    rotation_time_ms: AtomicU64,
     rotation_interval: Duration,
-    grace_period:      Duration,
+    grace_period: Duration,
 }
 
 impl NonceManager {
     fn new() -> Self {
         Self {
-            current:           RwLock::new(turna_crypto::generate_nonce()),
-            previous:          RwLock::new(None),
-            start:             Instant::now(),
-            last_rotation_ms:  AtomicU64::new(0),
-            rotation_time_ms:  AtomicU64::new(0),
+            current: RwLock::new(turna_crypto::generate_nonce()),
+            previous: RwLock::new(None),
+            start: Instant::now(),
+            last_rotation_ms: AtomicU64::new(0),
+            rotation_time_ms: AtomicU64::new(0),
             rotation_interval: Duration::from_secs(600),
-            grace_period:      Duration::from_secs(30),
+            grace_period: Duration::from_secs(30),
         }
     }
 
     #[inline]
-    fn now_ms(&self) -> u64 { self.start.elapsed().as_millis() as u64 }
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
 
     fn current(&self) -> String {
         self.maybe_rotate();
@@ -120,7 +135,7 @@ impl NonceManager {
     }
 
     fn maybe_rotate(&self) {
-        let now  = self.now_ms();
+        let now = self.now_ms();
         let last = self.last_rotation_ms.load(Ordering::Acquire);
         // Common path: not due — no lock, no write.
         if now.saturating_sub(last) < self.rotation_interval.as_millis() as u64 {
@@ -143,65 +158,156 @@ impl NonceManager {
     }
 }
 
-enum NonceStatus { Valid, Stale }
+enum NonceStatus {
+    Valid,
+    Stale,
+}
 
 // ── PacketProcessor ──────────────────────────────────────────────────────────
 
+/// Shared cluster-routing state used to redirect new clients to their owner node.
+#[derive(Clone)]
+pub struct ClusterRouting {
+    pub local_node_id: String,
+    pub hash_ring: Arc<RwLock<HashRing>>,
+    /// Lame-duck flag: while set, new clients are redirected to another node
+    /// even ones this node would normally own, so it can drain before exit.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ClusterRouting {
+    pub fn new(local_node_id: String, hash_ring: Arc<RwLock<HashRing>>) -> Self {
+        Self {
+            local_node_id,
+            hash_ring,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Enter lame-duck mode: stop taking new clients (existing stay put).
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    /// Current live cluster membership (for `turnactl`/management surfaces).
+    pub fn members(&self) -> Vec<turna_cluster::ClusterNode> {
+        self.hash_ring.read().snapshot()
+    }
+}
+
 /// Pure packet processor — shared between async (tokio) and io_uring modes.
 pub struct PacketProcessor {
-    store:        Arc<AllocationStore>,
-    auth:         Arc<AuthMode>,
+    store: Arc<AllocationStore>,
+    auth: Arc<AuthMode>,
     rate_limiter: TieredRateLimiter,
-    external_ip:  std::net::IpAddr,
-    nonce_mgr:    NonceManager,
-    metrics:      Arc<Metrics>,
+    external_ip: std::net::IpAddr,
+    nonce_mgr: NonceManager,
+    metrics: Arc<Metrics>,
     rtp_analyzer: Arc<RtpAnalyzer>,
-    mtu:          u16,
+    mtu: u16,
+    cluster: Option<ClusterRouting>,
 }
 
 impl PacketProcessor {
     pub fn new(
-        store:       Arc<AllocationStore>,
-        auth:        Arc<AuthMode>,
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthMode>,
         external_ip: std::net::IpAddr,
-        metrics:     Arc<Metrics>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self::with_mtu(store, auth, external_ip, metrics, 1280)
     }
 
-    pub fn with_mtu(
-        store:       Arc<AllocationStore>,
-        auth:        Arc<AuthMode>,
+    pub fn new_with_cluster(
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthMode>,
         external_ip: std::net::IpAddr,
-        metrics:     Arc<Metrics>,
-        mtu:         u16,
+        metrics: Arc<Metrics>,
+        cluster: Option<ClusterRouting>,
+    ) -> Self {
+        Self::with_mtu_and_cluster(store, auth, external_ip, metrics, 1280, cluster)
+    }
+
+    pub fn with_mtu(
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthMode>,
+        external_ip: std::net::IpAddr,
+        metrics: Arc<Metrics>,
+        mtu: u16,
+    ) -> Self {
+        Self::with_mtu_and_cluster(store, auth, external_ip, metrics, mtu, None)
+    }
+
+    pub fn with_mtu_and_cluster(
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthMode>,
+        external_ip: std::net::IpAddr,
+        metrics: Arc<Metrics>,
+        mtu: u16,
+        cluster: Option<ClusterRouting>,
     ) -> Self {
         Self {
-            store, auth,
+            store,
+            auth,
             rate_limiter: {
                 let mut limits = TieredLimits::default();
                 let env_pair = |bkey: &str, rkey: &str, pair: &mut (u32, u32)| {
-                    if let Some(b) = std::env::var(bkey).ok().and_then(|v| v.parse().ok()) { pair.0 = b; }
-                    if let Some(r) = std::env::var(rkey).ok().and_then(|v| v.parse().ok()) { pair.1 = r; }
+                    if let Some(b) = std::env::var(bkey).ok().and_then(|v| v.parse().ok()) {
+                        pair.0 = b;
+                    }
+                    if let Some(r) = std::env::var(rkey).ok().and_then(|v| v.parse().ok()) {
+                        pair.1 = r;
+                    }
                 };
-                env_pair("TURNA_RATE_LIMIT_BURST", "TURNA_RATE_LIMIT_RPS", &mut limits.per_ip);
-                env_pair("TURNA_PREFIX_BURST", "TURNA_PREFIX_RPS", &mut limits.per_prefix);
-                env_pair("TURNA_ALLOCATE_BURST", "TURNA_ALLOCATE_RPS", &mut limits.allocate);
-                env_pair("TURNA_CREATE_PERM_BURST", "TURNA_CREATE_PERM_RPS", &mut limits.create_permission);
-                env_pair("TURNA_CHANNEL_BIND_BURST", "TURNA_CHANNEL_BIND_RPS", &mut limits.channel_bind);
+                env_pair(
+                    "TURNA_RATE_LIMIT_BURST",
+                    "TURNA_RATE_LIMIT_RPS",
+                    &mut limits.per_ip,
+                );
+                env_pair(
+                    "TURNA_PREFIX_BURST",
+                    "TURNA_PREFIX_RPS",
+                    &mut limits.per_prefix,
+                );
+                env_pair(
+                    "TURNA_ALLOCATE_BURST",
+                    "TURNA_ALLOCATE_RPS",
+                    &mut limits.allocate,
+                );
+                env_pair(
+                    "TURNA_CREATE_PERM_BURST",
+                    "TURNA_CREATE_PERM_RPS",
+                    &mut limits.create_permission,
+                );
+                env_pair(
+                    "TURNA_CHANNEL_BIND_BURST",
+                    "TURNA_CHANNEL_BIND_RPS",
+                    &mut limits.channel_bind,
+                );
                 TieredRateLimiter::new(limits)
             },
             external_ip,
-            nonce_mgr:    NonceManager::new(),
+            nonce_mgr: NonceManager::new(),
             metrics,
             rtp_analyzer: Arc::new(RtpAnalyzer::new()),
             mtu,
+            cluster,
         }
     }
 
-    pub fn store(&self)        -> &Arc<AllocationStore> { &self.store }
-    pub fn metrics(&self)      -> &Arc<Metrics>         { &self.metrics }
-    pub fn rtp_analyzer(&self) -> &Arc<RtpAnalyzer>     { &self.rtp_analyzer }
+    pub fn store(&self) -> &Arc<AllocationStore> {
+        &self.store
+    }
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+    pub fn rtp_analyzer(&self) -> &Arc<RtpAnalyzer> {
+        &self.rtp_analyzer
+    }
 
     // ── Main entry point ─────────────────────────────────────────────────────
 
@@ -221,8 +327,12 @@ impl PacketProcessor {
     /// let actions = processor.process(raw, src);
     /// ```
     pub fn process(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
-        self.metrics.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_received.fetch_add(raw.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_received
+            .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
         // Cheap stateless protocol classification BEFORE rate limiting.
         //
@@ -231,10 +341,12 @@ impl PacketProcessor {
         // hides the benefit of the socket BPF filter.  Keep this check limited
         // to fixed header bytes and length fields.
         let is_channel = message::is_channel_data(&raw);
-        let is_stun    = message::is_stun_message(&raw);
+        let is_stun = message::is_stun_message(&raw);
 
         if !is_channel && !is_stun {
-            self.metrics.malformed_packets.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .malformed_packets
+                .fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
 
@@ -269,8 +381,8 @@ impl PacketProcessor {
     /// hot path (most bidirectional media uses ChannelData client→server).
     pub fn process_relay_recv(
         &self,
-        data:       &[u8],
-        peer_addr:  SocketAddr,
+        data: &[u8],
+        peer_addr: SocketAddr,
         relay_addr: SocketAddr,
     ) -> Vec<Action> {
         // Normalize so ::ffff: peers match the permission stored as v4 (C3).
@@ -282,7 +394,7 @@ impl PacketProcessor {
 
         let alloc = match self.store.get(&client_addr) {
             Some(a) => a,
-            None    => return vec![Action::None],
+            None => return vec![Action::None],
         };
 
         if !alloc.has_permission(&peer_addr) {
@@ -292,7 +404,9 @@ impl PacketProcessor {
 
         alloc.add_bytes(data.len() as u64);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.rtp_analyzer.analyze(data, peer_addr);
 
         // Prefer ChannelData if a channel is bound.
@@ -308,22 +422,27 @@ impl PacketProcessor {
             let written = message::encode_channel_data(&mut buf, ch, data);
             buf.truncate(written);
 
-            return vec![Action::Send { data: buf.freeze(), target: ca }];
+            return vec![Action::Send {
+                data: buf.freeze(),
+                target: ca,
+            }];
         }
 
         // Fallback: Data Indication.
         let ca = alloc.client_addr;
         drop(alloc);
 
-        let mut ind = StunMessage::with_transaction_id(
-            Method::Data, MessageClass::Indication, [0; 12],
-        );
+        let mut ind =
+            StunMessage::with_transaction_id(Method::Data, MessageClass::Indication, [0; 12]);
         ind.add(Attribute::XorPeerAddress(peer_addr));
         ind.add(Attribute::Data(data.to_vec()));
 
         let mut buf = [0u8; 4096];
         let len = ind.encode(&mut buf);
-        vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: ca }]
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: ca,
+        }]
     }
 
     // ── ChannelData (hot path) ────────────────────────────────────────────────
@@ -335,7 +454,7 @@ impl PacketProcessor {
 
         let alloc = match self.store.get(&src) {
             Some(a) => a,
-            None    => return vec![Action::None],
+            None => return vec![Action::None],
         };
 
         let Some(peer_addr) = alloc.get_channel_peer(channel).copied() else {
@@ -343,7 +462,10 @@ impl PacketProcessor {
         };
 
         if self.store.quota.max_bytes_per_sec > 0 {
-            if alloc.check_bandwidth(self.store.quota.max_bytes_per_sec).is_err() {
+            if alloc
+                .check_bandwidth(self.store.quota.max_bytes_per_sec)
+                .is_err()
+            {
                 debug!(%src, "bandwidth quota exceeded, dropping packet");
                 self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
                 return vec![Action::None];
@@ -351,9 +473,13 @@ impl PacketProcessor {
         }
 
         alloc.add_bytes(data_slice.len() as u64);
-        self.metrics.zero_copy_forwards.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .zero_copy_forwards
+            .fetch_add(1, Ordering::Relaxed);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(data_slice.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(data_slice.len() as u64, Ordering::Relaxed);
         let relay_port = alloc.relay_addr.port();
         drop(alloc);
 
@@ -367,19 +493,35 @@ impl PacketProcessor {
         let offset = data_slice.as_ptr() as usize - raw.as_ptr() as usize;
         let data = raw.slice(offset..offset + data_slice.len());
 
-        vec![Action::Forward { data, target: peer_addr, relay_port }]
+        vec![Action::Forward {
+            data,
+            target: peer_addr,
+            relay_port,
+        }]
     }
 
     // ── STUN dispatch ─────────────────────────────────────────────────────────
 
     fn process_stun(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
         let msg = match StunMessage::decode(&raw) {
-            Ok(m)  => m,
-            Err(e) => { warn!(%src, %e, "STUN decode error"); self.metrics.parser_rejections.fetch_add(1, Ordering::Relaxed); return vec![Action::None]; }
+            Ok(m) => m,
+            Err(e) => {
+                warn!(%src, %e, "STUN decode error");
+                self.metrics
+                    .parser_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return vec![Action::None];
+            }
         };
 
+        if matches!(msg.class, MessageClass::Request) {
+            if let Some(actions) = self.maybe_redirect_new_client(&msg, src) {
+                return actions;
+            }
+        }
+
         match (&msg.class, &msg.method) {
-            (MessageClass::Request, Method::Binding)          => self.handle_binding(&msg, &raw, src),
+            (MessageClass::Request, Method::Binding) => self.handle_binding(&msg, &raw, src),
             (MessageClass::Request, Method::Allocate) => {
                 if !self.rate_limiter.check_allocate(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -387,7 +529,7 @@ impl PacketProcessor {
                 }
                 self.handle_allocate(&msg, &raw, src)
             }
-            (MessageClass::Request, Method::Refresh)          => self.handle_refresh(&msg, &raw, src),
+            (MessageClass::Request, Method::Refresh) => self.handle_refresh(&msg, &raw, src),
             (MessageClass::Request, Method::CreatePermission) => {
                 if !self.rate_limiter.check_create_permission(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -402,9 +544,68 @@ impl PacketProcessor {
                 }
                 self.handle_channel_bind(&msg, &raw, src)
             }
-            (MessageClass::Indication, Method::Send)          => self.handle_send_indication(&msg, &raw, src),
+            (MessageClass::Indication, Method::Send) => {
+                self.handle_send_indication(&msg, &raw, src)
+            }
             _ => vec![Action::None],
         }
+    }
+
+    fn maybe_redirect_new_client(&self, msg: &StunMessage, src: SocketAddr) -> Option<Vec<Action>> {
+        let routing = self.cluster.as_ref()?;
+
+        // Existing local sessions stay local even if the ring changes.
+        if self.store.get(&src).is_some() {
+            return None;
+        }
+
+        let key = format!("{}:{}", src.ip(), src.port());
+        let draining = routing.is_draining();
+        let target = {
+            let ring = routing.hash_ring.read();
+            if draining {
+                // Lame-duck: hand every new client to the next-best node so this
+                // node can exit cleanly. If we're the only node, fall through to
+                // serving locally (there is nowhere to drain to).
+                ring.get_node_excluding(&key, &routing.local_node_id).cloned()
+            } else {
+                ring.get_node(&key).cloned()
+            }
+        }?;
+
+        // When not draining and we own the key, serve locally. When draining,
+        // `target` already excludes us, so we always redirect.
+        if !draining && target.node_id == routing.local_node_id {
+            return None;
+        }
+
+        debug!(
+            %src,
+            draining,
+            local_node_id = %routing.local_node_id,
+            target_node_id = %target.node_id,
+            alternate = %target.turn_addr,
+            "redirecting new TURN/STUN client to alternate cluster node"
+        );
+        Some(self.redirect_to(target.turn_addr, msg, src))
+    }
+
+    pub fn redirect_to(
+        &self,
+        alternate_addr: SocketAddr,
+        msg: &StunMessage,
+        src: SocketAddr,
+    ) -> Vec<Action> {
+        let resp =
+            turn::build_redirect_response(msg.method, msg.transaction_id, alternate_addr, src);
+        let mut buf = [0u8; 512];
+        let len = resp.encode(&mut buf);
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.cluster_redirects.fetch_add(1, Ordering::Relaxed);
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: src,
+        }]
     }
 
     // ── STUN handlers ─────────────────────────────────────────────────────────
@@ -413,17 +614,24 @@ impl PacketProcessor {
         // RFC 5389 §10.1.2: if MESSAGE-INTEGRITY present, validate it over the
         // actual message bytes (not an empty buffer).
         let has_integrity = msg.attributes.iter().any(|a| {
-            matches!(a, turna_proto_stun::attribute::Attribute::MessageIntegrity(_))
+            matches!(
+                a,
+                turna_proto_stun::attribute::Attribute::MessageIntegrity(_)
+            )
         });
         if has_integrity {
             if self.auth.validate(msg, raw).is_err() {
-                self.metrics.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .auth_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
             }
         }
 
         let mut resp = StunMessage::with_transaction_id(
-            Method::Binding, MessageClass::SuccessResponse, msg.transaction_id,
+            Method::Binding,
+            MessageClass::SuccessResponse,
+            msg.transaction_id,
         );
         resp.add(Attribute::XorMappedAddress(src));
         resp.add(Attribute::Software("turna 0.1".into()));
@@ -431,7 +639,10 @@ impl PacketProcessor {
         let mut buf = [0u8; 256];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: src }]
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: src,
+        }]
     }
 
     fn handle_allocate(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
@@ -452,7 +663,7 @@ impl PacketProcessor {
         }
 
         let key = match self.auth.validate(msg, raw) {
-            Ok(k)  => k,
+            Ok(k) => k,
             Err(e) => {
                 warn!(%src, %e, "auth failed");
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -462,21 +673,31 @@ impl PacketProcessor {
 
         let (relay_port, relay_sock) = match self.store.ports.allocate_and_bind() {
             Some(x) => x,
-            None    => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
+            None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
         };
 
         let relay_addr = SocketAddr::new(self.external_ip, relay_port);
-        let lifetime   = msg.get_lifetime().unwrap_or(turn::DEFAULT_LIFETIME).min(turn::MAX_LIFETIME);
-        let username   = msg.get_username().unwrap_or("").to_string();
+        let lifetime = msg
+            .get_lifetime()
+            .unwrap_or(turn::DEFAULT_LIFETIME)
+            .min(turn::MAX_LIFETIME);
+        let username = msg.get_username().unwrap_or("").to_string();
 
-        if let Err(_) = self.store.create(src, relay_addr, username, key.clone(), lifetime) {
+        if let Err(_) = self
+            .store
+            .create(src, relay_addr, username, key.clone(), lifetime)
+        {
             self.store.ports.release(relay_port);
             // relay_sock dropped here → socket closed, port freed.
             return self.encode_error(msg, src, 508, "Insufficient Capacity");
         }
 
-        self.metrics.active_allocations.fetch_add(1, Ordering::Relaxed);
-        self.metrics.total_allocations.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .active_allocations
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .total_allocations
+            .fetch_add(1, Ordering::Relaxed);
 
         let resp = turn::build_allocate_response(msg.transaction_id, relay_addr, src, lifetime);
         let mut buf = [0u8; 1024];
@@ -485,8 +706,15 @@ impl PacketProcessor {
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
 
         vec![
-            Action::RegisterRelay { port: relay_port, socket: relay_sock, client_addr: src },
-            Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: src },
+            Action::RegisterRelay {
+                port: relay_port,
+                socket: relay_sock,
+                client_addr: src,
+            },
+            Action::Send {
+                data: Bytes::copy_from_slice(&buf[..len]),
+                target: src,
+            },
         ]
     }
 
@@ -498,14 +726,17 @@ impl PacketProcessor {
             return stale;
         }
         let key = match self.auth.validate(msg, raw) {
-            Ok(k)  => k,
+            Ok(k) => k,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
             }
         };
 
-        let lifetime = msg.get_lifetime().unwrap_or(turn::DEFAULT_LIFETIME).min(turn::MAX_LIFETIME);
+        let lifetime = msg
+            .get_lifetime()
+            .unwrap_or(turn::DEFAULT_LIFETIME)
+            .min(turn::MAX_LIFETIME);
         // Capture the relay port before refresh, so a release (lifetime 0)
         // can tell the server to close the relay socket.
         let relay_port = self.store.get(&src).map(|a| a.relay_addr.port());
@@ -516,9 +747,14 @@ impl PacketProcessor {
                 let mut buf = [0u8; 1024];
                 let len = resp.encode_with_integrity(&mut buf, &key);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-                let mut actions = vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: src }];
+                let mut actions = vec![Action::Send {
+                    data: Bytes::copy_from_slice(&buf[..len]),
+                    target: src,
+                }];
                 if lifetime == 0 {
-                    self.metrics.active_allocations.fetch_sub(1, Ordering::Relaxed);
+                    self.metrics
+                        .active_allocations
+                        .fetch_sub(1, Ordering::Relaxed);
                     if let Some(port) = relay_port {
                         actions.push(Action::CloseRelay { port });
                     }
@@ -529,7 +765,12 @@ impl PacketProcessor {
         }
     }
 
-    fn handle_create_permission(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
+    fn handle_create_permission(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        src: SocketAddr,
+    ) -> Vec<Action> {
         if msg.get_username().is_none() {
             return self.encode_auth_challenge(msg, src);
         }
@@ -537,7 +778,7 @@ impl PacketProcessor {
             return stale;
         }
         let key = match self.auth.validate(msg, raw) {
-            Ok(k)  => k,
+            Ok(k) => k,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
@@ -558,11 +799,15 @@ impl PacketProcessor {
 
         match self.store.add_permission(&src, peer_ip) {
             Ok(_) => {
-                let resp = turn::build_success_response(Method::CreatePermission, msg.transaction_id);
+                let resp =
+                    turn::build_success_response(Method::CreatePermission, msg.transaction_id);
                 let mut buf = [0u8; 1024];
                 let len = resp.encode_with_integrity(&mut buf, &key);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-                vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: src }]
+                vec![Action::Send {
+                    data: Bytes::copy_from_slice(&buf[..len]),
+                    target: src,
+                }]
             }
             Err(_) => self.encode_error(msg, src, 437, "Allocation Mismatch"),
         }
@@ -576,15 +821,19 @@ impl PacketProcessor {
             return stale;
         }
         let key = match self.auth.validate(msg, raw) {
-            Ok(k)  => k,
+            Ok(k) => k,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
             }
         };
 
-        let Some(channel)   = msg.get_channel_number()    else { return self.encode_error(msg, src, 400, "Bad Request"); };
-        let Some(peer_addr) = msg.get_xor_peer_address()  else { return self.encode_error(msg, src, 400, "Bad Request"); };
+        let Some(channel) = msg.get_channel_number() else {
+            return self.encode_error(msg, src, 400, "Bad Request");
+        };
+        let Some(peer_addr) = msg.get_xor_peer_address() else {
+            return self.encode_error(msg, src, 400, "Bad Request");
+        };
 
         if !turn::is_valid_channel(channel) {
             return self.encode_error(msg, src, 400, "Bad Request: invalid channel");
@@ -604,15 +853,27 @@ impl PacketProcessor {
                 let mut buf = [0u8; 1024];
                 let len = resp.encode_with_integrity(&mut buf, &key);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-                vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: src }]
+                vec![Action::Send {
+                    data: Bytes::copy_from_slice(&buf[..len]),
+                    target: src,
+                }]
             }
             Err(_) => self.encode_error(msg, src, 437, "Allocation Mismatch"),
         }
     }
 
-    fn handle_send_indication(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
-        let Some(peer_addr) = msg.get_xor_peer_address() else { return vec![Action::None]; };
-        let Some(data)      = msg.get_data()              else { return vec![Action::None]; };
+    fn handle_send_indication(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        src: SocketAddr,
+    ) -> Vec<Action> {
+        let Some(peer_addr) = msg.get_xor_peer_address() else {
+            return vec![Action::None];
+        };
+        let Some(data) = msg.get_data() else {
+            return vec![Action::None];
+        };
 
         // Normalize ::ffff: → v4 and reject special-use peers (C2/C3).
         let peer_addr = normalize_addr(peer_addr);
@@ -622,9 +883,10 @@ impl PacketProcessor {
         }
 
         // DONT-FRAGMENT: drop if payload exceeds MTU.
-        let has_dont_fragment = msg.attributes.iter().any(|a| {
-            matches!(a, turna_proto_stun::attribute::Attribute::DontFragment)
-        });
+        let has_dont_fragment = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, turna_proto_stun::attribute::Attribute::DontFragment));
         if has_dont_fragment && data.len() > self.mtu as usize {
             debug!(%src, len = data.len(), mtu = self.mtu, "DONT-FRAGMENT: packet too large, dropping");
             return vec![Action::None];
@@ -632,14 +894,18 @@ impl PacketProcessor {
 
         let alloc = match self.store.get(&src) {
             Some(a) => a,
-            None    => return vec![Action::None],
+            None => return vec![Action::None],
         };
 
-        if !alloc.has_permission(&peer_addr) { return vec![Action::None]; }
+        if !alloc.has_permission(&peer_addr) {
+            return vec![Action::None];
+        }
 
         alloc.add_bytes(data.len() as u64);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         let relay_port = alloc.relay_addr.port();
         drop(alloc);
 
@@ -650,38 +916,60 @@ impl PacketProcessor {
         let offset = data.as_ptr() as usize - raw.as_ptr() as usize;
         let data_bytes = Bytes::copy_from_slice(&raw[offset..offset + data.len()]);
 
-        vec![Action::SendViaRelay { data: data_bytes, target: peer_addr, relay_port }]
+        vec![Action::SendViaRelay {
+            data: data_bytes,
+            target: peer_addr,
+            relay_port,
+        }]
     }
 
     // ── Response builders ─────────────────────────────────────────────────────
 
-    fn encode_error(&self, msg: &StunMessage, dst: SocketAddr, code: u16, reason: &str) -> Vec<Action> {
+    fn encode_error(
+        &self,
+        msg: &StunMessage,
+        dst: SocketAddr,
+        code: u16,
+        reason: &str,
+    ) -> Vec<Action> {
         let resp = turn::build_error_response(msg.method, msg.transaction_id, code, reason);
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: dst }]
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: dst,
+        }]
     }
 
     fn encode_auth_challenge(&self, msg: &StunMessage, dst: SocketAddr) -> Vec<Action> {
         let resp = turn::build_auth_challenge(
-            msg.method, msg.transaction_id,
-            self.auth.realm(), &self.nonce_mgr.current(),
+            msg.method,
+            msg.transaction_id,
+            self.auth.realm(),
+            &self.nonce_mgr.current(),
         );
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: dst }]
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: dst,
+        }]
     }
 
     fn encode_stale_nonce(&self, msg: &StunMessage, dst: SocketAddr) -> Vec<Action> {
-        let mut resp = turn::build_error_response(msg.method, msg.transaction_id, 438, "Stale Nonce");
+        let mut resp =
+            turn::build_error_response(msg.method, msg.transaction_id, 438, "Stale Nonce");
         resp.add(Attribute::Realm(self.auth.realm().to_string()));
         resp.add(Attribute::Nonce(self.nonce_mgr.current()));
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        vec![Action::Send { data: Bytes::copy_from_slice(&buf[..len]), target: dst }]
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: dst,
+        }]
     }
 
     fn validate_nonce(&self, msg: &StunMessage, dst: SocketAddr) -> Option<Vec<Action>> {

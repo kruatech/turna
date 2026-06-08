@@ -1,8 +1,8 @@
 //! Cryptographic primitives for TURN auth
 
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use rand::RngCore;
+use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -20,7 +20,11 @@ pub fn long_term_key(username: &str, realm: &str, password: &str) -> Vec<u8> {
 }
 
 /// Generate time-limited TURN credentials (REST API style).
-pub fn generate_turn_credentials(user_id: &str, shared_secret: &[u8], ttl_secs: u64) -> (String, String) {
+pub fn generate_turn_credentials(
+    user_id: &str,
+    shared_secret: &[u8],
+    ttl_secs: u64,
+) -> (String, String) {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -40,14 +44,20 @@ pub fn generate_turn_credentials(user_id: &str, shared_secret: &[u8], ttl_secs: 
 
 /// Verify time-limited TURN credentials.
 pub fn verify_turn_credentials(username: &str, password: &str, shared_secret: &[u8]) -> bool {
-    let Some(ts_str) = username.split(':').next() else { return false };
-    let Ok(timestamp) = ts_str.parse::<u64>() else { return false };
+    let Some(ts_str) = username.split(':').next() else {
+        return false;
+    };
+    let Ok(timestamp) = ts_str.parse::<u64>() else {
+        return false;
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    if now > timestamp { return false }
+    if now > timestamp {
+        return false;
+    }
 
     let mut mac = HmacSha1::new_from_slice(shared_secret).unwrap();
     mac.update(username.as_bytes());

@@ -122,10 +122,8 @@ impl StunMessage {
             });
         }
 
-        let attributes = attribute::parse_attributes(
-            &buf[HEADER_SIZE..total],
-            &header.transaction_id,
-        )?;
+        let attributes =
+            attribute::parse_attributes(&buf[HEADER_SIZE..total], &header.transaction_id)?;
 
         Ok(Self {
             class: header.class,
@@ -266,7 +264,10 @@ pub fn is_channel_data(buf: &[u8]) -> bool {
 /// Decode a ChannelData header: returns (channel_number, data_slice).
 pub fn decode_channel_data(buf: &[u8]) -> Result<(u16, &[u8])> {
     if buf.len() < 4 {
-        return Err(StunError::BufferTooShort { need: 4, have: buf.len() });
+        return Err(StunError::BufferTooShort {
+            need: 4,
+            have: buf.len(),
+        });
     }
     let channel = u16::from_be_bytes([buf[0], buf[1]]);
     let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
@@ -281,7 +282,7 @@ pub fn decode_channel_data(buf: &[u8]) -> Result<(u16, &[u8])> {
 
 /// Encode a ChannelData message.
 pub fn encode_channel_data(buf: &mut [u8], channel: u16, data: &[u8]) -> usize {
-    let total  = 4 + data.len();
+    let total = 4 + data.len();
     let padded = (total + 3) & !3;
     assert!(
         buf.len() >= padded,
@@ -337,7 +338,6 @@ mod tests {
         assert!(is_stun_message(&buf[..len]));
         assert!(!is_channel_data(&buf[..len]));
     }
-
 
     #[test]
     fn test_channel_data_classifier_rejects_bad_length() {

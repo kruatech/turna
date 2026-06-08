@@ -44,9 +44,8 @@ fn arb_short_string() -> impl Strategy<Value = String> {
 }
 
 fn arb_ipv4_addr() -> impl Strategy<Value = std::net::SocketAddr> {
-    (any::<[u8; 4]>(), 1024u16..=65535).prop_map(|(ip, port)| {
-        std::net::SocketAddr::new(std::net::Ipv4Addr::from(ip).into(), port)
-    })
+    (any::<[u8; 4]>(), 1024u16..=65535)
+        .prop_map(|(ip, port)| std::net::SocketAddr::new(std::net::Ipv4Addr::from(ip).into(), port))
 }
 
 fn arb_lifetime() -> impl Strategy<Value = u32> {
@@ -63,7 +62,7 @@ fn arb_lifetime() -> impl Strategy<Value = u32> {
 
 fn arb_channel() -> impl Strategy<Value = u16> {
     prop_oneof![
-        0x4000u16..=0x7FFEu16,  // валидные
+        0x4000u16..=0x7FFEu16, // валидные
         Just(0x4000u16),
         Just(0x7FFEu16),
     ]
@@ -95,10 +94,10 @@ proptest! {
 fn matches_class(a: &MessageClass, b: &MessageClass) -> bool {
     matches!(
         (a, b),
-        (MessageClass::Request,         MessageClass::Request)         |
-        (MessageClass::Indication,      MessageClass::Indication)      |
-        (MessageClass::SuccessResponse, MessageClass::SuccessResponse) |
-        (MessageClass::ErrorResponse,   MessageClass::ErrorResponse)
+        (MessageClass::Request, MessageClass::Request)
+            | (MessageClass::Indication, MessageClass::Indication)
+            | (MessageClass::SuccessResponse, MessageClass::SuccessResponse)
+            | (MessageClass::ErrorResponse, MessageClass::ErrorResponse)
     )
 }
 

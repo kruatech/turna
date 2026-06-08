@@ -60,23 +60,23 @@ impl Default for HugePagesConfig {
 // ---------------------------------------------------------------------------
 
 pub struct HugePagePool {
-    base:            NonNull<u8>,
-    total_size:      usize,
-    slot_size:       usize,
-    slot_count:      usize,
+    base: NonNull<u8>,
+    total_size: usize,
+    slot_size: usize,
+    slot_count: usize,
     uses_huge_pages: bool,
     /// FIX (SUSPECT #1): was AtomicPtr<FreeNode> + Treiber CAS stack.
     /// Replaced with Mutex<Vec<usize>> — slot indices of free buffers.
     /// No ABA possible: pop/push on Vec under Mutex is trivially correct.
-    free_slots:  Mutex<Vec<usize>>,
-    allocated:   AtomicUsize,
-    _dropped:    AtomicBool,
-    stats:       PoolStats,
+    free_slots: Mutex<Vec<usize>>,
+    allocated: AtomicUsize,
+    _dropped: AtomicBool,
+    stats: PoolStats,
 }
 
 pub struct PoolStats {
-    pub total_allocs:  AtomicU64,
-    pub total_frees:   AtomicU64,
+    pub total_allocs: AtomicU64,
+    pub total_frees: AtomicU64,
     pub failed_allocs: AtomicU64,
 }
 
@@ -91,7 +91,7 @@ unsafe impl Sync for HugePagePool {}
 
 impl HugePagePool {
     pub fn new(config: HugePagesConfig) -> io::Result<Self> {
-        let total_size   = config.slot_size * config.slot_count;
+        let total_size = config.slot_size * config.slot_count;
         let aligned_size = (total_size + (2 * 1024 * 1024 - 1)) & !(2 * 1024 * 1024 - 1);
 
         let (base, uses_huge) = alloc_memory(aligned_size, &config)?;
@@ -102,15 +102,15 @@ impl HugePagePool {
         let pool = Self {
             base,
             total_size: aligned_size,
-            slot_size:  config.slot_size,
+            slot_size: config.slot_size,
             slot_count: config.slot_count,
             uses_huge_pages: uses_huge,
-            free_slots:  Mutex::new(free_slots),
-            allocated:   AtomicUsize::new(0),
-            _dropped:    AtomicBool::new(false),
+            free_slots: Mutex::new(free_slots),
+            allocated: AtomicUsize::new(0),
+            _dropped: AtomicBool::new(false),
             stats: PoolStats {
-                total_allocs:  AtomicU64::new(0),
-                total_frees:   AtomicU64::new(0),
+                total_allocs: AtomicU64::new(0),
+                total_frees: AtomicU64::new(0),
                 failed_allocs: AtomicU64::new(0),
             },
         };
@@ -120,7 +120,7 @@ impl HugePagePool {
         }
 
         info!(
-            slots     = config.slot_count,
+            slots = config.slot_count,
             slot_size = config.slot_size,
             total_mib = aligned_size / (1024 * 1024),
             huge_pages = uses_huge,
@@ -146,9 +146,9 @@ impl HugePagePool {
         // so offset + slot_size <= total_size <= mmap region.
         let ptr = unsafe { self.base.as_ptr().add(offset) };
         Some(PoolBuffer {
-            ptr:        NonNull::new(ptr).unwrap(),
-            len:        0,
-            capacity:   self.slot_size,
+            ptr: NonNull::new(ptr).unwrap(),
+            len: 0,
+            capacity: self.slot_size,
             slot_index,
         })
     }
@@ -172,12 +172,24 @@ impl HugePagePool {
         debug!(pages = self.total_size / 4096, "prefaulted pages");
     }
 
-    pub fn capacity(&self)        -> usize { self.slot_count }
-    pub fn allocated_count(&self) -> usize { self.allocated.load(Ordering::Relaxed) }
-    pub fn free_count(&self)      -> usize { self.slot_count - self.allocated_count() }
-    pub fn uses_huge_pages(&self) -> bool  { self.uses_huge_pages }
-    pub fn total_allocs(&self)    -> u64   { self.stats.total_allocs.load(Ordering::Relaxed) }
-    pub fn failed_allocs(&self)   -> u64   { self.stats.failed_allocs.load(Ordering::Relaxed) }
+    pub fn capacity(&self) -> usize {
+        self.slot_count
+    }
+    pub fn allocated_count(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+    pub fn free_count(&self) -> usize {
+        self.slot_count - self.allocated_count()
+    }
+    pub fn uses_huge_pages(&self) -> bool {
+        self.uses_huge_pages
+    }
+    pub fn total_allocs(&self) -> u64 {
+        self.stats.total_allocs.load(Ordering::Relaxed)
+    }
+    pub fn failed_allocs(&self) -> u64 {
+        self.stats.failed_allocs.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for HugePagePool {
@@ -206,9 +218,9 @@ impl Drop for HugePagePool {
 // ---------------------------------------------------------------------------
 
 pub struct PoolBuffer {
-    ptr:        NonNull<u8>,
-    len:        usize,
-    capacity:   usize,
+    ptr: NonNull<u8>,
+    len: usize,
+    capacity: usize,
     slot_index: usize,
 }
 
@@ -248,21 +260,30 @@ impl PoolBuffer {
         // SAFETY: ptr is valid for `capacity` bytes. MaybeUninit<u8> has the
         // same layout as u8 and validity only requires the allocation be live.
         unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr.as_ptr() as *mut MaybeUninit<u8>,
-                self.capacity,
-            )
+            std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut MaybeUninit<u8>, self.capacity)
         }
     }
 
     pub fn set_len(&mut self, len: usize) {
-        assert!(len <= self.capacity, "set_len({len}) > capacity({})", self.capacity);
+        assert!(
+            len <= self.capacity,
+            "set_len({len}) > capacity({})",
+            self.capacity
+        );
         self.len = len;
     }
-    pub fn len(&self)       -> usize { self.len }
-    pub fn is_empty(&self)  -> bool  { self.len == 0 }
-    pub fn capacity(&self)  -> usize { self.capacity }
-    pub fn as_mut_ptr(&mut self) -> *mut u8 { self.ptr.as_ptr() }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
 }
 
 // SAFETY: PoolBuffer owns a disjoint slot in the mmap region — no aliasing.
@@ -282,9 +303,12 @@ fn alloc_memory(size: usize, config: &HugePagesConfig) -> io::Result<(NonNull<u8
 
         let ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(), size,
+                std::ptr::null_mut(),
+                size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                huge_flags, -1, 0,
+                huge_flags,
+                -1,
+                0,
             )
         };
 
@@ -305,10 +329,12 @@ fn alloc_memory(size: usize, config: &HugePagesConfig) -> io::Result<(NonNull<u8
 
     let ptr = unsafe {
         libc::mmap(
-            std::ptr::null_mut(), size,
+            std::ptr::null_mut(),
+            size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1, 0,
+            -1,
+            0,
         )
     };
     if ptr == libc::MAP_FAILED {
@@ -322,16 +348,21 @@ fn alloc_memory(size: usize, config: &HugePagesConfig) -> io::Result<(NonNull<u8
 fn alloc_memory(size: usize, _config: &HugePagesConfig) -> io::Result<(NonNull<u8>, bool)> {
     let ptr = unsafe {
         libc::mmap(
-            std::ptr::null_mut(), size,
+            std::ptr::null_mut(),
+            size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1, 0,
+            -1,
+            0,
         )
     };
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    info!(size_mib = size / (1024 * 1024), "mmap (no huge pages on this platform)");
+    info!(
+        size_mib = size / (1024 * 1024),
+        "mmap (no huge pages on this platform)"
+    );
     Ok((NonNull::new(ptr as *mut u8).unwrap(), false))
 }
 
@@ -345,9 +376,9 @@ fn free_memory(base: NonNull<u8>, size: usize) {
 
 #[derive(Debug, Clone)]
 pub struct HugePagesInfo {
-    pub available:    bool,
-    pub total_pages:  u64,
-    pub free_pages:   u64,
+    pub available: bool,
+    pub total_pages: u64,
+    pub free_pages: u64,
     pub page_size_kb: u64,
 }
 
@@ -360,13 +391,23 @@ pub fn check_hugepages_available() -> HugePagesInfo {
             .unwrap_or(0)
     };
     let total = read_val("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages");
-    let free  = read_val("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages");
-    HugePagesInfo { available: free > 0, total_pages: total, free_pages: free, page_size_kb: 2048 }
+    let free = read_val("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages");
+    HugePagesInfo {
+        available: free > 0,
+        total_pages: total,
+        free_pages: free,
+        page_size_kb: 2048,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn check_hugepages_available() -> HugePagesInfo {
-    HugePagesInfo { available: false, total_pages: 0, free_pages: 0, page_size_kb: 0 }
+    HugePagesInfo {
+        available: false,
+        total_pages: 0,
+        free_pages: 0,
+        page_size_kb: 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,11 +420,11 @@ mod tests {
 
     fn small_pool() -> HugePagePool {
         HugePagePool::new(HugePagesConfig {
-            slot_count:          16,
-            slot_size:           256,
-            try_huge_pages:      false,
+            slot_count: 16,
+            slot_size: 256,
+            try_huge_pages: false,
             fallback_to_regular: true,
-            prefault:            false,
+            prefault: false,
         })
         .unwrap()
     }
@@ -408,11 +449,11 @@ mod tests {
     #[test]
     fn exhaust_and_recover() {
         let pool = HugePagePool::new(HugePagesConfig {
-            slot_count:          4,
-            slot_size:           64,
-            try_huge_pages:      false,
+            slot_count: 4,
+            slot_size: 64,
+            try_huge_pages: false,
             fallback_to_regular: true,
-            prefault:            false,
+            prefault: false,
         })
         .unwrap();
 
@@ -425,7 +466,9 @@ mod tests {
 
         // Free everything so the pool's Drop invariant (active == 0) holds.
         pool.free(recovered.unwrap());
-        for b in bufs { pool.free(b); }
+        for b in bufs {
+            pool.free(b);
+        }
     }
 
     #[test]
@@ -478,7 +521,7 @@ mod tests {
     fn drop_with_active_panics() {
         let pool = small_pool();
         let _buf = pool.alloc().unwrap(); // not freed
-        // drop(pool) while buf is still alive — must panic
+                                          // drop(pool) while buf is still alive — must panic
     }
 
     #[test]

@@ -175,11 +175,19 @@ pub enum QuicEvent {
     /// Bidirectional stream opened by client.
     BiStreamOpened { session_id: String, stream_id: u64 },
     /// Stream data received.
-    StreamData { session_id: String, stream_id: u64, data: Vec<u8> },
+    StreamData {
+        session_id: String,
+        stream_id: u64,
+        data: Vec<u8>,
+    },
     /// Session closed.
     SessionClosed { session_id: String, reason: String },
     /// Connection migrated to new address.
-    ConnectionMigrated { session_id: String, old_addr: SocketAddr, new_addr: SocketAddr },
+    ConnectionMigrated {
+        session_id: String,
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+    },
 }
 
 /// QUIC server handle.
@@ -199,10 +207,7 @@ impl QuicServer {
     /// negotiates ALPN, creates WebTransportSessions.
     ///
     /// Events sent via channel for the SFU to process.
-    pub async fn run(
-        &self,
-        _event_tx: tokio::sync::mpsc::Sender<QuicEvent>,
-    ) -> Result<()> {
+    pub async fn run(&self, _event_tx: tokio::sync::mpsc::Sender<QuicEvent>) -> Result<()> {
         info!(
             addr = %self.config.listen_addr,
             alpn = ?self.config.alpn,
@@ -219,7 +224,9 @@ impl QuicServer {
         // }
 
         // Placeholder: wait forever
-        tokio::signal::ctrl_c().await.map_err(|e| QuicError::Connection(e.to_string()))?;
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|e| QuicError::Connection(e.to_string()))?;
         Ok(())
     }
 

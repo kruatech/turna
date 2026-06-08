@@ -211,7 +211,10 @@ impl RtpAnalyzer {
         let video_streams = total_streams - audio_streams;
 
         let avg_loss = streams.iter().map(|s| s.loss_percent).sum::<f64>() / total_streams as f64;
-        let max_loss = streams.iter().map(|s| s.loss_percent).fold(0.0f64, f64::max);
+        let max_loss = streams
+            .iter()
+            .map(|s| s.loss_percent)
+            .fold(0.0f64, f64::max);
         let avg_jitter = streams.iter().map(|s| s.jitter_ms).sum::<f64>() / total_streams as f64;
         let max_jitter = streams.iter().map(|s| s.jitter_ms).fold(0.0f64, f64::max);
         let total_bitrate: u64 = streams.iter().map(|s| s.bitrate_bps).sum();
@@ -231,7 +234,8 @@ impl RtpAnalyzer {
     /// Remove stale streams (no packets for > 30s).
     pub fn cleanup_stale(&self) -> usize {
         let cutoff = Instant::now() - std::time::Duration::from_secs(30);
-        let stale: Vec<u32> = self.streams
+        let stale: Vec<u32> = self
+            .streams
             .iter()
             .filter(|e| e.value().last_arrival < cutoff)
             .map(|e| *e.key())
@@ -249,7 +253,9 @@ impl RtpAnalyzer {
 }
 
 impl Default for RtpAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Aggregate quality across all streams.

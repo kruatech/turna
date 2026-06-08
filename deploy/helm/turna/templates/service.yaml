@@ -28,6 +28,28 @@ spec:
     app.kubernetes.io/name: turna
     app.kubernetes.io/instance: {{ .Release.Name }}
 ---
+{{- if .Values.cluster.enabled }}
+# Headless service: stable per-pod DNS for gossip seeding and the StatefulSet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-gossip
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: gossip-udp
+      port: {{ .Values.cluster.gossipPort }}
+      targetPort: gossip-udp
+      protocol: UDP
+  selector:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+{{- end }}
 {{- if .Values.signaling.enabled }}
 apiVersion: v1
 kind: Service
