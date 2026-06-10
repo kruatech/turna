@@ -15,7 +15,11 @@ High-performance TURN/STUN server written in Rust (RFC 5766, RFC 8656, RFC 5389)
 - Pluggable state backend (in-memory, Tarantool) for clustered deployments
 - gRPC control plane + CLI (`turnactl`) for live management
 - OpenTelemetry tracing and Prometheus metrics out of the box
-- Graceful drain, session migration and crash recovery
+- Graceful drain and RFC 8016 session migration on the default (tokio)
+  datapath, with FD-passing graceful restart and crash recovery via shared
+  state. The io_uring datapath is experimental; its graceful drain rejects new
+  allocations while existing flows finish, but is not yet runtime-verified — see
+  [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md)
 - Continuously fuzzed STUN/TURN parsers (cargo-fuzz, see `fuzz/`)
 
 ## Quick start
@@ -27,7 +31,10 @@ cargo build --release
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a complete walkthrough,
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for all options and
-[docs/DEPLOY.md](docs/DEPLOY.md) for Docker / Helm deployments.
+[docs/DEPLOY.md](docs/DEPLOY.md) for Docker / Helm deployments. Before a
+production rollout, read
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) for the recommended
+configuration and the experimental-datapath caveats.
 
 ## Using turna as a library
 

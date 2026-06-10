@@ -20,6 +20,11 @@ pub mod tokio_transport;
 pub mod uring;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod worker;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod relay_route;
+
+#[cfg(all(target_os = "linux", feature = "af-xdp"))]
+pub mod af_xdp;
 
 #[cfg(feature = "tls")]
 pub mod tcp_tls;
@@ -74,3 +79,5 @@ pub async fn bind(addr: SocketAddr) -> Result<TokioTransport> {
 pub mod gso;
 #[cfg(target_os = "linux")]
 pub mod numa;
+
+pub mod dtls;

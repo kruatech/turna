@@ -17,11 +17,10 @@
 #![cfg(target_os = "linux")]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Error)]
 pub enum AfXdpError {
@@ -89,6 +88,7 @@ impl Default for AfXdpConfig {
 // ---------------------------------------------------------------------------
 
 /// UMEM: shared memory between kernel and userspace.
+#[allow(dead_code)] // legacy hand-rolled datapath; the xsk module is the live one
 pub struct Umem {
     /// mmap'd memory region.
     area: *mut u8,
@@ -270,6 +270,7 @@ impl Drop for Umem {
 // ---------------------------------------------------------------------------
 
 /// AF_XDP socket handle.
+#[allow(dead_code)] // legacy hand-rolled datapath; the xsk module is the live one
 pub struct AfXdpSocket {
     fd: RawFd,
     config: AfXdpConfig,
@@ -469,18 +470,24 @@ impl AfXdpTransport {
     ///
     /// Returns Vec of (frame_addr, length, source_addr).
     /// Caller must parse Ethernet+IP+UDP to extract source_addr.
-    pub fn recv_batch(&mut self, max: usize) -> Vec<ReceivedFrame> {
-        // In production: drain RX ring, parse each frame
-        // Each frame contains: ETH | IP | UDP | TURN payload
-        // We strip headers and return TURN payload + source addr
-        Vec::new() // placeholder
+    pub fn recv_batch(&mut self, _max: usize) -> Vec<ReceivedFrame> {
+        // Datapath: drain up to `_max` descriptors from the RX ring (via xsk-rs
+        // — Phase 1 in docs/design/af-xdp-datapath.md) and, for each frame, call
+        // `frame::parse_eth_ipv4_udp` to extract (source, payload) into a
+        // `ReceivedFrame`. The ETH/IP/UDP parsing is implemented and tested in
+        // the `frame` module; only the ring drain (the unsafe/xsk-rs piece)
+        // remains.
+        Vec::new() // ring drain TODO
     }
 
     /// Send a packet.
-    pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
-        // In production: alloc frame from UMEM, build ETH+IP+UDP headers,
-        // copy payload, submit to TX ring
-        Ok(()) // placeholder
+    pub fn send_to(&mut self, _data: &[u8], _target: SocketAddr) -> Result<()> {
+        // Datapath: alloc a UMEM frame, build the wire frame with
+        // `frame::build_eth_ipv4_udp` (destination MAC resolved via the kernel
+        // neighbour table), copy it into the frame, submit to the TX ring and
+        // `wakeup_tx` when needed. Header building + checksums are implemented
+        // and tested in the `frame` module; only the ring submit remains.
+        Ok(()) // ring submit TODO
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -498,6 +505,9 @@ pub struct ReceivedFrame {
     pub data: Vec<u8>,
     /// Source address (parsed from IP+UDP headers).
     pub source: SocketAddr,
+    /// Destination address (parsed from IP+UDP headers). Used to demux the main
+    /// TURN socket vs an allocation's relay port on the AF_XDP datapath.
+    pub dst: SocketAddr,
     /// Frame address in UMEM (for returning to free pool).
     pub frame_addr: u64,
 }
@@ -566,6 +576,211 @@ fn set_ring_size(fd: RawFd, opt: i32, size: u32) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Pure L2–L4 stack (no kernel/ring involvement — unit-testable).
+//
+// AF_XDP delivers and accepts *full Ethernet frames*, so the datapath must
+// parse inbound ETH/IP/UDP itself and build the headers for outbound frames.
+// This module is Phase 2 of docs/design/af-xdp-datapath.md. IPv4 only for now
+// (IPv6 is a TODO). MAC resolution for TX is the caller's responsibility (the
+// kernel neighbour table); these functions take the MACs as inputs and are
+// completely free of any socket/ring state, so they are directly unit-testable.
+// ---------------------------------------------------------------------------
+pub mod frame {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    pub const ETH_HDR_LEN: usize = 14;
+    pub const ETHERTYPE_IPV4: u16 = 0x0800;
+    pub const IPPROTO_UDP: u8 = 17;
+
+    /// A parsed inbound IPv4/UDP datagram. `payload_offset`/`payload_len` index
+    /// into the *original frame* so the caller can slice the UMEM frame without
+    /// copying.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ParsedUdpV4 {
+        pub src: SocketAddrV4,
+        pub dst: SocketAddrV4,
+        pub payload_offset: usize,
+        pub payload_len: usize,
+    }
+
+    /// Parse an Ethernet+IPv4+UDP frame. Returns `None` for non-IPv4, non-UDP,
+    /// fragmented, or truncated frames. RX checksums are not re-validated (the
+    /// NIC already did); this only locates the payload + endpoints.
+    pub fn parse_eth_ipv4_udp(frame: &[u8]) -> Option<ParsedUdpV4> {
+        if frame.len() < ETH_HDR_LEN + 20 + 8 {
+            return None;
+        }
+        if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
+            return None;
+        }
+        let ip = &frame[ETH_HDR_LEN..];
+        let version = ip[0] >> 4;
+        let ihl = (ip[0] & 0x0f) as usize * 4;
+        if version != 4 || ihl < 20 || ip.len() < ihl + 8 {
+            return None;
+        }
+        if ip[9] != IPPROTO_UDP {
+            return None;
+        }
+        // Drop fragments (MF set or non-zero fragment offset).
+        if u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0 {
+            return None;
+        }
+        let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+        let dst_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+        let udp = &ip[ihl..];
+        let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+        let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+        let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+        if udp_len < 8 || udp.len() < udp_len {
+            return None;
+        }
+        let payload_len = udp_len - 8;
+        let payload_offset = ETH_HDR_LEN + ihl + 8;
+        if frame.len() < payload_offset + payload_len {
+            return None;
+        }
+        Some(ParsedUdpV4 {
+            src: SocketAddrV4::new(src_ip, src_port),
+            dst: SocketAddrV4::new(dst_ip, dst_port),
+            payload_offset,
+            payload_len,
+        })
+    }
+
+    /// Build an Ethernet+IPv4+UDP frame carrying `payload` from `src` to `dst`
+    /// using the given MACs. Computes the IPv4 header checksum and the UDP
+    /// checksum (with pseudo-header). TTL 64, DF set, no IP options.
+    pub fn build_eth_ipv4_udp(
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = 8 + payload.len();
+        let total_len = 20 + udp_len;
+        let mut f = Vec::with_capacity(ETH_HDR_LEN + total_len);
+        // Ethernet
+        f.extend_from_slice(&dst_mac);
+        f.extend_from_slice(&src_mac);
+        f.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        // IPv4 header (checksum patched below)
+        let ip = f.len();
+        f.push(0x45); // version 4, IHL 5
+        f.push(0x00); // DSCP/ECN
+        f.extend_from_slice(&(total_len as u16).to_be_bytes());
+        f.extend_from_slice(&0u16.to_be_bytes()); // identification
+        f.extend_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, fragment=0
+        f.push(64); // TTL
+        f.push(IPPROTO_UDP);
+        f.extend_from_slice(&0u16.to_be_bytes()); // header checksum placeholder
+        f.extend_from_slice(&src.ip().octets());
+        f.extend_from_slice(&dst.ip().octets());
+        let ipsum = ones_complement(&f[ip..ip + 20]);
+        f[ip + 10..ip + 12].copy_from_slice(&ipsum.to_be_bytes());
+        // UDP header (checksum patched below) + payload
+        let udp = f.len();
+        f.extend_from_slice(&src.port().to_be_bytes());
+        f.extend_from_slice(&dst.port().to_be_bytes());
+        f.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        f.extend_from_slice(&0u16.to_be_bytes()); // checksum placeholder
+        f.extend_from_slice(payload);
+        let mut udpsum = udp_checksum_v4(src.ip(), dst.ip(), &f[udp..]);
+        // RFC 768: a computed checksum of 0 is transmitted as 0xFFFF.
+        if udpsum == 0 {
+            udpsum = 0xFFFF;
+        }
+        f[udp + 6..udp + 8].copy_from_slice(&udpsum.to_be_bytes());
+        f
+    }
+
+    /// 16-bit one's-complement checksum over a byte slice (RFC 1071).
+    pub fn ones_complement(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// UDP checksum over the IPv4 pseudo-header + UDP header + payload. `udp`
+    /// must be the UDP header (checksum field zeroed) followed by the payload.
+    pub fn udp_checksum_v4(src: &Ipv4Addr, dst: &Ipv4Addr, udp: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let (s, d) = (src.octets(), dst.octets());
+        for pair in [[s[0], s[1]], [s[2], s[3]], [d[0], d[1]], [d[2], d[3]]] {
+            sum += u16::from_be_bytes(pair) as u32;
+        }
+        sum += IPPROTO_UDP as u32;
+        sum += udp.len() as u32;
+        let mut i = 0;
+        while i + 1 < udp.len() {
+            sum += u16::from_be_bytes([udp[i], udp[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < udp.len() {
+            sum += (udp[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[cfg(test)]
+    mod frame_tests {
+        use super::*;
+
+        #[test]
+        fn build_then_parse_roundtrips() {
+            let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 50000);
+            let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 5), 3478);
+            let payload = b"STUN-ish payload bytes";
+            let f = build_eth_ipv4_udp([1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], src, dst, payload);
+            let p = parse_eth_ipv4_udp(&f).expect("must parse");
+            assert_eq!(p.src, src);
+            assert_eq!(p.dst, dst);
+            assert_eq!(&f[p.payload_offset..p.payload_offset + p.payload_len], payload);
+        }
+
+        #[test]
+        fn checksums_are_valid() {
+            // A frame we build must have a self-consistent IPv4 header checksum
+            // (ones-complement over the 20-byte header sums to 0) and a valid
+            // UDP checksum (ones-complement over pseudo-header+UDP sums to 0).
+            let src = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234);
+            let dst = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 5678);
+            let f = build_eth_ipv4_udp([0; 6], [0; 6], src, dst, b"abc");
+            let ip = &f[ETH_HDR_LEN..ETH_HDR_LEN + 20];
+            assert_eq!(ones_complement(ip), 0, "IPv4 header checksum invalid");
+            let udp = &f[ETH_HDR_LEN + 20..];
+            // Verify by recomputing over the as-sent UDP (checksum field intact):
+            // the verifier sum (pseudo-header + udp incl. checksum) must be 0.
+            assert_eq!(udp_checksum_v4(src.ip(), dst.ip(), udp), 0, "UDP checksum invalid");
+        }
+
+        #[test]
+        fn rejects_non_udp_and_truncated() {
+            assert!(parse_eth_ipv4_udp(&[0u8; 10]).is_none()); // too short
+            let mut f = build_eth_ipv4_udp([0; 6], [0; 6],
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2), b"x");
+            f[ETH_HDR_LEN + 9] = 6; // protocol TCP, not UDP
+            assert!(parse_eth_ipv4_udp(&f).is_none());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -600,5 +815,390 @@ mod tests {
         let c = AfXdpConfig::default();
         assert_eq!(c.frame_count, 4096);
         assert_eq!(c.frame_size, 2048);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// xsk-rs ring datapath (AF_XDP Phase 1)
+// ---------------------------------------------------------------------------
+
+/// xsk-rs-backed AF_XDP datapath. Rather than hand-rolling the four rings and
+/// their memory ordering, this delegates UMEM + socket + ring management to
+/// `xsk-rs` and keeps only the turna-specific L2-L4 (de)framing, reusing
+/// [`frame`]. This is the datapath the `af-xdp` feature should use in
+/// production; the hand-rolled `Umem`/`AfXdpSocket` above remain as the raw
+/// libc reference.
+///
+/// NOTE (draft): written against the xsk-rs 0.6 API. `Umem::new` / `Socket::new`
+/// return shapes and the queue methods (`fill`, `poll_and_consume`,
+/// `produce_and_wakeup`, `consume`) plus UMEM access (`umem.data` /
+/// `umem.data_mut`, `FrameDesc` len/addr accessors) are version-sensitive —
+/// verify with `cargo build --features af-xdp` on Linux with a bound NIC queue.
+/// All unsafe UMEM access is isolated to this module.
+pub mod xsk {
+    use super::{frame, AfXdpConfig, AfXdpError, ReceivedFrame, Result};
+    use std::net::{SocketAddr, SocketAddrV4};
+    use std::num::NonZeroU32;
+
+    use xsk_rs::{
+        config::{Interface, SocketConfig, UmemConfig},
+        CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem,
+    };
+
+    /// One AF_XDP socket bound to a single NIC queue, with its UMEM and rings.
+    pub struct XskDatapath {
+        umem: Umem,
+        rx: RxQueue,
+        tx: TxQueue,
+        fill: FillQueue,
+        comp: CompQueue,
+        /// Descriptors not currently owned by a kernel ring — available for TX.
+        free_frames: Vec<FrameDesc>,
+        /// Pre-allocated buffer the completion ring overwrites with the
+        /// descriptors of finished TX frames (see `reclaim_completions`).
+        comp_scratch: Vec<FrameDesc>,
+        local_addr: SocketAddr,
+        src_mac: [u8; 6],
+        // TX needs the next-hop (gateway) MAC. Phase 1: configured/placeholder;
+        // real neighbor resolution (ARP / netlink NEIGH) is a follow-up.
+        dst_mac: [u8; 6],
+    }
+
+    /// Parse "aa:bb:cc:dd:ee:ff" into 6 octets.
+    fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
+        let parts: Vec<&str> = s.trim().split(':').collect();
+        if parts.len() != 6 {
+            return None;
+        }
+        let mut m = [0u8; 6];
+        for (i, p) in parts.iter().enumerate() {
+            m[i] = u8::from_str_radix(p, 16).ok()?;
+        }
+        Some(m)
+    }
+
+    /// Read the interface's own MAC from sysfs (`/sys/class/net/<iface>/address`).
+    fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
+        let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).ok()?;
+        parse_mac_str(&s)
+    }
+
+    /// Default-route gateway IPv4 for `iface` from `/proc/net/route` (the field
+    /// is a little-endian hex of the address in memory; swap to get dotted IP).
+    fn default_gateway_ip(iface: &str) -> Option<std::net::Ipv4Addr> {
+        let txt = std::fs::read_to_string("/proc/net/route").ok()?;
+        for line in txt.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 3 || f[0] != iface || f[1] != "00000000" {
+                continue;
+            }
+            let v = u32::from_str_radix(f[2], 16).ok()?;
+            return Some(std::net::Ipv4Addr::from(v.swap_bytes()));
+        }
+        None
+    }
+
+    /// Look up an IPv4's MAC in the kernel ARP cache (`/proc/net/arp`).
+    fn arp_mac_for_ip(ip: std::net::Ipv4Addr) -> Option<[u8; 6]> {
+        let txt = std::fs::read_to_string("/proc/net/arp").ok()?;
+        let target = ip.to_string();
+        for line in txt.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 4 && f[0] == target {
+                return parse_mac_str(f[3]);
+            }
+        }
+        None
+    }
+
+    /// Resolve the source MAC: keep the configured value if non-zero, else read
+    /// the interface MAC from sysfs.
+    fn resolve_src_mac(iface: &str, configured: [u8; 6]) -> [u8; 6] {
+        if configured != [0u8; 6] {
+            return configured;
+        }
+        match read_iface_mac(iface) {
+            Some(m) => {
+                tracing::info!(iface, mac = ?m, "AF_XDP: resolved source MAC from sysfs");
+                m
+            }
+            None => {
+                tracing::warn!(iface, "AF_XDP: could not read source MAC; using zero placeholder");
+                configured
+            }
+        }
+    }
+
+    /// Resolve the next-hop (TX destination) MAC: keep the configured value if
+    /// non-zero, else resolve the default gateway's MAC from the ARP cache.
+    ///
+    /// First-cut neighbor resolution: this uses the *default-route gateway* MAC
+    /// for all TX, which is correct for an internet-facing relay. Per-destination
+    /// resolution (on-link peers, multiple routes) and live ARP refresh are a
+    /// follow-up (netlink NEIGH); for now an empty ARP cache yields the zero
+    /// placeholder and a warning. The gateway must already be in the ARP cache
+    /// (ping it once at startup if needed).
+    fn resolve_dst_mac(iface: &str, configured: [u8; 6]) -> [u8; 6] {
+        if configured != [0u8; 6] {
+            return configured;
+        }
+        let resolved = default_gateway_ip(iface).and_then(arp_mac_for_ip);
+        match resolved {
+            Some(m) => {
+                tracing::info!(iface, mac = ?m, "AF_XDP: resolved gateway (next-hop) MAC from ARP cache");
+                m
+            }
+            None => {
+                tracing::warn!(
+                    iface,
+                    "AF_XDP: could not resolve gateway MAC (no default route or empty ARP cache); \
+                     using zero placeholder — set [turn.af_xdp].dst_mac or warm the ARP cache"
+                );
+                configured
+            }
+        }
+    }
+
+    impl XskDatapath {
+        /// Create the UMEM and bind an AF_XDP socket to `cfg.interface` queue
+        /// `cfg.queue_id`. `src_mac`/`dst_mac` frame the L2 headers for TX.
+        pub fn bind(
+            cfg: &AfXdpConfig,
+            local_addr: SocketAddr,
+            src_mac: [u8; 6],
+            dst_mac: [u8; 6],
+        ) -> Result<Self> {
+            // Phase-1 neighbor resolution: fill empty MACs from sysfs (src) and
+            // the default-gateway ARP entry (dst). Configured non-zero values win.
+            let src_mac = resolve_src_mac(&cfg.interface, src_mac);
+            let dst_mac = resolve_dst_mac(&cfg.interface, dst_mac);
+
+            let frame_count = NonZeroU32::new(cfg.frame_count)
+                .ok_or_else(|| AfXdpError::Umem("frame_count must be > 0".into()))?;
+
+            // xsk-rs 0.6 gates frame/queue sizes behind FrameSize/QueueSize newtypes
+            // whose constructors are version-sensitive. For first-light use library
+            // defaults (frame 4096, rings 2048) and honour only frame_count.
+            let umem_config = UmemConfig::default();
+
+            // (Umem, Vec<FrameDesc>): one descriptor per frame in the UMEM.
+            let (umem, mut frames) = Umem::new(umem_config, frame_count, false)
+                .map_err(|e| AfXdpError::Umem(format!("umem: {e}")))?;
+
+            let socket_config = SocketConfig::default();
+
+            let iface = Interface::new(
+                std::ffi::CString::new(cfg.interface.clone()).map_err(|e| {
+                    AfXdpError::Socket(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("interface name: {e}"),
+                    ))
+                })?,
+            );
+            // The first socket on a UMEM owns the (fill, comp) pair.
+            let (tx, rx, fill_comp) = unsafe { Socket::new(socket_config, &umem, &iface, cfg.queue_id) }
+                .map_err(|e| {
+                    AfXdpError::Socket(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("xsk socket: {e}"),
+                    ))
+                })?;
+            let (mut fill, comp) = fill_comp
+                .ok_or_else(|| AfXdpError::Umem("no fill/comp queue for first socket".into()))?;
+
+            // Reserve a small buffer of descriptor slots for the completion
+            // ring to write finished TX frames into (it overwrites these). The
+            // reserved frames themselves are effectively donated to the scratch
+            // and not used as RX/TX frames — a few wasted frames, fine here.
+            let scratch_n = frames.len().min(64);
+            let comp_scratch: Vec<FrameDesc> = frames.drain(..scratch_n).collect();
+
+            // Split remaining descriptors: half seed the fill ring (kernel RX
+            // targets), the rest stay free for TX. Simple even split for the draft.
+            let split = frames.len() / 2;
+            let for_rx: Vec<FrameDesc> = frames.drain(..split).collect();
+            // SAFETY: these descriptors point at frames we own and are not in
+            // any other ring; handing them to the fill ring transfers them to
+            // the kernel for RX DMA.
+            unsafe {
+                fill.produce(&for_rx);
+            }
+
+            Ok(Self {
+                umem,
+                rx,
+                tx,
+                fill,
+                comp,
+                free_frames: frames,
+                comp_scratch,
+                local_addr,
+                src_mac,
+                dst_mac,
+            })
+        }
+
+        pub fn local_addr(&self) -> SocketAddr {
+            self.local_addr
+        }
+
+        /// Drain up to `max` received frames: poll RX, parse ETH+IPv4+UDP, emit
+        /// the TURN payloads, then return the descriptors to the fill ring.
+        pub fn recv_batch(&mut self, max: usize) -> Vec<ReceivedFrame> {
+            let want = self.free_frames.len().min(max);
+            if want == 0 {
+                return Vec::new();
+            }
+            let mut rx_descs: Vec<FrameDesc> = self.free_frames.drain(..want).collect();
+
+            // Non-blocking poll (timeout 0). Returns how many descs were filled.
+            let n = unsafe { self.rx.poll_and_consume(&mut rx_descs, 0) }.unwrap_or(0);
+
+            let mut out = Vec::with_capacity(n);
+            for desc in rx_descs.iter().take(n) {
+                // SAFETY: the kernel has completed RX DMA into this frame; we
+                // read it immutably and copy out the payload.
+                let data = unsafe { self.umem.data(desc) };
+                let bytes = data.contents();
+                if let Some(p) = frame::parse_eth_ipv4_udp(bytes) {
+                    out.push(ReceivedFrame {
+                        data: bytes[p.payload_offset..p.payload_offset + p.payload_len].to_vec(),
+                        source: SocketAddr::V4(p.src),
+                        dst: SocketAddr::V4(p.dst),
+                        frame_addr: desc.addr() as u64,
+                    });
+                }
+            }
+
+            // Recycle consumed descriptors back to the kernel for more RX; any
+            // we didn't use return to the free pool.
+            // SAFETY: as in `bind` — these frames are ours and ring-free.
+            unsafe {
+                self.fill.produce(&rx_descs[..n]);
+            }
+            self.free_frames.extend(rx_descs.drain(n..));
+            out
+        }
+
+        /// Build an ETH+IPv4+UDP frame for `data` → `target` and submit it on
+        /// the TX ring. IPv4-only in Phase 1.
+        pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
+            let dst = match target {
+                SocketAddr::V4(v4) => v4,
+                SocketAddr::V6(_) => {
+                    return Err(AfXdpError::Umem("AF_XDP datapath is IPv4-only (Phase 1)".into()))
+                }
+            };
+            let src: SocketAddrV4 = match self.local_addr {
+                SocketAddr::V4(v4) => v4,
+                SocketAddr::V6(_) => {
+                    return Err(AfXdpError::Umem("local_addr must be IPv4".into()))
+                }
+            };
+
+            // Reclaim completed TX frames so the free pool can refill.
+            self.reclaim_completions();
+
+            let mut desc = self
+                .free_frames
+                .pop()
+                .ok_or_else(|| AfXdpError::Umem("no free TX frame".into()))?;
+
+            let pkt = frame::build_eth_ipv4_udp(self.src_mac, self.dst_mac, src, dst, data);
+            // Write via the Data cursor: copies the packet AND updates the
+            // descriptor length (xsk-rs 0.6 has no FrameDesc::set_len).
+            {
+                use std::io::Write;
+                // SAFETY: `desc` was popped from the free pool — we own it
+                // exclusively and no kernel access is in flight for it.
+                let write_res =
+                    unsafe { self.umem.data_mut(&mut desc).cursor().write_all(&pkt) };
+                if let Err(e) = write_res {
+                    self.free_frames.push(desc);
+                    return Err(AfXdpError::Umem(format!(
+                        "frame write ({} bytes): {e}",
+                        pkt.len()
+                    )));
+                }
+            }
+
+            let batch = [desc];
+            unsafe { self.tx.produce_and_wakeup(&batch) }.map_err(|e| {
+                AfXdpError::Socket(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("tx produce: {e}"),
+                ))
+            })?;
+            Ok(())
+        }
+
+        /// Like [`send_to`] but with an explicit UDP source port. Used to emit
+        /// client→peer relay frames from the allocation's relay port instead of
+        /// the main TURN port (the source IP stays `local_addr`'s).
+        pub fn send_to_from(
+            &mut self,
+            src_port: u16,
+            data: &[u8],
+            target: SocketAddr,
+        ) -> Result<()> {
+            let dst = match target {
+                SocketAddr::V4(v4) => v4,
+                SocketAddr::V6(_) => {
+                    return Err(AfXdpError::Umem("AF_XDP datapath is IPv4-only (Phase 1)".into()))
+                }
+            };
+            let mut src: SocketAddrV4 = match self.local_addr {
+                SocketAddr::V4(v4) => v4,
+                SocketAddr::V6(_) => {
+                    return Err(AfXdpError::Umem("local_addr must be IPv4".into()))
+                }
+            };
+            src.set_port(src_port);
+
+            self.reclaim_completions();
+
+            let mut desc = self
+                .free_frames
+                .pop()
+                .ok_or_else(|| AfXdpError::Umem("no free TX frame".into()))?;
+
+            let pkt = frame::build_eth_ipv4_udp(self.src_mac, self.dst_mac, src, dst, data);
+            {
+                use std::io::Write;
+                let write_res =
+                    unsafe { self.umem.data_mut(&mut desc).cursor().write_all(&pkt) };
+                if let Err(e) = write_res {
+                    self.free_frames.push(desc);
+                    return Err(AfXdpError::Umem(format!(
+                        "frame write ({} bytes): {e}",
+                        pkt.len()
+                    )));
+                }
+            }
+
+            let batch = [desc];
+            unsafe { self.tx.produce_and_wakeup(&batch) }.map_err(|e| {
+                AfXdpError::Socket(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("tx produce: {e}"),
+                ))
+            })?;
+            Ok(())
+        }
+
+        /// Move completed TX descriptors from the completion ring back to free.
+        fn reclaim_completions(&mut self) {
+            if self.comp_scratch.is_empty() {
+                return;
+            }
+            // SAFETY: consuming the completion ring transfers ownership of the
+            // listed descriptors back to us; xsk-rs overwrites `comp_scratch`
+            // with the finished frames' descriptors and returns the count.
+            let c = unsafe { self.comp.consume(&mut self.comp_scratch) };
+            for i in 0..c {
+                // FrameDesc is Copy in xsk-rs 0.6 — verify; else `.clone()`.
+                self.free_frames.push(self.comp_scratch[i]);
+            }
+        }
     }
 }

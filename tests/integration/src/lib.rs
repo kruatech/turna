@@ -1371,4 +1371,114 @@ mod cluster_tests {
         }
         eprintln!("WARN: no redirect seen in 128 probes (single node, or all keys local)");
     }
+
+    // ── RFC 8016 Connection Migration (wire-level) ───────────────────────────
+    // Requires a running node with `turn.migration.enabled = true`. Skips if no
+    // server, or if the server does not issue a MOBILITY-TICKET (feature off).
+    const ATTR_MOBILITY_TICKET: u16 = 0x8030;
+
+    fn extract_attr(data: &[u8], typ: u16) -> Option<Vec<u8>> {
+        iter_attrs(data).find(|(t, _)| *t == typ).map(|(_, v)| v.to_vec())
+    }
+
+    /// Authenticated Allocate with the RFC 8016 opt-in (empty MOBILITY-TICKET).
+    /// Returns the server-issued ticket, or None if the server didn't issue one.
+    async fn allocate_with_mobility(socket: &UdpSocket, target: SocketAddr) -> Option<Vec<u8>> {
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let (r401, _) = send_recv(socket, target, &probe.encode(), 2000).await?;
+        let realm = extract_realm(&r401)?;
+        let nonce = extract_nonce(&r401)?;
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        alloc.add_attr(ATTR_MOBILITY_TICKET, &[]); // opt-in marker
+        let (resp, _) = send_recv(socket, target, &alloc.encode_with_integrity(&key), 2000).await?;
+        if !is_success(&resp) {
+            return None;
+        }
+        extract_attr(&resp, ATTR_MOBILITY_TICKET)
+    }
+
+    /// A Refresh carrying `ticket`, self-authenticating from this socket.
+    async fn refresh_with_ticket(
+        socket: &UdpSocket,
+        target: SocketAddr,
+        ticket: &[u8],
+    ) -> Option<Vec<u8>> {
+        let probe = TurnMsg::request(0x0004); // Refresh, unauthenticated → 401
+        let (r401, _) = send_recv(socket, target, &probe.encode(), 2000).await?;
+        let realm = extract_realm(&r401)?;
+        let nonce = extract_nonce(&r401)?;
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+        let mut m = TurnMsg::request(0x0004);
+        m.add_lifetime(600);
+        m.add_username(&username);
+        m.add_realm(&realm);
+        m.add_nonce(&nonce);
+        m.add_attr(ATTR_MOBILITY_TICKET, ticket);
+        let (resp, _) = send_recv(socket, target, &m.encode_with_integrity(&key), 2000).await?;
+        Some(resp)
+    }
+
+    #[tokio::test]
+    async fn turn_migration_rebind_and_replay() {
+        let target = target_addr();
+        let sock_a = bind_socket().await;
+
+        // Liveness probe (Binding) for the skip gate.
+        let probe = {
+            let mut m = TurnMsg::request(0x0001);
+            m.class = 0x0000;
+            m.encode()
+        };
+        let result = send_recv(&sock_a, target, &probe, 2000).await;
+        let _ = skip_if_no_server!(result, target);
+
+        // Allocate with mobility opt-in.
+        let ticket = match allocate_with_mobility(&sock_a, target).await {
+            Some(t) => t,
+            None => {
+                eprintln!("⚠ no MOBILITY-TICKET issued (turn.migration disabled?) — skipping");
+                return;
+            }
+        };
+        eprintln!("✓ MOBILITY-TICKET issued ({} bytes)", ticket.len());
+
+        // Migrate: present the ticket in a Refresh from a brand-new socket
+        // (a fresh 5-tuple — the "network changed" case).
+        let sock_b = bind_socket().await;
+        let resp = refresh_with_ticket(&sock_b, target, &ticket)
+            .await
+            .expect("no response to migrating Refresh");
+        assert!(
+            is_success(&resp),
+            "migration Refresh should succeed; err={:?}",
+            extract_error_code(&resp)
+        );
+        assert!(
+            extract_attr(&resp, ATTR_MOBILITY_TICKET).is_some(),
+            "server should issue a fresh ticket on successful migration"
+        );
+        eprintln!("✓ rebind from new socket succeeded; fresh ticket issued");
+
+        // Replay the OLD ticket from a third socket → must be rejected: the
+        // successful migration bumped the allocation epoch (anti-replay).
+        let sock_c = bind_socket().await;
+        let replay = refresh_with_ticket(&sock_c, target, &ticket)
+            .await
+            .expect("no response to replay Refresh");
+        assert!(
+            is_error(&replay),
+            "replaying the stale ticket must be rejected (anti-replay)"
+        );
+        eprintln!("✓ stale-ticket replay rejected: {:?}", extract_error_code(&replay));
+    }
+
 }

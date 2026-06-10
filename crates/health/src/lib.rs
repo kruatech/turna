@@ -129,6 +129,53 @@ pub struct Metrics {
     /// Updated by the gossip topology callback in main.rs.
     pub cluster_nodes: AtomicU64,
 
+    // ── Auth reason codes ──────────────────────────────────────────────────────
+    // Reason-coded auth failures (each is also counted in `auth_failures`),
+    // keyed by the turna_auth::AuthError variant the validator returned.
+    pub auth_fail_missing_credentials: AtomicU64,
+    pub auth_fail_invalid_credentials: AtomicU64,
+    pub auth_fail_expired: AtomicU64,
+    pub auth_fail_integrity: AtomicU64,
+
+    // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
+    // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
+    // task in the node listeners (the transport crate is leaf-level and cannot
+    // depend on turna-health). `*_active` are gauges; the rest are counters.
+    pub quic_active: AtomicU64,
+    pub quic_sessions_total: AtomicU64,
+    pub quic_closed_total: AtomicU64,
+    pub quic_datagrams_rx: AtomicU64,
+    pub quic_datagrams_tx: AtomicU64,
+    pub quic_streams_opened: AtomicU64,
+    pub quic_control_bytes_tx: AtomicU64,
+    pub quic_send_errors: AtomicU64,
+    pub dtls_active: AtomicU64,
+    pub dtls_sessions_total: AtomicU64,
+    pub dtls_rejected_over_cap: AtomicU64,
+    pub dtls_closed_total: AtomicU64,
+    pub dtls_idle_timeouts: AtomicU64,
+    pub dtls_bytes_rx: AtomicU64,
+    pub dtls_bytes_tx: AtomicU64,
+
+    // ── io_uring worker-pool ring utilisation (Linux io-uring backend) ───────
+    // Summed across workers by a periodic copy task in the node's io_uring arm.
+    // `*_total` are monotonic; the rest are last-sampled gauges. All zero on
+    // non-io_uring backends/builds.
+    pub uring_workers: AtomicU64,
+    pub uring_cqe_drained_total: AtomicU64,
+    pub uring_cqe_batches_total: AtomicU64,
+    pub uring_cqe_max_batch: AtomicU64,
+    pub uring_sq_push_failed_total: AtomicU64,
+    pub uring_sq_len: AtomicU64,
+    pub uring_sq_capacity: AtomicU64,
+    pub uring_cq_len: AtomicU64,
+    pub uring_buffers_available: AtomicU64,
+
+    // ── Latency histograms ─────────────────────────────────────────────────────
+    /// Request-latency histograms (STUN/relay/auth/allocation-lifetime). The
+    /// processor `observe`s into named entries; rendered on `/metrics`.
+    pub histograms: histogram::HistogramRegistry,
+
     // ── Multi-tenancy ─────────────────────────────────────────────────────────
     /// Per-tenant total allocations (monotonic). Keyed by tenant id. A `Mutex`
     /// is fine here — allocation is not the per-packet hot path. Expiry happens
@@ -186,6 +233,35 @@ impl Metrics {
             // Cluster
             cluster_redirects: AtomicU64::new(0),
             cluster_nodes: AtomicU64::new(0),
+            auth_fail_missing_credentials: AtomicU64::new(0),
+            auth_fail_invalid_credentials: AtomicU64::new(0),
+            auth_fail_expired: AtomicU64::new(0),
+            auth_fail_integrity: AtomicU64::new(0),
+            quic_active: AtomicU64::new(0),
+            quic_sessions_total: AtomicU64::new(0),
+            quic_closed_total: AtomicU64::new(0),
+            quic_datagrams_rx: AtomicU64::new(0),
+            quic_datagrams_tx: AtomicU64::new(0),
+            quic_streams_opened: AtomicU64::new(0),
+            quic_control_bytes_tx: AtomicU64::new(0),
+            quic_send_errors: AtomicU64::new(0),
+            dtls_active: AtomicU64::new(0),
+            dtls_sessions_total: AtomicU64::new(0),
+            dtls_rejected_over_cap: AtomicU64::new(0),
+            dtls_closed_total: AtomicU64::new(0),
+            dtls_idle_timeouts: AtomicU64::new(0),
+            dtls_bytes_rx: AtomicU64::new(0),
+            dtls_bytes_tx: AtomicU64::new(0),
+            uring_workers: AtomicU64::new(0),
+            uring_cqe_drained_total: AtomicU64::new(0),
+            uring_cqe_batches_total: AtomicU64::new(0),
+            uring_cqe_max_batch: AtomicU64::new(0),
+            uring_sq_push_failed_total: AtomicU64::new(0),
+            uring_sq_len: AtomicU64::new(0),
+            uring_sq_capacity: AtomicU64::new(0),
+            uring_cq_len: AtomicU64::new(0),
+            uring_buffers_available: AtomicU64::new(0),
+            histograms: histogram::HistogramRegistry::new(),
             tenant_allocations_total: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -229,6 +305,129 @@ impl Metrics {
         }
         out
     }
+
+    /// Render reason-coded auth failures as a single labelled counter. The
+    /// labels sum to (at most) `turna_auth_failures`; emitted unconditionally so
+    /// scrapes have a stable series set.
+    fn render_auth_reason_metrics(&self) -> String {
+        format!(
+            "# HELP turna_auth_failures_by_reason_total Auth failures by AuthError reason\n\
+             # TYPE turna_auth_failures_by_reason_total counter\n\
+             turna_auth_failures_by_reason_total{{reason=\"missing_credentials\"}} {}\n\
+             turna_auth_failures_by_reason_total{{reason=\"invalid_credentials\"}} {}\n\
+             turna_auth_failures_by_reason_total{{reason=\"expired\"}} {}\n\
+             turna_auth_failures_by_reason_total{{reason=\"integrity_failed\"}} {}\n",
+            self.auth_fail_missing_credentials.load(Ordering::Relaxed),
+            self.auth_fail_invalid_credentials.load(Ordering::Relaxed),
+            self.auth_fail_expired.load(Ordering::Relaxed),
+            self.auth_fail_integrity.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Render the experimental-transport (QUIC/WebTransport + DTLS) counters,
+    /// mirrored from the transport layer by the node's periodic copy task. All
+    /// zero unless the corresponding transport is enabled and built in.
+    fn render_transport_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_quic_active_sessions Active QUIC/WebTransport sessions\n\
+             # TYPE turna_quic_active_sessions gauge\n\
+             turna_quic_active_sessions {}\n\
+             # HELP turna_quic_sessions_total QUIC/WebTransport sessions accepted since start\n\
+             # TYPE turna_quic_sessions_total counter\n\
+             turna_quic_sessions_total {}\n\
+             # HELP turna_quic_closed_total QUIC/WebTransport sessions closed since start\n\
+             # TYPE turna_quic_closed_total counter\n\
+             turna_quic_closed_total {}\n\
+             # HELP turna_quic_datagrams_rx_total Inbound QUIC datagrams\n\
+             # TYPE turna_quic_datagrams_rx_total counter\n\
+             turna_quic_datagrams_rx_total {}\n\
+             # HELP turna_quic_datagrams_tx_total Outbound QUIC datagrams\n\
+             # TYPE turna_quic_datagrams_tx_total counter\n\
+             turna_quic_datagrams_tx_total {}\n\
+             # HELP turna_quic_streams_opened_total Client-opened bidi streams\n\
+             # TYPE turna_quic_streams_opened_total counter\n\
+             turna_quic_streams_opened_total {}\n\
+             # HELP turna_quic_control_bytes_tx_total Bytes written on QUIC control streams\n\
+             # TYPE turna_quic_control_bytes_tx_total counter\n\
+             turna_quic_control_bytes_tx_total {}\n\
+             # HELP turna_quic_send_errors_total QUIC outbound send failures\n\
+             # TYPE turna_quic_send_errors_total counter\n\
+             turna_quic_send_errors_total {}\n\
+             # HELP turna_dtls_active_sessions Active DTLS sessions\n\
+             # TYPE turna_dtls_active_sessions gauge\n\
+             turna_dtls_active_sessions {}\n\
+             # HELP turna_dtls_sessions_total DTLS sessions accepted since start\n\
+             # TYPE turna_dtls_sessions_total counter\n\
+             turna_dtls_sessions_total {}\n\
+             # HELP turna_dtls_rejected_over_cap_total DTLS sessions refused at max_sessions cap\n\
+             # TYPE turna_dtls_rejected_over_cap_total counter\n\
+             turna_dtls_rejected_over_cap_total {}\n\
+             # HELP turna_dtls_closed_total DTLS sessions closed since start\n\
+             # TYPE turna_dtls_closed_total counter\n\
+             turna_dtls_closed_total {}\n\
+             # HELP turna_dtls_idle_timeouts_total DTLS sessions closed by idle timeout\n\
+             # TYPE turna_dtls_idle_timeouts_total counter\n\
+             turna_dtls_idle_timeouts_total {}\n\
+             # HELP turna_dtls_bytes_rx_total Decrypted bytes received over DTLS\n\
+             # TYPE turna_dtls_bytes_rx_total counter\n\
+             turna_dtls_bytes_rx_total {}\n\
+             # HELP turna_dtls_bytes_tx_total Bytes encrypted+sent over DTLS\n\
+             # TYPE turna_dtls_bytes_tx_total counter\n\
+             turna_dtls_bytes_tx_total {}\n\
+             # HELP turna_uring_workers io_uring worker threads in the pool\n\
+             # TYPE turna_uring_workers gauge\n\
+             turna_uring_workers {}\n\
+             # HELP turna_uring_cqe_drained_total Completion queue entries drained (summed over workers)\n\
+             # TYPE turna_uring_cqe_drained_total counter\n\
+             turna_uring_cqe_drained_total {}\n\
+             # HELP turna_uring_cqe_batches_total Drain iterations that pulled >=1 CQE (summed over workers)\n\
+             # TYPE turna_uring_cqe_batches_total counter\n\
+             turna_uring_cqe_batches_total {}\n\
+             # HELP turna_uring_cqe_max_batch Largest single CQE drain seen (max over workers)\n\
+             # TYPE turna_uring_cqe_max_batch gauge\n\
+             turna_uring_cqe_max_batch {}\n\
+             # HELP turna_uring_sq_push_failed_total Submission-queue pushes that failed because the SQ was full (summed)\n\
+             # TYPE turna_uring_sq_push_failed_total counter\n\
+             turna_uring_sq_push_failed_total {}\n\
+             # HELP turna_uring_sq_len Last-sampled submission-queue occupancy (summed over workers)\n\
+             # TYPE turna_uring_sq_len gauge\n\
+             turna_uring_sq_len {}\n\
+             # HELP turna_uring_sq_capacity Total submission-queue capacity across workers\n\
+             # TYPE turna_uring_sq_capacity gauge\n\
+             turna_uring_sq_capacity {}\n\
+             # HELP turna_uring_cq_len Last-sampled completion-queue occupancy (summed over workers)\n\
+             # TYPE turna_uring_cq_len gauge\n\
+             turna_uring_cq_len {}\n\
+             # HELP turna_uring_buffers_available Free registered RX buffers (summed over workers)\n\
+             # TYPE turna_uring_buffers_available gauge\n\
+             turna_uring_buffers_available {}\n",
+            l(&self.quic_active),
+            l(&self.quic_sessions_total),
+            l(&self.quic_closed_total),
+            l(&self.quic_datagrams_rx),
+            l(&self.quic_datagrams_tx),
+            l(&self.quic_streams_opened),
+            l(&self.quic_control_bytes_tx),
+            l(&self.quic_send_errors),
+            l(&self.dtls_active),
+            l(&self.dtls_sessions_total),
+            l(&self.dtls_rejected_over_cap),
+            l(&self.dtls_closed_total),
+            l(&self.dtls_idle_timeouts),
+            l(&self.dtls_bytes_rx),
+            l(&self.dtls_bytes_tx),
+            l(&self.uring_workers),
+            l(&self.uring_cqe_drained_total),
+            l(&self.uring_cqe_batches_total),
+            l(&self.uring_cqe_max_batch),
+            l(&self.uring_sq_push_failed_total),
+            l(&self.uring_sq_len),
+            l(&self.uring_sq_capacity),
+            l(&self.uring_cq_len),
+            l(&self.uring_buffers_available),
+        )
+    }
 }
 
 impl Default for Metrics {
@@ -264,6 +463,68 @@ struct StatusResponse {
     rtp_total_bitrate_kbps: u64,
 }
 
+/// Snapshot of the io_uring relay-route forwarding counters (RFC 8016 sharded
+/// ownership). Mirrors `turna_transport::relay_route::RelayRouteSnapshot`, but
+/// is declared here so the health crate stays free of a `turna-transport`
+/// dependency and of the `io-uring` feature: the node maps one into the other
+/// inside the provider closure below.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayRouteMetrics {
+    pub send_local: u64,
+    pub send_forwarded: u64,
+    pub send_forward_failed: u64,
+    pub send_stale: u64,
+    pub route_miss: u64,
+    pub owner_cleanup_stale: u64,
+}
+
+/// Pulls a fresh [`RelayRouteMetrics`] on each `/metrics` scrape. `None` (the
+/// default) omits the relay-route block entirely — e.g. on builds without the
+/// io_uring datapath, where no route table exists.
+pub type RelayRouteMetricsProvider = Arc<dyn Fn() -> RelayRouteMetrics + Send + Sync>;
+
+/// Render the relay-route forwarding counters in Prometheus text format,
+/// including the derived `turna_relay_route_forwarded_ratio` gauge — the
+/// per-scrape "cost of migration" (forwarded / (local + forwarded)).
+fn render_relay_route_metrics(s: &RelayRouteMetrics) -> String {
+    let denom = s.send_local + s.send_forwarded;
+    let ratio = if denom == 0 {
+        0.0
+    } else {
+        s.send_forwarded as f64 / denom as f64
+    };
+    format!(
+        "# HELP turna_relay_route_send_local_total Relay sends handled by the owning worker locally\n\
+         # TYPE turna_relay_route_send_local_total counter\n\
+         turna_relay_route_send_local_total {}\n\
+         # HELP turna_relay_route_send_forwarded_total Relay sends forwarded to the owning worker after a reshard\n\
+         # TYPE turna_relay_route_send_forwarded_total counter\n\
+         turna_relay_route_send_forwarded_total {}\n\
+         # HELP turna_relay_route_send_forward_failed_total Forwarded relay sends that failed to deliver to the owner\n\
+         # TYPE turna_relay_route_send_forward_failed_total counter\n\
+         turna_relay_route_send_forward_failed_total {}\n\
+         # HELP turna_relay_route_send_stale_total Forwarded sends dropped because the owner's (allocation,generation) no longer matched\n\
+         # TYPE turna_relay_route_send_stale_total counter\n\
+         turna_relay_route_send_stale_total {}\n\
+         # HELP turna_relay_route_miss_total Relay sends with no route (port not owned by any worker)\n\
+         # TYPE turna_relay_route_miss_total counter\n\
+         turna_relay_route_miss_total {}\n\
+         # HELP turna_relay_route_owner_cleanup_stale_total Conditional route cleanups skipped because the port was already re-owned\n\
+         # TYPE turna_relay_route_owner_cleanup_stale_total counter\n\
+         turna_relay_route_owner_cleanup_stale_total {}\n\
+         # HELP turna_relay_route_forwarded_ratio Fraction of relay sends forwarded cross-worker (cost of migration)\n\
+         # TYPE turna_relay_route_forwarded_ratio gauge\n\
+         turna_relay_route_forwarded_ratio {:.4}\n",
+        s.send_local,
+        s.send_forwarded,
+        s.send_forward_failed,
+        s.send_stale,
+        s.route_miss,
+        s.owner_cleanup_stale,
+        ratio,
+    )
+}
+
 /// Start health check HTTP server.
 pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<()> {
     serve_with_cluster(addr, metrics, None).await
@@ -271,10 +532,29 @@ pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<(
 
 /// Like [`serve`], but also answers `GET /cluster` with the current cluster
 /// membership supplied by `cluster`. Pass `None` for no `/cluster` endpoint.
+///
+/// Signature kept stable for existing callers; for relay-route metrics use
+/// [`serve_with_cluster_routes`].
 pub async fn serve_with_cluster(
     addr: SocketAddr,
     metrics: Arc<Metrics>,
     cluster: Option<Arc<dyn ClusterView>>,
+) -> std::io::Result<()> {
+    serve_with_cluster_routes(addr, metrics, cluster, None).await
+}
+
+/// Like [`serve_with_cluster`], but also exposes the io_uring relay-route
+/// forwarding counters on `/metrics`.
+///
+/// `relay_routes`, when `Some`, adds the `turna_relay_route_*` block (including
+/// the derived `turna_relay_route_forwarded_ratio` gauge) to `/metrics`; pass
+/// `None` to omit it — e.g. on builds without the io_uring datapath, where no
+/// route table exists.
+pub async fn serve_with_cluster_routes(
+    addr: SocketAddr,
+    metrics: Arc<Metrics>,
+    cluster: Option<Arc<dyn ClusterView>>,
+    relay_routes: Option<RelayRouteMetricsProvider>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "health check server started");
@@ -283,6 +563,7 @@ pub async fn serve_with_cluster(
         let (mut stream, _) = listener.accept().await?;
         let metrics = metrics.clone();
         let cluster = cluster.clone();
+        let relay_routes = relay_routes.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
@@ -535,6 +816,12 @@ pub async fn serve_with_cluster(
                         m.cluster_nodes.load(Ordering::Relaxed),
                     );
                     body.push_str(&m.render_tenant_metrics());
+                    body.push_str(&m.render_auth_reason_metrics());
+                    body.push_str(&m.render_transport_metrics());
+                    body.push_str(&m.histograms.render_prometheus());
+                    if let Some(provider) = &relay_routes {
+                        body.push_str(&render_relay_route_metrics(&provider()));
+                    }
                     ("200 OK", body, "text/plain; version=0.0.4")
                 }
                 _ => ("404 Not Found", "not found".to_string(), "text/plain"),

@@ -15,6 +15,9 @@ pub enum TransportPreference {
     IoUring,
     /// Force the tokio backend (epoll + recvmmsg/sendmmsg).
     Tokio,
+    /// Force the AF_XDP ring datapath (Linux + `--features af-xdp`; needs
+    /// CAP_NET_RAW and a bound NIC queue). Opt-in only — never auto-selected.
+    AfXdp,
 }
 
 /// The backend actually selected after applying preference + probe.
@@ -22,6 +25,35 @@ pub enum TransportPreference {
 pub enum TransportBackend {
     Tokio,
     IoUring,
+    AfXdp,
+}
+
+/// AF_XDP availability probe. Unlike io_uring (which can be auto-selected),
+/// AF_XDP is opt-in: this only reports whether the build/platform *could* run
+/// it; the real readiness check (privileges, driver, NIC queue) happens at
+/// `XskDatapath::bind`.
+#[derive(Debug, Clone)]
+pub enum AfXdpProbe {
+    Available,
+    Unavailable(String),
+}
+
+impl AfXdpProbe {
+    pub fn is_available(&self) -> bool {
+        matches!(self, AfXdpProbe::Available)
+    }
+}
+
+/// Report whether AF_XDP could run here (Linux + `af-xdp` feature compiled in).
+pub fn probe_af_xdp() -> AfXdpProbe {
+    #[cfg(all(target_os = "linux", feature = "af-xdp"))]
+    {
+        AfXdpProbe::Available
+    }
+    #[cfg(not(all(target_os = "linux", feature = "af-xdp")))]
+    {
+        AfXdpProbe::Unavailable("built without the `af-xdp` feature or not on Linux".to_string())
+    }
 }
 
 /// Selection result, carrying a log-friendly reason for the choice.
@@ -72,6 +104,18 @@ pub fn resolve(pref: TransportPreference) -> Result<TransportDecision, String> {
                  host ({r})"
             )),
         },
+
+        // AF_XDP is opt-in only (never reached via Auto). Fail fast if the build
+        // or platform can't run it — no silent downgrade.
+        TransportPreference::AfXdp => match probe_af_xdp() {
+            AfXdpProbe::Available => Ok(TransportDecision {
+                backend: TransportBackend::AfXdp,
+                reason: "af_xdp: explicitly requested and available".to_string(),
+            }),
+            AfXdpProbe::Unavailable(r) => Err(format!(
+                "transport=af_xdp was requested, but AF_XDP is unavailable here ({r})"
+            )),
+        },
     }
 }
 
@@ -108,6 +152,18 @@ mod tests {
         let r = resolve(TransportPreference::IoUring);
         if probe_io_uring().is_available() {
             assert_eq!(r.unwrap().backend, TransportBackend::IoUring);
+        } else {
+            assert!(r.is_err());
+        }
+    }
+
+    #[test]
+    fn forced_af_xdp_matches_probe() {
+        // AF_XDP is opt-in: forcing it resolves to the AfXdp backend when the
+        // build/platform supports it, otherwise it's a hard error (no downgrade).
+        let r = resolve(TransportPreference::AfXdp);
+        if probe_af_xdp().is_available() {
+            assert_eq!(r.unwrap().backend, TransportBackend::AfXdp);
         } else {
             assert!(r.is_err());
         }

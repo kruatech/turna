@@ -8,6 +8,13 @@ edition.workspace = true
 tls = ["turna-relay/tls", "turna-transport/tls"]
 default = []
 io-uring = ["turna-transport/io-uring", "turna-relay/io-uring"]
+# Raw QUIC datapath. WebTransport (browser H3) builds on it.
+quic = ["turna-transport/quic"]
+web-transport = ["quic", "turna-transport/web-transport"]
+# AF_XDP ring datapath backend (Linux only).
+af-xdp = ["turna-transport/af-xdp"]
+# TURN over DTLS (RFC 7350).
+dtls = ["turna-transport/dtls"]
 
 [dependencies]
 tokio.workspace = true

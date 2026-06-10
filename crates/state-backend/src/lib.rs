@@ -67,6 +67,20 @@ pub struct StoredAllocation {
     pub user_id: String,
     pub realm: String,
     pub node_id: String,
+    /// RFC 8016 stable allocation identity (the value a MOBILITY-TICKET is
+    /// minted against). Persisted so that after a cross-node failover the
+    /// adopting node rehydrates with the *same* id and a ticket issued by the
+    /// original owner still validates. `#[serde(default)]` keeps rows written
+    /// before this field existed readable (they decode to an empty id, and the
+    /// rehydrate path then mints a fresh one — pre-RFC-8016 behaviour).
+    #[serde(default)]
+    pub allocation_id: String,
+    /// RFC 8016 migration generation (anti-replay). Persisted alongside
+    /// `allocation_id` so the epoch survives failover and a captured
+    /// older-epoch ticket stays rejected on the new owner. `#[serde(default)]`
+    /// → old rows decode as epoch 0.
+    #[serde(default)]
+    pub migration_epoch: u64,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
     pub bytes_in: u64,

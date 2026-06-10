@@ -103,6 +103,24 @@ impl StunMessage {
         })
     }
 
+    /// RFC 8016 MOBILITY-TICKET bytes, if present. In an Allocate *request* a
+    /// client opts into mobility by including this attribute (typically with a
+    /// zero-length value); in a Refresh it carries the server-issued ticket.
+    pub fn get_mobility_ticket(&self) -> Option<&[u8]> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::MobilityTicket(t) => Some(t.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Whether a MOBILITY-TICKET attribute is present at all (the Allocate
+    /// opt-in signal — value may be empty).
+    pub fn has_mobility_ticket(&self) -> bool {
+        self.attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::MobilityTicket(_)))
+    }
+
     pub fn get_message_integrity(&self) -> Option<&[u8; 20]> {
         self.attributes.iter().find_map(|a| match a {
             Attribute::MessageIntegrity(h) => Some(h),

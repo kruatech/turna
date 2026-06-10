@@ -8,6 +8,14 @@ edition.workspace = true
 default = []
 io-uring = ["dep:io-uring"]
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
+quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile"]
+# WebTransport-over-HTTP/3 on top of the raw QUIC endpoint (browser handshake).
+web-transport = ["quic", "dep:wtransport"]
+# AF_XDP zero-copy datapath (Linux). Pure L2-L4 stack is dependency-free; the
+# ring/mmap datapath should adopt xsk-rs (see docs/design/af-xdp-datapath.md).
+af-xdp = ["dep:xsk-rs"]
+# TURN over DTLS (RFC 7350), pure-Rust DTLS 1.2 via webrtc-dtls.
+dtls = ["dep:webrtc-dtls", "dep:webrtc-util"]
 
 [dependencies]
 tokio.workspace = true
@@ -18,6 +26,7 @@ turna-packet.workspace = true
 libc = "0.2"
 hmac.workspace = true
 sha1.workspace = true
+sha2.workspace = true
 rand.workspace = true
 
 # TLS/TCP transport (feature: tls)
@@ -25,8 +34,28 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = { version = "2", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 
+# QUIC / WebTransport transport (feature: quic). Reuses rustls 0.23 above.
+quinn = { version = "0.11", optional = true }
+# WebTransport (feature: web-transport). NOTE: wtransport bundles its own quinn
+# + rustls; verify the chosen version aligns with quinn 0.11 / rustls 0.23 above
+# (wtransport 0.6.x targets quinn 0.11). If it re-exports a conflicting quinn,
+# prefer wtransport's re-export and drop the standalone quinn dep for this build.
+wtransport = { version = "0.6", optional = true }
+
+# TURN over DTLS (feature: dtls). Pure-Rust, cross-platform DTLS 1.2 — NOT
+# Linux-only, so it belongs in the main [dependencies] table (a previous version
+# wrongly put it under [target.linux] which broke macOS builds). webrtc-dtls
+# 0.10 API (Config / listener::listen / Conn+Listener / Certificate::from_pem
+# behind the `pem` feature) verified against 0.10.0 source.
+webrtc-dtls = { version = "0.10", features = ["pem"], optional = true }
+webrtc-util = { version = "0.9", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }
+# AF_XDP ring datapath (feature: af-xdp). NOTE: verify the xsk-rs 0.6 API —
+# Umem::new / Socket::new return shapes and the queue methods
+# (fill / poll_and_consume / produce_and_wakeup / consume) are version-sensitive.
+xsk-rs = { version = "0.6", optional = true }

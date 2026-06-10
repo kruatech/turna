@@ -33,6 +33,7 @@ use turna_proto_turn as turn;
 use turna_qos::{TieredLimits, TieredRateLimiter};
 use turna_rtp_analyzer::RtpAnalyzer;
 use turna_session::AllocationStore;
+use turna_transport::migration::MigrationManager;
 
 use crate::peer_filter::{is_forbidden_peer, normalize_addr, normalize_ip};
 
@@ -70,6 +71,9 @@ pub enum Action {
         port: u16,
         socket: std::net::UdpSocket,
         client_addr: SocketAddr,
+        /// RFC 8016 sharded ownership: the owning allocation id, threaded to
+        /// the io_uring worker so it registers the relay route on bind.
+        allocation_id: String,
     },
 
     /// Close and unregister the relay socket for this port (on release), so
@@ -210,6 +214,10 @@ pub struct PacketProcessor {
     rtp_analyzer: Arc<RtpAnalyzer>,
     mtu: u16,
     cluster: Option<ClusterRouting>,
+    /// RFC 8016 Connection Migration. `None` = feature disabled (the default);
+    /// `Some` holds the ticket signer/verifier. Only `&self` methods are used,
+    /// so no interior mutability is needed.
+    migration: Option<MigrationManager>,
 }
 
 impl PacketProcessor {
@@ -296,12 +304,22 @@ impl PacketProcessor {
             rtp_analyzer: Arc::new(RtpAnalyzer::new()),
             mtu,
             cluster,
+            migration: None,
         }
     }
 
     pub fn store(&self) -> &Arc<AllocationStore> {
         &self.store
     }
+
+    /// Attach an RFC 8016 migration ticket signer/verifier. Builder-style so
+    /// existing constructor call sites are untouched; `services/node` calls
+    /// this when `turn.migration.enabled`.
+    pub fn with_migration(mut self, migration: Option<MigrationManager>) -> Self {
+        self.migration = migration;
+        self
+    }
+
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
     }
@@ -356,9 +374,19 @@ impl PacketProcessor {
         }
 
         if is_channel {
-            return self.process_channel_data(raw, src);
+            let t0 = std::time::Instant::now();
+            let actions = self.process_channel_data(raw, src);
+            self.metrics
+                .histograms
+                .observe("turna_relay_forward_duration_seconds", t0.elapsed());
+            return actions;
         }
-        self.process_stun(raw, src)
+        let t0 = std::time::Instant::now();
+        let actions = self.process_stun(raw, src);
+        self.metrics
+            .histograms
+            .observe("turna_stun_request_duration_seconds", t0.elapsed());
+        actions
     }
 
     /// Compatibility shim for the io_uring handler which provides `&[u8]`.
@@ -500,6 +528,38 @@ impl PacketProcessor {
 
     // ── STUN dispatch ─────────────────────────────────────────────────────────
 
+    /// Validate credentials via the registry, recording observability as a
+    /// side effect: auth-processing latency into the `turna_auth_duration_seconds`
+    /// histogram, and on failure a reason-coded counter keyed by the
+    /// `AuthError` variant. The per-reason counters are a breakdown *under* the
+    /// total `auth_failures`, which the call sites still bump — so the totals
+    /// stay consistent and behaviour is unchanged.
+    fn auth_validate(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+    ) -> Result<turna_auth::AuthResolution, turna_auth::AuthError> {
+        let started = std::time::Instant::now();
+        let r = self.auth.validate(msg, raw);
+        self.metrics
+            .histograms
+            .observe("turna_auth_duration_seconds", started.elapsed());
+        if let Err(e) = &r {
+            let counter = match e {
+                turna_auth::AuthError::MissingCredentials => {
+                    &self.metrics.auth_fail_missing_credentials
+                }
+                turna_auth::AuthError::InvalidCredentials => {
+                    &self.metrics.auth_fail_invalid_credentials
+                }
+                turna_auth::AuthError::Expired => &self.metrics.auth_fail_expired,
+                turna_auth::AuthError::IntegrityFailed => &self.metrics.auth_fail_integrity,
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
     fn process_stun(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
         let msg = match StunMessage::decode(&raw) {
             Ok(m) => m,
@@ -599,6 +659,7 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         self.metrics.cluster_redirects.fetch_add(1, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
@@ -618,7 +679,7 @@ impl PacketProcessor {
             )
         });
         if has_integrity {
-            if self.auth.validate(msg, raw).is_err() {
+            if self.auth_validate(msg, raw).is_err() {
                 self.metrics
                     .auth_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -637,6 +698,7 @@ impl PacketProcessor {
         let mut buf = [0u8; 256];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: src,
@@ -660,7 +722,7 @@ impl PacketProcessor {
             return stale;
         }
 
-        let resolution = match self.auth.validate(msg, raw) {
+        let resolution = match self.auth_validate(msg, raw) {
             Ok(r) => r,
             Err(e) => {
                 warn!(%src, %e, "auth failed");
@@ -716,17 +778,41 @@ impl PacketProcessor {
             self.metrics.record_tenant_allocation(t);
         }
 
-        let resp = turn::build_allocate_response(msg.transaction_id, relay_addr, src, lifetime);
+        let mut resp = turn::build_allocate_response(msg.transaction_id, relay_addr, src, lifetime);
+        // RFC 8016: if migration is enabled and the client opted in by sending a
+        // MOBILITY-TICKET (typically zero-length) in the request, issue one bound
+        // to this allocation's id + epoch. Added BEFORE encode_with_integrity so
+        // MESSAGE-INTEGRITY covers the ticket.
+        if let Some(mgr) = &self.migration {
+            if msg.has_mobility_ticket() {
+                if let Some(a) = self.store.get(&src) {
+                    let token = mgr.issue_token(&a.allocation_id, a.migration_epoch);
+                    drop(a);
+                    resp.add(Attribute::MobilityTicket(token.token));
+                }
+            }
+        }
         let mut buf = [0u8; 1024];
         let len = resp.encode_with_integrity(&mut buf, &key);
         info!(%src, %relay_addr, lifetime, "allocation created");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+
+        // RFC 8016: stamp the relay route with the owning allocation id so the
+        // io_uring worker pool can forward relay sends to this owner after a
+        // client migration reshards onto another worker.
+        let allocation_id = self
+            .store
+            .get(&src)
+            .map(|a| a.allocation_id.clone())
+            .unwrap_or_default();
 
         vec![
             Action::RegisterRelay {
                 port: relay_port,
                 socket: relay_sock,
                 client_addr: src,
+                allocation_id,
             },
             Action::Send {
                 data: Bytes::copy_from_slice(&buf[..len]),
@@ -742,7 +828,7 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth.validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -754,6 +840,21 @@ impl PacketProcessor {
             .get_lifetime()
             .unwrap_or(turn::DEFAULT_LIFETIME)
             .min(turn::MAX_LIFETIME);
+
+        // RFC 8016 Connection Migration: a Refresh arriving from an address with
+        // no allocation may be a migrating client presenting a MOBILITY-TICKET
+        // minted for an allocation that currently lives on its OLD address.
+        // MESSAGE-INTEGRITY was already verified above (the client proved its
+        // long-term credentials), so the ticket only needs to prove *which*
+        // allocation and that it isn't a replay (epoch).
+        if self.store.get(&src).is_none() {
+            if let Some(actions) = self.try_migration_refresh(msg, src, &key, lifetime) {
+                return actions;
+            }
+            // Not a (valid) migration attempt → fall through; the refresh below
+            // will 437 on the unknown source as before.
+        }
+
         // Capture the relay port before refresh, so a release (lifetime 0)
         // can tell the server to close the relay socket.
         let relay_port = self.store.get(&src).map(|a| a.relay_addr.port());
@@ -764,6 +865,7 @@ impl PacketProcessor {
                 let mut buf = [0u8; 1024];
                 let len = resp.encode_with_integrity(&mut buf, &key);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                 let mut actions = vec![Action::Send {
                     data: Bytes::copy_from_slice(&buf[..len]),
                     target: src,
@@ -782,6 +884,79 @@ impl PacketProcessor {
         }
     }
 
+    /// RFC 8016 migration on the Refresh path. Returns:
+    /// - `Some(actions)` — this was a mobility attempt (success **or** a
+    ///   definitive reject), so the caller must not fall through.
+    /// - `None` — not a migration attempt (no/empty ticket, or feature off);
+    ///   the caller proceeds with the normal Refresh handling.
+    ///
+    /// `key` is the long-term key already validated against MESSAGE-INTEGRITY
+    /// by the caller, so a successful migration required BOTH a valid ticket
+    /// and valid credentials.
+    fn try_migration_refresh(
+        &self,
+        msg: &StunMessage,
+        src: SocketAddr,
+        key: &[u8],
+        lifetime: u32,
+    ) -> Option<Vec<Action>> {
+        let mgr = self.migration.as_ref()?;
+        let ticket = msg.get_mobility_ticket()?;
+        if ticket.is_empty() {
+            // A zero-length ticket is the Allocate opt-in marker, never a valid
+            // Refresh ticket — not a migration.
+            return None;
+        }
+
+        // Validate signature + TTL → (allocation_id, epoch).
+        let (alloc_id, epoch) = match mgr.verify_ticket(ticket) {
+            Some(v) => v,
+            None => return Some(self.encode_error(msg, src, 437, "Allocation Mismatch")),
+        };
+        let old_addr = match self.store.get_by_id(&alloc_id) {
+            Some(a) => a,
+            None => return Some(self.encode_error(msg, src, 437, "Allocation Mismatch")),
+        };
+        // Anti-replay: the ticket's epoch must equal the allocation's current
+        // epoch. A re-keyed allocation has a bumped epoch, so a captured older
+        // ticket no longer matches.
+        if self.store.get(&old_addr).map(|a| a.migration_epoch) != Some(epoch) {
+            return Some(self.encode_error(msg, src, 437, "Allocation Mismatch"));
+        }
+
+        // Re-key old → new (relay address preserved; epoch bumped inside).
+        let relay_addr = match self.store.re_key(&old_addr, src) {
+            Ok(r) => r,
+            Err(_) => return Some(self.encode_error(msg, src, 437, "Allocation Mismatch")),
+        };
+        // Apply the requested lifetime to the migrated allocation.
+        let _ = self.store.refresh(&src, lifetime);
+
+        // Success response: LIFETIME + XOR-MAPPED-ADDRESS(new addr) + a fresh
+        // ticket at the bumped epoch so the client can migrate again.
+        let new_epoch = self
+            .store
+            .get(&src)
+            .map(|a| a.migration_epoch)
+            .unwrap_or(epoch.wrapping_add(1));
+        let mut resp = turn::build_success_response(Method::Refresh, msg.transaction_id);
+        resp.add(Attribute::Lifetime(lifetime));
+        resp.add(Attribute::XorMappedAddress(src));
+        let new_token = mgr.issue_token(&alloc_id, new_epoch);
+        resp.add(Attribute::MobilityTicket(new_token.token));
+
+        let mut buf = [0u8; 1024];
+        let len = resp.encode_with_integrity(&mut buf, key);
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        info!(%src, %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
+
+        Some(vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: src,
+        }])
+    }
+
     fn handle_create_permission(
         &self,
         msg: &StunMessage,
@@ -794,7 +969,7 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth.validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -821,6 +996,7 @@ impl PacketProcessor {
                 let mut buf = [0u8; 1024];
                 let len = resp.encode_with_integrity(&mut buf, &key);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                 vec![Action::Send {
                     data: Bytes::copy_from_slice(&buf[..len]),
                     target: src,
@@ -837,7 +1013,7 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth.validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(_) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -870,6 +1046,7 @@ impl PacketProcessor {
                 let mut buf = [0u8; 1024];
                 let len = resp.encode_with_integrity(&mut buf, &key);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                 vec![Action::Send {
                     data: Bytes::copy_from_slice(&buf[..len]),
                     target: src,
@@ -953,6 +1130,7 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: dst,
@@ -969,6 +1147,7 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: dst,
@@ -983,6 +1162,7 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = resp.encode(&mut buf);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: dst,

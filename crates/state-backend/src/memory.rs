@@ -177,6 +177,8 @@ mod tests {
             user_id: "alice".into(),
             realm: "turna".into(),
             node_id: "node-1".into(),
+            allocation_id: format!("alloc-id-{port}"),
+            migration_epoch: 0,
             created_at_ms: now_ms(),
             expires_at_ms: now_ms() + 86400_000,
             bytes_in: 0,
@@ -295,5 +297,27 @@ mod tests {
         let huge = Duration::from_secs(60 * 60 * 24 * 365 * 100);
         let n = b.get_live_nodes(huge).await.unwrap();
         assert_eq!(n.len(), 1, "huge max_age must include all records");
+    }
+
+    /// RFC 8016: `allocation_id` and `migration_epoch` survive a store→get
+    /// round-trip, and a CAS claim (failover adoption) preserves them.
+    #[tokio::test]
+    async fn migration_fields_round_trip_and_survive_claim() {
+        let b = InMemoryBackend::new();
+        let mut a = test_alloc(50100);
+        a.allocation_id = "alloc-abc".into();
+        a.migration_epoch = 7;
+        b.store_allocation(&a).await.unwrap();
+
+        let got = b.get_allocation(50100).await.unwrap().unwrap();
+        assert_eq!(got.allocation_id, "alloc-abc");
+        assert_eq!(got.migration_epoch, 7);
+
+        // Adoption by another node must not disturb migration identity.
+        assert!(b.claim_allocation(50100, "node-1", "node-2").await.unwrap());
+        let after = b.get_allocation(50100).await.unwrap().unwrap();
+        assert_eq!(after.node_id, "node-2");
+        assert_eq!(after.allocation_id, "alloc-abc", "id must survive claim");
+        assert_eq!(after.migration_epoch, 7, "epoch must survive claim");
     }
 }

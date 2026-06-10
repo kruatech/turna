@@ -44,6 +44,10 @@ pub enum SessionError {
     BandwidthExceeded(String),
     #[error("max allocations per user reached")]
     MaxAllocationsPerUser,
+    /// The migration target 5-tuple already hosts a different allocation.
+    /// Re-keying onto it would clobber that allocation, so we refuse.
+    #[error("migration target address already in use")]
+    MigrationTargetInUse,
 }
 
 /// Permission with expiry.
@@ -99,6 +103,18 @@ impl ChannelBinding {
 /// A single TURN allocation.
 #[derive(Debug)]
 pub struct Allocation {
+    /// Stable identity, independent of the client 5-tuple. Minted once at
+    /// creation and preserved across migration (RFC 8016): a MOBILITY-TICKET
+    /// carries this id, and [`AllocationStore::re_key`] moves the allocation
+    /// to a new `client_addr` while `allocation_id` stays constant. This is
+    /// what lets identity survive a client address change.
+    pub allocation_id: String,
+    /// Migration generation counter (anti-replay for RFC 8016). Starts at 0;
+    /// each successful [`AllocationStore::re_key`] bumps it. A MOBILITY-TICKET
+    /// embeds the epoch it was minted at, so a captured older-epoch ticket no
+    /// longer matches after a migration — effectively single-use, with no
+    /// server-side replay cache.
+    pub migration_epoch: u64,
     pub client_addr: SocketAddr,
     pub relay_addr: SocketAddr,
     pub username: String,
@@ -369,6 +385,15 @@ pub struct AllocationStore {
     allocations: DashMap<SocketAddr, Allocation>,
     relay_to_client: DashMap<SocketAddr, SocketAddr>,
     channel_to_client: DashMap<(u16, u16), SocketAddr>,
+    /// Stable-id -> client address index (RFC 8016 Connection Migration).
+    /// Lets a Refresh carrying a MOBILITY-TICKET find its allocation by id
+    /// even when it arrives from a brand-new 5-tuple. Kept in lock-step with
+    /// `allocations` by `create`/`rehydrate`/`re_key`/`remove`.
+    id_to_client: DashMap<String, SocketAddr>,
+    /// Monotonic source for `allocation_id`. Node-local and dependency-free;
+    /// the ticket's HMAC — not the id — is what prevents forgery, so the id
+    /// itself need not be unpredictable, only unique within this process.
+    next_id: AtomicU64,
     /// Username -> list of client addresses (for multi-allocation tracking).
     user_allocations: DashMap<String, Vec<SocketAddr>>,
     pub ports: PortAllocator,
@@ -401,6 +426,8 @@ impl AllocationStore {
             allocations: DashMap::new(),
             relay_to_client: DashMap::new(),
             channel_to_client: DashMap::new(),
+            id_to_client: DashMap::new(),
+            next_id: AtomicU64::new(1),
             user_allocations: DashMap::new(),
             ports: PortAllocator::new(min_port, max_port),
             tenant_pools: Vec::new(),
@@ -555,6 +582,12 @@ impl AllocationStore {
         }
     }
 
+    /// Mint a fresh, process-unique allocation id. See `next_id`.
+    fn mint_id(&self) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        format!("{n:016x}")
+    }
+
     pub fn create(
         &self,
         client_addr: SocketAddr,
@@ -613,7 +646,10 @@ impl AllocationStore {
         }
 
         let now = Instant::now();
+        let allocation_id = self.mint_id();
         let alloc = Allocation {
+            allocation_id: allocation_id.clone(),
+            migration_epoch: 0,
             client_addr,
             relay_addr,
             username: username.clone(),
@@ -631,6 +667,7 @@ impl AllocationStore {
         };
 
         self.relay_to_client.insert(relay_addr, client_addr);
+        self.id_to_client.insert(allocation_id.clone(), client_addr);
         self.allocations.insert(client_addr, alloc);
 
         // Track per-user
@@ -649,6 +686,8 @@ impl AllocationStore {
             username: username.clone(),
             created_at_ms: now_epoch,
             expires_at_ms: now_epoch + (lifetime as u64) * 1000,
+            allocation_id,
+            migration_epoch: 0,
         });
 
         tracing::info!(%client_addr, %relay_addr, %username, "allocation created");
@@ -692,6 +731,8 @@ impl AllocationStore {
         client_addr: SocketAddr,
         relay_addr: SocketAddr,
         username: String,
+        allocation_id: String,
+        migration_epoch: u64,
         created_at_ms: u64,
         expires_at_ms: u64,
         permissions: impl IntoIterator<Item = (std::net::IpAddr, u64)>,
@@ -773,6 +814,20 @@ impl AllocationStore {
         }
 
         let alloc = Allocation {
+            // Restore the persisted RFC 8016 identity so a MOBILITY-TICKET
+            // issued by the previous owner validates here after a cross-node
+            // failover. A row written before this field existed decodes to an
+            // empty id (serde default) — mint a fresh one then, matching the
+            // old node-local behaviour (the old ticket simply won't be
+            // portable, which is the pre-RFC-8016 status quo, not a regression).
+            allocation_id: if allocation_id.is_empty() {
+                self.mint_id()
+            } else {
+                allocation_id
+            },
+            // Restore the persisted migration generation so a captured
+            // older-epoch ticket stays rejected on the new owner.
+            migration_epoch,
             client_addr,
             relay_addr,
             username: username.clone(),
@@ -793,6 +848,8 @@ impl AllocationStore {
 
         // Reverse indices: relay→client, (relay_port, channel)→client.
         self.relay_to_client.insert(relay_addr, client_addr);
+        self.id_to_client
+            .insert(alloc.allocation_id.clone(), client_addr);
         for (&number, _) in alloc.channel_bindings.iter() {
             self.channel_to_client
                 .insert((relay_addr.port(), number), client_addr);
@@ -832,6 +889,103 @@ impl AllocationStore {
         self.channel_to_client
             .get(&(relay_port, channel))
             .map(|r| *r.value())
+    }
+
+    /// Resolve a stable allocation id to its *current* client address
+    /// (RFC 8016). Returns `None` if no live allocation carries that id.
+    pub fn get_by_id(&self, allocation_id: &str) -> Option<SocketAddr> {
+        self.id_to_client.get(allocation_id).map(|r| *r.value())
+    }
+
+    /// Re-key an allocation from `old_addr` to `new_addr` — the core of
+    /// RFC 8016 Connection Migration. The relay binding, permissions,
+    /// channels, `allocation_id`, `username` and `key` are all preserved;
+    /// only the client 5-tuple moves. Every index that is keyed on, or stores,
+    /// the client address is updated in lock-step:
+    ///
+    /// - `allocations`       — entry moved from `old_addr` to `new_addr`
+    /// - `relay_to_client`   — value (same relay key) → `new_addr`
+    /// - `channel_to_client` — each `(relay_port, channel)` value → `new_addr`
+    /// - `user_allocations`  — the user's vector entry `old_addr` → `new_addr`
+    /// - `id_to_client`      — value → `new_addr`
+    ///
+    /// Returns the (unchanged) relay address on success — the caller echoes it
+    /// back so the peer-facing media path is provably untouched.
+    ///
+    /// Errors:
+    /// - [`SessionError::NotFound`] if no allocation lives at `old_addr`.
+    /// - [`SessionError::MigrationTargetInUse`] if `new_addr` already hosts a
+    ///   *different* allocation (we refuse to clobber it).
+    ///
+    /// Atomicity: this is not a single cross-shard transaction. For the
+    /// intended use — a single migrating client rebinding its own allocation
+    /// — there is no competing writer, so the brief window where `get(old)`
+    /// and `get(new)` both miss is benign (the client has, by definition, just
+    /// changed address). Concurrent migration of the *same* allocation is
+    /// prevented one level up (the processor's per-ticket guard, Заход 2).
+    pub fn re_key(
+        &self,
+        old_addr: &SocketAddr,
+        new_addr: SocketAddr,
+    ) -> Result<SocketAddr, SessionError> {
+        // Idempotent no-op: refreshing from the same address is not a move.
+        if *old_addr == new_addr {
+            return self
+                .allocations
+                .get(old_addr)
+                .map(|a| a.relay_addr)
+                .ok_or(SessionError::NotFound);
+        }
+
+        // Refuse to overwrite a live allocation already sitting on the target.
+        if self.allocations.contains_key(&new_addr) {
+            return Err(SessionError::MigrationTargetInUse);
+        }
+
+        // Take ownership of the allocation out of the old slot.
+        let (_, mut alloc) = self
+            .allocations
+            .remove(old_addr)
+            .ok_or(SessionError::NotFound)?;
+
+        let relay_addr = alloc.relay_addr;
+        let relay_port = relay_addr.port();
+        let allocation_id = alloc.allocation_id.clone();
+        let username = alloc.username.clone();
+
+        // Rewrite the owned copy, then re-insert under the new key.
+        alloc.client_addr = new_addr;
+        // Bump the migration generation so the just-used ticket (minted at the
+        // previous epoch) can never be replayed against this allocation.
+        alloc.migration_epoch = alloc.migration_epoch.wrapping_add(1);
+        // Capture the post-bump epoch before `alloc` is moved back into the
+        // map — the writer persists it so failover keeps anti-replay intact.
+        let new_epoch = alloc.migration_epoch;
+        let channels: Vec<u16> = alloc.channel_bindings.keys().copied().collect();
+        self.allocations.insert(new_addr, alloc);
+
+        // relay key is unchanged; only its value moves.
+        self.relay_to_client.insert(relay_addr, new_addr);
+        for ch in channels {
+            self.channel_to_client.insert((relay_port, ch), new_addr);
+        }
+        self.id_to_client.insert(allocation_id, new_addr);
+        if let Some(mut addrs) = self.user_allocations.get_mut(&username) {
+            for a in addrs.iter_mut() {
+                if a == old_addr {
+                    *a = new_addr;
+                }
+            }
+        }
+
+        self.emit_write(WriteOp::ReKey {
+            relay_port,
+            new_client_addr: new_addr,
+            new_epoch,
+        });
+
+        tracing::info!(%old_addr, %new_addr, %relay_addr, %username, "allocation re-keyed (migration)");
+        Ok(relay_addr)
     }
 
     /// Add or refresh a permission (5 min lifetime per RFC).
@@ -977,6 +1131,7 @@ impl AllocationStore {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
             }
             self.relay_to_client.remove(&relay_addr);
+            self.id_to_client.remove(&alloc.allocation_id);
             self.pool_for_port(relay_addr.port())
                 .release(relay_addr.port());
 
@@ -1041,6 +1196,7 @@ impl AllocationStore {
     pub fn force_remove(&self, client_addr: &std::net::SocketAddr) {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
             self.relay_to_client.remove(&alloc.relay_addr);
+            self.id_to_client.remove(&alloc.allocation_id);
             for (&ch, _) in &alloc.channel_bindings {
                 self.channel_to_client
                     .remove(&(alloc.relay_addr.port(), ch));
@@ -1164,6 +1320,7 @@ mod tests_write_behind {
                 WriteOp::Create { .. } => "Create",
                 WriteOp::Refresh { .. } => "Refresh",
                 WriteOp::Remove { .. } => "Remove",
+                WriteOp::ReKey { .. } => "ReKey",
                 WriteOp::Permission { .. } => "Permission",
                 WriteOp::Channel { .. } => "Channel",
             }
@@ -1298,6 +1455,8 @@ mod tests_write_behind {
                 client(3000),
                 relay(40050),
                 "alice".into(),
+                "rehy-alice".into(),
+                0,
                 now.saturating_sub(10_000),
                 now + 600_000,
                 std::iter::empty(),
@@ -1321,6 +1480,8 @@ mod tests_write_behind {
                 client(3001),
                 relay(40051),
                 "bob".into(),
+                "rehy-bob".into(),
+                0,
                 epoch_ms().saturating_sub(10_000),
                 epoch_ms() + 600_000,
                 std::iter::empty(),
@@ -1344,6 +1505,8 @@ mod tests_write_behind {
                 client(3002),
                 relay(40052),
                 "carol".into(),
+                "rehy-carol".into(),
+                0,
                 now.saturating_sub(120_000),
                 now.saturating_sub(60_000), // already expired
                 std::iter::empty(),
@@ -1372,6 +1535,8 @@ mod tests_write_behind {
                 client(3003),
                 relay(40053),
                 "dave".into(),
+                "rehy-dave".into(),
+                0,
                 now.saturating_sub(10_000),
                 now + 600_000,
                 std::iter::empty(),
@@ -1383,6 +1548,8 @@ mod tests_write_behind {
             client(3004),
             relay(40053),
             "eve".into(),
+            "rehy-eve".into(),
+            0,
             now.saturating_sub(10_000),
             now + 600_000,
             std::iter::empty(),
@@ -1407,6 +1574,8 @@ mod tests_write_behind {
                 client(3005),
                 relay(40054),
                 "frank".into(),
+                "rehy-frank".into(),
+                0,
                 now.saturating_sub(10_000),
                 now + 600_000,
                 // peer_ok has fresh expiry, peer_old already expired
@@ -1429,6 +1598,155 @@ mod tests_write_behind {
             store.get_by_channel(40054, 0x4001).is_none(),
             "expired channel must not be present"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Connection Migration (RFC 8016) — re_key + id index
+    // -----------------------------------------------------------------
+
+    /// Every allocation gets a unique, stable id, resolvable via `get_by_id`.
+    #[test]
+    fn allocation_id_is_minted_and_indexed() {
+        let store = make_store();
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
+            .unwrap();
+        store
+            .create(client(1001), relay(40001), "alice".into(), vec![], 600)
+            .unwrap();
+
+        let id0 = store.get(&client(1000)).unwrap().allocation_id.clone();
+        let id1 = store.get(&client(1001)).unwrap().allocation_id.clone();
+        assert_ne!(id0, id1, "ids must be unique");
+        assert_eq!(store.get_by_id(&id0), Some(client(1000)));
+        assert_eq!(store.get_by_id(&id1), Some(client(1001)));
+        assert_eq!(store.get_by_id("nonexistent"), None);
+    }
+
+    /// The heart of migration: re_key moves the allocation and *every* index
+    /// that references the client address, while id / relay / channels survive.
+    #[test]
+    fn re_key_moves_every_index() {
+        let store = make_store();
+        let old = client(1000);
+        let new = client(1500); // "new network" — different port/ip in practice
+        let r = relay(40000);
+        let peer = SocketAddr::new("5.6.7.8".parse().unwrap(), 9000);
+
+        store.create(old, r, "alice".into(), vec![], 600).unwrap();
+        store.add_permission(&old, peer.ip()).unwrap();
+        store.add_channel(&old, 0x4000, peer).unwrap();
+        let id = store.get(&old).unwrap().allocation_id.clone();
+
+        // Pre-conditions.
+        assert_eq!(store.get(&old).unwrap().migration_epoch, 0, "epoch starts at 0");
+        assert_eq!(store.get_by_relay(&r), Some(old));
+        assert_eq!(store.get_by_channel(40000, 0x4000), Some(old));
+        assert_eq!(store.get_by_id(&id), Some(old));
+        assert_eq!(store.user_allocation_count("alice"), 1);
+
+        let relay_addr = store.re_key(&old, new).expect("re_key");
+        assert_eq!(relay_addr, r, "relay address must be preserved");
+
+        // Old 5-tuple is gone; new 5-tuple owns the allocation.
+        assert!(store.get(&old).is_none());
+        assert!(store.get(&new).is_some());
+        assert_eq!(store.get(&new).unwrap().client_addr, new);
+        // Epoch bumped exactly once (anti-replay handle).
+        assert_eq!(store.get(&new).unwrap().migration_epoch, 1, "epoch bumps on re_key");
+        // id is preserved and now points to the new address.
+        assert_eq!(store.get(&new).unwrap().allocation_id, id);
+        assert_eq!(store.get_by_id(&id), Some(new));
+        // Reverse indices follow the move (relay key unchanged, value moved).
+        assert_eq!(store.get_by_relay(&r), Some(new));
+        assert_eq!(store.get_by_channel(40000, 0x4000), Some(new));
+        // Permission survives.
+        assert!(store.get(&new).unwrap().has_permission(&peer));
+        // User tracking still shows exactly one allocation, under the new addr.
+        assert_eq!(store.user_allocation_count("alice"), 1);
+    }
+
+    /// Re-keying onto an address that already hosts another allocation must be
+    /// refused — we never clobber a live allocation.
+    #[test]
+    fn re_key_target_in_use_is_rejected() {
+        let store = make_store();
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
+            .unwrap();
+        store
+            .create(client(1001), relay(40001), "bob".into(), vec![], 600)
+            .unwrap();
+
+        let err = store.re_key(&client(1000), client(1001)).unwrap_err();
+        assert!(matches!(err, SessionError::MigrationTargetInUse));
+        // Both allocations remain intact and untouched.
+        assert!(store.get(&client(1000)).is_some());
+        assert!(store.get(&client(1001)).is_some());
+    }
+
+    /// Re-keying an unknown source address is NotFound.
+    #[test]
+    fn re_key_unknown_source_is_not_found() {
+        let store = make_store();
+        let err = store.re_key(&client(9999), client(8888)).unwrap_err();
+        assert!(matches!(err, SessionError::NotFound));
+    }
+
+    /// Re-key to the same address is an idempotent no-op returning the relay.
+    #[test]
+    fn re_key_same_address_is_noop() {
+        let store = make_store();
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
+            .unwrap();
+        let r = store.re_key(&client(1000), client(1000)).unwrap();
+        assert_eq!(r, relay(40000));
+        assert!(store.get(&client(1000)).is_some());
+    }
+
+    /// After re_key, removing under the *new* address fully cleans the id
+    /// index (no dangling id → client mapping).
+    #[test]
+    fn re_key_then_remove_clears_id_index() {
+        let store = make_store();
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
+            .unwrap();
+        let id = store.get(&client(1000)).unwrap().allocation_id.clone();
+        store.re_key(&client(1000), client(1500)).unwrap();
+        store.remove(&client(1500), relay(40000)).unwrap();
+
+        assert_eq!(store.get_by_id(&id), None, "id index must be cleared");
+        assert_eq!(store.get_by_relay(&relay(40000)), None);
+        assert_eq!(store.len(), 0);
+    }
+
+    /// re_key emits exactly one WriteOp::ReKey carrying the relay port and
+    /// the new client address.
+    #[tokio::test]
+    async fn re_key_emits_rekey_event() {
+        let store = make_store();
+        let (tx, mut rx) = mpsc::channel(64);
+        store
+            .create(client(1000), relay(40000), "alice".into(), vec![], 600)
+            .unwrap();
+        store.attach_writer(tx); // attach AFTER create so we only see ReKey
+
+        store.re_key(&client(1000), client(1500)).unwrap();
+        match rx.try_recv() {
+            Ok(WriteOp::ReKey {
+                relay_port,
+                new_client_addr,
+                new_epoch,
+            }) => {
+                assert_eq!(relay_port, 40000);
+                assert_eq!(new_client_addr, client(1500));
+                assert_eq!(new_epoch, 1, "first re_key bumps epoch 0 → 1");
+            }
+            other => panic!("expected ReKey, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one event expected");
     }
 }
 

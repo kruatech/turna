@@ -21,6 +21,13 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::uring::{CompletionEvent, UringEngine};
+use crate::relay_route::{
+    classify_owned_command, OwnedSendOutcome, RelayRoutes, RouteDecision, WorkerCommand,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -29,6 +36,24 @@ pub struct WorkerPoolConfig {
     pub num_workers: usize,
     pub buffers_per_worker: u16,
     pub external_ip: std::net::IpAddr,
+    /// RFC 8016 sharded ownership: shared relay route table (port → owner).
+    pub relay_routes: Arc<RelayRoutes>,
+    /// Bounded wait for the worker loop so it unparks to drain the cross-worker
+    /// command channel even with no ring activity (v1 wakeup).
+    pub cmd_poll_timeout: Duration,
+    /// Graceful-drain trigger. When flipped to `true` (on SIGTERM / management
+    /// drain) every worker stops taking new traffic on its main socket, lets
+    /// existing relay flows finish for `drain_grace`, unregisters its routes,
+    /// and exits its loop so the pool can be `join`ed instead of abandoned.
+    pub shutdown: Arc<AtomicBool>,
+    /// Lame-duck window after `shutdown` is observed: how long a worker keeps
+    /// servicing already-established relay flows before it tears down.
+    pub drain_grace: Duration,
+    /// Optional shared per-worker io_uring ring-stats publisher. When `Some`,
+    /// each worker publishes its `RingStats` into slot `worker_id` on every
+    /// ring-log tick; the node sums the slots for Prometheus. `None` keeps the
+    /// log-only behaviour with no publishing.
+    pub ring_stats: Option<Arc<crate::uring::RingStatsAggregate>>,
 }
 
 impl Default for WorkerPoolConfig {
@@ -38,6 +63,11 @@ impl Default for WorkerPoolConfig {
             num_workers: num_cpus(),
             buffers_per_worker: 2048,
             external_ip: "127.0.0.1".parse().unwrap(),
+            relay_routes: RelayRoutes::new(),
+            cmd_poll_timeout: Duration::from_micros(500),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            drain_grace: Duration::from_secs(5),
+            ring_stats: None,
         }
     }
 }
@@ -87,6 +117,9 @@ pub enum ForwardAction {
     /// Create a relay socket on this port.
     CreateRelay {
         port: u16,
+        /// RFC 8016: owning allocation id, registered into the route table so
+        /// other workers can forward sends to this owner.
+        allocation_id: String,
     },
     /// Close a relay socket on this port (allocation released or expired).
     CloseRelay {
@@ -113,6 +146,13 @@ where
         let addr = config.listen_addr;
         let bufs = config.buffers_per_worker;
         let factory = factory.clone();
+        let routes = config.relay_routes.clone();
+        let poll = config.cmd_poll_timeout;
+        let shutdown = config.shutdown.clone();
+        let drain_grace = config.drain_grace;
+        let ring_stats = config.ring_stats.clone();
+        // Per-worker inbound command channel (cross-worker relay-send forwards).
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCommand>();
 
         let handle = std::thread::Builder::new()
             .name(format!("turna-worker-{worker_id}"))
@@ -120,7 +160,10 @@ where
                 #[cfg(target_os = "linux")]
                 pin_to_core(worker_id);
                 let handler = factory(worker_id);
-                run_worker(worker_id, addr, bufs, handler);
+                run_worker(
+                    worker_id, addr, bufs, handler, routes, cmd_tx, cmd_rx, poll, shutdown,
+                    drain_grace, ring_stats,
+                );
             })
             .expect("failed to spawn worker thread");
 
@@ -138,6 +181,13 @@ fn run_worker<H: PacketHandler>(
     addr: SocketAddr,
     buf_count: u16,
     mut handler: H,
+    routes: Arc<RelayRoutes>,
+    cmd_tx: std::sync::mpsc::Sender<WorkerCommand>,
+    cmd_rx: Receiver<WorkerCommand>,
+    cmd_poll_timeout: Duration,
+    shutdown: Arc<AtomicBool>,
+    drain_grace: Duration,
+    ring_stats: Option<Arc<crate::uring::RingStatsAggregate>>,
 ) {
     let mut engine = match UringEngine::new(addr, true, buf_count) {
         Ok(e) => e,
@@ -156,13 +206,104 @@ fn run_worker<H: PacketHandler>(
 
     info!(worker_id, addr = %engine.local_addr(), "worker started");
 
+    // Graceful-drain bookkeeping (Fix 4). `owned_ports` mirrors the relay
+    // sockets this worker currently owns (the engine exposes no enumerator, so
+    // we track ownership locally from the new/close batches). `drain_deadline`
+    // is armed the first time `shutdown` is observed.
+    let mut owned_ports: HashSet<u16> = HashSet::new();
+    let mut drain_deadline: Option<Instant> = None;
+    // Throttle for periodic io_uring ring/CQE utilisation logging.
+    let mut last_ring_log = Instant::now();
+
     loop {
-        if let Err(e) = engine.submit_and_wait() {
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
+        match engine.submit_and_wait_timeout(cmd_poll_timeout) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                error!(worker_id, %e, "submit_and_wait_timeout failed");
+                break;
             }
-            error!(worker_id, %e, "submit_and_wait failed");
-            break;
+        }
+
+        if last_ring_log.elapsed() >= Duration::from_secs(30) {
+            let rs = engine.ring_stats();
+            if let Some(agg) = &ring_stats {
+                agg.publish(worker_id, &rs, engine.buffers_available() as u32);
+            }
+            let avg = if rs.cqe_batches > 0 {
+                rs.cqe_drained / rs.cqe_batches
+            } else {
+                0
+            };
+            info!(
+                worker_id,
+                cqe_drained = rs.cqe_drained,
+                drain_batches = rs.cqe_batches,
+                avg_cqe_per_drain = avg,
+                max_cqe_batch = rs.cqe_max_batch,
+                sq_push_failed = rs.sq_push_failed,
+                sq_len = rs.sq_len,
+                sq_capacity = rs.sq_capacity,
+                cq_len = rs.cq_len,
+                buffers_available = engine.buffers_available(),
+                "io_uring ring stats"
+            );
+            last_ring_log = Instant::now();
+        }
+
+        // ── Graceful drain (Fix 4) ────────────────────────────────────────────
+        // On the first observed shutdown signal, enter lame-duck: keep
+        // servicing in-flight completions and established relay flows, but stop
+        // arming new main-socket recvs (no new clients / Allocates). After
+        // `drain_grace` — or as soon as this worker owns no relays — tear down:
+        // cancel every still-owned relay (the engine drains in-flight ops
+        // safely) and drop its route from the shared table so peers stop
+        // forwarding to a worker that is going away.
+        if shutdown.load(Ordering::Acquire) && drain_deadline.is_none() {
+            drain_deadline = Some(Instant::now() + drain_grace);
+            info!(
+                worker_id,
+                grace_ms = drain_grace.as_millis() as u64,
+                owned_relays = owned_ports.len(),
+                "worker draining: existing flows keep running, new allocations rejected upstream"
+            );
+        }
+        if let Some(deadline) = drain_deadline {
+            if Instant::now() >= deadline || owned_ports.is_empty() {
+                // Tear down: drop each owned route from the shared table and
+                // begin closing its relay socket (the engine cancels in-flight
+                // ops and reclaims the block once they drain).
+                let closing: Vec<u16> = owned_ports.drain().collect();
+                for &port in &closing {
+                    if let Some((aid, gen)) =
+                        engine.relay_record(port).map(|(a, g)| (a.to_string(), g))
+                    {
+                        routes.unregister_if(port, &aid, gen);
+                    }
+                    engine.remove_relay(port);
+                }
+                // Best-effort, bounded wait-until-reclaimed (#2b): drive the ring
+                // so the cancellations complete and the registered buffer/msghdr
+                // blocks return to their pools before we drop the engine, rather
+                // than relying on the kernel closing fds at process exit.
+                let reclaim_cap = Instant::now() + Duration::from_millis(250);
+                while !closing.iter().all(|p| !engine.has_relay(*p))
+                    && Instant::now() < reclaim_cap
+                {
+                    if engine.submit_and_wait_timeout(cmd_poll_timeout).is_err() {
+                        break;
+                    }
+                    let _ = engine.collect_completions(); // drives reclaim
+                }
+                let _ = engine.flush();
+                info!(
+                    worker_id,
+                    relays = closing.len(),
+                    fully_reclaimed = closing.iter().all(|p| !engine.has_relay(*p)),
+                    "worker drain complete; exiting loop"
+                );
+                break;
+            }
         }
 
         // Bytes-typed send queues: clones are AtomicAdd, not memcpy.
@@ -171,7 +312,7 @@ fn run_worker<H: PacketHandler>(
         let mut zc_relay_sends: Vec<(u16, u16, usize, usize, SocketAddr)> = Vec::new();
         let mut resubmit_main: Vec<(u16, u16)> = Vec::new();
         let mut resubmit_relay: Vec<(u16, u16, u16)> = Vec::new();
-        let mut new_relays: Vec<u16> = Vec::new();
+        let mut new_relays: Vec<(u16, String)> = Vec::new();
         let mut close_relays: Vec<u16> = Vec::new();
 
         let events = engine.collect_completions();
@@ -242,11 +383,16 @@ fn run_worker<H: PacketHandler>(
             }
         }
 
-        // Create new relay sockets.
-        for port in &new_relays {
+        // Create new relay sockets and register ownership (RFC 8016). Register
+        // first to obtain the generation, then bind the socket stamped with
+        // (allocation_id, generation); roll the route back on bind failure.
+        for (port, allocation_id) in &new_relays {
             if !engine.has_relay(*port) {
-                if let Err(e) = engine.add_relay(*port) {
-                    warn!(worker_id, port, %e, "failed to add relay");
+                let generation =
+                    routes.register(*port, worker_id, cmd_tx.clone(), allocation_id.clone());
+                if let Err(e) = engine.add_relay(*port, allocation_id.clone(), generation) {
+                    warn!(worker_id, port, %e, "failed to add relay; rolling back route");
+                    routes.unregister_if(*port, allocation_id, generation);
                 }
             }
         }
@@ -256,7 +402,24 @@ fn run_worker<H: PacketHandler>(
         // complete (in-flight-safe). Done before resubmits so a relay closed in
         // this same batch isn't re-armed.
         for port in &close_relays {
+            // Conditional unregister: only drop the route if it still names this
+            // allocation/generation (guards a delayed close vs a reused port).
+            if let Some((aid, gen)) = engine.relay_record(*port).map(|(a, g)| (a.to_string(), g)) {
+                routes.unregister_if(*port, &aid, gen);
+            }
             engine.remove_relay(*port);
+        }
+
+        // Drain bookkeeping (Fix 4): mirror this batch's ownership changes so
+        // the teardown knows which routes to drop. `has_relay` filters out new
+        // relays whose bind failed and rolled back.
+        for (port, _aid) in &new_relays {
+            if engine.has_relay(*port) {
+                owned_ports.insert(*port);
+            }
+        }
+        for port in &close_relays {
+            owned_ports.remove(port);
         }
 
         // Submit main sends. The engine now allocates an in-flight-safe send
@@ -269,10 +432,72 @@ fn run_worker<H: PacketHandler>(
             }
         }
 
-        // Submit relay sends.
-        for (port, data, target) in &relay_sends {
-            if engine.submit_relay_send(*port, &data, *target).is_err() {
-                stats.errors += 1;
+        // Submit relay sends. A relay socket not owned by this worker (post
+        // migration reshard) returns NotFound → route the send to its owner.
+        for (port, data, target) in relay_sends.drain(..) {
+            match engine.submit_relay_send(port, &data, target) {
+                Ok(_) => {
+                    routes.stats.send_local.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    match routes.route_send(worker_id, port, target, data) {
+                        RouteDecision::Forward { tx, cmd } => {
+                            if tx.send(cmd).is_ok() {
+                                routes.stats.send_forwarded.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                routes.stats.send_forward_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        RouteDecision::Miss => {
+                            warn!(worker_id, port, "relay route miss — dropping send");
+                            stats.errors += 1;
+                        }
+                        RouteDecision::SelfOwned => {
+                            warn!(worker_id, port,
+                                "relay route names self but local socket missing (desync)");
+                            stats.errors += 1;
+                        }
+                    }
+                }
+                Err(_) => {
+                    stats.errors += 1;
+                }
+            }
+        }
+
+        // Drain cross-worker commands: relay sends forwarded to us as the owner.
+        // Validate against our local record (anti-stale) and never re-route
+        // (anti-loop — SendViaRelayOwned is terminal).
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                WorkerCommand::SendViaRelayOwned {
+                    allocation_id,
+                    generation,
+                    relay_port,
+                    peer_addr,
+                    payload,
+                } => {
+                    let local = engine
+                        .relay_record(relay_port)
+                        .map(|(a, g)| (a.to_string(), g));
+                    match classify_owned_command(local.as_ref(), &allocation_id, generation) {
+                        OwnedSendOutcome::Send => {
+                            if engine.submit_relay_send(relay_port, &payload, peer_addr).is_ok() {
+                                routes.stats.send_local.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats.errors += 1;
+                            }
+                        }
+                        OwnedSendOutcome::StaleAllocation => {
+                            routes.stats.send_stale.fetch_add(1, Ordering::Relaxed);
+                            warn!(worker_id, relay_port, "forwarded relay send stale — dropping");
+                        }
+                        OwnedSendOutcome::MissingSocket => {
+                            warn!(worker_id, relay_port,
+                                "forwarded relay send for unknown local socket");
+                        }
+                    }
+                }
             }
         }
 
@@ -288,7 +513,12 @@ fn run_worker<H: PacketHandler>(
             engine.release_buffer(*buf_idx);
         }
 
-        // Re-submit recvs.
+        // Re-submit recvs. Even while draining we keep the MAIN socket armed:
+        // existing clients' Send/ChannelData keep flowing through the grace
+        // window, while *new* Allocates are rejected upstream by the processor
+        // (508 Server Draining, or 300 Try Alternate when clustered — see
+        // PacketProcessor::handle_allocate / maybe_redirect_new_client). So the
+        // drain services real traffic instead of going silent.
         for (msghdr_idx, buf_idx) in resubmit_main {
             let _ = engine.resubmit_main_recv(msghdr_idx, buf_idx);
         }
@@ -325,7 +555,7 @@ fn process_action(
     relay_sends: &mut Vec<(u16, Bytes, SocketAddr)>,
     zc_relay_sends: &mut Vec<(u16, u16, usize, usize, SocketAddr)>,
     resubmit_main: &mut Vec<(u16, u16)>,
-    new_relays: &mut Vec<u16>,
+    new_relays: &mut Vec<(u16, String)>,
     close_relays: &mut Vec<u16>,
     stats: &mut Stats,
 ) {
@@ -361,8 +591,8 @@ fn process_action(
             zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
             // Don't resubmit — buffer is held until the send completes.
         }
-        ForwardAction::CreateRelay { port } => {
-            new_relays.push(port);
+        ForwardAction::CreateRelay { port, allocation_id } => {
+            new_relays.push((port, allocation_id));
             if is_main {
                 resubmit_main.push((msghdr_idx, buf_idx));
             }
@@ -393,7 +623,7 @@ fn process_action(
                         has_zc = true;
                         zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
                     }
-                    ForwardAction::CreateRelay { port } => new_relays.push(port),
+                    ForwardAction::CreateRelay { port, allocation_id } => new_relays.push((port, allocation_id)),
                     ForwardAction::CloseRelay { port } => close_relays.push(port),
                     _ => {}
                 }

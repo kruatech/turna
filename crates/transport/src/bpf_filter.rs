@@ -16,8 +16,8 @@
 //! shape check.
 //!
 //! `SO_ATTACH_FILTER` on a `SOCK_DGRAM` UDP socket runs the program over
-//! the UDP **payload** (offset 0 = first byte of the STUN/ChannelData
-//! message), which is what the offsets above assume. On macOS this is a
+//! the packet from the **UDP header** (8 bytes), so the STUN/ChannelData
+//! message starts at offset 8; build_stun_filter shifts offsets by UDP_HDR. On macOS this is a
 //! no-op. The filter can be disabled at runtime with
 //! `TURNA_BPF_FILTER=0` if a particular kernel misbehaves.
 
@@ -85,16 +85,21 @@ pub(crate) mod prog {
     /// 11  RET DROP
     /// ```
     pub fn build_stun_filter(max_size: u32) -> Vec<BpfInsn> {
+        // SOCK_DGRAM UDP: the kernel runs SO_ATTACH_FILTER over the packet
+        // starting at the UDP HEADER, so the message begins at offset
+        // UDP_HDR. All message-relative offsets + BPF_LEN thresholds are
+        // shifted by it. (Verified empirically against the live kernel.)
+        const UDP_HDR: u32 = 8;
         vec![
             insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),                  // 0
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 9, 4),                 // 1  A>=4 ? : DROP
-            insn(BPF_JMP | BPF_JGT | BPF_K, 8, 0, max_size),          // 2  A>max ? DROP :
-            insn(BPF_LD | BPF_H | BPF_ABS, 0, 0, 0),                  // 3  A=u16[0]
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 9, UDP_HDR + 4),                 // 1  A>=4 ? : DROP
+            insn(BPF_JMP | BPF_JGT | BPF_K, 8, 0, max_size + UDP_HDR),          // 2  A>max ? DROP :
+            insn(BPF_LD | BPF_H | BPF_ABS, 0, 0, UDP_HDR),                  // 3  A=u16[0]
             insn(BPF_JMP | BPF_JGE | BPF_K, 0, 1, CHANNEL_MIN),       // 4 A>=0x4000 ? : STUN
             insn(BPF_JMP | BPF_JGT | BPF_K, 0, 4, CHANNEL_MAX),       // 5 A>0x7FFE ? STUN : ACCEPT
             insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),                  // 6  A=len
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 3, 20),                // 7  A>=20 ? : DROP
-            insn(BPF_LD | BPF_W | BPF_ABS, 0, 0, 4),                  // 8  A=u32[4]
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 3, UDP_HDR + 20),                // 7  A>=20 ? : DROP
+            insn(BPF_LD | BPF_W | BPF_ABS, 0, 0, UDP_HDR + 4),                  // 8  A=u32[4]
             insn(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, STUN_MAGIC_COOKIE), // 9 ==MAGIC ? ACCEPT : DROP
             insn(BPF_RET | BPF_K, 0, 0, ACCEPT),                      // 10
             insn(BPF_RET | BPF_K, 0, 0, DROP),                        // 11
@@ -285,17 +290,18 @@ mod tests {
     use prog::{build_stun_filter, simulate, ACCEPT, DROP, STUN_MAGIC_COOKIE};
 
     fn stun(len: usize) -> Vec<u8> {
-        let mut p = vec![0u8; len.max(8)];
-        p[0] = 0x00;
-        p[1] = 0x01; // Binding request
-        p[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        // prepend an 8-byte dummy UDP header (kernel feeds filter from there)
+        let mut p = vec![0u8; 8 + len.max(8)];
+        p[8] = 0x00;
+        p[9] = 0x01; // Binding request
+        p[12..16].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         p
     }
     fn channel(ch: u16, len: usize) -> Vec<u8> {
-        let mut p = vec![0u8; len.max(4)];
-        p[0..2].copy_from_slice(&ch.to_be_bytes());
+        let mut p = vec![0u8; 8 + len.max(4)];
+        p[8..10].copy_from_slice(&ch.to_be_bytes());
         let body = (len.max(4) - 4) as u16;
-        p[2..4].copy_from_slice(&body.to_be_bytes());
+        p[10..12].copy_from_slice(&body.to_be_bytes());
         p
     }
 

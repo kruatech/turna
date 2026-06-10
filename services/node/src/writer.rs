@@ -91,6 +91,11 @@ struct CreateData {
     client_addr: SocketAddr,
     relay_addr: SocketAddr,
     username: String,
+    /// RFC 8016 stable identity, persisted so a MOBILITY-TICKET survives a
+    /// cross-node failover (see `StoredAllocation::allocation_id`).
+    allocation_id: String,
+    /// RFC 8016 migration generation at the time this Create/ReKey was seen.
+    migration_epoch: u64,
     created_at_ms: u64,
     expires_at_ms: u64,
 }
@@ -101,6 +106,17 @@ struct PortBatch {
     /// Latest expires_at_ms from any Refresh seen for this port.
     /// Applied to whichever `StoredAllocation` we end up writing.
     refresh_expires: Option<u64>,
+    /// RFC 8016 connection migration: the latest re-keyed client_addr for
+    /// this port, if a `ReKey` was seen in this batch. When set, the flush
+    /// path overrides `client_addr` on whatever `StoredAllocation` it writes
+    /// so the persisted record tracks the migrated 5-tuple (and failover /
+    /// rehydrate restore the client on its current address, not the stale
+    /// one). The relay binding is unchanged, so only `client_addr` moves.
+    rekey_addr: Option<SocketAddr>,
+    /// The post-bump `migration_epoch` from a `ReKey` seen in this batch, if
+    /// any. Applied to the persisted record alongside `rekey_addr` so the
+    /// stored epoch tracks the in-memory one across failover.
+    rekey_epoch: Option<u64>,
     /// peer_ip → expires_at_ms. Last write wins.
     perms: HashMap<IpAddr, u64>,
     /// channel_number → (peer, expires_at_ms). Last write wins.
@@ -112,6 +128,8 @@ impl PortBatch {
         Self {
             state: PortState::Touched,
             refresh_expires: None,
+            rekey_addr: None,
+            rekey_epoch: None,
             perms: HashMap::new(),
             chans: HashMap::new(),
         }
@@ -121,6 +139,8 @@ impl PortBatch {
         Self {
             state: PortState::New(data),
             refresh_expires: None,
+            rekey_addr: None,
+            rekey_epoch: None,
             perms: HashMap::new(),
             chans: HashMap::new(),
         }
@@ -144,12 +164,16 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             username,
             created_at_ms,
             expires_at_ms,
+            allocation_id,
+            migration_epoch,
             ..
         } => {
             let data = CreateData {
                 client_addr,
                 relay_addr,
                 username,
+                allocation_id,
+                migration_epoch,
                 created_at_ms,
                 expires_at_ms,
             };
@@ -162,6 +186,50 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             batch.insert(port, PortBatch::new_created(data));
             coalesced
         }
+        WriteOp::ReKey {
+            new_client_addr,
+            new_epoch,
+            ..
+        } => {
+            // RFC 8016 re-key: the client's 5-tuple moved (Wi-Fi → cellular);
+            // the relay binding is unchanged. We must make the persisted
+            // record track the new client_addr, covering two cases:
+            //
+            //   1. A Create for this port is still pending in *this* batch
+            //      (not yet flushed): patch its address in place so
+            //      `build_stored` writes the fresh one — the backend never
+            //      sees the stale address at all.
+            //   2. The record was flushed in an earlier batch (the common
+            //      migration case): record `rekey_addr` so the flush reads
+            //      the existing record and rewrites `client_addr` before
+            //      storing it back (see `flush_port`'s `Touched` path).
+            //
+            // If no batch entry exists yet we create a `Touched` carrier so
+            // case 2 fires. A subsequent Create in the same batch replaces
+            // the entry (and resets `rekey_addr`), which is correct: the
+            // Create's own `client_addr` is then authoritative.
+            match batch.get_mut(&port) {
+                Some(pb) => {
+                    pb.rekey_addr = Some(new_client_addr);
+                    pb.rekey_epoch = Some(new_epoch);
+                    if let PortState::New(data) = &mut pb.state {
+                        data.client_addr = new_client_addr;
+                        data.migration_epoch = new_epoch;
+                    }
+                    // Folded into an existing batch entry — no net-new port.
+                    true
+                }
+                None => {
+                    let mut pb = PortBatch::new_touched();
+                    pb.rekey_addr = Some(new_client_addr);
+                    pb.rekey_epoch = Some(new_epoch);
+                    batch.insert(port, pb);
+                    // Net-new entry: a backend read-modify-write will happen.
+                    false
+                }
+            }
+        }
+
         WriteOp::Remove { .. } => {
             // Remove wipes any earlier work for this port.
             // Special case: if there was a Create in this same batch,
@@ -246,6 +314,8 @@ async fn flush_port(
         PortState::New(data) => {
             counters.ops_create.fetch_add(1, Ordering::Relaxed);
             let expires = batch.refresh_expires.unwrap_or(data.expires_at_ms);
+            // `data.client_addr` already reflects any in-batch ReKey (patched
+            // in `apply`), so `build_stored` writes the migrated address.
             let stored = build_stored(
                 node_id,
                 realm,
@@ -275,6 +345,18 @@ async fn flush_port(
                 merged.expires_at_ms = exp;
                 counters.ops_refresh.fetch_add(1, Ordering::Relaxed);
             }
+            // RFC 8016 re-key: the persisted record was written before the
+            // client migrated. Rewrite `client_addr` to the new 5-tuple so a
+            // later failover/rehydrate restores the client on its current
+            // address. The relay binding (relay_addr / relay_port) is
+            // untouched — only the client side moves.
+            if let Some(addr) = batch.rekey_addr {
+                merged.client_addr = addr.to_string();
+                debug!(port, new_client = %addr, "persisting migrated client_addr");
+            }
+            if let Some(ep) = batch.rekey_epoch {
+                merged.migration_epoch = ep;
+            }
             // Permissions: replace if a newer expiry was emitted.
             // Stored as plain Vec<String>; we keep that shape but dedupe.
             apply_perms(&mut merged.permissions, &batch.perms, counters);
@@ -296,6 +378,8 @@ fn build_stored(
     StoredAllocation {
         id: format!("{node_id}:{port}"),
         relay_port: port,
+        allocation_id: data.allocation_id.clone(),
+        migration_epoch: data.migration_epoch,
         client_addr: data.client_addr.to_string(),
         relay_addr: data.relay_addr.to_string(),
         user_id: data.username.clone(),
@@ -578,6 +662,8 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9000),
             relay_addr: ipv4(10, 0, 0, 1, 40000),
             username: "alice".into(),
+            allocation_id: "wr-id-1".into(),
+            migration_epoch: 0,
             created_at_ms: 1000,
             expires_at_ms: 1_600_000,
         })
@@ -613,6 +699,8 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9001),
             relay_addr: ipv4(10, 0, 0, 1, 40001),
             username: "bob".into(),
+            allocation_id: "wr-id-2".into(),
+            migration_epoch: 0,
             created_at_ms: 1000,
             expires_at_ms: 1_600_000,
         })
@@ -656,6 +744,8 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9002),
             relay_addr: ipv4(10, 0, 0, 1, 40002),
             username: "carol".into(),
+            allocation_id: "wr-id-3".into(),
+            migration_epoch: 0,
             created_at_ms: 1000,
             expires_at_ms: 1_600_000,
         })
@@ -700,6 +790,8 @@ mod tests {
                 client_addr: ipv4(127, 0, 0, 1, 9000 + i),
                 relay_addr: ipv4(10, 0, 0, 1, 40010 + i),
                 username: format!("u{i}"),
+                allocation_id: "wr-id-4".into(),
+                migration_epoch: 0,
                 created_at_ms: 1000,
                 expires_at_ms: 1_600_000,
             })
@@ -737,6 +829,8 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9020),
             relay_addr: ipv4(10, 0, 0, 1, 40020),
             username: "dave".into(),
+            allocation_id: "wr-id-5".into(),
+            migration_epoch: 0,
             created_at_ms: 1000,
             expires_at_ms: 1_600_000,
         })
@@ -751,5 +845,116 @@ mod tests {
             backend.get_allocation(40020).await.unwrap().is_some(),
             "shutdown should flush partial batch"
         );
+    }
+
+    /// RFC 8016 migration, already-persisted record: a `ReKey` arriving in a
+    /// later batch (so the port is `Touched`, not `New`) rewrites the
+    /// persisted `client_addr` while leaving the relay binding intact.
+    #[tokio::test]
+    async fn rekey_persists_new_client_addr_when_already_flushed() {
+        let backend = fresh_backend().await;
+        let store = fresh_store();
+        // batch_max=1 → each op flushes on its own, so the Create is durable
+        // *before* the ReKey is processed: the ReKey lands as a Touched port.
+        let (tx, sd, _counters, _metrics, handle) =
+            spawn_writer(backend.clone(), store.clone(), 1, 60_000);
+
+        let old_client = ipv4(192, 168, 1, 10, 5000); // Wi-Fi
+        let new_client = ipv4(10, 20, 30, 40, 7000); // cellular
+        let relay = ipv4(10, 0, 0, 1, 40030);
+
+        tx.send(WriteOp::Create {
+            relay_port: 40030,
+            client_addr: old_client,
+            relay_addr: relay,
+            username: "mobile".into(),
+            allocation_id: "wr-id-6".into(),
+            migration_epoch: 0,
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Sanity: persisted with the old address.
+        let before = backend.get_allocation(40030).await.unwrap().unwrap();
+        assert_eq!(before.client_addr, old_client.to_string());
+        assert_eq!(before.relay_addr, relay.to_string());
+
+        // Client migrates → ReKey.
+        tx.send(WriteOp::ReKey {
+            relay_port: 40030,
+            new_client_addr: new_client,
+            new_epoch: 1,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let after = backend.get_allocation(40030).await.unwrap().unwrap();
+        assert_eq!(
+            after.client_addr,
+            new_client.to_string(),
+            "client_addr should track the migrated 5-tuple"
+        );
+        assert_eq!(
+            after.relay_addr,
+            relay.to_string(),
+            "relay binding must be unchanged by migration"
+        );
+        assert_eq!(after.user_id, "mobile");
+        assert_eq!(after.migration_epoch, 1, "persisted epoch must track the re-key bump");
+
+        sd.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// RFC 8016 migration, in-batch race: `Create` then `ReKey` coalesce in
+    /// the same batch — the backend must only ever see the new address.
+    #[tokio::test]
+    async fn rekey_patches_pending_create_in_same_batch() {
+        let backend = fresh_backend().await;
+        let store = fresh_store();
+        // Large batch + short deadline → Create and ReKey share one batch.
+        let (tx, sd, _counters, _metrics, handle) =
+            spawn_writer(backend.clone(), store.clone(), 100, 30);
+
+        let old_client = ipv4(192, 168, 1, 11, 5001);
+        let new_client = ipv4(10, 20, 30, 41, 7001);
+        let relay = ipv4(10, 0, 0, 1, 40031);
+
+        tx.send(WriteOp::Create {
+            relay_port: 40031,
+            client_addr: old_client,
+            relay_addr: relay,
+            username: "mobile2".into(),
+            allocation_id: "wr-id-7".into(),
+            migration_epoch: 0,
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
+        tx.send(WriteOp::ReKey {
+            relay_port: 40031,
+            new_client_addr: new_client,
+            new_epoch: 1,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let after = backend.get_allocation(40031).await.unwrap().unwrap();
+        assert_eq!(
+            after.client_addr,
+            new_client.to_string(),
+            "in-batch ReKey must patch the pending Create's address"
+        );
+        assert_eq!(after.relay_addr, relay.to_string());
+
+        sd.send(true).unwrap();
+        handle.await.unwrap();
     }
 }

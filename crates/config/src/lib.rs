@@ -173,6 +173,48 @@ impl TurnaConfig {
             }
         }
 
+        // Connection Migration (RFC 8016). A random per-process ticket secret
+        // is fine for dev but breaks across restarts and across cluster nodes,
+        // so production must pin a stable secret when mobility is enabled.
+        if self.turn.migration.enabled {
+            if self.turn.migration.ticket_secret.is_empty() {
+                // A random per-process ticket secret is only acceptable for a
+                // single, non-production node: every restart invalidates
+                // outstanding mobility tickets. With clustering enabled it is
+                // worse than that — each node derives an *independent* random
+                // key, so a ticket minted by node A is not valid on node B and
+                // cross-node migration (the advertised feature) silently fails
+                // with only a warning. So an empty secret is a hard error
+                // whenever clustering is on, regardless of the production flag,
+                // and also in production for the single-node restart reason.
+                if prod || self.cluster.cluster_mode {
+                    let reason = if self.cluster.cluster_mode {
+                        "in a cluster (each node would derive an independent \
+                         random key, so mobility tickets are not valid across \
+                         nodes and cross-node migration silently fails)"
+                    } else {
+                        "in production (a random per-process key would \
+                         invalidate every mobility ticket on restart)"
+                    };
+                    errors.push(format!(
+                        "turn.migration.ticket_secret is empty while migration is \
+                         enabled {reason}; generate one with `openssl rand -hex 32` \
+                         and set the SAME value on every node"
+                    ));
+                } else {
+                    warn!(
+                        "turn.migration.ticket_secret is empty — using a random \
+                         per-process key; mobility tickets will not survive a \
+                         restart. Set a stable secret (identical on every node) \
+                         before deploying or enabling cluster_mode."
+                    );
+                }
+            }
+            if self.turn.migration.ticket_ttl_secs == 0 {
+                errors.push("turn.migration.ticket_ttl_secs must be > 0".into());
+            }
+        }
+
         // Signaling validation
         if self.signaling.turn_shared_secret.is_empty() {
             errors.push("signaling.turn_shared_secret is empty".into());
@@ -322,6 +364,9 @@ pub enum TransportSelection {
     IoUring,
     /// Force the tokio backend (epoll + recvmmsg/sendmmsg).
     Tokio,
+    /// Force the AF_XDP ring datapath (Linux + `--features af-xdp`; needs
+    /// CAP_NET_RAW and a bound NIC queue). Opt-in only — never auto-selected.
+    AfXdp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,6 +380,22 @@ pub struct TurnConfig {
     pub auth: AuthConfig,
     pub relay: RelayConfig,
     pub observability: ObservabilityConfig,
+    /// RFC 8016 Connection Migration (mobility).
+    pub migration: MigrationConfig,
+    /// QUIC / WebTransport listener (browsers on UDP-blocked or high-loss
+    /// networks). Disabled by default. Requires the node binary built with the
+    /// `quic` (raw QUIC) and/or `web-transport` (browser H3) features.
+    #[serde(default)]
+    pub quic: QuicConfigSection,
+    /// AF_XDP ring-datapath parameters (used only when `transport = "af_xdp"`).
+    /// Requires a Linux build with `--features af-xdp`, CAP_NET_RAW, and a NIC
+    /// queue dedicated via an XDP program.
+    #[serde(default)]
+    pub af_xdp: AfXdpSection,
+    /// TURN over DTLS (RFC 7350): encrypted UDP transport. Disabled by default.
+    /// Requires the node binary built with `--features dtls`.
+    #[serde(default)]
+    pub dtls: DtlsSection,
 }
 
 impl Default for TurnConfig {
@@ -347,6 +408,10 @@ impl Default for TurnConfig {
             auth: AuthConfig::default(),
             relay: RelayConfig::default(),
             observability: ObservabilityConfig::default(),
+            migration: MigrationConfig::default(),
+            quic: QuicConfigSection::default(),
+            af_xdp: AfXdpSection::default(),
+            dtls: DtlsSection::default(),
         }
     }
 }
@@ -372,6 +437,49 @@ impl Default for AuthConfig {
             shared_secret: DEFAULT_SHARED_SECRET.into(),
             token_ttl: 86400,
             static_users: Vec::new(),
+        }
+    }
+}
+
+/// RFC 8016 "Mobility with TURN" (Connection Migration).
+///
+/// Opt-in (`enabled = false` by default). When enabled, the server hands a
+/// client a server-signed MOBILITY-TICKET in the Allocate success response —
+/// but only if the client opted in by including a (zero-length)
+/// MOBILITY-TICKET in its Allocate request. So clients that do not ask for
+/// mobility are unaffected even when the feature is on.
+///
+/// The ticket is an opaque HMAC-SHA256 token over `allocation_id:epoch:issued`.
+/// On a network change the client presents the ticket in a Refresh from its
+/// new address; the server re-keys the allocation to the new 5-tuple while
+/// keeping the same relay address (the peer-facing media path is undisturbed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MigrationConfig {
+    pub enabled: bool,
+    /// HMAC key used to sign and verify mobility tickets. Subject to the usual
+    /// `${VAR}` / `file:///` substitution. Empty means "generate a random
+    /// per-process key at startup" — fine for a single node where tickets only
+    /// need to outlive a network blip, but such tickets do NOT survive a
+    /// restart and are NOT valid on another node. Production deployments that
+    /// enable mobility must set a stable secret (validated below).
+    pub ticket_secret: String,
+    /// Ticket lifetime in seconds. A migration must complete within this
+    /// window. RFC 8016 leaves this to the server; 300s mirrors the default
+    /// permission lifetime.
+    pub ticket_ttl_secs: u64,
+}
+
+impl Default for MigrationConfig {
+    fn default() -> Self {
+        Self {
+            // Opt-in. Connection Migration changes allocation-identity
+            // semantics (an allocation can move between 5-tuples), so it is
+            // off unless an operator turns it on — at which point a stable
+            // ticket secret is required in production (see `validate`).
+            enabled: false,
+            ticket_secret: String::new(),
+            ticket_ttl_secs: 300,
         }
     }
 }
@@ -791,6 +899,145 @@ impl Default for TlsConfig {
     }
 }
 
+/// QUIC / WebTransport listener. Reuses the same PEM cert/key material as the
+/// TURNS (`[tls]`) listener by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuicConfigSection {
+    /// Enable the QUIC/WebTransport listener.
+    pub enabled: bool,
+    /// Negotiate WebTransport-over-HTTP/3 (browser handshake). When `false`,
+    /// only the raw-QUIC datapath runs. Requires the `web-transport` feature.
+    pub web_transport: bool,
+    /// Listen address (default `0.0.0.0:5350`).
+    pub listen: SocketAddr,
+    /// PEM certificate chain.
+    pub cert_path: PathBuf,
+    /// PEM private key.
+    pub key_path: PathBuf,
+    /// Max concurrent bidirectional streams per connection.
+    pub max_bi_streams: u64,
+    /// Max concurrent unidirectional streams per connection.
+    pub max_uni_streams: u64,
+    /// Enable QUIC datagrams (RFC 9221) for low-latency media.
+    pub enable_datagrams: bool,
+    /// Max datagram size, bytes.
+    pub max_datagram_size: usize,
+    /// Connection idle timeout, seconds.
+    pub idle_timeout_secs: u64,
+    /// Keep-alive interval, seconds.
+    pub keep_alive_secs: u64,
+    /// ALPN protocols for the raw-QUIC path (WebTransport forces `h3`).
+    pub alpn: Vec<String>,
+}
+
+impl Default for QuicConfigSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            web_transport: true,
+            listen: "0.0.0.0:5350".parse().unwrap(),
+            cert_path: PathBuf::from("/etc/turna/tls/cert.pem"),
+            key_path: PathBuf::from("/etc/turna/tls/key.pem"),
+            max_bi_streams: 256,
+            max_uni_streams: 256,
+            enable_datagrams: true,
+            max_datagram_size: 1200,
+            idle_timeout_secs: 30,
+            keep_alive_secs: 10,
+            alpn: vec!["stun.turn".to_string()],
+        }
+    }
+}
+
+/// AF_XDP ring-datapath parameters. Mirrors the transport-layer `AfXdpConfig`;
+/// kept in the config crate so it stays free of a `turna-transport` dependency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AfXdpSection {
+    /// NIC interface name (e.g. "eth0").
+    pub interface: String,
+    /// NIC queue id to bind the AF_XDP socket to.
+    pub queue_id: u32,
+    /// UMEM frame count.
+    pub frame_count: u32,
+    /// UMEM frame size, bytes.
+    pub frame_size: u32,
+    /// Fill ring size (power of two).
+    pub fill_ring_size: u32,
+    /// Completion ring size.
+    pub comp_ring_size: u32,
+    /// RX ring size.
+    pub rx_ring_size: u32,
+    /// TX ring size.
+    pub tx_ring_size: u32,
+    /// Zero-copy mode (requires driver support).
+    pub zero_copy: bool,
+    /// Use the NEED_WAKEUP flag.
+    pub need_wakeup: bool,
+    /// Source MAC for TX frames, e.g. "aa:bb:cc:dd:ee:ff". Empty → 00:..:00
+    /// placeholder until neighbor resolution lands.
+    pub src_mac: String,
+    /// Next-hop (gateway) MAC for TX frames. Empty → placeholder (ARP/netlink
+    /// neighbor resolution is a follow-up).
+    pub dst_mac: String,
+}
+
+impl Default for AfXdpSection {
+    fn default() -> Self {
+        Self {
+            interface: "eth0".into(),
+            queue_id: 0,
+            frame_count: 4096,
+            frame_size: 2048,
+            fill_ring_size: 2048,
+            comp_ring_size: 2048,
+            rx_ring_size: 2048,
+            tx_ring_size: 2048,
+            zero_copy: false,
+            need_wakeup: true,
+            src_mac: String::new(),
+            dst_mac: String::new(),
+        }
+    }
+}
+
+/// TURN over DTLS (RFC 7350) listener. Shares the same PEM material as TURNS
+/// by default; DTLS-over-UDP and TURNS (TLS-over-TCP) coexist on port 5349.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DtlsSection {
+    /// Enable the DTLS listener.
+    pub enabled: bool,
+    /// Listen address (default `0.0.0.0:5349`, the IANA TURNS/DTLS port).
+    pub listen: SocketAddr,
+    /// PEM certificate chain.
+    pub cert_path: PathBuf,
+    /// PEM private key.
+    pub key_path: PathBuf,
+    /// Max concurrent DTLS sessions.
+    pub max_sessions: usize,
+    /// Per-session idle timeout, seconds.
+    pub idle_timeout_secs: u64,
+    /// Application record MTU (caps outbound TURN responses to avoid IP
+    /// fragmentation). Default 1200, matching the QUIC datagram default.
+    pub mtu: usize,
+}
+
+impl Default for DtlsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "0.0.0.0:5349".parse().unwrap(),
+            cert_path: PathBuf::from("/etc/turna/tls/cert.pem"),
+            key_path: PathBuf::from("/etc/turna/tls/key.pem"),
+            max_sessions: 10_000,
+            idle_timeout_secs: 300,
+            mtu: 1200,
+        }
+    }
+}
+
 /// One tenant in a multi-tenant deployment. Matched by `realm`; isolated relay
 /// port pool, own credentials, own limits. No `Default` — every field that
 /// isn't `#[serde(default)]` must be set explicitly per tenant.
@@ -1136,6 +1383,219 @@ mod tests {
 
         restore_turna_production(saved_turna_production);
         result.unwrap();
+    }
+
+    #[test]
+    fn migration_defaults_to_opt_in() {
+        let m = MigrationConfig::default();
+        assert!(!m.enabled, "mobility is opt-in (off by default)");
+        assert!(m.ticket_secret.is_empty());
+        assert_eq!(m.ticket_ttl_secs, 300);
+    }
+
+    #[test]
+    fn quic_section_defaults_and_parse() {
+        // Off by default; when present, fields parse and unknown keys are
+        // rejected (deny_unknown_fields). Lives under [turn.quic].
+        let q = QuicConfigSection::default();
+        assert!(!q.enabled, "QUIC is opt-in");
+        assert!(q.web_transport, "WebTransport on when QUIC is enabled");
+        assert_eq!(q.listen.port(), 5350);
+        assert!(q.enable_datagrams);
+
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+
+            [turn.quic]
+            enabled = true
+            web_transport = true
+            listen = "0.0.0.0:5350"
+            cert_path = "/etc/turna/tls/cert.pem"
+            key_path = "/etc/turna/tls/key.pem"
+            enable_datagrams = false
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("quic section parses");
+        assert!(cfg.turn.quic.enabled);
+        assert!(!cfg.turn.quic.enable_datagrams, "explicit override applied");
+        // Untouched fields fall back to defaults.
+        assert_eq!(cfg.turn.quic.max_bi_streams, 256);
+    }
+
+    #[test]
+    fn af_xdp_section_and_transport_selection_parse() {
+        let q = AfXdpSection::default();
+        assert_eq!(q.queue_id, 0);
+        assert_eq!(q.frame_count, 4096);
+
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+            transport = "af_xdp"
+
+            [turn.af_xdp]
+            interface = "enp1s0"
+            queue_id = 3
+            zero_copy = true
+            dst_mac = "aa:bb:cc:dd:ee:ff"
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("af_xdp section parses");
+        assert!(matches!(cfg.turn.transport, TransportSelection::AfXdp));
+        assert_eq!(cfg.turn.af_xdp.interface, "enp1s0");
+        assert_eq!(cfg.turn.af_xdp.queue_id, 3);
+        assert!(cfg.turn.af_xdp.zero_copy);
+        assert_eq!(cfg.turn.af_xdp.dst_mac, "aa:bb:cc:dd:ee:ff");
+        // Untouched ring sizes keep defaults.
+        assert_eq!(cfg.turn.af_xdp.rx_ring_size, 2048);
+    }
+
+    #[test]
+    fn dtls_section_defaults_and_parse() {
+        let d = DtlsSection::default();
+        assert!(!d.enabled, "DTLS is opt-in");
+        assert_eq!(d.listen.port(), 5349);
+        assert_eq!(d.mtu, 1200);
+
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+
+            [turn.dtls]
+            enabled = true
+            listen = "0.0.0.0:5349"
+            cert_path = "/etc/turna/tls/cert.pem"
+            key_path = "/etc/turna/tls/key.pem"
+            mtu = 1100
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("dtls section parses");
+        assert!(cfg.turn.dtls.enabled);
+        assert_eq!(cfg.turn.dtls.mtu, 1100);
+        assert_eq!(cfg.turn.dtls.max_sessions, 10_000);
+    }
+
+    #[test]
+    fn migration_empty_ticket_secret_in_cluster_is_hard_error() {
+        // Cross-node migration needs the SAME ticket_secret on every node.
+        // An empty secret under cluster_mode must fail validation even outside
+        // production (otherwise each node picks an independent random key and
+        // migration silently breaks).
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
+        let mut cfg = TurnaConfig::default();
+        // External IP so the cluster redirect check doesn't add an unrelated
+        // error; we want the ticket_secret error to be the one under test.
+        cfg.turn.external_ip = "203.0.113.1".into();
+        cfg.turn.migration.enabled = true;
+        cfg.turn.migration.ticket_secret.clear();
+        cfg.cluster.cluster_mode = true;
+
+        let result = cfg.validate();
+        restore_turna_production(saved);
+
+        let msg = result
+            .expect_err("empty ticket_secret + cluster_mode must fail validation")
+            .to_string();
+        assert!(
+            msg.contains("ticket_secret"),
+            "validation error should call out ticket_secret, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn migration_empty_ticket_secret_single_node_is_warn_only() {
+        // A single, non-production node may run with a random per-process key
+        // (it only loses tickets across a restart) — that path stays a warning,
+        // not a hard error, to keep the first-run experience friendly.
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.migration.enabled = true;
+        cfg.turn.migration.ticket_secret.clear();
+        // cluster_mode left at its default (false) → single node.
+
+        let result = cfg.validate();
+        restore_turna_production(saved);
+
+        result.expect("single-node empty ticket_secret must validate (warn only)");
+    }
+
+    #[test]
+    fn migration_section_parses() {
+        let toml = r#"
+[turn]
+listen = "0.0.0.0:3478"
+external_ip = "127.0.0.1"
+
+[turn.auth]
+shared_secret = "s"
+
+[turn.migration]
+enabled = true
+ticket_secret = "deadbeef"
+ticket_ttl_secs = 120
+
+[signaling]
+listen = "0.0.0.0:9001"
+turn_shared_secret = "s"
+"#;
+        let config = TurnaConfig::from_str(toml).unwrap();
+        assert!(config.turn.migration.enabled);
+        assert_eq!(config.turn.migration.ticket_secret, "deadbeef");
+        assert_eq!(config.turn.migration.ticket_ttl_secs, 120);
+    }
+
+    #[test]
+    fn migration_ticket_secret_honours_env_substitution() {
+        // The same ${VAR:-default} expansion that covers auth secrets must
+        // apply to the migration ticket secret.
+        let toml = r#"
+[turn]
+external_ip = "127.0.0.1"
+[turn.auth]
+shared_secret = "s"
+[turn.migration]
+ticket_secret = "${TURNA_NONEXISTENT_MT_SECRET:-fallback-mt}"
+[signaling]
+turn_shared_secret = "s"
+"#;
+        let config = TurnaConfig::from_str(toml).unwrap();
+        assert_eq!(config.turn.migration.ticket_secret, "fallback-mt");
+    }
+
+    #[test]
+    fn migration_zero_ttl_rejected() {
+        // `from_str` runs `validate()`, and ttl=0 is rejected in any mode,
+        // so the load itself must fail. No env lock needed.
+        let toml = r#"
+[turn]
+external_ip = "127.0.0.1"
+[turn.auth]
+shared_secret = "s"
+[turn.migration]
+enabled = true
+ticket_secret = "x"
+ticket_ttl_secs = 0
+[signaling]
+turn_shared_secret = "s"
+"#;
+        assert!(
+            TurnaConfig::from_str(toml).is_err(),
+            "ticket_ttl_secs = 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn migration_unknown_key_rejected() {
+        // deny_unknown_fields discipline must extend to the new section.
+        let toml = r#"
+[turn.migration]
+enbaled = true
+"#;
+        assert!(TurnaConfig::from_str(toml).is_err());
     }
 
     #[test]

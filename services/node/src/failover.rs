@@ -364,6 +364,8 @@ mod tests {
             user_id: "alice".into(),
             realm: "turna".into(),
             node_id: node.into(),
+            allocation_id: format!("alloc-{node}-{port}"),
+            migration_epoch: 5,
             created_at_ms: now_ms().saturating_sub(60_000),
             expires_at_ms: now_ms() + 600_000,
             bytes_in: 0,
@@ -428,6 +430,13 @@ mod tests {
         }
         // And present in our local store.
         assert_eq!(store.len(), 3);
+        // RFC 8016: the adopted allocations must keep their original identity
+        // so a MOBILITY-TICKET minted by node-dead validates here.
+        let c: std::net::SocketAddr = "127.0.0.1:60010".parse().unwrap(); // 20000 + 40010
+        let a = store.get(&c).expect("rehydrated after claim");
+        assert_eq!(a.allocation_id, "alloc-node-dead-40010");
+        assert_eq!(a.migration_epoch, 5);
+        assert_eq!(store.get_by_id("alloc-node-dead-40010"), Some(c));
     }
 
     /// We don't claim our own allocations.

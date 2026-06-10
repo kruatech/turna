@@ -29,6 +29,12 @@ pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 pub const ATTR_DONT_FRAGMENT: u16 = 0x001A;
 
+// Comprehension-optional (>= 0x8000)
+// RFC 8016 "Mobility with TURN": opaque, server-issued ticket. Issued in an
+// Allocate success response; presented in a Refresh from a new address to
+// rebind the allocation to the new client 5-tuple without disturbing peers.
+pub const ATTR_MOBILITY_TICKET: u16 = 0x8030;
+
 // ── DoS / abuse caps ─────────────────────────────────────────────────────────
 //
 // Rationale: the STUN wire format gives each attribute a u16 length field, so
@@ -70,6 +76,8 @@ pub enum Attribute {
     ChannelNumber(u16),
     Data(Vec<u8>),
     DontFragment,
+    /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
+    MobilityTicket(Vec<u8>),
     Unknown { attr_type: u16, value: Vec<u8> },
 }
 
@@ -93,6 +101,7 @@ impl Attribute {
             Self::ChannelNumber(_) => ATTR_CHANNEL_NUMBER,
             Self::Data(_) => ATTR_DATA,
             Self::DontFragment => ATTR_DONT_FRAGMENT,
+            Self::MobilityTicket(_) => ATTR_MOBILITY_TICKET,
             Self::Unknown { attr_type, .. } => *attr_type,
         }
     }
@@ -155,6 +164,10 @@ impl Attribute {
                 data.len()
             }
             Self::DontFragment => 0,
+            Self::MobilityTicket(t) => {
+                buf[..t.len()].copy_from_slice(t);
+                t.len()
+            }
             Self::Unknown { value, .. } => {
                 buf[..value.len()].copy_from_slice(value);
                 value.len()
@@ -388,6 +401,7 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
             }
             ATTR_DATA => Attribute::Data(value.to_vec()),
             ATTR_DONT_FRAGMENT => Attribute::DontFragment,
+            ATTR_MOBILITY_TICKET => Attribute::MobilityTicket(value.to_vec()),
             _ => Attribute::Unknown {
                 attr_type,
                 value: value.to_vec(),
@@ -561,5 +575,33 @@ mod tests {
         let buf = build_attr(ATTR_ALTERNATE_SERVER, &value[..len]);
         let attrs = parse_attributes(&buf, &TID).unwrap();
         assert!(matches!(attrs.as_slice(), [Attribute::AlternateServer(a)] if *a == addr));
+    }
+
+    #[test]
+    fn mobility_ticket_roundtrip() {
+        // RFC 8016 MOBILITY-TICKET: opaque variable-length bytes.
+        let token = b"00000000000003e8:1700000000:9f86d081884c7d65";
+        let attr = Attribute::MobilityTicket(token.to_vec());
+        assert_eq!(attr.attr_type(), ATTR_MOBILITY_TICKET);
+
+        // encode → frame → parse → compare.
+        let mut value = [0u8; 256];
+        let len = attr.encode_value(&mut value, &TID);
+        assert_eq!(len, token.len());
+
+        let buf = build_attr(ATTR_MOBILITY_TICKET, &value[..len]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        match attrs.as_slice() {
+            [Attribute::MobilityTicket(t)] => assert_eq!(t.as_slice(), token),
+            other => panic!("expected MobilityTicket, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mobility_ticket_empty_is_valid() {
+        // A zero-length ticket must parse as an empty MobilityTicket, not panic.
+        let buf = build_attr(ATTR_MOBILITY_TICKET, &[]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(attrs.as_slice(), [Attribute::MobilityTicket(t)] if t.is_empty()));
     }
 }

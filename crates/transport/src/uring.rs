@@ -188,6 +188,12 @@ struct RelaySocket {
     /// Set by `remove_relay`. Suppresses event emission / resubmits and gates
     /// block reclaim on a full in-flight drain.
     closing: bool,
+    /// RFC 8016 sharded ownership: the allocation that owns this relay socket
+    /// and the route generation it registered with. Used to validate forwarded
+    /// `SendViaRelayOwned` commands — a stale forward (port since reused by a
+    /// newer allocation) is dropped rather than sent on the wrong socket.
+    allocation_id: String,
+    generation: u64,
 }
 
 /// Multi-fd io_uring manager: main socket + relay sockets.
@@ -207,6 +213,98 @@ struct RelaySocket {
 /// The old `Vec::with_capacity(N)` + fill-without-push pattern was safe
 /// in practice, but `Box<[T]>` makes the stability invariant a compile-time
 /// property rather than a fragile convention.
+/// Ring/CQE utilisation snapshot (see `UringEngine::ring_stats`).
+#[derive(Debug, Clone, Copy)]
+pub struct RingStats {
+    pub cqe_drained: u64,
+    pub cqe_batches: u64,
+    pub cqe_max_batch: u32,
+    pub sq_push_failed: u64,
+    pub sq_len: u32,
+    pub sq_capacity: u32,
+    pub cq_len: u32,
+}
+
+/// One worker's slot in [`RingStatsAggregate`]. Each io_uring worker owns its
+/// own engine and publishes a fresh snapshot here on its periodic ring-log
+/// tick; the node sums the slots for `/metrics`. Counters are cumulative
+/// per worker; gauges (`sq_len`/`cq_len`/`buffers_available`) are last-sampled.
+#[derive(Default)]
+pub struct PerWorkerRing {
+    pub cqe_drained: std::sync::atomic::AtomicU64,
+    pub cqe_batches: std::sync::atomic::AtomicU64,
+    pub cqe_max_batch: std::sync::atomic::AtomicU64,
+    pub sq_push_failed: std::sync::atomic::AtomicU64,
+    pub sq_len: std::sync::atomic::AtomicU64,
+    pub sq_capacity: std::sync::atomic::AtomicU64,
+    pub cq_len: std::sync::atomic::AtomicU64,
+    pub buffers_available: std::sync::atomic::AtomicU64,
+}
+
+/// Summed view across all workers, read by the node's Prometheus copy task.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RingTotals {
+    pub workers: u64,
+    pub cqe_drained: u64,
+    pub cqe_batches: u64,
+    pub cqe_max_batch: u64,
+    pub sq_push_failed: u64,
+    pub sq_len: u64,
+    pub sq_capacity: u64,
+    pub cq_len: u64,
+    pub buffers_available: u64,
+}
+
+/// Shared per-worker ring-stats publisher. Created by the node with one slot
+/// per worker, threaded into [`crate::worker::WorkerPoolConfig`], and read back
+/// (summed) for Prometheus. Lives in the transport crate so it stays free of a
+/// `turna-health` dependency; the node maps [`RingTotals`] into its metrics.
+pub struct RingStatsAggregate {
+    pub workers: Vec<PerWorkerRing>,
+}
+
+impl RingStatsAggregate {
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            workers: (0..num_workers).map(|_| PerWorkerRing::default()).collect(),
+        }
+    }
+
+    /// Publish one worker's latest snapshot into its slot (`idx == worker_id`).
+    pub fn publish(&self, idx: usize, rs: &RingStats, buffers_available: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(w) = self.workers.get(idx) else { return };
+        w.cqe_drained.store(rs.cqe_drained, Relaxed);
+        w.cqe_batches.store(rs.cqe_batches, Relaxed);
+        w.cqe_max_batch.store(rs.cqe_max_batch as u64, Relaxed);
+        w.sq_push_failed.store(rs.sq_push_failed, Relaxed);
+        w.sq_len.store(rs.sq_len as u64, Relaxed);
+        w.sq_capacity.store(rs.sq_capacity as u64, Relaxed);
+        w.cq_len.store(rs.cq_len as u64, Relaxed);
+        w.buffers_available.store(buffers_available as u64, Relaxed);
+    }
+
+    /// Sum counters / occupancy across all workers; `cqe_max_batch` is a max.
+    pub fn totals(&self) -> RingTotals {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut t = RingTotals {
+            workers: self.workers.len() as u64,
+            ..Default::default()
+        };
+        for w in &self.workers {
+            t.cqe_drained += w.cqe_drained.load(Relaxed);
+            t.cqe_batches += w.cqe_batches.load(Relaxed);
+            t.cqe_max_batch = t.cqe_max_batch.max(w.cqe_max_batch.load(Relaxed));
+            t.sq_push_failed += w.sq_push_failed.load(Relaxed);
+            t.sq_len += w.sq_len.load(Relaxed);
+            t.sq_capacity += w.sq_capacity.load(Relaxed);
+            t.cq_len += w.cq_len.load(Relaxed);
+            t.buffers_available += w.buffers_available.load(Relaxed);
+        }
+        t
+    }
+}
+
 pub struct UringEngine {
     ring: IoUring,
     // Main socket
@@ -228,6 +326,21 @@ pub struct UringEngine {
     relay_free_blocks: Vec<u16>,
     /// Free-slot bitmap for the 64 main-socket send slots (bit i set = free).
     main_send_free: u64,
+    // ── Ring/CQE utilisation metrics (single-owner thread; plain counters,
+    //    no atomics needed). Snapshotted by the worker for periodic logging. ──
+    /// Total CQEs drained across all `collect_completions` calls.
+    cqe_drained: u64,
+    /// Number of `collect_completions` calls (drain batches).
+    cqe_batches: u64,
+    /// Largest single drain batch (work events produced in one call).
+    cqe_max_batch: u32,
+    /// Count of SQE push failures (submission ring full → backpressure signal).
+    sq_push_failed: u64,
+    /// Last observed submission-queue occupancy / capacity (sampled per drain).
+    last_sq_len: u32,
+    sq_capacity: u32,
+    /// Last observed completion-queue pending count at drain entry.
+    last_cq_len: u32,
 }
 
 /// Completion event.
@@ -338,6 +451,13 @@ impl UringEngine {
             // All MAIN_SEND_SLOTS slots start free. MAIN_SEND_SLOTS == 64, so
             // the full u64 is "all free"; if it ever shrinks below 64, mask.
             main_send_free: u64::MAX,
+            cqe_drained: 0,
+            cqe_batches: 0,
+            cqe_max_batch: 0,
+            sq_push_failed: 0,
+            last_sq_len: 0,
+            sq_capacity: 0,
+            last_cq_len: 0,
         })
     }
 
@@ -404,6 +524,7 @@ impl UringEngine {
             .user_data(ud);
         let pushed = unsafe { self.ring.submission().push(&entry) };
         if pushed.is_err() {
+            self.sq_push_failed += 1;
             // Roll the slot back so a full SQ doesn't leak it forever.
             free_bit_u64(&mut self.main_send_free, slot);
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"));
@@ -414,7 +535,12 @@ impl UringEngine {
     // === Relay socket operations ===
 
     /// Create a relay socket and start receiving on it.
-    pub fn add_relay(&mut self, port: u16) -> std::io::Result<()> {
+    pub fn add_relay(
+        &mut self,
+        port: u16,
+        allocation_id: String,
+        generation: u64,
+    ) -> std::io::Result<()> {
         let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
@@ -452,6 +578,8 @@ impl UringEngine {
                 send_free: u32::MAX,
                 inflight: 0,
                 closing: false,
+                allocation_id,
+                generation,
             },
         );
 
@@ -549,6 +677,7 @@ impl UringEngine {
             .user_data(ud);
         let pushed = unsafe { self.ring.submission().push(&entry) };
         if pushed.is_err() {
+            self.sq_push_failed += 1;
             if let Some(relay) = self.relay_sockets.get_mut(&port) {
                 free_bit_u32(&mut relay.send_free, slot);
             }
@@ -569,11 +698,38 @@ impl UringEngine {
         self.ring.submit_and_wait(1)
     }
 
+    /// Bounded wait (RFC 8016 sharded-ownership v1 wakeup). Replaces a bare
+    /// `submit_and_wait(1)` so the worker loop unparks within `dur` even with
+    /// no ring activity, then drains its cross-worker command channel. Returns
+    /// `Ok(0)` on timeout (no completion within `dur`), `Ok(n)` otherwise.
+    pub fn submit_and_wait_timeout(&mut self, dur: std::time::Duration) -> std::io::Result<usize> {
+        let ts = types::Timespec::new()
+            .sec(dur.as_secs())
+            .nsec(dur.subsec_nanos());
+        let args = types::SubmitArgs::new().timespec(&ts);
+        match self.ring.submitter().submit_with_args(1, &args) {
+            Ok(n) => Ok(n),
+            // ETIME: the wait window elapsed with no completion — expected.
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Collect all completions into a Vec (avoids borrow issues).
     pub fn collect_completions(&mut self) -> Vec<CompletionEvent> {
         let mut events = Vec::new();
+        // Sample submission-queue occupancy before draining completions
+        // (disjoint-field borrow: `sq` borrows only `self.ring`).
+        {
+            let sq = self.ring.submission();
+            self.last_sq_len = sq.len() as u32;
+            self.sq_capacity = sq.capacity() as u32;
+        }
         let cq = self.ring.completion();
+        self.last_cq_len = cq.len() as u32;
+        let drained_before = self.cqe_drained;
         for cqe in cq {
+            self.cqe_drained += 1;
             let ud = cqe.user_data();
             let result = cqe.result();
             let (tag, relay_port, msghdr_idx, buf_or_slot) = decode_user_data(ud);
@@ -682,7 +838,36 @@ impl UringEngine {
             };
             events.push(event);
         }
+        // Count a drain "batch" only when we actually pulled >=1 CQE. The
+        // worker calls collect_completions every loop iteration (including
+        // empty 500us wait-timeout cycles); counting every call inflated
+        // cqe_batches far past cqe_drained and broke the HELP ("pulled >=1
+        // CQE"). cqe_max_batch now tracks the largest CQE drain in one call.
+        let drained_now = self.cqe_drained - drained_before;
+        if drained_now > 0 {
+            self.cqe_batches += 1;
+            if drained_now as u32 > self.cqe_max_batch {
+                self.cqe_max_batch = drained_now as u32;
+            }
+        }
         events
+    }
+
+    /// Snapshot of ring/CQE utilisation counters for periodic logging. The
+    /// average CQE-per-drain (`cqe_drained / cqe_batches`) indicates batching
+    /// efficiency; `sq_push_failed` rising means the submission ring is
+    /// saturating (backpressure); `sq_len`/`cq_len` are the last sampled live
+    /// occupancies.
+    pub fn ring_stats(&self) -> RingStats {
+        RingStats {
+            cqe_drained: self.cqe_drained,
+            cqe_batches: self.cqe_batches,
+            cqe_max_batch: self.cqe_max_batch,
+            sq_push_failed: self.sq_push_failed,
+            sq_len: self.last_sq_len,
+            sq_capacity: self.sq_capacity,
+            cq_len: self.last_cq_len,
+        }
     }
 
     pub fn buffer_data(&self, idx: u16, len: usize) -> &[u8] {
@@ -741,5 +926,14 @@ impl UringEngine {
 
     pub fn has_relay(&self, port: u16) -> bool {
         self.relay_sockets.contains_key(&port)
+    }
+
+    /// RFC 8016 sharded ownership: the `(allocation_id, generation)` of the
+    /// relay socket this worker owns for `port`, if any. The worker compares it
+    /// against a forwarded `SendViaRelayOwned` to reject stale commands.
+    pub fn relay_record(&self, port: u16) -> Option<(&str, u64)> {
+        self.relay_sockets
+            .get(&port)
+            .map(|r| (r.allocation_id.as_str(), r.generation))
     }
 }

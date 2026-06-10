@@ -40,23 +40,27 @@ pub struct MigrationToken {
 }
 
 impl MigrationToken {
-    /// Generate a new migration token.
-    pub fn generate(session_id: &str, secret: &[u8], ttl: Duration) -> Self {
+    /// Generate a new migration token bound to `session_id` at allocation
+    /// generation `epoch`. The epoch is the anti-replay handle: each
+    /// successful migration bumps the allocation's epoch, so a captured
+    /// older-epoch token no longer validates (effectively single-use without
+    /// a server-side replay cache).
+    pub fn generate(session_id: &str, epoch: u64, secret: &[u8], ttl: Duration) -> Self {
         use hmac::{Hmac, Mac};
-        use sha1::Sha1;
+        use sha2::Sha256;
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let payload = format!("{session_id}:{now_secs}");
-        let mut mac = Hmac::<Sha1>::new_from_slice(secret).unwrap();
+        let payload = format!("{session_id}:{epoch}:{now_secs}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
         mac.update(payload.as_bytes());
         let sig = mac.finalize().into_bytes();
 
         // Hex-encode the signature so the whole token is valid UTF-8. The raw
-        // 20-byte HMAC is almost never valid UTF-8, which previously made
+        // 32-byte HMAC is almost never valid UTF-8, which would make
         // validate()'s from_utf8() check fail and reject every token.
         let sig_hex: String = sig.iter().map(|b| format!("{b:02x}")).collect();
         let mut token = payload.into_bytes();
@@ -71,37 +75,41 @@ impl MigrationToken {
         }
     }
 
-    /// Validate a migration token.
-    pub fn validate(token_bytes: &[u8], secret: &[u8], max_age: Duration) -> Option<String> {
+    /// Validate a migration token. On success returns `(session_id, epoch)`;
+    /// the caller compares `epoch` against the allocation's current epoch and
+    /// rejects stale ones (anti-replay).
+    pub fn validate(token_bytes: &[u8], secret: &[u8], max_age: Duration) -> Option<(String, u64)> {
         use hmac::{Hmac, Mac};
-        use sha1::Sha1;
+        use sha2::Sha256;
 
-        // Token is "<session_id>:<issued_secs>:<hex_signature>" — all ASCII.
+        // Token is "<session_id>:<epoch>:<issued_secs>:<hex_signature>" — all ASCII.
         let token_str = std::str::from_utf8(token_bytes).ok()?;
         let (payload, sig_hex) = token_str.rsplit_once(':')?;
         let sig_bytes = decode_hex(sig_hex)?;
 
         // Verify HMAC over the payload.
-        let mut mac = Hmac::<Sha1>::new_from_slice(secret).unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
         mac.update(payload.as_bytes());
         if mac.verify_slice(&sig_bytes).is_err() {
             return None;
         }
 
-        // payload = "<session_id>:<issued_secs>"; split the timestamp off the
-        // right so a session id may itself contain ':'.
-        let (session_id, issued) = payload.rsplit_once(':')?;
+        // payload = "<session_id>:<epoch>:<issued_secs>"; peel the two numeric
+        // fields off the right so a session id may itself contain ':'.
+        let (rest, issued) = payload.rsplit_once(':')?;
+        let (session_id, epoch_str) = rest.rsplit_once(':')?;
+        let epoch: u64 = epoch_str.parse().ok()?;
         let issued_secs: u64 = issued.parse().ok()?;
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        if now_secs - issued_secs > max_age.as_secs() {
+        if now_secs.saturating_sub(issued_secs) > max_age.as_secs() {
             return None; // Token expired
         }
 
-        Some(session_id.to_string())
+        Some((session_id.to_string(), epoch))
     }
 
     pub fn is_expired(&self) -> bool {
@@ -168,12 +176,33 @@ impl MigrationManager {
         }
     }
 
-    /// Issue a migration token for a session.
-    pub fn issue_token(&self, session_id: &str) -> MigrationToken {
-        MigrationToken::generate(session_id, &self.secret, self.token_ttl)
+    /// Like [`new`](Self::new) but with an explicit ticket TTL (from config:
+    /// `turn.migration.ticket_ttl_secs`).
+    pub fn with_ttl(secret: Vec<u8>, token_ttl: Duration) -> Self {
+        Self {
+            token_ttl,
+            ..Self::new(secret)
+        }
     }
 
-    /// Attempt migration: validate token, return session_id if valid.
+    /// Stateless ticket verification for the request hot path. Validates the
+    /// signature and TTL and returns `(session_id, epoch)`. Unlike
+    /// [`attempt_migration`](Self::attempt_migration) this takes `&self` and
+    /// records no pending state: the relay processor drives the re-key
+    /// directly, and the allocation's epoch (bumped on every successful
+    /// re-key) provides anti-replay, so no server-side pending map is needed.
+    pub fn verify_ticket(&self, token_bytes: &[u8]) -> Option<(String, u64)> {
+        MigrationToken::validate(token_bytes, &self.secret, self.token_ttl)
+    }
+
+    /// Issue a migration token for a session at the given allocation epoch.
+    pub fn issue_token(&self, session_id: &str, epoch: u64) -> MigrationToken {
+        MigrationToken::generate(session_id, epoch, &self.secret, self.token_ttl)
+    }
+
+    /// Attempt migration: validate token, return `(session_id, epoch)` if the
+    /// signature and TTL check out. The caller still must compare `epoch`
+    /// against the allocation's current epoch before re-keying.
     ///
     /// After validation, caller should:
     /// 1. Update allocation's client_addr to new_addr
@@ -184,8 +213,9 @@ impl MigrationManager {
         token_bytes: &[u8],
         new_addr: SocketAddr,
         old_addr: SocketAddr,
-    ) -> Option<String> {
-        let session_id = MigrationToken::validate(token_bytes, &self.secret, self.token_ttl)?;
+    ) -> Option<(String, u64)> {
+        let (session_id, epoch) =
+            MigrationToken::validate(token_bytes, &self.secret, self.token_ttl)?;
 
         self.pending.insert(
             session_id.clone(),
@@ -199,11 +229,12 @@ impl MigrationManager {
 
         info!(
             session = %session_id,
+            epoch,
             %old_addr, %new_addr,
             "migration attempt"
         );
 
-        Some(session_id)
+        Some((session_id, epoch))
     }
 
     /// Complete a migration (after allocation rebind succeeds).
@@ -287,14 +318,35 @@ mod tests {
     #[test]
     fn token_generate_validate() {
         let secret = b"test-secret";
-        let token = MigrationToken::generate("session1", secret, Duration::from_secs(60));
+        let token = MigrationToken::generate("session1", 0, secret, Duration::from_secs(60));
         let result = MigrationToken::validate(&token.token, secret, Duration::from_secs(60));
-        assert_eq!(result, Some("session1".to_string()));
+        assert_eq!(result, Some(("session1".to_string(), 0)));
+    }
+
+    #[test]
+    fn token_carries_epoch() {
+        let secret = b"s";
+        let token = MigrationToken::generate("alloc-7", 42, secret, Duration::from_secs(60));
+        let (sid, epoch) =
+            MigrationToken::validate(&token.token, secret, Duration::from_secs(60)).unwrap();
+        assert_eq!(sid, "alloc-7");
+        assert_eq!(epoch, 42);
+    }
+
+    #[test]
+    fn token_session_id_may_contain_colon() {
+        let secret = b"s";
+        // realm:user style ids must survive the epoch/issued parsing.
+        let token = MigrationToken::generate("realm:user:5", 3, secret, Duration::from_secs(60));
+        let (sid, epoch) =
+            MigrationToken::validate(&token.token, secret, Duration::from_secs(60)).unwrap();
+        assert_eq!(sid, "realm:user:5");
+        assert_eq!(epoch, 3);
     }
 
     #[test]
     fn token_wrong_secret() {
-        let token = MigrationToken::generate("s1", b"secret1", Duration::from_secs(60));
+        let token = MigrationToken::generate("s1", 0, b"secret1", Duration::from_secs(60));
         let result = MigrationToken::validate(&token.token, b"secret2", Duration::from_secs(60));
         assert!(result.is_none());
     }
@@ -303,17 +355,32 @@ mod tests {
     fn migration_lifecycle() {
         let mut mgr = MigrationManager::new(b"secret".to_vec());
 
-        let token = mgr.issue_token("alloc1");
+        let token = mgr.issue_token("alloc1", 1);
         let old: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let new: SocketAddr = "10.0.0.2:6000".parse().unwrap();
 
-        let sid = mgr.attempt_migration(&token.token, new, old).unwrap();
+        let (sid, epoch) = mgr.attempt_migration(&token.token, new, old).unwrap();
         assert_eq!(sid, "alloc1");
+        assert_eq!(epoch, 1);
         assert_eq!(mgr.pending_count(), 1);
 
         mgr.complete_migration("alloc1");
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.completed_count(), 1);
+    }
+
+    #[test]
+    fn verify_ticket_stateless_with_ttl() {
+        let mgr = MigrationManager::with_ttl(b"sek".to_vec(), Duration::from_secs(60));
+        let token = mgr.issue_token("alloc-9", 7);
+        // Stateless &self verify returns (session_id, epoch); no pending state.
+        let (sid, epoch) = mgr.verify_ticket(&token.token).unwrap();
+        assert_eq!(sid, "alloc-9");
+        assert_eq!(epoch, 7);
+        assert_eq!(mgr.pending_count(), 0, "verify_ticket records nothing");
+        // Wrong secret → rejected.
+        let other = MigrationManager::new(b"different".to_vec());
+        assert!(other.verify_ticket(&token.token).is_none());
     }
 
     #[test]

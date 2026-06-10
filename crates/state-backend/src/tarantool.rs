@@ -1174,6 +1174,8 @@ mod tests {
             user_id: "user1".into(),
             realm: "turna".into(),
             node_id: "node1".into(),
+            allocation_id: "alloc-xyz".into(),
+            migration_epoch: 4,
             created_at_ms: 1000,
             expires_at_ms: 61000,
             bytes_in: 0,
@@ -1187,6 +1189,8 @@ mod tests {
         let back: StoredAllocation = serde_json::from_str(&json).unwrap();
         assert_eq!(back.relay_port, 12345);
         assert_eq!(back.user_id, "user1");
+        assert_eq!(back.allocation_id, "alloc-xyz");
+        assert_eq!(back.migration_epoch, 4);
     }
 
     /// chap-sha1 scramble has a well-known test vector that's easy to
@@ -1280,6 +1284,8 @@ mod tests {
             user_id: "testuser".into(),
             realm: "turna".into(),
             node_id: "node1".into(),
+            allocation_id: "alloc-t1".into(),
+            migration_epoch: 0,
             created_at_ms: now_ms(),
             expires_at_ms: now_ms() + 600_000,
             bytes_in: 0,

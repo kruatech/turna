@@ -5,10 +5,14 @@
 //! `send_to`. This is a transport *backend* (selected via
 //! `transport = "af_xdp"`), not an additional listener like QUIC.
 //!
-//! Scope: handles the main client↔server control path. Relay-data-plane actions
-//! (Forward / SendViaRelay / RegisterRelay / CloseRelay) need regular relay
-//! sockets and are not yet wired through AF_XDP — they are skipped (logged).
-//! The loop is blocking; the caller runs it via `spawn_blocking`.
+//! Scope: handles the main client↔server control path AND the relay data plane.
+//! Because the XDP redirect funnels all ingress on the queue into the xsk, relay
+//! traffic is demuxed here by destination port (main TURN port → `process_slice`;
+//! relay ports → `process_relay_recv`) and emitted via the xsk (`send_to` for
+//! client responses, `send_to_from` for client→peer with the relay source port).
+//! Peer MACs use the configured `dst_mac` (same-subnet); general ARP/neighbor
+//! resolution is a follow-up. The loop is blocking; the caller runs it via
+//! `spawn_blocking`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,6 +59,17 @@ pub fn run_af_xdp(
         "AF_XDP datapath running (main TURN socket)"
     );
 
+    // Relay ports owned by this datapath. The XDP redirect funnels ALL ingress
+    // on the queue into the xsk, so relay traffic (peer→client) arrives here too
+    // — there are no separate kernel relay sockets to receive it. We demux by
+    // destination port: the main TURN port goes to `process_slice`; an
+    // allocation's relay port goes to `process_relay_recv`. `held` keeps the
+    // kernel relay socket alive purely to reserve the OS port; its I/O is unused.
+    let mut relay_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut held: std::collections::HashMap<u16, std::net::UdpSocket> =
+        std::collections::HashMap::new();
+    let listen_port = listen.port();
+
     // Busy-poll RX → process → TX, backing off briefly when idle so a quiet
     // socket doesn't peg a core.
     loop {
@@ -64,18 +79,49 @@ pub fn run_af_xdp(
             continue;
         }
         for f in frames {
-            for action in processor.process_slice(&f.data, f.source) {
+            tracing::debug!(src = %f.source, dst = %f.dst, len = f.data.len(), "AF_XDP rx");
+            let dport = f.dst.port();
+            let actions = if dport == listen_port {
+                processor.process_slice(&f.data, f.source)
+            } else if relay_ports.contains(&dport) {
+                // Peer→client relay data arriving on an allocation's relay port.
+                processor.process_relay_recv(&f.data, f.source, f.dst)
+            } else {
+                continue;
+            };
+            for action in actions {
                 match action {
                     Action::Send { data, target } => {
                         if let Err(e) = dp.send_to(&data, target) {
                             tracing::debug!(%e, "AF_XDP send_to failed");
                         }
                     }
-                    _ => {
-                        // Relay-plane actions (Forward/RegisterRelay/…) require
-                        // regular relay sockets — not yet wired through AF_XDP.
-                        tracing::trace!("AF_XDP: non-Send action skipped (relay plane TODO)");
+                    Action::Forward {
+                        data,
+                        target,
+                        relay_port,
                     }
+                    | Action::SendViaRelay {
+                        data,
+                        target,
+                        relay_port,
+                    } => {
+                        // Client→peer relay: emit from the allocation's relay port.
+                        if let Err(e) = dp.send_to_from(relay_port, &data, target) {
+                            tracing::debug!(%e, port = relay_port, "AF_XDP relay send failed");
+                        }
+                    }
+                    Action::RegisterRelay { port, socket, .. } => {
+                        relay_ports.insert(port);
+                        held.insert(port, socket);
+                        tracing::debug!(port, "AF_XDP: relay port registered");
+                    }
+                    Action::CloseRelay { port } => {
+                        relay_ports.remove(&port);
+                        held.remove(&port);
+                        tracing::debug!(port, "AF_XDP: relay port closed");
+                    }
+                    Action::None => {}
                 }
             }
         }

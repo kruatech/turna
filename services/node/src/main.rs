@@ -8,6 +8,9 @@ mod bulk_load;
 mod failover;
 mod heartbeat;
 mod writer;
+mod dtls_listener;
+mod af_xdp_listener;
+mod quic_listener;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -320,6 +323,18 @@ fn run_tokio(
             None
         };
 
+        // RFC 8016 sharded-ownership route table (io_uring datapath only).
+        // Created here, before the health server starts, so the *same* instance
+        // feeds both the worker pool (later, in the IoUring transport arm) and
+        // the health server's relay-route metrics. On builds without the
+        // io_uring datapath the table does not exist and the metric block is
+        // simply omitted.
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let relay_routes = turna_transport::relay_route::RelayRoutes::new();
+        // Lame-duck window for the io_uring worker pool on shutdown (Fix 4).
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        let worker_drain_grace = std::time::Duration::from_secs(cluster.drain_grace_secs);
+
         // Health check server (also serves GET /cluster). The cluster view
         // returns the gossip ring when clustered, or just this node otherwise —
         // so `turnactl cluster nodes` works the same on one node or many.
@@ -330,9 +345,36 @@ fn run_tokio(
                 local_addr: resolve_turn_announce_addr(&cluster, &config, external_ip).to_string(),
                 ring: cluster_routing.as_ref().map(|r| r.hash_ring.clone()),
             });
+
+            // Relay-route metrics provider: snapshot the shared route table on
+            // each scrape and map it into the health crate's feature-neutral
+            // metric struct. `None` on non-io_uring builds.
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = {
+                let routes = relay_routes.clone();
+                Some(Arc::new(move || {
+                    let s = routes.snapshot();
+                    turna_health::RelayRouteMetrics {
+                        send_local: s.send_local,
+                        send_forwarded: s.send_forwarded,
+                        send_forward_failed: s.send_forward_failed,
+                        send_stale: s.send_stale,
+                        route_miss: s.route_miss,
+                        owner_cleanup_stale: s.owner_cleanup_stale,
+                    }
+                }))
+            };
+            #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+            let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = None;
+
             tokio::spawn(async move {
-                let _ = turna_health::serve_with_cluster(health_listen, health_metrics, Some(cluster_view))
-                    .await;
+                let _ = turna_health::serve_with_cluster_routes(
+                    health_listen,
+                    health_metrics,
+                    Some(cluster_view),
+                    relay_route_metrics,
+                )
+                .await;
             });
         }
 
@@ -481,6 +523,7 @@ fn run_tokio(
                 turna_transport::TransportPreference::IoUring
             }
             turna_config::TransportSelection::Tokio => turna_transport::TransportPreference::Tokio,
+            turna_config::TransportSelection::AfXdp => turna_transport::TransportPreference::AfXdp,
         };
         let transport_decision = turna_transport::resolve(transport_pref)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -493,6 +536,7 @@ fn run_tokio(
         let mode = match transport_decision.backend {
             turna_transport::TransportBackend::Tokio => "tokio",
             turna_transport::TransportBackend::IoUring => "io_uring",
+            turna_transport::TransportBackend::AfXdp => "af_xdp",
         };
 
         info!(
@@ -500,13 +544,14 @@ fn run_tokio(
             relay_ports = ?(config.relay.min_port, config.relay.max_port),
             max_alloc   = config.relay.max_allocations,
             threads     = num_threads,
-            health      = "http://0.0.0.0:9090/health",
+            health      = %format!("http://{health_listen}/health"),
             mode,
             "turna ready"
         );
 
         // Signal handler → shutdown (shared by both backends).
         let drain_routing = cluster_routing.clone();
+        let drain_metrics = metrics.clone();
         let drain_grace = cluster.drain_grace_secs;
         tokio::spawn(async move {
             let ctrl_c = tokio::signal::ctrl_c();
@@ -524,8 +569,12 @@ fn run_tokio(
                 ctrl_c.await.ok();
                 info!("SIGINT received");
             }
-            // Lame-duck: stop taking new clients, let the ring learn we're going,
-            // then exit. Existing sessions keep running until they expire.
+            // Reject new allocations immediately on every node (508 Server
+            // Draining via the processor). On a cluster also flip the routing
+            // lame-duck so new clients are redirected (300 Try Alternate) to
+            // another node during the grace window. Existing sessions keep
+            // running until they expire / the worker drain tears them down.
+            drain_metrics.set_draining(true);
             if let Some(routing) = &drain_routing {
                 if drain_grace > 0 {
                     routing.begin_drain();
@@ -537,6 +586,29 @@ fn run_tokio(
         });
 
         match transport_decision.backend {
+            // AF_XDP ring datapath (Linux + af-xdp feature). Opt-in backend;
+            // handles the main TURN socket via the xsk-rs datapath.
+            turna_transport::TransportBackend::AfXdp => {
+                let processor = Arc::new(turna_relay::PacketProcessor::new_with_cluster(
+                    store,
+                    auth,
+                    external_ip,
+                    metrics.clone(),
+                    cluster_routing.clone(),
+                ));
+                let af_cfg = config.af_xdp.clone();
+                let listen = config.listen;
+                match tokio::task::spawn_blocking(move || {
+                    af_xdp_listener::run_af_xdp(af_cfg, processor, listen)
+                })
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("af_xdp datapath: {e}").into()),
+                    Err(join) => Err(Box::new(join) as Box<dyn std::error::Error>),
+                }
+            }
+
             // epoll + recvmmsg/sendmmsg — all platforms.
             turna_transport::TransportBackend::Tokio => {
                 // With multiple workers the first socket must also join the
@@ -546,13 +618,15 @@ fn run_tokio(
                 } else {
                     turna_transport::TokioTransport::bind(config.listen).await?
                 };
-                let server = turna_relay::RelayServer::new_with_cluster(
+                let migration = build_migration_manager(&config.migration);
+                let server = turna_relay::RelayServer::new_full(
                     transport,
                     store,
                     auth,
                     external_ip,
                     metrics.clone(),
                     cluster_routing.clone(),
+                    migration,
                 );
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
@@ -561,6 +635,38 @@ fn run_tokio(
                 } else {
                     server
                 };
+                // QUIC/DTLS get a dedicated relay egress (sharing this server's
+                // processor + client_sinks) so their relay-plane actions
+                // (RegisterRelay/Forward/CloseRelay) reach a peer→client return
+                // path. Without it the listeners would drop those actions.
+                if config.quic.enabled || config.dtls.enabled {
+                    let egress_out =
+                        turna_transport::TokioTransport::bind("0.0.0.0:0".parse().unwrap()).await?;
+                    let (egress, _egress_task) = turna_relay::start_relay_egress(
+                        server.processor().clone(),
+                        server.client_sinks(),
+                        egress_out,
+                        external_ip,
+                    );
+                    if config.quic.enabled {
+                        quic_listener::spawn_quic(
+                            &config.quic,
+                            server.processor().clone(),
+                            server.client_sinks(),
+                            metrics.clone(),
+                            egress.clone(),
+                        );
+                    }
+                    if config.dtls.enabled {
+                        dtls_listener::spawn_dtls(
+                            &config.dtls,
+                            server.processor().clone(),
+                            server.client_sinks(),
+                            metrics.clone(),
+                            egress.clone(),
+                        );
+                    }
+                }
                 server.run(shutdown_rx).await
             }
 
@@ -598,17 +704,78 @@ fn run_tokio(
                                 .unwrap_or(1)
                         });
                     info!(num_workers, "io_uring multi-worker pool");
+
+                    // QUIC/DTLS coexist with the io_uring datapath: they run as
+                    // independent tokio transports (separate ports) served by a
+                    // dedicated PacketProcessor sharing the same store/auth, plus
+                    // a tokio relay-egress for the peer→client return path. The
+                    // io_uring workers own the main :3478 socket; QUIC/DTLS
+                    // clients are reached via the egress' client_sinks.
+                    if config.quic.enabled || config.dtls.enabled {
+                        let qd_processor = Arc::new(turna_relay::PacketProcessor::new_with_cluster(
+                            store.clone(),
+                            auth.clone(),
+                            external_ip,
+                            metrics.clone(),
+                            cluster_routing.clone(),
+                        ));
+                        let qd_sinks = turna_relay::new_client_sinks();
+                        // Ephemeral fallback socket (bound off :3478 so it never
+                        // joins the io_uring reuseport group); QUIC/DTLS clients
+                        // are always reached via client_sinks, so it is unused.
+                        let egress_out =
+                            turna_transport::TokioTransport::bind("0.0.0.0:0".parse().unwrap())
+                                .await?;
+                        let (egress, _egress_task) = turna_relay::start_relay_egress(
+                            qd_processor.clone(),
+                            qd_sinks.clone(),
+                            egress_out,
+                            external_ip,
+                        );
+                        if config.quic.enabled {
+                            quic_listener::spawn_quic(
+                                &config.quic,
+                                qd_processor.clone(),
+                                qd_sinks.clone(),
+                                metrics.clone(),
+                                egress.clone(),
+                            );
+                        }
+                        if config.dtls.enabled {
+                            dtls_listener::spawn_dtls(
+                                &config.dtls,
+                                qd_processor.clone(),
+                                qd_sinks.clone(),
+                                metrics.clone(),
+                                egress.clone(),
+                            );
+                        }
+                        info!("QUIC/DTLS listeners started alongside io_uring datapath");
+                    }
+                    // RFC 8016 sharded ownership: reuse the single route table
+                    // created above (also wired into the health server's
+                    // relay-route metrics), so what the workers update is
+                    // exactly what `/metrics` reports.
+                    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let ring_agg = Arc::new(
+                        turna_transport::uring::RingStatsAggregate::new(num_workers),
+                    );
                     let pool_cfg = WorkerPoolConfig {
                         listen_addr: config.listen,
                         num_workers,
                         buffers_per_worker: 2048,
                         external_ip,
+                        relay_routes,
+                        cmd_poll_timeout: std::time::Duration::from_micros(500),
+                        shutdown: shutdown.clone(),
+                        drain_grace: worker_drain_grace,
+                        ring_stats: Some(ring_agg.clone()),
                     };
                     let store_f = store.clone();
                     let auth_f = auth.clone();
                     let metrics_f = metrics.clone();
                     let cluster_f = cluster_routing.clone();
-                    let _handles = spawn_worker_pool(pool_cfg, move |_worker_id| {
+                    let handles = spawn_worker_pool(pool_cfg, move |_worker_id| {
                         RelayHandler::new_with_cluster(
                             store_f.clone(),
                             auth_f.clone(),
@@ -618,12 +785,83 @@ fn run_tokio(
                         )
                     });
 
-                    // Worker threads run blocking io_uring loops with no shutdown
-                    // hook yet: wait for the signal, then let the process exit
-                    // (threads are torn down on exit). Graceful drain is TODO.
+                    // io_uring mode does not run RelayServer::run, so nothing
+                    // else reaps expired allocations — without this the store and
+                    // port allocator grow unbounded. (Relay sockets are closed by
+                    // the worker engine on expiry; the DTLS/QUIC egress reaps its
+                    // own sockets in start_relay_egress.)
+                    {
+                        let store = store.clone();
+                        let metrics = metrics.clone();
+                        tokio::spawn(async move {
+                            let mut ticker =
+                                tokio::time::interval(std::time::Duration::from_secs(5));
+                            loop {
+                                ticker.tick().await;
+                                let removed = store.cleanup_expired();
+                                if removed > 0 {
+                                    metrics.active_allocations.fetch_sub(
+                                        removed as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    info!(
+                                        removed,
+                                        active = store.len(),
+                                        "expired allocations cleaned (io_uring)"
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                    // Mirror summed io_uring ring stats into Prometheus Metrics
+                    // every 5s (workers publish their slots on a 30s tick, so the
+                    // gauges refresh at worker cadence). Runs until process exit.
+                    {
+                        let ring_agg = ring_agg.clone();
+                        let metrics = metrics.clone();
+                        tokio::spawn(async move {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            let mut tick =
+                                tokio::time::interval(std::time::Duration::from_secs(5));
+                            loop {
+                                tick.tick().await;
+                                let t = ring_agg.totals();
+                                metrics.uring_workers.store(t.workers, Relaxed);
+                                metrics.uring_cqe_drained_total.store(t.cqe_drained, Relaxed);
+                                metrics.uring_cqe_batches_total.store(t.cqe_batches, Relaxed);
+                                metrics.uring_cqe_max_batch.store(t.cqe_max_batch, Relaxed);
+                                metrics
+                                    .uring_sq_push_failed_total
+                                    .store(t.sq_push_failed, Relaxed);
+                                metrics.uring_sq_len.store(t.sq_len, Relaxed);
+                                metrics.uring_sq_capacity.store(t.sq_capacity, Relaxed);
+                                metrics.uring_cq_len.store(t.cq_len, Relaxed);
+                                metrics
+                                    .uring_buffers_available
+                                    .store(t.buffers_available, Relaxed);
+                            }
+                        });
+                    }
+                    // pool's drain flag — each worker stops taking new traffic
+                    // on its main socket, lets established relay flows finish
+                    // for the grace window, unregisters its routes, and exits
+                    // its loop. We then join the threads (they return within the
+                    // grace window) instead of abandoning them on process exit.
                     let mut rx = shutdown_rx;
                     let _ = rx.changed().await;
-                    info!("shutdown signalled; io_uring workers are not gracefully drained yet");
+                    info!(
+                        grace_secs = worker_drain_grace.as_secs(),
+                        "shutdown signalled; draining io_uring worker pool"
+                    );
+                    shutdown.store(true, std::sync::atomic::Ordering::Release);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        for h in handles {
+                            let _ = h.join();
+                        }
+                    })
+                    .await;
+                    info!("io_uring worker pool drained");
                     Ok(())
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -690,6 +928,54 @@ fn resolve_turn_announce_addr(
 enum DumpMode {
     Masked,
     Raw,
+}
+
+/// Build the optional RFC 8016 migration ticket manager from config.
+/// Returns `None` when `turn.migration.enabled = false`.
+fn build_migration_manager(
+    cfg: &turna_config::MigrationConfig,
+) -> Option<turna_transport::migration::MigrationManager> {
+    use turna_transport::migration::MigrationManager;
+    if !cfg.enabled {
+        return None;
+    }
+    let secret = if cfg.ticket_secret.is_empty() {
+        // We only reach the random fallback on a single, non-production node:
+        // config validation now hard-errors on an empty ticket_secret whenever
+        // clustering is enabled (cross-node tickets would silently fail) or in
+        // production. So this warning is the dev-single-node case only.
+        warn!(
+            "turn.migration enabled with no ticket_secret — using a random \
+             per-process key (single-node/dev only); mobility tickets will not \
+             survive a restart. Set a stable ticket_secret before deploying."
+        );
+        random_secret()
+    } else {
+        cfg.ticket_secret.clone().into_bytes()
+    };
+    info!(ttl_secs = cfg.ticket_ttl_secs, "RFC 8016 connection migration enabled");
+    Some(MigrationManager::with_ttl(
+        secret,
+        std::time::Duration::from_secs(cfg.ticket_ttl_secs),
+    ))
+}
+
+/// 32 random bytes from the OS CSPRNG. Falls back to a (weak, dev-only)
+/// time seed if `/dev/urandom` is unavailable — acceptable because an empty
+/// secret is already rejected in production by config validation.
+fn random_secret() -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            return buf.to_vec();
+        }
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    n.to_le_bytes().to_vec()
 }
 
 fn print_usage() {
@@ -760,6 +1046,11 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("[turn.relay.quota]");
     println!("max_bytes_per_sec = {}", t.relay.quota.max_bytes_per_sec);
     println!("max_per_user      = {}", t.relay.quota.max_per_user);
+    println!();
+    println!("[turn.migration]");
+    println!("enabled         = {}", t.migration.enabled);
+    println!("ticket_secret   = \"{}\"", mask(&t.migration.ticket_secret));
+    println!("ticket_ttl_secs = {}", t.migration.ticket_ttl_secs);
     println!();
     println!("[turn.observability]");
     println!(

@@ -116,6 +116,8 @@ pub(crate) fn apply_one(
             client_addr,
             relay_addr,
             stored.user_id.clone(),
+            stored.allocation_id.clone(),
+            stored.migration_epoch,
             stored.created_at_ms,
             stored.expires_at_ms,
             permissions,
@@ -141,6 +143,8 @@ mod tests {
             user_id: user.into(),
             realm: "turna".into(),
             node_id: node.into(),
+            allocation_id: format!("alloc-{node}-{port}"),
+            migration_epoch: 3,
             created_at_ms: turna_session::epoch_ms().saturating_sub(60_000),
             expires_at_ms,
             bytes_in: 0,
@@ -301,5 +305,37 @@ mod tests {
             rx.try_recv().is_err(),
             "rehydrate must not emit any WriteOp"
         );
+    }
+
+    /// RFC 8016: the persisted `allocation_id` and `migration_epoch` are
+    /// restored into the in-memory store on rehydrate, so a MOBILITY-TICKET
+    /// minted by the previous owner remains valid after adoption.
+    #[tokio::test]
+    async fn rehydrate_restores_migration_identity() {
+        let (backend, _) = fresh().await;
+        let now = turna_session::epoch_ms();
+        backend
+            .store_allocation(&alloc_for("node-A", 40090, "u", now + 600_000))
+            .await
+            .unwrap();
+
+        let (_, store) = fresh().await;
+        let stats = bulk_load(&backend, &store, "node-A").await;
+        assert_eq!(stats.rehydrated, 1);
+
+        // alloc_for maps relay-port P → client 127.0.0.1:(20000+P).
+        let client: SocketAddr = "127.0.0.1:60090".parse().unwrap();
+        let a = store.get(&client).expect("rehydrated allocation present");
+        assert_eq!(
+            a.allocation_id, "alloc-node-A-40090",
+            "persisted allocation_id must be restored, not re-minted"
+        );
+        assert_eq!(
+            a.migration_epoch, 3,
+            "persisted migration_epoch must be restored"
+        );
+        // And the id index must point at the rehydrated client so ticket
+        // validation (get_by_id) resolves.
+        assert_eq!(store.get_by_id("alloc-node-A-40090"), Some(client));
     }
 }

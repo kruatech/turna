@@ -353,19 +353,72 @@ async fn handle_dtls_session(
 ///
 /// `webrtc_dtls::crypto::Certificate::from_pem` (behind webrtc-dtls' `pem`
 /// feature) expects a single PEM string with the **private key first** (PKCS#8,
-/// tag `PRIVATE KEY`) followed by the certificate chain. PKCS#1 (`RSA PRIVATE
+/// tag `PRIVATE_KEY`) followed by the certificate chain. PKCS#1 (`RSA PRIVATE
 /// KEY`) / SEC1 (`EC PRIVATE KEY`) keys are not accepted — convert with
 /// `openssl pkcs8 -topk8 -nocrypt` if needed.
 #[cfg(feature = "dtls")]
 fn load_certificate(cert_path: &str, key_path: &str) -> Result<webrtc_dtls::crypto::Certificate> {
-    // webrtc-dtls' `Certificate::from_pem` uses webrtc's OWN pem format (custom
-    // `PRIVATE_KEY` tag), NOT standard openssl PEM, so it cannot load operator
-    // certs. Proper PEM loading needs `Certificate { certificate:
-    // vec![rustls::Certificate(der)], private_key:
-    // CryptoPrivateKey::from_key_pair(&rcgen::KeyPair..) }` with rcgen pinned to
-    // webrtc-dtls' exact version (brittle). For first-light/testing we generate
-    // a runtime self-signed cert. TODO: production PEM loading.
-    let _ = (cert_path, key_path);
-    webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["turn.local".to_owned()])
-        .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")))
+    match load_operator_certificate(cert_path, key_path) {
+        Ok(cert) => {
+            tracing::info!(cert = %cert_path, key = %key_path, "DTLS using operator certificate");
+            Ok(cert)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                cert = %cert_path,
+                key = %key_path,
+                "DTLS operator certificate unavailable; using ephemeral self-signed cert"
+            );
+            webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["turn.local".to_owned()])
+                .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")))
+        }
+    }
+}
+
+/// Load an operator-supplied PEM cert + key into a `webrtc-dtls` certificate.
+///
+/// `Certificate::from_pem` parses via the `pem` crate and needs the private-key
+/// block tagged `PRIVATE_KEY` (underscore) with PKCS#8 DER — not the openssl
+/// `PRIVATE KEY` (space). We re-tag the key block and concatenate key-first +
+/// cert chain. Non-PKCS#8 keys (`RSA`/`EC PRIVATE KEY`) must be converted first:
+/// `openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pk8.pem`.
+///
+/// IMPORTANT: the key MUST be ECDSA P-256. webrtc-dtls negotiates only
+/// `ECDHE-ECDSA-*` cipher suites, so an RSA cert loads cleanly but every
+/// DTLS handshake then aborts with an `internal_error` alert (no shared
+/// cipher). Generate with `openssl ecparam -name prime256v1 -genkey`.
+#[cfg(feature = "dtls")]
+fn load_operator_certificate(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<webrtc_dtls::crypto::Certificate> {
+    if cert_path.is_empty() || key_path.is_empty() {
+        return Err(DtlsError::Other(
+            "no DTLS cert_path/key_path configured".to_owned(),
+        ));
+    }
+    let cert_pem = std::fs::read_to_string(cert_path)
+        .map_err(|e| DtlsError::Other(format!("read cert {cert_path}: {e}")))?;
+    let key_pem = std::fs::read_to_string(key_path)
+        .map_err(|e| DtlsError::Other(format!("read key {key_path}: {e}")))?;
+    // Re-tag the PKCS#8 header/footer to webrtc's expected `PRIVATE_KEY` tag,
+    // then place the key block first, followed by the certificate chain.
+    let retagged_key = key_pem
+        .replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE_KEY-----")
+        .replace("-----END PRIVATE KEY-----", "-----END PRIVATE_KEY-----");
+    let combined = format!("{}\n{}", retagged_key.trim_end(), cert_pem.trim_start());
+    // `from_pem` may panic on unexpected key DER; contain it so a bad operator
+    // cert degrades to the self-signed fallback instead of crashing the node.
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        webrtc_dtls::crypto::Certificate::from_pem(&combined)
+    }));
+    match parsed {
+        Ok(Ok(cert)) => Ok(cert),
+        Ok(Err(e)) => Err(DtlsError::Other(format!("from_pem: {e}"))),
+        Err(_) => Err(DtlsError::Other(
+            "from_pem panicked (key likely not PKCS#8; convert with `openssl pkcs8 -topk8`)"
+                .to_owned(),
+        )),
+    }
 }

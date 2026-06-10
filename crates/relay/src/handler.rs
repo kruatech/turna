@@ -6,7 +6,7 @@
 use crate::processor::{Action, ClusterRouting, PacketProcessor};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use turna_auth::AuthMode;
+use turna_auth::AuthRegistry;
 use turna_health::Metrics;
 use turna_session::AllocationStore;
 use turna_transport::worker::{ForwardAction, PacketHandler};
@@ -20,7 +20,7 @@ pub struct RelayHandler {
 impl RelayHandler {
     pub fn new(
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -29,7 +29,7 @@ impl RelayHandler {
 
     pub fn new_with_cluster(
         store: Arc<AllocationStore>,
-        auth: Arc<AuthMode>,
+        auth: Arc<AuthRegistry>,
         external_ip: std::net::IpAddr,
         metrics: Arc<Metrics>,
         cluster: Option<ClusterRouting>,
@@ -78,7 +78,7 @@ impl RelayHandler {
             // freeing the port for the worker to rebind. CloseRelay has no
             // worker equivalent yet — the worker path keeps its prior
             // (non-transactional) relay lifecycle.
-            Action::RegisterRelay { port, .. } => ForwardAction::CreateRelay { port },
+            Action::RegisterRelay { port, allocation_id, .. } => ForwardAction::CreateRelay { port, allocation_id },
 
             Action::CloseRelay { port } => ForwardAction::CloseRelay { port },
 

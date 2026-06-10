@@ -92,10 +92,10 @@ coturn gap to turna's design answer and its current status.
 | coturn gap | turna's answer | Status |
 |---|---|---|
 | Peer-filter bypasses (§1) | Single peer-filter that **normalizes the address before the deny check** (unwraps `::ffff:`, special-cases `0.0.0.0`/`[::]`/`[::1]`); RFC 6890 special-use ranges (loopback, link-local, multicast, unspecified, cloud-metadata `169.254.169.254`) denied by default; property-tested | ✅ (`relay::peer_filter`, env opt-in for loopback; config-driven ranges 📋) |
-| Throughput ceiling (§2) | AF_XDP / eBPF kernel-bypass option; GSO + batched recvmmsg/sendmmsg on the tokio fallback; per-core sharding with `SO_REUSEPORT` + NUMA pinning; hugepages | 🚧 |
+| Throughput ceiling (§2) | eBPF socket pre-filter (real, `TURNA_BPF_FILTER=1`); GSO + batched recvmmsg/sendmmsg on the tokio datapath; experimental io_uring thread-per-core datapath; per-core sharding with `SO_REUSEPORT` + NUMA pinning; hugepages | 🚧 (eBPF pre-filter ✅; io_uring experimental; AF_XDP scaffolding only — see PRODUCTION_READINESS.md R2/R3) |
 | Cheap garbage reject (§2) | **Reject malformed packets before rate-limit, and before allocation lookup**; BPF/XDP pre-filter; zero-copy ChannelData fast path that skips full STUN parse | ✅ (classifier + zero-copy verified; XDP pre-filter 🚧) |
 | Flood resistance | **Per-IP + per-prefix (/24, /48) + per-method (Allocate/CreatePermission/ChannelBind) limiters** (`qos::TieredRateLimiter`); bounded, sharded token buckets | ✅ (per-IP/prefix/method shipped; per-tenant quotas 📋) |
-| Observability (§3) | Prometheus-first metrics (incl. `turna_peer_rejected_total`, malformed/rate-limited/quota/parser counters); OpenTelemetry traces; allocation lifecycle events; **per-reason `auth_fail_reason` breakdown and latency histograms planned** | ✅ partial (Prometheus/OTel ✅; reason-coded auth & p50/p95/p99 🚧) |
+| Observability (§3) | Prometheus-first metrics (incl. `turna_peer_rejected_total`, malformed/rate-limited/quota/parser counters); OpenTelemetry traces; allocation lifecycle events; per-reason `auth_fail_reason` breakdown and latency histograms | ✅ partial (Prometheus/OTel ✅; reason-coded auth `turna_auth_failures_by_reason_total` and STUN/relay/auth latency histograms now emitted — runtime-unverified) |
 | Memory safety (§4) | Rust; `unsafe` confined to the transport layer and tracked in `docs/security/unsafe-inventory.json` and checked in CI; continuous STUN/TURN fuzzing (`fuzz/`); property tests for ChannelData/STUN framing; strict parser rejects ambiguous frames | ✅ (fuzzing/inventory) |
 | Differential correctness | `tools/diff-test` replays the same STUN/TURN packets through turna and coturn and asserts identical behavior | 🚧 |
 | Clustering / HA (§5) | Built-in gRPC control plane; shared allocation state (`state-backend`: Tarantool/in-memory); node discovery; **graceful drain** and **live session migration** so node restarts don't drop calls; crash recovery | 🚧 |
@@ -113,11 +113,22 @@ coturn gap to turna's design answer and its current status.
 Saying no is part of being a product. These are explicit non-goals for the
 first releases, planned but not blocking adoption for WebRTC-over-UDP:
 
-- TURN over TCP / TLS / DTLS allocations (TCP relay path exists; TLS/DTLS later)
+- DTLS (TLS-over-UDP) allocations — *not yet*. Note that **TURN over TCP/TLS is
+  already supported**: the TURNS transport (rustls, behind the `tls` feature,
+  port 5349) and RFC 6062 TCP relay allocations are both implemented; only DTLS
+  is outstanding. See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) (R4).
 - OAuth third-party authorization (RFC 7635)
 - SQL / Redis / Mongo user database backends
 - RFC 5780 NAT-behavior discovery
 - Full coturn flag-for-flag compatibility and legacy modes
+
+**Operational caveats.** Some shipped features have experimental datapaths:
+the io_uring backend's graceful drain is not yet runtime-verified,
+sharded-ownership routing
+is so far static-checked only, and cross-node migration requires the same
+`ticket_secret` on every node. Run the default `transport = "tokio"` in
+production and see [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the
+full risk register and recommended configuration.
 
 If you need those today, coturn remains the right tool. turna's bet is that
 most WebRTC operators don't, and would trade them for speed, safety, and

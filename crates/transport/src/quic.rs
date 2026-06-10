@@ -190,6 +190,94 @@ pub enum QuicEvent {
     },
 }
 
+/// An outbound packet to deliver back over a WebTransport session (Phase 4).
+/// `via_datagram` selects the unreliable datagram path (media) over the
+/// reliable control stream (STUN/TURN responses) — see the bridge's framing
+/// contract ("control on the bidi stream, media as a datagram").
+#[derive(Debug, Clone)]
+pub struct QuicOutbound {
+    pub session_id: String,
+    pub data: Vec<u8>,
+    pub via_datagram: bool,
+}
+
+/// `session_id` → sender into that session's writer task. The relay-bridge
+/// consumer pushes `QuicOutbound`s here; each session task drains its own
+/// receiver and writes to the wtransport connection. A cheap `std::Mutex` is
+/// fine — no `.await` is held across the lock and unbounded sends don't block.
+#[cfg(any(feature = "quic", feature = "web-transport"))]
+pub type OutboundRegistry = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<QuicOutbound>>,
+    >,
+>;
+
+/// Process-wide counters for the WebTransport/QUIC path (parity with the DTLS
+/// transport's `DtlsStats`). Cheap atomics, snapshotted by a periodic logger;
+/// the node side can also read these to publish real metrics.
+#[cfg(any(feature = "quic", feature = "web-transport"))]
+#[derive(Default)]
+pub struct QuicStats {
+    /// Sessions currently alive (handshake done, task running).
+    pub active: std::sync::atomic::AtomicUsize,
+    /// Sessions admitted since start.
+    pub accepted: std::sync::atomic::AtomicU64,
+    /// Sessions closed (peer close or error).
+    pub closed: std::sync::atomic::AtomicU64,
+    /// Inbound datagrams (media path).
+    pub datagrams_rx: std::sync::atomic::AtomicU64,
+    /// Outbound datagrams (media path).
+    pub datagrams_tx: std::sync::atomic::AtomicU64,
+    /// Client-opened bidi streams (control path).
+    pub streams_opened: std::sync::atomic::AtomicU64,
+    /// Bytes written on the control (bidi) stream.
+    pub control_bytes_tx: std::sync::atomic::AtomicU64,
+    /// Outbound send failures (datagram or stream).
+    pub send_errors: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(feature = "quic", feature = "web-transport"))]
+impl QuicStats {
+    #[allow(clippy::type_complexity)]
+    pub fn snapshot(&self) -> (usize, u64, u64, u64, u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.active.load(Relaxed),
+            self.accepted.load(Relaxed),
+            self.closed.load(Relaxed),
+            self.datagrams_rx.load(Relaxed),
+            self.datagrams_tx.load(Relaxed),
+            self.streams_opened.load(Relaxed),
+            self.control_bytes_tx.load(Relaxed),
+            self.send_errors.load(Relaxed),
+        )
+    }
+}
+
+/// Periodic stats line so operators can see QUIC/WebTransport health.
+#[cfg(any(feature = "quic", feature = "web-transport"))]
+fn spawn_quic_stats_logger(stats: std::sync::Arc<QuicStats>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let (active, accepted, closed, drx, dtx, streams, ctl, errs) = stats.snapshot();
+            info!(
+                active,
+                accepted,
+                closed,
+                datagrams_rx = drx,
+                datagrams_tx = dtx,
+                streams_opened = streams,
+                control_bytes_tx = ctl,
+                send_errors = errs,
+                "QUIC stats"
+            );
+        }
+    });
+}
+
 /// QUIC server handle.
 pub struct QuicServer {
     config: QuicConfig,
@@ -203,11 +291,32 @@ impl QuicServer {
 
     /// Start the QUIC server.
     ///
-    /// In production: creates quinn::Endpoint, accepts connections,
-    /// negotiates ALPN, creates WebTransportSessions.
-    ///
-    /// Events sent via channel for the SFU to process.
+    /// Without the `quic` feature this is a no-op stub returning
+    /// `NotSupported` (no quinn dependency is compiled in). With the feature it
+    /// runs a real quinn endpoint; see the `#[cfg(feature = "quic")]` impl.
+    #[cfg(not(feature = "quic"))]
     pub async fn run(&self, _event_tx: tokio::sync::mpsc::Sender<QuicEvent>) -> Result<()> {
+        info!("QUIC server requested but built without the `quic` feature");
+        Err(QuicError::NotSupported)
+    }
+
+    /// Real quinn-backed QUIC server (Phase 1: endpoint + accept loop + inbound
+    /// events). WebTransport-over-HTTP/3 negotiation (the browser handshake) is
+    /// Phase 2 — see `docs/design/quic-webtransport.md`; this loop currently
+    /// surfaces raw QUIC streams/datagrams as `QuicEvent`s.
+    ///
+    /// NOTE (draft): written against quinn 0.11 + rustls 0.23. The endpoint /
+    /// `ServerConfig` / `Incoming` / stream APIs are the version-sensitive
+    /// calls — verify with `cargo build --features quic`.
+    #[cfg(feature = "quic")]
+    pub async fn run(
+        &self,
+        event_tx: tokio::sync::mpsc::Sender<QuicEvent>,
+        outbound: OutboundRegistry,
+        stats: std::sync::Arc<QuicStats>,
+    ) -> Result<()> {
+        use std::sync::Arc;
+
         info!(
             addr = %self.config.listen_addr,
             alpn = ?self.config.alpn,
@@ -215,23 +324,472 @@ impl QuicServer {
             "QUIC server starting"
         );
 
-        // In production:
-        // let endpoint = quinn::Endpoint::server(server_config, self.config.listen_addr)?;
-        // while let Some(connecting) = endpoint.accept().await {
-        //     let conn = connecting.await?;
-        //     // Check ALPN → create WebTransportSession
-        //     // Spawn per-session handler
-        // }
+        // ── rustls server config from cert/key (reuse the PEM material the
+        // `tls` transport already uses). ──
+        let certs = load_certs(&self.config.cert_path)?;
+        let key = load_key(&self.config.key_path)?;
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| QuicError::Tls(e.to_string()))?;
+        tls.alpn_protocols = self
+            .config
+            .alpn
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
 
-        // Placeholder: wait forever
-        tokio::signal::ctrl_c()
-            .await
+        // ── quinn server config + transport tuning. ──
+        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+            .map_err(|e| QuicError::Tls(e.to_string()))?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        {
+            let tp = Arc::get_mut(&mut server_config.transport)
+                .expect("fresh ServerConfig has a unique transport");
+            tp.max_concurrent_bidi_streams((self.config.max_bi_streams as u32).into());
+            tp.max_concurrent_uni_streams((self.config.max_uni_streams as u32).into());
+            tp.max_idle_timeout(Some(
+                self.config
+                    .idle_timeout
+                    .try_into()
+                    .map_err(|_| QuicError::Connection("idle_timeout too large".into()))?,
+            ));
+            tp.keep_alive_interval(Some(self.config.keep_alive));
+            if self.config.enable_datagrams {
+                tp.datagram_receive_buffer_size(Some(self.config.max_datagram_size * 16));
+            } else {
+                tp.datagram_receive_buffer_size(None);
+            }
+        }
+
+        let endpoint = quinn::Endpoint::server(server_config, self.config.listen_addr)
             .map_err(|e| QuicError::Connection(e.to_string()))?;
+        info!(addr = %self.config.listen_addr, "QUIC endpoint listening");
+
+        spawn_quic_stats_logger(stats.clone());
+
+        // Accept loop: one task per connection, each translating quinn events
+        // into `QuicEvent`s on the shared channel.
+        while let Some(incoming) = endpoint.accept().await {
+            let tx = event_tx.clone();
+            let reg = outbound.clone();
+            let st = stats.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_quic_connection(incoming, tx, reg, st).await {
+                    tracing::warn!(%e, "QUIC connection ended with error");
+                }
+            });
+        }
         Ok(())
+    }
+
+    /// WebTransport-over-HTTP/3 server (Phase 2). Performs the browser CONNECT
+    /// handshake via `wtransport`, then surfaces each session's datagrams and
+    /// bidi streams as the same `QuicEvent`s the raw-QUIC path emits — so the
+    /// relay bridge (`turna_relay::quic_bridge`) consumes both identically.
+    ///
+    /// Unlike the quinn Phase-1 path (which buffers a whole bidi stream before
+    /// surfacing it), this pumps `StreamData` per read chunk: a WebTransport
+    /// session keeps one control bidi stream open for its whole lifetime, so
+    /// `read_to_end` would block forever and starve the framer. Per-chunk
+    /// delivery matches `StreamFramer`'s incremental reassembly.
+    ///
+    /// NOTE (draft): written against the wtransport 0.6 API. `Endpoint::server`,
+    /// `ServerConfig::builder`, `Identity::load_pemfiles`, `accept()` →
+    /// `IncomingSession` → `SessionRequest::accept()` → `Connection`, and the
+    /// `Connection` stream/datagram accessors are the version-sensitive calls —
+    /// verify with `cargo build --features web-transport`.
+    #[cfg(feature = "web-transport")]
+    pub async fn run_web_transport(
+        &self,
+        event_tx: tokio::sync::mpsc::Sender<QuicEvent>,
+        outbound: OutboundRegistry,
+        stats: std::sync::Arc<QuicStats>,
+    ) -> Result<()> {
+        use wtransport::{Endpoint, Identity, ServerConfig};
+
+        info!(addr = %self.config.listen_addr, "WebTransport (H3) server starting");
+
+        // wtransport loads cert+key as an Identity (PEM) and negotiates the "h3"
+        // ALPN itself, so QuicConfig.alpn is unused on this path.
+        let identity = Identity::load_pemfiles(&self.config.cert_path, &self.config.key_path)
+            .await
+            .map_err(|e| QuicError::Tls(format!("wtransport identity: {e}")))?;
+
+        // Builder: bind addr + identity + keep-alive. Additional transport tuning
+        // (idle timeout, datagram buffer) maps onto the wtransport builder —
+        // verify method names/return types against 0.6.
+        let config = ServerConfig::builder()
+            .with_bind_address(self.config.listen_addr)
+            .with_identity(identity)
+            .keep_alive_interval(Some(self.config.keep_alive))
+            .build();
+
+        let endpoint =
+            Endpoint::server(config).map_err(|e| QuicError::Connection(e.to_string()))?;
+        info!(addr = %self.config.listen_addr, "WebTransport endpoint listening");
+
+        spawn_quic_stats_logger(stats.clone());
+
+        // wtransport's accept() yields an IncomingSession each iteration (never
+        // None), so this is an unbounded loop rather than `while let Some`.
+        loop {
+            let incoming = endpoint.accept().await;
+            let tx = event_tx.clone();
+            let reg = outbound.clone();
+            let st = stats.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_wt_session(incoming, tx, reg, st).await {
+                    tracing::warn!(%e, "WebTransport session ended with error");
+                }
+            });
+        }
     }
 
     pub fn config(&self) -> &QuicConfig {
         &self.config
+    }
+}
+
+// ---------------------------------------------------------------------------
+// quinn-backed helpers (feature = "quic", draft — verify the quinn 0.11 /
+// rustls 0.23 / rustls-pemfile 2.x APIs with `cargo build --features quic`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "quic")]
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let data = std::fs::read(path).map_err(|e| QuicError::Tls(format!("read cert {path}: {e}")))?;
+    let mut rd = std::io::BufReader::new(&data[..]);
+    rustls_pemfile::certs(&mut rd)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| QuicError::Tls(e.to_string()))
+}
+
+#[cfg(feature = "quic")]
+fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let data = std::fs::read(path).map_err(|e| QuicError::Tls(format!("read key {path}: {e}")))?;
+    let mut rd = std::io::BufReader::new(&data[..]);
+    rustls_pemfile::private_key(&mut rd)
+        .map_err(|e| QuicError::Tls(e.to_string()))?
+        .ok_or_else(|| QuicError::Tls(format!("no private key in {path}")))
+}
+
+/// Per-connection task: emit `NewSession`, then surface inbound datagrams and
+/// bidi streams as events until the connection closes. Phase 1 draft — it does
+/// not yet perform the WebTransport CONNECT handshake (Phase 2) and buffers
+/// whole bidi streams rather than streaming them.
+#[cfg(feature = "quic")]
+async fn handle_quic_connection(
+    incoming: quinn::Incoming,
+    tx: tokio::sync::mpsc::Sender<QuicEvent>,
+    outbound: OutboundRegistry,
+    stats: std::sync::Arc<QuicStats>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let conn = incoming
+        .await
+        .map_err(|e| QuicError::Connection(e.to_string()))?;
+    let remote = conn.remote_address();
+    let session_id = format!("quic-{}", conn.stable_id());
+    let alpn = conn
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|h| h.protocol.clone())
+        .map(|p| String::from_utf8_lossy(&p).into_owned())
+        .unwrap_or_default();
+
+    // Register the outbound channel before announcing the session, so the
+    // bridge can route responses as soon as it processes NewSession.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<QuicOutbound>();
+    if let Ok(mut g) = outbound.lock() {
+        g.insert(session_id.clone(), out_tx);
+    }
+
+    let session = WebTransportSession {
+        session_id: session_id.clone(),
+        remote_addr: remote,
+        local_addr: remote, // local addr not exposed on Connection; bridge can fill it
+        connection_id: (conn.stable_id() as u64).to_le_bytes().to_vec(),
+        datagrams_available: conn.max_datagram_size().is_some(),
+        alpn,
+        created_at: std::time::Instant::now(),
+    };
+    let _ = tx.send(QuicEvent::NewSession(session)).await;
+    stats.active.fetch_add(1, Relaxed);
+    stats.accepted.fetch_add(1, Relaxed);
+
+    // Reliable control writer = send half of the first client-opened bidi
+    // stream (STUN/TURN responses go on the bidi stream; media as datagrams).
+    let mut control_writer: Option<quinn::SendStream> = None;
+
+    loop {
+        tokio::select! {
+            dgram = conn.read_datagram() => match dgram {
+                Ok(bytes) => {
+                    stats.datagrams_rx.fetch_add(1, Relaxed);
+                    let _ = tx
+                        .send(QuicEvent::Datagram {
+                            session_id: session_id.clone(),
+                            data: bytes.to_vec(),
+                        })
+                        .await;
+                }
+                Err(_) => break,
+            },
+            bi = conn.accept_bi() => match bi {
+                Ok((send, mut recv)) => {
+                    stats.streams_opened.fetch_add(1, Relaxed);
+                    if control_writer.is_none() {
+                        control_writer = Some(send);
+                    }
+                    let stream_id = recv.id().index();
+                    let _ = tx
+                        .send(QuicEvent::BiStreamOpened {
+                            session_id: session_id.clone(),
+                            stream_id,
+                        })
+                        .await;
+                    // Draft: buffer the whole stream (cap 1 MiB) before surfacing.
+                    if let Ok(data) = recv.read_to_end(1024 * 1024).await {
+                        let _ = tx
+                            .send(QuicEvent::StreamData {
+                                session_id: session_id.clone(),
+                                stream_id,
+                                data,
+                            })
+                            .await;
+                    }
+                }
+                Err(_) => break,
+            },
+            out = out_rx.recv() => match out {
+                Some(msg) if msg.via_datagram => {
+                    // Unreliable media path.
+                    match conn.send_datagram(bytes::Bytes::from(msg.data)) {
+                        Ok(_) => {
+                            stats.datagrams_tx.fetch_add(1, Relaxed);
+                        }
+                        Err(_) => {
+                            stats.send_errors.fetch_add(1, Relaxed);
+                        }
+                    }
+                }
+                Some(msg) => {
+                    // Reliable control path on the first bidi stream's send half.
+                    if let Some(w) = control_writer.as_mut() {
+                        let len = msg.data.len();
+                        match w.write_all(&msg.data).await {
+                            Ok(_) => {
+                                stats.control_bytes_tx.fetch_add(len as u64, Relaxed);
+                            }
+                            Err(_) => {
+                                stats.send_errors.fetch_add(1, Relaxed);
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            session = %session_id,
+                            "raw-QUIC control response dropped: no bidi stream open yet"
+                        );
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+
+    if let Ok(mut g) = outbound.lock() {
+        g.remove(&session_id);
+    }
+    stats.active.fetch_sub(1, Relaxed);
+    stats.closed.fetch_add(1, Relaxed);
+    let _ = tx
+        .send(QuicEvent::SessionClosed {
+            session_id,
+            reason: "connection closed".into(),
+        })
+        .await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// wtransport-backed helpers (feature = "web-transport", draft — verify the
+// wtransport 0.6 API with `cargo build --features web-transport`)
+// ---------------------------------------------------------------------------
+
+/// Per-WebTransport-session task: complete the CONNECT handshake, emit
+/// `NewSession`, then surface datagrams and (per-chunk) bidi-stream data as
+/// `QuicEvent`s until the session closes. Inbound only — retaining the send
+/// half for outbound `Action::Send` delivery is Phase 4.
+#[cfg(feature = "web-transport")]
+async fn handle_wt_session(
+    incoming: wtransport::endpoint::IncomingSession,
+    tx: tokio::sync::mpsc::Sender<QuicEvent>,
+    outbound: OutboundRegistry,
+    stats: std::sync::Arc<QuicStats>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // CONNECT: IncomingSession → SessionRequest → accept() → Connection.
+    let session_request = incoming
+        .await
+        .map_err(|e| QuicError::Connection(format!("wt incoming: {e}")))?;
+    let conn = session_request
+        .accept()
+        .await
+        .map_err(|e| QuicError::Connection(format!("wt accept: {e}")))?;
+
+    let remote = conn.remote_address();
+    let session_id = format!("wt-{}", conn.stable_id());
+
+    // Register the outbound channel *before* announcing the session, so the
+    // bridge can route responses as soon as it processes NewSession.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<QuicOutbound>();
+    if let Ok(mut g) = outbound.lock() {
+        g.insert(session_id.clone(), out_tx);
+    }
+
+    let session = WebTransportSession {
+        session_id: session_id.clone(),
+        remote_addr: remote,
+        local_addr: remote, // not exposed on Connection; bridge can fill it
+        connection_id: (conn.stable_id() as u64).to_le_bytes().to_vec(),
+        datagrams_available: true, // WebTransport datagrams negotiated by wtransport
+        alpn: "h3".into(),
+        created_at: std::time::Instant::now(),
+    };
+    let _ = tx.send(QuicEvent::NewSession(session)).await;
+    stats.active.fetch_add(1, Relaxed);
+    stats.accepted.fetch_add(1, Relaxed);
+
+    // Reliable control writer = send half of the first client-opened bidi
+    // stream (the contract puts STUN/TURN responses on the bidi stream; media
+    // goes out as datagrams).
+    let mut control_writer: Option<wtransport::SendStream> = None;
+
+    loop {
+        tokio::select! {
+            dgram = conn.receive_datagram() => match dgram {
+                // wtransport Datagram exposes its bytes via `payload()` — verify.
+                Ok(d) => {
+                    stats.datagrams_rx.fetch_add(1, Relaxed);
+                    let _ = tx
+                        .send(QuicEvent::Datagram {
+                            session_id: session_id.clone(),
+                            data: d.payload().to_vec(),
+                        })
+                        .await;
+                }
+                Err(_) => break,
+            },
+            bi = conn.accept_bi() => match bi {
+                Ok((send, recv)) => {
+                    stats.streams_opened.fetch_add(1, Relaxed);
+                    // Keep the first stream's send half as the control writer;
+                    // pump every stream's recv half incrementally.
+                    if control_writer.is_none() {
+                        control_writer = Some(send);
+                    }
+                    let tx2 = tx.clone();
+                    let sid = session_id.clone();
+                    tokio::spawn(async move { pump_wt_stream(recv, tx2, sid).await });
+                }
+                Err(_) => break,
+            },
+            out = out_rx.recv() => match out {
+                Some(msg) if msg.via_datagram => {
+                    // Unreliable media path. wtransport: send_datagram(payload).
+                    match conn.send_datagram(msg.data) {
+                        Ok(_) => {
+                            stats.datagrams_tx.fetch_add(1, Relaxed);
+                        }
+                        Err(_) => {
+                            stats.send_errors.fetch_add(1, Relaxed);
+                        }
+                    }
+                }
+                Some(msg) => {
+                    // Reliable control path. Requires the client to have opened a
+                    // bidi stream first (it does — that's how it sends the
+                    // request). If none is open yet, drop and log.
+                    if let Some(w) = control_writer.as_mut() {
+                        let len = msg.data.len();
+                        match w.write_all(&msg.data).await {
+                            Ok(_) => {
+                                stats.control_bytes_tx.fetch_add(len as u64, Relaxed);
+                            }
+                            Err(_) => {
+                                stats.send_errors.fetch_add(1, Relaxed);
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            session = %session_id,
+                            "control response dropped: no bidi stream open yet"
+                        );
+                    }
+                }
+                None => break, // registry dropped the sender
+            },
+        }
+    }
+
+    if let Ok(mut g) = outbound.lock() {
+        g.remove(&session_id);
+    }
+    stats.active.fetch_sub(1, Relaxed);
+    stats.closed.fetch_add(1, Relaxed);
+    let _ = tx
+        .send(QuicEvent::SessionClosed {
+            session_id,
+            reason: "session closed".into(),
+        })
+        .await;
+    Ok(())
+}
+
+/// Pump one bidi RecvStream, emitting `StreamData` per read chunk so the relay
+/// bridge's `StreamFramer` can reassemble messages incrementally (a control
+/// stream stays open for the whole session — never `read_to_end`).
+#[cfg(feature = "web-transport")]
+async fn pump_wt_stream(
+    mut recv: wtransport::RecvStream,
+    tx: tokio::sync::mpsc::Sender<QuicEvent>,
+    session_id: String,
+) {
+    // wtransport does not expose a stable per-stream index here; 0 is a
+    // placeholder (the bridge keys on session_id, not stream_id). Replace with
+    // the real accessor if/when StreamData needs to disambiguate streams.
+    let stream_id = 0u64;
+    let _ = tx
+        .send(QuicEvent::BiStreamOpened {
+            session_id: session_id.clone(),
+            stream_id,
+        })
+        .await;
+
+    // RecvStream::read(&mut buf) → Result<Option<usize>>: Some(n) bytes,
+    // None on EOF. Verify against the wtransport 0.6 RecvStream API.
+    let mut chunk = [0u8; 8192];
+    loop {
+        match recv.read(&mut chunk).await {
+            Ok(Some(n)) if n > 0 => {
+                if tx
+                    .send(QuicEvent::StreamData {
+                        session_id: session_id.clone(),
+                        stream_id,
+                        data: chunk[..n].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Some(_)) | Ok(None) => break,
+            Err(_) => break,
+        }
     }
 }
 

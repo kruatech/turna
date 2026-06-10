@@ -60,6 +60,14 @@ pub enum WriteOp {
         username: String,
         created_at_ms: u64,
         expires_at_ms: u64,
+        /// RFC 8016 stable allocation identity, persisted so a MOBILITY-TICKET
+        /// minted by this node still validates after a cross-node failover
+        /// rehydrates the allocation elsewhere.
+        allocation_id: String,
+        /// RFC 8016 migration generation at creation time (always 0 for a
+        /// fresh allocation; carried explicitly so the persist path is
+        /// uniform with `ReKey`).
+        migration_epoch: u64,
     },
 
     /// Allocation lifetime was extended (or it expired naturally if
@@ -70,6 +78,20 @@ pub enum WriteOp {
     /// Allocation was removed (Refresh with lifetime=0, explicit cleanup,
     /// or expiry sweep).
     Remove { relay_port: u16 },
+
+    /// Allocation was re-keyed from one client 5-tuple to another
+    /// (RFC 8016 Connection Migration). The relay binding, permissions and
+    /// channels are unchanged — only the client address moves. The writer
+    /// updates the persisted record's `client_addr` column in place; the
+    /// relay port (the coalescing owner key) is the join handle.
+    ReKey {
+        relay_port: u16,
+        new_client_addr: SocketAddr,
+        /// The migration generation *after* the re-key bump. Persisted so the
+        /// backend record's epoch tracks the in-memory one — a captured
+        /// older-epoch ticket then stays rejected even after a failover.
+        new_epoch: u64,
+    },
 
     /// A peer-address permission was added or refreshed.
     Permission {
@@ -96,6 +118,7 @@ impl WriteOp {
             WriteOp::Create { relay_port, .. }
             | WriteOp::Refresh { relay_port, .. }
             | WriteOp::Remove { relay_port }
+            | WriteOp::ReKey { relay_port, .. }
             | WriteOp::Permission { relay_port, .. }
             | WriteOp::Channel { relay_port, .. } => *relay_port,
         }
