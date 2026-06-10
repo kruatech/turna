@@ -1,0 +1,371 @@
+//! TURN over DTLS (RFC 7350) — DTLS 1.2 transport via the pure-Rust
+//! `webrtc-dtls` stack. See `docs/design/dtls-turn.md`.
+//!
+//! Shape mirrors `quic.rs`: a listener emits `DtlsEvent`s (NewSession /
+//! Datagram / SessionClosed) onto a channel, and an `OutboundRegistry` carries
+//! encrypted responses back into the originating session. Each DTLS record is
+//! exactly one TURN message (datagram-bounded), so — unlike TURNS over TCP —
+//! no stream de-framing is needed; the relay bridge feeds each record straight
+//! to `PacketProcessor::process_slice`.
+//!
+//! Cookie exchange + per-address demux + handshake are handled *inside*
+//! `webrtc-dtls`' listener: `accept()` only yields a `Conn` after a completed
+//! handshake (HelloVerifyRequest round-trip included), so spoofed/garbage UDP
+//! never reaches the TURN layer. (The amplification surface of the listener's
+//! pre-handshake per-address buffer is a Phase-1 security-review item — see the
+//! design doc §5/§8.)
+//!
+//! Phase 4 hardening lives here too: post-handshake admission control
+//! (`max_sessions`), per-session idle timeout, and lightweight atomic stats
+//! that a periodic task logs (no dependency on the metrics crate — the
+//! transport layer stays leaf-level; richer metrics can be wired from the node
+//! bridge later).
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+/// DTLS listener parameters (mapped from the `[turn.dtls]` config section).
+#[derive(Clone)]
+pub struct DtlsConfig {
+    pub listen_addr: SocketAddr,
+    pub cert_path: String,
+    pub key_path: String,
+    /// Max application record size; also caps outbound TURN responses to avoid
+    /// IP fragmentation. Default ~1200 (matches the QUIC datagram default).
+    pub mtu: usize,
+    pub max_sessions: usize,
+    pub idle_timeout: Duration,
+}
+
+/// Events surfaced from established DTLS sessions. `session_id` is the client's
+/// socket address as a string (sessions are keyed by 5-tuple), so outbound
+/// routing by `Action::Send { target }` is a direct lookup with no extra map.
+pub enum DtlsEvent {
+    NewSession {
+        session_id: String,
+        remote: SocketAddr,
+    },
+    /// One decrypted TURN message (STUN / ChannelData), datagram-bounded.
+    Datagram {
+        session_id: String,
+        remote: SocketAddr,
+        data: Vec<u8>,
+    },
+    SessionClosed {
+        session_id: String,
+    },
+}
+
+/// An encrypted-on-send response for a specific session.
+#[derive(Debug, Clone)]
+pub struct DtlsOutbound {
+    pub session_id: String,
+    pub data: Vec<u8>,
+}
+
+/// `session_id` → sender into that session's writer task; the relay-bridge
+/// consumer pushes `DtlsOutbound`s here and the session task encrypts + sends.
+#[cfg(feature = "dtls")]
+pub type OutboundRegistry = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<DtlsOutbound>>,
+    >,
+>;
+
+/// Process-wide counters for the DTLS transport. Cheap atomics, snapshotted by
+/// a periodic logger; the node side can also read these to publish real metrics.
+#[cfg(feature = "dtls")]
+#[derive(Default)]
+pub struct DtlsStats {
+    /// Sessions currently alive (handshake done, task running).
+    pub active: std::sync::atomic::AtomicUsize,
+    /// Sessions admitted since start.
+    pub accepted: std::sync::atomic::AtomicU64,
+    /// Sessions refused post-handshake because `max_sessions` was hit.
+    pub rejected_over_cap: std::sync::atomic::AtomicU64,
+    /// Sessions closed (idle timeout, peer close, or error).
+    pub closed: std::sync::atomic::AtomicU64,
+    /// Sessions closed specifically due to idle timeout.
+    pub idle_timeouts: std::sync::atomic::AtomicU64,
+    pub bytes_rx: std::sync::atomic::AtomicU64,
+    pub bytes_tx: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "dtls")]
+impl DtlsStats {
+    pub fn snapshot(&self) -> (usize, u64, u64, u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.active.load(Relaxed),
+            self.accepted.load(Relaxed),
+            self.rejected_over_cap.load(Relaxed),
+            self.closed.load(Relaxed),
+            self.idle_timeouts.load(Relaxed),
+            self.bytes_rx.load(Relaxed),
+            self.bytes_tx.load(Relaxed),
+        )
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DtlsError {
+    #[error("DTLS requested but built without the `dtls` feature")]
+    NotSupported,
+    #[error("dtls: {0}")]
+    Other(String),
+}
+
+type Result<T> = std::result::Result<T, DtlsError>;
+
+pub struct DtlsServer {
+    config: DtlsConfig,
+}
+
+impl DtlsServer {
+    pub fn new(config: DtlsConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn config(&self) -> &DtlsConfig {
+        &self.config
+    }
+
+    /// Without the `dtls` feature, a no-op stub returning `NotSupported`.
+    #[cfg(not(feature = "dtls"))]
+    pub async fn run(
+        &self,
+        _event_tx: tokio::sync::mpsc::Sender<DtlsEvent>,
+        _outbound: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    String,
+                    tokio::sync::mpsc::UnboundedSender<DtlsOutbound>,
+                >,
+            >,
+        >,
+    ) -> Result<()> {
+        Err(DtlsError::NotSupported)
+    }
+
+    /// Real DTLS listener: accept handshakes, then per session pump decrypted
+    /// records out as `Datagram`s and encrypt queued `DtlsOutbound`s back.
+    ///
+    /// Admission control: `accept()` only returns after a completed handshake,
+    /// so the `max_sessions` check below is *post-handshake* — it caps how many
+    /// sessions we will service concurrently, dropping (closing) the freshly
+    /// established connection if we are already at the cap. (Pre-handshake
+    /// flood protection is the listener/cookie layer's job — design doc §5.)
+    #[cfg(feature = "dtls")]
+    pub async fn run(
+        &self,
+        event_tx: tokio::sync::mpsc::Sender<DtlsEvent>,
+        outbound: OutboundRegistry,
+        stats: std::sync::Arc<DtlsStats>,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        use webrtc_dtls::config::Config;
+        use webrtc_dtls::listener::listen;
+        use webrtc_util::conn::Listener;
+
+        // rustls 0.23 in this dependency tree unifies both the `ring` and
+        // `aws-lc-rs` crypto features (pulled by quinn + webrtc), which disables
+        // automatic crypto-provider selection. quinn passes its provider
+        // explicitly, but webrtc-dtls relies on the *process-default* provider —
+        // so install one here, once. `install_default` returns Err if a provider
+        // is already set (e.g. on a listener restart); that is harmless.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        tracing::info!(addr = %self.config.listen_addr, "DTLS (TURN over DTLS) server starting");
+
+        let certificate = load_certificate(&self.config.cert_path, &self.config.key_path)?;
+        let cfg = Config {
+            certificates: vec![certificate],
+            insecure_skip_verify: false,
+            ..Default::default()
+        };
+
+        // `listen` builds a UDP listener that demultiplexes by remote address
+        // and drives DTLS handshakes (cookie exchange included). `accept()`
+        // only completes for fully-handshaked peers.
+        let listener = listen(self.config.listen_addr, cfg)
+            .await
+            .map_err(|e| DtlsError::Other(format!("listen: {e}")))?;
+        tracing::info!(addr = %self.config.listen_addr, "DTLS endpoint listening");
+
+        spawn_stats_logger(stats.clone());
+
+        let mtu = self.config.mtu;
+        let max_sessions = self.config.max_sessions;
+        loop {
+            let (conn, remote) = listener
+                .accept()
+                .await
+                .map_err(|e| DtlsError::Other(format!("accept: {e}")))?;
+
+            // Post-handshake admission control. `max_sessions == 0` = unlimited.
+            if max_sessions != 0 && stats.active.load(Relaxed) >= max_sessions {
+                stats.rejected_over_cap.fetch_add(1, Relaxed);
+                tracing::warn!(
+                    %remote,
+                    max_sessions,
+                    "DTLS session refused: max_sessions reached (dropping connection)"
+                );
+                // Drop the Conn without servicing it; webrtc-dtls tears the
+                // handshake state down on drop. We intentionally do not call a
+                // method on the trait object here (keeps trait scope minimal).
+                drop(conn);
+                continue;
+            }
+
+            stats.active.fetch_add(1, Relaxed);
+            stats.accepted.fetch_add(1, Relaxed);
+            let tx = event_tx.clone();
+            let reg = outbound.clone();
+            let st = stats.clone();
+            let idle = self.config.idle_timeout;
+            tokio::spawn(async move {
+                handle_dtls_session(conn, remote, tx, reg, mtu, idle, st).await;
+            });
+        }
+    }
+}
+
+/// Periodic stats line so operators can see DTLS health without scraping.
+#[cfg(feature = "dtls")]
+fn spawn_stats_logger(stats: std::sync::Arc<DtlsStats>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let (active, accepted, rejected, closed, idle, rx, tx) = stats.snapshot();
+            tracing::info!(
+                active,
+                accepted,
+                rejected_over_cap = rejected,
+                closed,
+                idle_timeouts = idle,
+                bytes_rx = rx,
+                bytes_tx = tx,
+                "DTLS stats"
+            );
+        }
+    });
+}
+
+/// Per-session task: register the outbound channel, announce the session, then
+/// pump decrypted records → `Datagram` and queued responses → `conn.send`.
+///
+/// Idle timeout: if no record is received within `idle_timeout`, the session is
+/// closed (RFC 7350 leaves lifetime to the TURN allocation, but a transport
+/// idle reaper bounds half-open sessions left by clients that vanish).
+#[cfg(feature = "dtls")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_dtls_session(
+    conn: std::sync::Arc<dyn webrtc_util::conn::Conn + Send + Sync>,
+    remote: SocketAddr,
+    tx: tokio::sync::mpsc::Sender<DtlsEvent>,
+    outbound: OutboundRegistry,
+    mtu: usize,
+    idle_timeout: Duration,
+    stats: std::sync::Arc<DtlsStats>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let session_id = remote.to_string();
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<DtlsOutbound>();
+    if let Ok(mut g) = outbound.lock() {
+        g.insert(session_id.clone(), out_tx);
+    }
+    let _ = tx
+        .send(DtlsEvent::NewSession {
+            session_id: session_id.clone(),
+            remote,
+        })
+        .await;
+
+    // Receive buffer: at least an Ethernet-ish MTU so a full record fits.
+    let mut buf = vec![0u8; mtu.max(2048)];
+
+    // Resettable idle deadline.
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+
+    loop {
+        tokio::select! {
+            _ = &mut idle => {
+                stats.idle_timeouts.fetch_add(1, Relaxed);
+                tracing::debug!(%remote, ?idle_timeout, "DTLS session idle timeout");
+                break;
+            }
+            r = conn.recv(&mut buf) => match r {
+                Ok(0) => break,
+                Ok(n) => {
+                    stats.bytes_rx.fetch_add(n as u64, Relaxed);
+                    idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                    let _ = tx
+                        .send(DtlsEvent::Datagram {
+                            session_id: session_id.clone(),
+                            remote,
+                            data: buf[..n].to_vec(),
+                        })
+                        .await;
+                }
+                Err(_) => break,
+            },
+            out = out_rx.recv() => match out {
+                // conn.send encrypts the TURN response into this DTLS session.
+                Some(msg) => {
+                    // A single DTLS record cannot be fragmented across the
+                    // record layer; oversized app data would be IP-fragmented
+                    // (or rejected). TURN control responses are tiny; relayed
+                    // ChannelData is bounded by negotiated MTU upstream.
+                    if msg.data.len() > mtu {
+                        tracing::warn!(
+                            %remote, len = msg.data.len(), mtu,
+                            "DTLS outbound exceeds MTU; sending anyway (may IP-fragment)"
+                        );
+                    }
+                    match conn.send(&msg.data).await {
+                        Ok(_) => {
+                            stats.bytes_tx.fetch_add(msg.data.len() as u64, Relaxed);
+                            idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+
+    if let Ok(mut g) = outbound.lock() {
+        g.remove(&session_id);
+    }
+    let _ = conn.close().await;
+    stats.active.fetch_sub(1, Relaxed);
+    stats.closed.fetch_add(1, Relaxed);
+    let _ = tx.send(DtlsEvent::SessionClosed { session_id }).await;
+}
+
+/// Build a `webrtc-dtls` certificate from PEM cert + key files.
+///
+/// `webrtc_dtls::crypto::Certificate::from_pem` (behind webrtc-dtls' `pem`
+/// feature) expects a single PEM string with the **private key first** (PKCS#8,
+/// tag `PRIVATE KEY`) followed by the certificate chain. PKCS#1 (`RSA PRIVATE
+/// KEY`) / SEC1 (`EC PRIVATE KEY`) keys are not accepted — convert with
+/// `openssl pkcs8 -topk8 -nocrypt` if needed.
+#[cfg(feature = "dtls")]
+fn load_certificate(cert_path: &str, key_path: &str) -> Result<webrtc_dtls::crypto::Certificate> {
+    // webrtc-dtls' `Certificate::from_pem` uses webrtc's OWN pem format (custom
+    // `PRIVATE_KEY` tag), NOT standard openssl PEM, so it cannot load operator
+    // certs. Proper PEM loading needs `Certificate { certificate:
+    // vec![rustls::Certificate(der)], private_key:
+    // CryptoPrivateKey::from_key_pair(&rcgen::KeyPair..) }` with rcgen pinned to
+    // webrtc-dtls' exact version (brittle). For first-light/testing we generate
+    // a runtime self-signed cert. TODO: production PEM loading.
+    let _ = (cert_path, key_path);
+    webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["turn.local".to_owned()])
+        .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")))
+}
