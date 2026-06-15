@@ -61,7 +61,7 @@ xsk-rs = { version = "0.6", optional = true }
 # Per-destination neighbor resolution (feature: af-xdp). rtnetlink 0.21 pulls
 # netlink-packet-route 0.30 — pin the same to avoid type-version skew.
 rtnetlink = { version = "0.21", optional = true }
-netlink-packet-route = { version = "0.30", optional = true }
+netlink-packet-route = { version = "0.31", optional = true }
 futures-util = { version = "0.3", optional = true }
 # 1.1: embedded XDP program load/attach + xskmap/ports maps. libxdp-sys already
 # enters the tree transitively via xsk-rs; declaring it directly exposes its FFI
