@@ -4822,9 +4822,9 @@ dependencies = [
 
 [[package]]
 name = "xsk-rs"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "570e1cc137e4befeff734a2daa6fd88c54991890c67768b862ac42d29193515d"
+checksum = "d1fef46e3505c5055082f52ada0a7f8e5dcaebdbb9eccf8e978c32382c159270"
 dependencies = [
  "bitflags 2.12.1",
  "cfg-if",

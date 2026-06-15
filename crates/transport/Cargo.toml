@@ -57,7 +57,7 @@ io-uring = { version = "0.7", optional = true }
 # AF_XDP ring datapath (feature: af-xdp). NOTE: verify the xsk-rs 0.6 API —
 # Umem::new / Socket::new return shapes and the queue methods
 # (fill / poll_and_consume / produce_and_wakeup / consume) are version-sensitive.
-xsk-rs = { version = "0.6", optional = true }
+xsk-rs = { version = "0.8", optional = true }
 # Per-destination neighbor resolution (feature: af-xdp). rtnetlink 0.21 pulls
 # netlink-packet-route 0.30 — pin the same to avoid type-version skew.
 rtnetlink = { version = "0.21", optional = true }
