@@ -32,4 +32,4 @@ hostname.workspace = true
 # PR2 (task #3): write-behind writer task uses the state backend.
 turna-state-backend.workspace = true
 # PR A (task 2.4): system resource metrics in heartbeat.
-sysinfo = "0.30"
+sysinfo = "0.39"
