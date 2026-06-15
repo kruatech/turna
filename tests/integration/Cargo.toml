@@ -24,7 +24,7 @@ turna-common = { path = "../../crates/common" }
 # DTL-5: optional DTLS client for the TURN-over-DTLS e2e test (feature `dtls`).
 # Pinned to the same versions the transport crate uses for the server side.
 webrtc-dtls = { version = "0.10", optional = true }
-webrtc-util = { version = "0.9", optional = true }
+webrtc-util = { version = "0.17", optional = true }
 
 [features]
 # Enables `stun_binding_over_dtls` (also #[ignore]d). Needs a server built and

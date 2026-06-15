@@ -47,7 +47,7 @@ wtransport = { version = "0.6", optional = true }
 # 0.10 API (Config / listener::listen / Conn+Listener / Certificate::from_pem
 # behind the `pem` feature) verified against 0.10.0 source.
 webrtc-dtls = { version = "0.10", features = ["pem"], optional = true }
-webrtc-util = { version = "0.9", optional = true }
+webrtc-util = { version = "0.17", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
