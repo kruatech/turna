@@ -453,14 +453,14 @@ impl QuicServer {
 
 // ---------------------------------------------------------------------------
 // quinn-backed helpers (feature = "quic", draft — verify the quinn 0.11 /
-// rustls 0.23 / rustls-pemfile 2.x APIs with `cargo build --features quic`)
+// rustls 0.23 / rustls-pki-types PEM APIs with `cargo build --features quic`)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "quic")]
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let data = std::fs::read(path).map_err(|e| QuicError::Tls(format!("read cert {path}: {e}")))?;
-    let mut rd = std::io::BufReader::new(&data[..]);
-    rustls_pemfile::certs(&mut rd)
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    CertificateDer::pem_slice_iter(&data[..])
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| QuicError::Tls(e.to_string()))
 }
@@ -468,10 +468,9 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
 #[cfg(feature = "quic")]
 fn load_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
     let data = std::fs::read(path).map_err(|e| QuicError::Tls(format!("read key {path}: {e}")))?;
-    let mut rd = std::io::BufReader::new(&data[..]);
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|e| QuicError::Tls(e.to_string()))?
-        .ok_or_else(|| QuicError::Tls(format!("no private key in {path}")))
+    use rustls::pki_types::{pem::PemObject, PrivateKeyDer};
+    PrivateKeyDer::from_pem_slice(&data[..])
+        .map_err(|e| QuicError::Tls(format!("no private key in {path}: {e}")))
 }
 
 /// Per-connection task: emit `NewSession`, then surface inbound datagrams and

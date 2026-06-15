@@ -22,7 +22,9 @@ fn main() {
             "{target} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             m[0], m[1], m[2], m[3], m[4], m[5]
         ),
-        Ok(None) => println!("{target} -> (no neighbor entry; try `ping -c1 {target}` then re-run)"),
+        Ok(None) => {
+            println!("{target} -> (no neighbor entry; try `ping -c1 {target}` then re-run)")
+        }
         Err(e) => {
             eprintln!("netlink error: {e}");
             std::process::exit(1);

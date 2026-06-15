@@ -335,15 +335,11 @@ mod tests {
 
     #[test]
     fn allow_list_overrides_internet_facing_deny() {
-        let p = PeerPolicy::from_config(
-            "internet-facing",
-            false,
-            &[],
-            &["10.10.0.0/16".to_string()],
-        );
+        let p =
+            PeerPolicy::from_config("internet-facing", false, &[], &["10.10.0.0/16".to_string()]);
         assert!(!p.is_forbidden(ip("10.10.5.6"))); // explicitly allowed subnet
         assert!(p.is_forbidden(ip("10.20.5.6"))); // other private still denied
-        // Allow-list cannot resurrect special-use.
+                                                  // Allow-list cannot resurrect special-use.
         let meta = PeerPolicy::from_config(
             "internet-facing",
             false,

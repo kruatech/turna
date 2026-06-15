@@ -25,6 +25,14 @@
 
 Полный список SUSPECT и их статус — в `unsafe-inventory.json` (`suspect_fixed = 9`).
 
+> **Текущее состояние (регенерация `scripts/unsafe-inventory.sh`, 2026-06-15).**
+> Воспроизводимый счёт `unsafe`-строк в скоупе `crates/{transport,relay}/src/` — **104**
+> (transport 85, relay 19). Маркеры в коде: `// SAFETY:` 97, `// NEEDS-REVIEW:` 2,
+> `// SUSPECT:` 0. Все 104 задокументированы; `crates/transport/src/tokio_transport.rs` (6
+> блоков) проаудирован и внесён (USF-010/011, SAFETY_JUSTIFIED) — вне audited
+> set ничего нет. Счётчики 76/14/9 ниже относятся
+> к исходному проходу 2026-05-16, а не к перекатегоризации текущих 104.
+
 ---
 
 ## Методология
@@ -341,3 +349,16 @@ pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
 - **SUSPECT #1-4** реализуйте как отдельные PR. Каждый — 100-200 строк, легко ревьюится.
 - **Miri-кампанию** для STUN/TURN парсеров запустите параллельно (`cargo +nightly miri test -p turna-proto-stun`).
 - **Fuzzing** (отдельный TODO из критичного списка) логически продолжает этот аудит — найдённые fuzz-крэши скорее всего будут касаться этих же блоков.
+
+---
+
+## USF-010/011 — `tokio_transport.rs` recvmmsg/sendmmsg FFI (SAFETY_JUSTIFIED)
+
+**Файл:** `crates/transport/src/tokio_transport.rs` (Linux-only, `cfg(target_os = "linux")`)
+
+6 `unsafe`-блоков в батч-I/O путях `recv_mmsg`/`send_mmsg`:
+
+- **USF-010 — `recv_mmsg()`** (4 блока): `mem::zeroed()` для `sockaddr_storage`/`mmsghdr` (C POD, нулевой паттерн валиден), `libc::recvmmsg`, `socket2::SockAddr::new`. Инварианты: `fd` открыт на время жизни сокета (`Arc<UdpSocket>`); `iovecs`/`addrs` живут на время вызова и не реаллоцируются после setup; читаются только записи `[0, r)`, где `r` — результат `recvmmsg`; `msg_namelen <= size_of::<sockaddr_storage>()`. Инлайн `// SAFETY:` присутствуют и корректны. UB/OOB/aliasing не найдено.
+- **USF-011 — `send_mmsg()`** (2 блока): `mem::zeroed()` для `mmsghdr`, `libc::sendmmsg`. Инварианты: `fd` открыт; буферы (`bytes::Bytes` из `pkts`, заимствованы на всю функцию) и `addrs` переживают вызов; `sendmmsg` только читает буферы, поэтому `*const -> *mut` каст безопасен. Инлайн `// SAFETY:` корректны.
+
+Статус: **SAFETY_JUSTIFIED**. Файл добавлен в `AUDITED_PATHS` (`scripts/unsafe-inventory.sh`) и в `docs/security/unsafe-inventory.json`.

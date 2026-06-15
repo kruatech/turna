@@ -7,8 +7,8 @@ edition.workspace = true
 [features]
 default = []
 io-uring = ["dep:io-uring"]
-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
-quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile"]
+tls = ["dep:rustls", "dep:tokio-rustls"]
+quic = ["dep:quinn", "dep:rustls"]
 # WebTransport-over-HTTP/3 on top of the raw QUIC endpoint (browser handshake).
 web-transport = ["quic", "dep:wtransport"]
 # AF_XDP zero-copy datapath (Linux). Pure L2-L4 stack is dependency-free; the
@@ -31,7 +31,6 @@ rand.workspace = true
 
 # TLS/TCP transport (feature: tls)
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
-rustls-pemfile = { version = "2", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 
 # QUIC / WebTransport transport (feature: quic). Reuses rustls 0.23 above.
@@ -51,7 +50,7 @@ webrtc-dtls = { version = "0.10", features = ["pem"], optional = true }
 webrtc-util = { version = "0.9", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7", optional = true }

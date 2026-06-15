@@ -1,0 +1,68 @@
+{{- if .Values.networkPolicy.enabled }}
+# TURN is a relay, so it must be able to egress UDP/TCP to arbitrary peer
+# addresses; egress is therefore intentionally broad. Ingress is the part this
+# policy locks down: TURN/STUN signalling and the relay UDP range stay public,
+# while the health/metrics port is reachable only from `networkPolicy.metricsFrom`.
+#
+# The relay-range rule uses `endPort`, which requires Kubernetes >= 1.25.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-turn
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: turna
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Public TURN/STUN signalling (UDP + TCP) on the listen port.
+    - ports:
+        - port: {{ .Values.turn.listenPort }}
+          protocol: UDP
+        - port: {{ .Values.turn.listenPort }}
+          protocol: TCP
+    # Public relayed media: the allocated UDP relay port range.
+    - ports:
+        - port: {{ .Values.turn.relayPortRange.min }}
+          endPort: {{ .Values.turn.relayPortRange.max }}
+          protocol: UDP
+    # Health / metrics: cluster-internal sources only.
+    - from:
+        {{- toYaml .Values.networkPolicy.metricsFrom | nindent 8 }}
+      ports:
+        - port: {{ .Values.turn.healthPort }}
+          protocol: TCP
+    {{- if .Values.cluster.enabled }}
+    # Gossip between cluster pods.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: turna
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - port: {{ .Values.cluster.gossipPort }}
+          protocol: UDP
+    {{- end }}
+  egress:
+    # DNS resolution.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Relayed traffic to arbitrary peers — required for TURN to function.
+    # Restrict via networkPolicy.extraEgress only with a full understanding of
+    # your peer topology.
+    - ports:
+        - protocol: UDP
+        - protocol: TCP
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

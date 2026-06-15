@@ -17,11 +17,11 @@ pub mod select;
 pub mod tokio_transport;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod relay_route;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod worker;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub mod relay_route;
 
 #[cfg(all(target_os = "linux", feature = "af-xdp"))]
 pub mod af_xdp;

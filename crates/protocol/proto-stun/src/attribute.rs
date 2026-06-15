@@ -89,7 +89,10 @@ pub enum Attribute {
     Username(String),
     MessageIntegrity([u8; 20]),
     Fingerprint(u32),
-    ErrorCode { code: u16, reason: String },
+    ErrorCode {
+        code: u16,
+        reason: String,
+    },
     Realm(String),
     Nonce(String),
     Software(String),
@@ -107,7 +110,10 @@ pub enum Attribute {
     ReservationToken([u8; 8]),
     /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
     MobilityTicket(Vec<u8>),
-    Unknown { attr_type: u16, value: Vec<u8> },
+    Unknown {
+        attr_type: u16,
+        value: Vec<u8>,
+    },
 }
 
 impl Attribute {

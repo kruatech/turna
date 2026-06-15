@@ -24,13 +24,18 @@ fn arb_tid() -> impl Strategy<Value = [u8; 12]> {
 }
 
 fn arb_ipv4_socket_addr() -> impl Strategy<Value = SocketAddr> {
-    (any::<[u8; 4]>(), 1024u16..=65535).prop_map(|(octets, port)| {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), port))
-    })
+    (any::<[u8; 4]>(), 1024u16..=65535)
+        .prop_map(|(octets, port)| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), port)))
 }
 
 fn arb_lifetime() -> impl Strategy<Value = u32> {
-    prop_oneof![Just(0u32), Just(1u32), Just(600u32), Just(3600u32), any::<u32>()]
+    prop_oneof![
+        Just(0u32),
+        Just(1u32),
+        Just(600u32),
+        Just(3600u32),
+        any::<u32>()
+    ]
 }
 
 fn arb_channel() -> impl Strategy<Value = u16> {
@@ -39,7 +44,9 @@ fn arb_channel() -> impl Strategy<Value = u16> {
 
 fn encode_decode(msg: &StunMessage) -> StunMessage {
     let mut buf = [0u8; 2048];
-    let len = msg.encode(&mut buf).expect("TURN builder output must encode");
+    let len = msg
+        .encode(&mut buf)
+        .expect("TURN builder output must encode");
     StunMessage::decode(&buf[..len]).expect("encoded TURN builder output must decode")
 }
 

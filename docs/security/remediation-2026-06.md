@@ -42,7 +42,7 @@ fuzzing, model checking, a dependency upgrade), not findings.
 |------|----------------|------------------------------|
 | Continuous fuzzing of `encode` | `fuzz/fuzz_targets/fuzz_encode.rs` + Cargo bin + CI smoke entry (catches the M2 class) | Let nightly fuzz accumulate corpus |
 | Model checking | `qos` token-bucket loom model; `relay` nonce-rotation loom model; `miri` + `loom` CI jobs | Run them on Linux/nightly; for the *production* `NonceManager`, inject the clock to model the struct directly |
-| RUSTSEC ignores (4) | — (guidance only) | Upgrade `tonic 0.12.3 → 0.14.x` to drop the unmaintained `rustls-pemfile` (RUSTSEC-2025-0134) and webpki advisories. This is a migration (codegen split into `tonic-prost-build`, TLS API moved, MSRV 1.88), done on a branch with the build available. **Do not remove the `deny.toml` ignores until the upgrade compiles** — `cargo-deny` would fail otherwise |
+| RUSTSEC ignores | Resolved — `tonic` upgraded to 0.14 (codegen → `tonic-prost-build`, TLS API moved); `deny.toml` advisory ignores removed and `cargo deny check advisories` is green | `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) is **not** fully removed: it remains a direct dep of `turna-transport` (`tls`/`quic` PEM parsing) and transitive via `wtransport` (`web-transport`), so it cannot be dropped while QUIC/WebTransport are offered. cargo-deny does not surface the unmaintained advisory under the current config. Planned cleanup: migrate PEM parsing to `rustls-pki-types` |
 
 ## Verification checklist
 

@@ -1,16 +1,17 @@
 name: release
 
 # Cut a release on a version tag: build and publish a multi-arch container
-# image to GHCR, build standalone linux/amd64 binaries, and create a GitHub
-# Release with the binaries, checksums, and auto-generated notes.
+# image to GHCR (cosign-signed, with SLSA provenance + SBOM attestations),
+# build standalone linux/amd64 binaries with checksums + SBOM + provenance,
+# and create a GitHub Release.
 on:
   push:
     tags:
       - "v*"
 
+# Least privilege at the top; each job elevates only what it needs.
 permissions:
-  contents: write # create the GitHub Release and upload assets
-  packages: write # push the image to GHCR
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -19,51 +20,94 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Multi-arch container image -> GHCR (no external secrets; uses GITHUB_TOKEN).
+  # Multi-arch container image -> GHCR (no external secrets; uses GITHUB_TOKEN
+  # and OIDC keyless signing). The image is signed by digest with cosign and
+  # carries SLSA provenance + SBOM attestations.
   #
   # NOTE: the linux/arm64 leg builds under QEMU emulation, which is slow for a
   # Rust release build. If it becomes too slow or times out, either drop arm64
-  # from `platforms` below, or move this job to a native arm64 runner
-  # (`runs-on: ubuntu-24.04-arm`) with a per-arch matrix.
+  # from `platforms`, or move to a native arm64 runner with a per-arch matrix.
   # ---------------------------------------------------------------------------
   docker:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout
+      packages: write      # push image to GHCR
+      id-token: write      # keyless cosign + provenance (OIDC)
+      attestations: write  # build-provenance / SBOM attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image tags
+        id: imagetags
+        run: |
+          REF="${GITHUB_REF_NAME}"
+          REPO="${REGISTRY}/${IMAGE_NAME}"
+          tags="${REPO}:${REF}"
+          # Only a final (non-prerelease) tag moves :latest. Prerelease tags
+          # (containing a hyphen, e.g. v0.2.0-alpha.1) do not.
+          case "$REF" in
+            *-*) ;;
+            *)  tags="${tags}"$'\n'"${REPO}:latest" ;;
+          esac
+          { echo "tags<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # BuildKit attaches SLSA provenance and an SBOM to the image in GHCR.
+          provenance: true
+          sbom: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.imagetags.outputs.tags }}
+
+      - name: Sign image (keyless, by digest)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+
+      - name: Attest build provenance (GitHub, pushed to registry)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
   # ---------------------------------------------------------------------------
-  # Standalone linux/amd64 binaries -> tar.gz + SHA256. The container image
-  # above already covers arm64 users; cross-compiling standalone arm64 binaries
-  # is left as a follow-up.
+  # Standalone linux/amd64 binaries -> tar.gz + SHA256 + SBOM + provenance.
+  # The container image above covers arm64 users; cross-compiling standalone
+  # arm64 binaries is left as a follow-up.
   # ---------------------------------------------------------------------------
   binaries:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout
+      id-token: write      # provenance attestation (OIDC)
+      attestations: write  # build-provenance attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: 1.95.0
 
@@ -89,15 +133,30 @@ jobs:
              target/release/turna-control-plane \
              target/release/turnactl \
              "dist/${PKG}/"
-          cp README.md LICENSE "dist/${PKG}/" 2>/dev/null || true
+          cp README.md LICENSE NOTICE "dist/${PKG}/" 2>/dev/null || true
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
           ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
 
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/turna-${{ github.ref_name }}.spdx.json
+
+      - name: Attest binary provenance (GitHub)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*.tar.gz
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-binaries
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.spdx.json
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -106,20 +165,37 @@ jobs:
   release:
     needs: [docker, binaries]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the GitHub Release and upload assets
     steps:
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-binaries
           path: dist
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/*.spdx.json
           body: |
             Container image (linux/amd64, linux/arm64):
             `ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
+
+            ## Supply chain
+
+            The image is **cosign-signed** (keyless) and carries SLSA
+            provenance + SBOM attestations. Verify:
+
+            ```
+            cosign verify ghcr.io/${{ github.repository }}:${{ github.ref_name }} \
+              --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            ```
+
+            Binary tarballs ship with `.sha256` checksums and an SPDX SBOM
+            (`*.spdx.json`), plus a GitHub build-provenance attestation.

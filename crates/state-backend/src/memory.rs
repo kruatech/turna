@@ -180,7 +180,7 @@ mod tests {
             allocation_id: format!("alloc-id-{port}"),
             migration_epoch: 0,
             created_at_ms: now_ms(),
-            expires_at_ms: now_ms() + 86400_000,
+            expires_at_ms: now_ms() + 86_400_000,
             bytes_in: 0,
             bytes_out: 0,
             packets_in: 0,

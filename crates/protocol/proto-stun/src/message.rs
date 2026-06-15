@@ -295,8 +295,7 @@ impl StunMessage {
 
         let hmac = integrity::compute_message_integrity_sha256(&buf[..len], key);
 
-        buf[len..len + 2]
-            .copy_from_slice(&attribute::ATTR_MESSAGE_INTEGRITY_SHA256.to_be_bytes());
+        buf[len..len + 2].copy_from_slice(&attribute::ATTR_MESSAGE_INTEGRITY_SHA256.to_be_bytes());
         buf[len + 2..len + 4].copy_from_slice(&32u16.to_be_bytes());
         buf[len + 4..len + 36].copy_from_slice(&hmac);
         len += 36;
@@ -670,7 +669,10 @@ mod tests {
         // There is no SHA-1 MESSAGE-INTEGRITY here, so the SHA-1 verifier fails.
         assert!(!decoded.verify_integrity(&buf[..len], key));
         // The SHA-256 tag is exposed via the type code.
-        assert_eq!(decoded.get_message_integrity_sha256().map(|t| t.len()), Some(32));
+        assert_eq!(
+            decoded.get_message_integrity_sha256().map(|t| t.len()),
+            Some(32)
+        );
 
         let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         assert_eq!(declared, len - 20);

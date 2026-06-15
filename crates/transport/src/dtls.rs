@@ -71,9 +71,7 @@ pub struct DtlsOutbound {
 /// consumer pushes `DtlsOutbound`s here and the session task encrypts + sends.
 #[cfg(feature = "dtls")]
 pub type OutboundRegistry = std::sync::Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::mpsc::Sender<DtlsOutbound>>,
-    >,
+    std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<DtlsOutbound>>>,
 >;
 
 /// Process-wide counters for the DTLS transport. Cheap atomics, snapshotted by
@@ -159,10 +157,7 @@ impl DtlsServer {
         _event_tx: tokio::sync::mpsc::Sender<DtlsEvent>,
         _outbound: std::sync::Arc<
             std::sync::Mutex<
-                std::collections::HashMap<
-                    String,
-                    tokio::sync::mpsc::Sender<DtlsOutbound>,
-                >,
+                std::collections::HashMap<String, tokio::sync::mpsc::Sender<DtlsOutbound>>,
             >,
         >,
         _shutdown: tokio::sync::watch::Receiver<bool>,
@@ -221,8 +216,9 @@ impl DtlsServer {
         let mtu = self.config.mtu;
         let max_sessions = self.config.max_sessions;
         let max_per_ip = self.config.max_sessions_per_ip;
-        let per_ip: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let per_ip: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         loop {
             // DTL-4: stop accepting new handshakes on shutdown. accept() is
             // cancel-safe (dropped if shutdown wins); the listener is released

@@ -120,10 +120,14 @@ impl TokioTransport {
                 }
                 let r = r as usize;
                 for k in 0..r {
-                    let sa =
-                        // SAFETY: addrs[k] was filled by recvmmsg with namelen bytes,
-                        // a valid initialized sockaddr.
-                        unsafe { socket2::SockAddr::new(addrs[k], hdrs[k].msg_hdr.msg_namelen) };
+                    // SAFETY: addrs[k] was filled by recvmmsg with msg_namelen bytes,
+                    // a valid initialized sockaddr; copied into a socket2 0.6
+                    // storage view (SockAddrStorage) before constructing SockAddr.
+                    let sa = unsafe {
+                        let mut storage = socket2::SockAddrStorage::zeroed();
+                        *storage.view_as::<libc::sockaddr_storage>() = addrs[k];
+                        socket2::SockAddr::new(storage, hdrs[k].msg_hdr.msg_namelen)
+                    };
                     let src = sa.as_socket().ok_or_else(|| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "non-IP source addr")
                     })?;

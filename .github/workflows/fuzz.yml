@@ -48,7 +48,7 @@ jobs:
           || github.event_name == 'push' && '30'
           || github.event.inputs.max_total_time || '600' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install nightly + cargo-fuzz
         run: |
@@ -72,7 +72,7 @@ jobs:
       # Cache the corpus so nightly runs accumulate interesting inputs across
       # days. Keyed by week so it doesn't grow without bound forever.
       - name: Cache corpus
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
@@ -101,7 +101,7 @@ jobs:
 
       - name: Upload crashes
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ github.run_id }}
           path: fuzz/artifacts/
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload corpus
         if: always() && github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-corpus-${{ github.run_id }}
           path: fuzz/corpus/

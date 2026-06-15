@@ -91,18 +91,18 @@ pub(crate) mod prog {
         // shifted by it. (Verified empirically against the live kernel.)
         const UDP_HDR: u32 = 8;
         vec![
-            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),                  // 0
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 9, UDP_HDR + 4),                 // 1  A>=4 ? : DROP
-            insn(BPF_JMP | BPF_JGT | BPF_K, 8, 0, max_size + UDP_HDR),          // 2  A>max ? DROP :
-            insn(BPF_LD | BPF_H | BPF_ABS, 0, 0, UDP_HDR),                  // 3  A=u16[0]
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 1, CHANNEL_MIN),       // 4 A>=0x4000 ? : STUN
-            insn(BPF_JMP | BPF_JGT | BPF_K, 0, 4, CHANNEL_MAX),       // 5 A>0x7FFE ? STUN : ACCEPT
-            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),                  // 6  A=len
-            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 3, UDP_HDR + 20),                // 7  A>=20 ? : DROP
-            insn(BPF_LD | BPF_W | BPF_ABS, 0, 0, UDP_HDR + 4),                  // 8  A=u32[4]
+            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),            // 0
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 9, UDP_HDR + 4), // 1  A>=4 ? : DROP
+            insn(BPF_JMP | BPF_JGT | BPF_K, 8, 0, max_size + UDP_HDR), // 2  A>max ? DROP :
+            insn(BPF_LD | BPF_H | BPF_ABS, 0, 0, UDP_HDR),      // 3  A=u16[0]
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 1, CHANNEL_MIN), // 4 A>=0x4000 ? : STUN
+            insn(BPF_JMP | BPF_JGT | BPF_K, 0, 4, CHANNEL_MAX), // 5 A>0x7FFE ? STUN : ACCEPT
+            insn(BPF_LD | BPF_W | BPF_LEN, 0, 0, 0),            // 6  A=len
+            insn(BPF_JMP | BPF_JGE | BPF_K, 0, 3, UDP_HDR + 20), // 7  A>=20 ? : DROP
+            insn(BPF_LD | BPF_W | BPF_ABS, 0, 0, UDP_HDR + 4),  // 8  A=u32[4]
             insn(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, STUN_MAGIC_COOKIE), // 9 ==MAGIC ? ACCEPT : DROP
-            insn(BPF_RET | BPF_K, 0, 0, ACCEPT),                      // 10
-            insn(BPF_RET | BPF_K, 0, 0, DROP),                        // 11
+            insn(BPF_RET | BPF_K, 0, 0, ACCEPT),                // 10
+            insn(BPF_RET | BPF_K, 0, 0, DROP),                  // 11
         ]
     }
 

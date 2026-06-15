@@ -320,7 +320,7 @@ mod tests {
 
         mgr.register("a1", "alice", cred);
         assert_eq!(
-            mgr.validate("a1", |k| k == &key),
+            mgr.validate("a1", |k| k == key),
             ValidateResult::Valid {
                 in_grace_period: false
             }
@@ -346,13 +346,13 @@ mod tests {
         mgr.rotate("a1", new);
 
         assert_eq!(
-            mgr.validate("a1", |k| k == &old_key),
+            mgr.validate("a1", |k| k == old_key),
             ValidateResult::Valid {
                 in_grace_period: false
             }
         );
         assert_eq!(
-            mgr.validate("a1", |k| k == &new_key),
+            mgr.validate("a1", |k| k == new_key),
             ValidateResult::Valid {
                 in_grace_period: false
             }

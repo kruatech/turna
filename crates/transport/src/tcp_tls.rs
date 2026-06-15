@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,9 +41,17 @@ pub enum TlsError {
     #[error("TLS config: {0}")]
     TlsConfig(#[from] rustls::Error),
     #[error("cert load {path}: {source}")]
-    CertLoad { path: PathBuf, #[source] source: io::Error },
+    CertLoad {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("key load {path}: {source}")]
-    KeyLoad { path: PathBuf, #[source] source: io::Error },
+    KeyLoad {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("no private key in {0}")]
     NoKey(PathBuf),
     #[error("frame too large: {size} (max {max})")]
@@ -196,9 +204,20 @@ impl std::fmt::Display for TcpConnectionId {
 
 #[derive(Debug)]
 pub enum TcpTransportEvent {
-    PacketReceived { conn_id: TcpConnectionId, peer_addr: SocketAddr, data: BytesMut },
-    ConnectionOpened { conn_id: TcpConnectionId, peer_addr: SocketAddr },
-    ConnectionClosed { conn_id: TcpConnectionId, peer_addr: SocketAddr, reason: String },
+    PacketReceived {
+        conn_id: TcpConnectionId,
+        peer_addr: SocketAddr,
+        data: BytesMut,
+    },
+    ConnectionOpened {
+        conn_id: TcpConnectionId,
+        peer_addr: SocketAddr,
+    },
+    ConnectionClosed {
+        conn_id: TcpConnectionId,
+        peer_addr: SocketAddr,
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -268,12 +287,20 @@ impl TlsTransportServer {
             let conns = conns.clone();
 
             tokio::spawn(async move {
-                let reason = match handle_conn(conn_id, stream, peer, tls, &cfg, etx.clone(), conn_rx).await {
-                    Ok(()) => "clean close".into(),
-                    Err(e) => format!("{e}"),
-                };
+                let reason =
+                    match handle_conn(conn_id, stream, peer, tls, &cfg, etx.clone(), conn_rx).await
+                    {
+                        Ok(()) => "clean close".into(),
+                        Err(e) => format!("{e}"),
+                    };
                 conns.write().await.remove(&conn_id);
-                let _ = etx.send(TcpTransportEvent::ConnectionClosed { conn_id, peer_addr: peer, reason }).await;
+                let _ = etx
+                    .send(TcpTransportEvent::ConnectionClosed {
+                        conn_id,
+                        peer_addr: peer,
+                        reason,
+                    })
+                    .await;
             });
         }
     }
@@ -294,7 +321,12 @@ async fn handle_conn(
         .map_err(|_| TlsError::HandshakeTimeout(cfg.handshake_timeout))?
         .map_err(|e| TlsError::Io(io::Error::other(e)))?;
 
-    let _ = etx.send(TcpTransportEvent::ConnectionOpened { conn_id: id, peer_addr: peer }).await;
+    let _ = etx
+        .send(TcpTransportEvent::ConnectionOpened {
+            conn_id: id,
+            peer_addr: peer,
+        })
+        .await;
 
     let (mut rd, mut wr) = tokio::io::split(tls_stream);
     let codec = TcpFrameCodec::new(cfg.max_frame_size);
@@ -360,30 +392,38 @@ fn build_tls_config(cfg: &TlsTransportConfig) -> Result<ServerConfig> {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let data = std::fs::read(path).map_err(|e| TlsError::CertLoad { path: path.into(), source: e })?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(data.as_slice()))
+    let data = std::fs::read(path).map_err(|e| TlsError::CertLoad {
+        path: path.into(),
+        source: e,
+    })?;
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(data.as_slice())
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| TlsError::CertLoad { path: path.into(), source: e })?;
+        .map_err(|e| TlsError::CertLoad {
+            path: path.into(),
+            source: io::Error::new(io::ErrorKind::InvalidData, e),
+        })?;
     if certs.is_empty() {
-        return Err(TlsError::CertLoad { path: path.into(), source: io::Error::new(io::ErrorKind::InvalidData, "empty") });
+        return Err(TlsError::CertLoad {
+            path: path.into(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "empty"),
+        });
     }
     Ok(certs)
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let data = std::fs::read(path).map_err(|e| TlsError::KeyLoad { path: path.into(), source: e })?;
-    let mut rdr = io::BufReader::new(data.as_slice());
-    loop {
-        match rustls_pemfile::read_one(&mut rdr) {
-            Ok(Some(rustls_pemfile::Item::Pkcs1Key(k))) => return Ok(PrivateKeyDer::Pkcs1(k)),
-            Ok(Some(rustls_pemfile::Item::Pkcs8Key(k))) => return Ok(PrivateKeyDer::Pkcs8(k)),
-            Ok(Some(rustls_pemfile::Item::Sec1Key(k))) => return Ok(PrivateKeyDer::Sec1(k)),
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(e) => return Err(TlsError::KeyLoad { path: path.into(), source: e }),
-        }
+    let data = std::fs::read(path).map_err(|e| TlsError::KeyLoad {
+        path: path.into(),
+        source: e,
+    })?;
+    match PrivateKeyDer::from_pem_slice(data.as_slice()) {
+        Ok(key) => Ok(key),
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => Err(TlsError::NoKey(path.into())),
+        Err(e) => Err(TlsError::KeyLoad {
+            path: path.into(),
+            source: io::Error::new(io::ErrorKind::InvalidData, e),
+        }),
     }
-    Err(TlsError::NoKey(path.into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +439,12 @@ pub struct CertReloader {
 
 impl CertReloader {
     pub fn new(cfg: &TlsTransportConfig, interval: Duration) -> Self {
-        Self { cert_path: cfg.cert_path.clone(), key_path: cfg.key_path.clone(), interval, enable_alpn: cfg.enable_alpn }
+        Self {
+            cert_path: cfg.cert_path.clone(),
+            key_path: cfg.key_path.clone(),
+            interval,
+            enable_alpn: cfg.enable_alpn,
+        }
     }
 
     pub async fn spawn(self) -> Result<tokio::sync::watch::Receiver<Arc<ServerConfig>>> {
@@ -414,7 +459,12 @@ impl CertReloader {
                 let new_key = mtime(&self.key_path);
                 if new_cert != cert_mt || new_key != key_mt {
                     match self.reload() {
-                        Ok(c) => { let _ = tx.send(Arc::new(c)); cert_mt = new_cert; key_mt = new_key; info!("TLS cert reloaded"); }
+                        Ok(c) => {
+                            let _ = tx.send(Arc::new(c));
+                            cert_mt = new_cert;
+                            key_mt = new_key;
+                            info!("TLS cert reloaded");
+                        }
                         Err(e) => error!(%e, "cert reload failed"),
                     }
                 }
@@ -535,9 +585,8 @@ mod tests {
     #[test]
     fn frame_too_large() {
         let codec = TcpFrameCodec::new(64); // max 64 bytes
-        // STUN claiming a 1000-byte body.
-        let mut buf =
-            BytesMut::from(&[0x00, 0x01, 0x03, 0xE8, 0x21, 0x12, 0xA4, 0x42][..]);
+                                            // STUN claiming a 1000-byte body.
+        let mut buf = BytesMut::from(&[0x00, 0x01, 0x03, 0xE8, 0x21, 0x12, 0xA4, 0x42][..]);
         assert!(matches!(
             codec.decode(&mut buf),
             Err(TlsError::FrameTooLarge { .. })

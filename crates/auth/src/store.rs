@@ -498,7 +498,8 @@ mod tests {
         // Process 1: a user logs in, the token is revoked and (in production)
         // persisted to the backend.
         let s1 = UserStore::new(cfg.clone());
-        s1.register("kate", "kate@a.com", "pass12345", None).unwrap();
+        s1.register("kate", "kate@a.com", "pass12345", None)
+            .unwrap();
         let (_, token) = s1.login("kate", "pass12345").unwrap();
         let claims = s1.verify_token(&token).unwrap();
         s1.revoke_token(&token).unwrap();
@@ -556,7 +557,10 @@ mod tests {
     #[test]
     fn validate_jwt_secret_rejects_weak_and_accepts_strong() {
         assert!(validate_jwt_secret(b"").is_err(), "empty must be rejected");
-        assert!(validate_jwt_secret(b"short").is_err(), "too short must be rejected");
+        assert!(
+            validate_jwt_secret(b"short").is_err(),
+            "too short must be rejected"
+        );
         assert!(
             validate_jwt_secret(PLACEHOLDER_JWT_SECRET).is_err(),
             "placeholder must be rejected"
@@ -572,7 +576,10 @@ mod tests {
         // One test owns the env var so set/remove can't race other tests.
         std::env::remove_var("TURNA_JWT_SECRET");
         assert!(
-            matches!(UserStoreConfig::try_from_env(), Err(UserAuthError::Config(_))),
+            matches!(
+                UserStoreConfig::try_from_env(),
+                Err(UserAuthError::Config(_))
+            ),
             "missing secret must be a hard error"
         );
 

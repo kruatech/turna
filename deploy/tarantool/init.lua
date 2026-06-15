@@ -190,11 +190,11 @@ end
 
 -- body must be the FULL function text: function(...) ... end
 -- Tarantool prepends "return" to get the function object at load time.
--- is_sandboxed = false gives access to box.* at call time.
+-- is_sandboxed = false, setuid = true gives access to box.* at call time.
 
 box.schema.func.create("turna_init_schema", {
     language = "LUA",
-    is_sandboxed = false,
+    is_sandboxed = false, setuid = true,
     body = [[function()
         box.schema.space.create("turna_allocations", { if_not_exists = true })
         box.space.turna_allocations:format({
@@ -230,7 +230,7 @@ box.schema.func.create("turna_init_schema", {
 })
 
 box.schema.func.create("turna_store_allocation", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(port, user_id, node_id, expires_at_ms, data)
         box.space.turna_allocations:replace({
             tonumber(port), user_id, node_id, tonumber(expires_at_ms), data
@@ -239,7 +239,7 @@ box.schema.func.create("turna_store_allocation", {
 })
 
 box.schema.func.create("turna_get_allocation", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(port)
         local t = box.space.turna_allocations:get(tonumber(port))
         if t then return t[5] end
@@ -247,14 +247,14 @@ box.schema.func.create("turna_get_allocation", {
 })
 
 box.schema.func.create("turna_remove_allocation", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(port)
         box.space.turna_allocations:delete(tonumber(port))
     end]],
 })
 
 box.schema.func.create("turna_update_bandwidth", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(port, bytes_in, bytes_out, packets_in, packets_out)
         local p = tonumber(port)
         local t = box.space.turna_allocations:get(p)
@@ -270,7 +270,7 @@ box.schema.func.create("turna_update_bandwidth", {
 })
 
 box.schema.func.create("turna_find_by_user", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(user_id)
         local res = {}
         for _,t in box.space.turna_allocations.index.by_user:pairs({user_id}) do
@@ -281,7 +281,7 @@ box.schema.func.create("turna_find_by_user", {
 })
 
 box.schema.func.create("turna_find_by_node", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(node_id)
         local res = {}
         for _,t in box.space.turna_allocations.index.by_node:pairs({node_id}) do
@@ -292,7 +292,7 @@ box.schema.func.create("turna_find_by_node", {
 })
 
 box.schema.func.create("turna_find_expired", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(before_ms)
         local cutoff = tonumber(before_ms)
         local res = {}
@@ -305,12 +305,12 @@ box.schema.func.create("turna_find_expired", {
 })
 
 box.schema.func.create("turna_count_allocations", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function() return box.space.turna_allocations:len() end]],
 })
 
 box.schema.func.create("turna_list_allocations", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(offset, limit)
         local off = tonumber(offset)
         local lim = tonumber(limit)
@@ -326,14 +326,14 @@ box.schema.func.create("turna_list_allocations", {
 })
 
 box.schema.func.create("turna_store_heartbeat", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(node_id, data)
         box.space.turna_nodes:replace({node_id, data})
     end]],
 })
 
 box.schema.func.create("turna_get_live_nodes", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(cutoff_ms)
         local cutoff = tonumber(cutoff_ms)
         local res = {}
@@ -346,14 +346,14 @@ box.schema.func.create("turna_get_live_nodes", {
 })
 
 box.schema.func.create("turna_store_room", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(room_id, data)
         box.space.turna_rooms:replace({room_id, data})
     end]],
 })
 
 box.schema.func.create("turna_get_room", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(room_id)
         local t = box.space.turna_rooms:get(room_id)
         if t then return t[2] end
@@ -361,20 +361,20 @@ box.schema.func.create("turna_get_room", {
 })
 
 box.schema.func.create("turna_remove_room", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(room_id)
         box.space.turna_rooms:delete(room_id)
     end]],
 })
 
 box.schema.func.create("turna_ping", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function() return 'pong' end]],
 })
 
 
 box.schema.func.create("turna_revoke_token", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(jti, sub, revoked_at_ms, expires_at_ms)
         box.space.turna_token_blacklist:replace({
             jti, sub, tonumber(revoked_at_ms), tonumber(expires_at_ms)
@@ -383,14 +383,14 @@ box.schema.func.create("turna_revoke_token", {
 })
 
 box.schema.func.create("turna_is_token_revoked", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(jti)
         return box.space.turna_token_blacklist:get(jti) ~= nil
     end]],
 })
 
 box.schema.func.create("turna_cleanup_revoked_tokens", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(before_ms)
         local cutoff = tonumber(before_ms)
         local deleted = 0
@@ -404,7 +404,7 @@ box.schema.func.create("turna_cleanup_revoked_tokens", {
 })
 
 box.schema.func.create("turna_load_active_revocations", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(after_ms)
         local cutoff = tonumber(after_ms)
         local res = {}
@@ -416,7 +416,7 @@ box.schema.func.create("turna_load_active_revocations", {
 })
 
 box.schema.func.create("turna_claim_allocation", {
-    language = "LUA", is_sandboxed = false,
+    language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(port, expected_node_id, new_node_id)
         local p = tonumber(port)
         local t = box.space.turna_allocations:get(p)

@@ -173,7 +173,13 @@ impl MsgHdrStorage {
     pub fn source_addr(&self) -> Option<SocketAddr> {
         // SAFETY: `self.addr`/`self.addr_len` were filled by a completed recvmsg,
         // so they describe a valid initialized sockaddr.
-        let sa = unsafe { SockAddr::new(self.addr, self.addr_len) };
+        // SAFETY: self.addr was filled by the kernel with self.addr_len bytes
+        // (a valid initialized sockaddr); copied into a socket2 0.6 storage view.
+        let sa = unsafe {
+            let mut storage = socket2::SockAddrStorage::zeroed();
+            *storage.view_as::<libc::sockaddr_storage>() = self.addr;
+            SockAddr::new(storage, self.addr_len)
+        };
         sa.as_socket()
     }
 }
@@ -297,7 +303,9 @@ impl RingStatsAggregate {
     /// Publish one worker's latest snapshot into its slot (`idx == worker_id`).
     pub fn publish(&self, idx: usize, rs: &RingStats, buffers_available: u32) {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(w) = self.workers.get(idx) else { return };
+        let Some(w) = self.workers.get(idx) else {
+            return;
+        };
         w.cqe_drained.store(rs.cqe_drained, Relaxed);
         w.cqe_batches.store(rs.cqe_batches, Relaxed);
         w.cqe_max_batch.store(rs.cqe_max_batch as u64, Relaxed);

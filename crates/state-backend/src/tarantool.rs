@@ -1441,7 +1441,10 @@ mod tests {
         let orphans = backend.find_by_node("dead").await.unwrap();
         assert!(orphans.iter().any(|a| a.relay_port == port));
         // …and claims each for itself.
-        assert!(backend.claim_allocation(port, "dead", "live").await.unwrap());
+        assert!(backend
+            .claim_allocation(port, "dead", "live")
+            .await
+            .unwrap());
         assert_eq!(
             backend.get_allocation(port).await.unwrap().unwrap().node_id,
             "live"

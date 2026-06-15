@@ -259,7 +259,9 @@ where
     futures::stream::unfold((Box::pin(inner), guard), |(mut s, g)| async move {
         // Use fully-qualified syntax to avoid ambiguity between
         // tokio_stream::StreamExt and futures::StreamExt.
-        futures::StreamExt::next(&mut s).await.map(|item| (item, (s, g)))
+        futures::StreamExt::next(&mut s)
+            .await
+            .map(|item| (item, (s, g)))
     })
 }
 
@@ -442,9 +444,10 @@ impl TurnaManagement for TurnaManagementService {
                         return None;
                     }
                     if !org_filter.is_empty()
-                        && ev.allocation.organization.as_deref() != Some(&org_filter) {
-                            return None;
-                        }
+                        && ev.allocation.organization.as_deref() != Some(&org_filter)
+                    {
+                        return None;
+                    }
                     Some(Ok(AllocationEvent_ {
                         event_type: event_type_to_proto(ev.event_type),
                         allocation: Some(alloc_to_proto(ev.allocation)),

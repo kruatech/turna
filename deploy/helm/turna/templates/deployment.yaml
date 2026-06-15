@@ -24,18 +24,23 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
-      {{- if .Values.sysctls.enabled }}
       securityContext:
+        {{- with .Values.podSecurityContext }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.sysctls.enabled }}
         sysctls:
         {{- range .Values.sysctls.values }}
         - name: {{ .name }}
           value: {{ .value | quote }}
         {{- end }}
-      {{- end }}
+        {{- end }}
       containers:
         - name: turn
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           args: ["/etc/turna/turn.toml"]
           ports:
             - name: stun-udp
@@ -55,17 +60,29 @@ spec:
               value: "info,turna=debug"
             - name: TURNA_WORKERS
               value: {{ .Values.turn.workers | quote }}
+            {{- if or .Values.turn.auth.existingSecret .Values.turn.auth.sharedSecret }}
+            - name: TURNA_SHARED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.turn.auth.existingSecret }}
+                  name: {{ .Values.turn.auth.existingSecret }}
+                  key: {{ .Values.turn.auth.existingSecretKey }}
+                  {{- else }}
+                  name: {{ .Release.Name }}-turn-auth
+                  key: shared-secret
+                  {{- end }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources.turn | nindent 12 }}
           livenessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.probes.livenessPath }}
               port: health
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.probes.readinessPath }}
               port: health
             initialDelaySeconds: 3
             periodSeconds: 5
@@ -74,10 +91,18 @@ spec:
               mountPath: /etc/turna/turn.toml
               subPath: turn.toml
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run/turna
       volumes:
         - name: config
           configMap:
             name: {{ .Release.Name }}-config
+        - name: tmp
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -88,6 +113,10 @@ spec:
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}

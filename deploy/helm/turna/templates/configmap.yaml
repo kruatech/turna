@@ -16,7 +16,9 @@ data:
     transport = {{ .Values.turn.transport | quote }}
 
     [turn.auth]
-    shared_secret = {{ .Values.turn.auth.sharedSecret | quote }}
+    # Injected at runtime from a Secret (env TURNA_SHARED_SECRET); never stored
+    # in this ConfigMap. See deploy/helm/turna/values.yaml (turn.auth).
+    shared_secret = "${TURNA_SHARED_SECRET:-}"
     token_ttl = 86400
     {{- range .Values.turn.auth.staticUsers }}
 
@@ -50,7 +52,7 @@ data:
     # is still present because the shared root config validates it.
     listen = "127.0.0.1:9001"
     turn_url = {{ .Values.turn.turnUrl | quote }}
-    turn_shared_secret = {{ .Values.turn.auth.sharedSecret | quote }}
+    turn_shared_secret = "${TURNA_SHARED_SECRET:-}"
 
     {{- if .Values.cluster.enabled }}
     [cluster]

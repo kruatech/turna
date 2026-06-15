@@ -94,7 +94,14 @@ impl RelayHandler {
             // freeing the port for the worker to rebind. CloseRelay has no
             // worker equivalent yet — the worker path keeps its prior
             // (non-transactional) relay lifecycle.
-            Action::RegisterRelay { port, allocation_id, .. } => ForwardAction::CreateRelay { port, allocation_id },
+            Action::RegisterRelay {
+                port,
+                allocation_id,
+                ..
+            } => ForwardAction::CreateRelay {
+                port,
+                allocation_id,
+            },
 
             Action::CloseRelay { port } => ForwardAction::CloseRelay { port },
 

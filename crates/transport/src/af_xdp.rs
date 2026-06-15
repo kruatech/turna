@@ -295,13 +295,7 @@ impl AfXdpSocket {
         // Create AF_XDP socket
         // SAFETY: libc::socket takes scalar args only; the returned fd is
         // checked (< 0) before use.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_XDP,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(AfXdpError::Socket(std::io::Error::last_os_error()));
         }
@@ -443,8 +437,7 @@ impl AfXdpSocket {
         // EAGAIN/ENOBUFS are expected
         if ret < 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EAGAIN)
-                && err.raw_os_error() != Some(libc::ENOBUFS)
+            if err.raw_os_error() != Some(libc::EAGAIN) && err.raw_os_error() != Some(libc::ENOBUFS)
             {
                 return Err(AfXdpError::Io(err));
             }
@@ -931,7 +924,10 @@ pub mod frame {
             let p = parse_eth_ipv4_udp(&f).expect("must parse");
             assert_eq!(p.src, src);
             assert_eq!(p.dst, dst);
-            assert_eq!(&f[p.payload_offset..p.payload_offset + p.payload_len], payload);
+            assert_eq!(
+                &f[p.payload_offset..p.payload_offset + p.payload_len],
+                payload
+            );
         }
 
         #[test]
@@ -947,15 +943,23 @@ pub mod frame {
             let udp = &f[ETH_HDR_LEN + 20..];
             // Verify by recomputing over the as-sent UDP (checksum field intact):
             // the verifier sum (pseudo-header + udp incl. checksum) must be 0.
-            assert_eq!(udp_checksum_v4(src.ip(), dst.ip(), udp), 0, "UDP checksum invalid");
+            assert_eq!(
+                udp_checksum_v4(src.ip(), dst.ip(), udp),
+                0,
+                "UDP checksum invalid"
+            );
         }
 
         #[test]
         fn rejects_non_udp_and_truncated() {
             assert!(parse_eth_ipv4_udp(&[0u8; 10]).is_none()); // too short
-            let mut f = build_eth_ipv4_udp([0; 6], [0; 6],
+            let mut f = build_eth_ipv4_udp(
+                [0; 6],
+                [0; 6],
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1),
-                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2), b"x");
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2),
+                b"x",
+            );
             f[ETH_HDR_LEN + 9] = 6; // protocol TCP, not UDP
             assert!(parse_eth_ipv4_udp(&f).is_none());
         }
@@ -969,7 +973,10 @@ pub mod frame {
             let p = parse_eth_ipv6_udp(&f).expect("must parse");
             assert_eq!(p.src, src);
             assert_eq!(p.dst, dst);
-            assert_eq!(&f[p.payload_offset..p.payload_offset + p.payload_len], payload);
+            assert_eq!(
+                &f[p.payload_offset..p.payload_offset + p.payload_len],
+                payload
+            );
         }
 
         #[test]
@@ -978,7 +985,11 @@ pub mod frame {
             let dst = SocketAddrV6::new("fe80::2".parse().unwrap(), 5678, 0, 0);
             let f = build_eth_ipv6_udp([0; 6], [0; 6], src, dst, b"abc");
             let udp = &f[ETH_HDR_LEN + 40..];
-            assert_eq!(udp_checksum_v6(src.ip(), dst.ip(), udp), 0, "v6 UDP checksum invalid");
+            assert_eq!(
+                udp_checksum_v6(src.ip(), dst.ip(), udp),
+                0,
+                "v6 UDP checksum invalid"
+            );
         }
 
         #[test]
@@ -1028,7 +1039,11 @@ pub mod frame {
             let na_icmp = &na[ETH_HDR_LEN + 40..];
             assert_eq!(na_icmp[0], 136);
             assert_eq!(na[ETH_HDR_LEN + 7], 255);
-            assert_eq!(icmpv6_checksum(&our, &peer, na_icmp), 0, "NA checksum invalid");
+            assert_eq!(
+                icmpv6_checksum(&our, &peer, na_icmp),
+                0,
+                "NA checksum invalid"
+            );
         }
 
         #[test]
@@ -1101,11 +1116,13 @@ pub mod xsk {
     use std::net::SocketAddr;
     use std::num::NonZeroU32;
 
+    use std::os::fd::AsRawFd;
     use xsk_rs::{
-        config::{BindFlags, Interface, LibxdpFlags, SocketConfig, SocketConfigBuilder, UmemConfig},
+        config::{
+            BindFlags, Interface, LibxdpFlags, SocketConfig, SocketConfigBuilder, UmemConfig,
+        },
         CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem,
     };
-    use std::os::fd::AsRawFd;
 
     /// 1.1: load/attach the embedded selective XDP program and manage its maps
     /// (`xsks_map`, `ports`). All libxdp/libbpf FFI is isolated here; the handle
@@ -1146,7 +1163,11 @@ pub mod xsk {
                 listen_port: u16,
                 native: bool,
             ) -> Result<Self> {
-                let mode = if native { XDP_MODE_NATIVE } else { XDP_MODE_SKB };
+                let mode = if native {
+                    XDP_MODE_NATIVE
+                } else {
+                    XDP_MODE_SKB
+                };
                 // SAFETY: FFI into libxdp/libbpf. Every returned pointer is
                 // null-checked; on any failure we unwind the partial state
                 // (detach/close) before returning. The owned handles live in
@@ -1232,7 +1253,9 @@ pub mod xsk {
                 // Deletes can legitimately fail with -ENOENT (already gone); only
                 // surface add failures.
                 if add && rc != 0 {
-                    return Err(AfXdpError::Xdp(format!("ports map update failed (rc={rc})")));
+                    return Err(AfXdpError::Xdp(format!(
+                        "ports map update failed (rc={rc})"
+                    )));
                 }
                 Ok(())
             }
@@ -1353,7 +1376,10 @@ pub mod xsk {
                 m
             }
             None => {
-                tracing::warn!(iface, "AF_XDP: could not read source MAC; using zero placeholder");
+                tracing::warn!(
+                    iface,
+                    "AF_XDP: could not read source MAC; using zero placeholder"
+                );
                 configured
             }
         }
@@ -1431,18 +1457,17 @@ pub mod xsk {
                 .bind_flags(bind_flags);
             let socket_config: SocketConfig = scb.build();
 
-            let iface = Interface::new(
-                std::ffi::CString::new(cfg.interface.clone()).map_err(|e| {
+            let iface =
+                Interface::new(std::ffi::CString::new(cfg.interface.clone()).map_err(|e| {
                     AfXdpError::Socket(std::io::Error::other(format!("interface name: {e}")))
-                })?,
-            );
+                })?);
             // The first socket on a UMEM owns the (fill, comp) pair.
             // SAFETY: `umem`/`iface` outlive the socket and `queue_id` is valid
             // for the device, satisfying xsk-rs Socket::new requirements.
-            let (tx, rx, fill_comp) = unsafe { Socket::new(socket_config, &umem, &iface, cfg.queue_id) }
-                .map_err(|e| {
-                    AfXdpError::Socket(std::io::Error::other(format!("xsk socket: {e}")))
-                })?;
+            let (tx, rx, fill_comp) =
+                unsafe { Socket::new(socket_config, &umem, &iface, cfg.queue_id) }.map_err(
+                    |e| AfXdpError::Socket(std::io::Error::other(format!("xsk socket: {e}"))),
+                )?;
             let (mut fill, comp) = fill_comp
                 .ok_or_else(|| AfXdpError::Umem("no fill/comp queue for first socket".into()))?;
 
@@ -1467,9 +1492,8 @@ pub mod xsk {
             // 1.1: attach the selective XDP program and wire its xskmap to this
             // socket's queue. Must follow socket creation (we need the xsk fd).
             let xsk_fd = rx.fd().as_raw_fd();
-            let ifname = std::ffi::CString::new(cfg.interface.clone()).map_err(|e| {
-                AfXdpError::Xdp(format!("interface name: {e}"))
-            })?;
+            let ifname = std::ffi::CString::new(cfg.interface.clone())
+                .map_err(|e| AfXdpError::Xdp(format!("interface name: {e}")))?;
             // SAFETY: `ifname` is a valid NUL-terminated C string for the call.
             let ifindex = unsafe { libc::if_nametoindex(ifname.as_ptr()) };
             if ifindex == 0 {
@@ -1631,8 +1655,7 @@ pub mod xsk {
                     });
                 } else if let Some(p6) = frame::parse_eth_ipv6_udp(bytes) {
                     out.push(ReceivedFrame {
-                        data: bytes[p6.payload_offset..p6.payload_offset + p6.payload_len]
-                            .to_vec(),
+                        data: bytes[p6.payload_offset..p6.payload_offset + p6.payload_len].to_vec(),
                         source: SocketAddr::V6(p6.src),
                         dst: SocketAddr::V6(p6.dst),
                         frame_addr: desc.addr() as u64,

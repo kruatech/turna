@@ -4,7 +4,7 @@ production: false
 
 image:
   repository: turna
-  tag: "0.1.0"
+  tag: "0.2.0-alpha.1"
   pullPolicy: IfNotPresent
 
 turn:
@@ -23,7 +23,22 @@ turn:
     maxBytesPerSec: 0
     maxPerUser: 100
   auth:
-    sharedSecret: "change-me-in-production"
+    # TURN long-term/shared secret. It is NEVER written into the ConfigMap; the
+    # config references it as ${TURNA_SHARED_SECRET} and it is injected as an
+    # env var from a Secret.
+    #
+    # Resolution order:
+    #   1. existingSecret set -> read existingSecretKey from that Secret.
+    #   2. else sharedSecret non-empty -> a chart-managed Secret is created.
+    #   3. else (both empty) -> no secret injected (dev only; shared-secret auth
+    #      effectively disabled). production=true rejects an empty/placeholder
+    #      secret at startup.
+    #
+    #   For production prefer existingSecret; the chart-managed sharedSecret
+    #   path is intended for dev/demo only.
+    sharedSecret: ""
+    existingSecret: ""
+    existingSecretKey: "shared-secret"
     staticUsers: []
     # - username: alice
     #   password: secret
@@ -37,6 +52,39 @@ resources:
     limits:
       cpu: "4"
       memory: "2Gi"
+
+# Liveness/readiness HTTP probe paths on turn.healthPort.
+# readinessPath MUST be an endpoint that only reports ready once the server can
+# actually serve TURN traffic (state backend / control plane up). The health
+# crate exposes /health (liveness) and /ready (readiness).
+probes:
+  livenessPath: /health
+  readinessPath: /ready
+
+# Pod-level security context. Defaults assume the image runs as the pinned
+# non-root uid/gid 65532 (see deploy/Dockerfile). If you build the image with a
+# different user, override runAsUser/runAsGroup/fsGroup to match, or set
+# runAsNonRoot: false.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context. readOnlyRootFilesystem is satisfied via
+# writable emptyDir mounts for /tmp and /var/run/turna.
+# NOTE: the AF_XDP / BPF datapath needs extra capabilities (e.g. NET_RAW,
+# NET_ADMIN, BPF, SYS_ADMIN) and likely privileged/hostNetwork. Enable them by
+# overriding this block ONLY when running that datapath; the default below is
+# correct for the tokio/io_uring UDP path.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
 
 service:
   type: LoadBalancer
@@ -61,10 +109,13 @@ metrics:
     enabled: false
     interval: 15s
 
-# Pod disruption budget
+# Pod disruption budget. Disabled by default: with replicaCount=1 a PDB of
+# minAvailable=1 blocks voluntary evictions (node drains) of the only pod.
+# Enable it together with replicas > 1 (see values-production.example.yaml).
 podDisruptionBudget:
-  enabled: true
+  enabled: false
   minAvailable: 1
+  # maxUnavailable: 1   # alternative to minAvailable; set only one
 
 # Sysctls for network performance. Some managed clusters disallow net.core
 # sysctls; disable this block if the pod is rejected by admission control.
@@ -75,6 +126,31 @@ sysctls:
       value: "8388608"
     - name: net.core.wmem_max
       value: "8388608"
+
+# Optional NetworkPolicy. TURN is a relay: it must egress UDP/TCP to arbitrary
+# peer addresses, so egress is intentionally broad (DNS explicit + all UDP/TCP).
+# Ingress is what gets locked down: TURN/STUN and the relay UDP range stay
+# public, health/metrics are restricted to the sources listed in metricsFrom.
+# Requires Kubernetes >= 1.25 for the relay-range endPort.
+networkPolicy:
+  enabled: false
+  # NetworkPolicyPeers allowed to reach the health/metrics port (turn.healthPort).
+  # Default: any in-cluster namespace. Tighten to your monitoring namespace.
+  metricsFrom:
+    - namespaceSelector: {}
+  # Extra egress rules appended to the built-in DNS + relay egress.
+  extraEgress: []
+
+# Spread pods across nodes/zones. A list of TopologySpreadConstraint; empty by
+# default. Recommended with replicas > 1 / cluster mode. Example:
+# topologySpreadConstraints:
+#   - maxSkew: 1
+#     topologyKey: topology.kubernetes.io/zone
+#     whenUnsatisfiable: ScheduleAnyway
+#     labelSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: turna
+topologySpreadConstraints: []
 
 # Multi-node cluster (gossip discovery + TURN-redirect load balancing).
 # When enabled, the TURN workload is deployed as a StatefulSet (stable per-pod

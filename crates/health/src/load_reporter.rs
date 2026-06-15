@@ -288,13 +288,13 @@ mod tests {
     #[test]
     fn load_mixed() {
         let pct = NodeLoad::compute_load_percent(50.0, 0.0, 0.5, 20.0);
-        assert!(pct >= 35 && pct <= 36);
+        assert!((35..=36).contains(&pct));
     }
 
     #[test]
     fn cpu_no_panic() {
         let cpu = read_cpu_usage();
-        assert!(cpu >= 0.0 && cpu <= 1.0);
+        assert!((0.0..=1.0).contains(&cpu));
     }
 
     #[test]

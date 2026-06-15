@@ -140,9 +140,7 @@ pub(crate) async fn run_tls_bridge(
                             // Allocate: the relay socket was bound during process();
                             // hand it to the UDP server, which adopts it and spawns
                             // the peer→client relay-recv task (TLS-aware via sinks).
-                            let _ = relay_tx
-                                .send(OutMsg::RegisterRelay { port, socket })
-                                .await;
+                            let _ = relay_tx.send(OutMsg::RegisterRelay { port, socket }).await;
                         }
                         Action::CloseRelay { port } => {
                             let _ = relay_tx.send(OutMsg::CloseRelay { port }).await;

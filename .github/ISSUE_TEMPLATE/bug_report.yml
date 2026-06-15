@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a problem with turna
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please do **not** report security
+        vulnerabilities here — see [SECURITY.md](../blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `turna-node --version`, or the git tag/commit you built.
+      placeholder: "v0.2.0-alpha.1 / commit e738804"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it?
+      options:
+        - Binary (cargo / release artifact)
+        - Docker
+        - Kubernetes (Helm)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: datapath
+    attributes:
+      label: Datapath
+      options:
+        - tokio (default)
+        - io_uring
+        - af_xdp
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps. Include client/tooling if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Minimal config
+      description: Relevant parts of turn.toml. REDACT secrets.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output (RUST_LOG=debug if possible). REDACT secrets.
+      render: shell
+  - type: input
+    id: environment
+    attributes:
+      label: OS / kernel / arch
+      placeholder: "Ubuntu 24.04, kernel 6.8, x86_64"

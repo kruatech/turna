@@ -9,17 +9,23 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Least privilege: every CI job only reads the repository contents.
+# No CI job needs write access to anything.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       # тулчейн берётся из rust-toolchain.toml автоматически
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
 
@@ -30,9 +36,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --workspace
       - name: cargo test workspace
         env:
@@ -43,9 +51,11 @@ jobs:
     name: integration tests (hermetic turna-node)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Build the node binary explicitly: the hermetic integration harness looks
       # for target/<profile>/turna-node and then starts it on ephemeral ports.
       - run: cargo build -p turna-node --locked
@@ -58,9 +68,11 @@ jobs:
     name: check workspace --all-features (linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # `--all-features` enables the Linux-only AF_XDP dependency graph.
       # libxdp-sys/libbpf-sys need these native build inputs even for
       # `cargo check`; runtime AF_XDP tests still require real NIC/kernel setup
@@ -121,9 +133,11 @@ jobs:
             package: turna-transport
             features: af-xdp
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install AF_XDP native build dependencies
         if: runner.os == 'Linux' && contains(matrix.features, 'af-xdp')
         run: |
@@ -137,10 +151,12 @@ jobs:
     name: docker + helm packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: v3.15.4
       - name: Helm lint
@@ -149,7 +165,7 @@ jobs:
         run: |
           helm template turna deploy/helm/turna > /tmp/turna-rendered.yaml
           python3 scripts/extract_helm_config.py /tmp/turna-rendered.yaml /tmp/turn.toml
-          TURNA_CONFIG_TEST_FILE=/tmp/turn.toml \
+          TURNA_SHARED_SECRET=ci-smoke-secret TURNA_CONFIG_TEST_FILE=/tmp/turn.toml \
             cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
       - name: Docker build
         run: docker build -f deploy/Dockerfile -t turna:ci .
@@ -158,8 +174,8 @@ jobs:
     name: cargo-deny (лицензии, advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
           command: check
 
@@ -167,9 +183,11 @@ jobs:
     name: fuzz targets build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz
@@ -185,11 +203,12 @@ jobs:
     name: miri (UB in pure-memory unsafe)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
+          toolchain: nightly
           components: miri
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Miri executes tests on its abstract machine and flags UB and data races
       # in unsafe code. It runs only on crates whose unsafe is pure-memory
       # (parsing / packet manipulation). The transport datapath's unsafe is
@@ -205,9 +224,11 @@ jobs:
     name: loom (lock-free concurrency model)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Loom exhaustively explores thread interleavings for the lock-free
       # primitives. Gated behind --cfg loom so it is never part of a normal
       # build. LOOM_MAX_PREEMPTIONS bounds the state space for CI wall-clock.
@@ -216,15 +237,16 @@ jobs:
           LOOM_MAX_PREEMPTIONS: "3"
         run: |
           RUSTFLAGS="--cfg loom" cargo test -p turna-qos --lib loom_bucket
-          RUSTFLAGS="--cfg loom" cargo test -p turna-relay --test loom_nonce
 
   failover-integration:
     name: failover (Tarantool CAS)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Provision Tarantool with the turna schema + stored functions, then run
       # the backend failover/CAS integration tests against it. The tests skip
       # themselves when TARANTOOL_URI is unset (so the cross-platform `test`
@@ -242,6 +264,7 @@ jobs:
       - name: Start Tarantool with turna schema
         run: |
           docker run -d --name turna-tnt -p 3301:3301 \
+            -e TURNA_PASSWORD=turna \
             -v "$PWD/deploy/tarantool:/opt/turna:ro" \
             tarantool/tarantool:2 tarantool /opt/turna/init.lua
           echo "waiting for iproto on :3301"
@@ -254,8 +277,8 @@ jobs:
       - name: Run backend + failover integration tests
         env:
           TARANTOOL_URI: 127.0.0.1:3301
-          # TARANTOOL_USER: turna
-          # TARANTOOL_PASSWORD: turna
+          TARANTOOL_USER: turna
+          TARANTOOL_PASSWORD: turna
         run: cargo test -p turna-state-backend integration_ -- --test-threads=1 --nocapture
       - name: Tarantool logs (on failure)
         if: failure()

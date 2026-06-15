@@ -368,7 +368,10 @@ mod tests {
             h.observe(Duration::from_millis(1500));
         }
         let p99 = h.percentile(0.99);
-        assert!((1.0..=2.0).contains(&p99), "p99 must fall in the second bucket, got {p99}");
+        assert!(
+            (1.0..=2.0).contains(&p99),
+            "p99 must fall in the second bucket, got {p99}"
+        );
 
         // p50 (rank 10) sits exactly at the first boundary.
         let p50 = h.percentile(0.50);

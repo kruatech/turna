@@ -139,10 +139,7 @@ pub fn spawn_quic(
                                 .unwrap_or(false);
                             // Resolve the session writer at send time (robust to
                             // the registry entry landing just after NewSession).
-                            let sender = reg
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.get(&session_id).cloned());
+                            let sender = reg.lock().ok().and_then(|g| g.get(&session_id).cloned());
                             if let Some(tx) = sender {
                                 let _ = tx.send(QuicOutbound {
                                     session_id: session_id.clone(),

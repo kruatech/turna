@@ -1,12 +1,20 @@
 {
   "version": "1.0",
-  "generated": "2026-05-23",
+  "generated": "2026-06-15",
   "scope": "crates/{transport,relay}/src/",
   "summary": {
-    "total": 99,
+    "total": 104,
     "safety_justified": 76,
     "needs_review": 14,
-    "suspect_fixed": 9
+    "suspect_fixed": 9,
+    "note": "total is the reproducible line-based count from scripts/unsafe-inventory.sh over crates/{transport,relay}/src. safety_justified/needs_review/suspect_fixed are the original first-pass (2026-05-16) categorization, not a per-block re-categorization of the current 104; see summary.markers.",
+    "markers": {
+      "safety": 97,
+      "needs_review": 2,
+      "suspect_active": 0
+    },
+    "audited_in_doc": 104,
+    "unaudited": 0
   },
   "entries": [
     {
@@ -132,6 +140,38 @@
         "total_size stored at construction, passed unchanged to munmap"
       ],
       "review_status": "SAFETY_JUSTIFIED"
+    },
+    {
+      "id": "USF-010",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/tokio_transport.rs",
+      "lines": "recv_mmsg(): mem::zeroed sockaddr_storage/mmsghdr, libc::recvmmsg, socket2::SockAddr::new",
+      "category": "ffi",
+      "reason": "recvmmsg(2) FFI batch receive: zero-init C POD structs, raw syscall, SockAddr from kernel-filled storage",
+      "invariant": "fd open for socket lifetime (Arc<UdpSocket>); iovecs/addrs Vecs outlive the call and are not reallocated after setup; only entries [0, r) returned by recvmmsg are read; msg_namelen <= size_of::<sockaddr_storage>()",
+      "safety_assumptions": [
+        "sockaddr_storage and mmsghdr are C POD — all-zero bit pattern is valid",
+        "recvmmsg writes at most n entries and reports count r; loop reads only 0..r",
+        "msg_name/msg_iov pointers reference local Vecs that live across the syscall"
+      ],
+      "review_status": "SAFETY_JUSTIFIED",
+      "notes": "Linux-only (cfg target_os=linux). Inline // SAFETY: comments present and accurate. Standard recvmmsg pattern; no aliasing/OOB found."
+    },
+    {
+      "id": "USF-011",
+      "crate": "turna-transport",
+      "file": "crates/transport/src/tokio_transport.rs",
+      "lines": "send_mmsg(): mem::zeroed mmsghdr, libc::sendmmsg",
+      "category": "ffi",
+      "reason": "sendmmsg(2) FFI batch send: zero-init mmsghdr, raw syscall over caller-owned buffers",
+      "invariant": "fd open for socket lifetime; iovecs reference bytes::Bytes in `pkts` (borrowed for the whole fn) and a local addrs Vec, both outlive the call; sendmmsg only reads the buffers",
+      "safety_assumptions": [
+        "mmsghdr is C POD — all-zero valid",
+        "send buffers (bytes::Bytes) and SockAddr outlive the syscall; kernel does not write them",
+        "iov_base *const -> *mut cast is sound because sendmmsg treats it as read-only"
+      ],
+      "review_status": "SAFETY_JUSTIFIED",
+      "notes": "Linux-only. Inline // SAFETY: comments present and accurate. Standard sendmmsg pattern; buffers outlive call."
     }
   ],
   "categories": {
@@ -145,5 +185,6 @@
     "parser_layer": "No unsafe in proto-stun, proto-turn, proto-rtcp — pure safe Rust",
     "auth_layer": "No unsafe in turna-auth — Argon2, HMAC via safe crates",
     "crypto_layer": "No unsafe in turna-crypto — delegates to ring/hmac crates"
-  }
+  },
+  "unaudited_files": []
 }

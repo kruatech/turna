@@ -9,6 +9,7 @@ fn stun_pkt(n_attrs: usize) -> Vec<u8> {
     p[0] = 0x00;
     p[1] = 0x01;
     p[4..8].copy_from_slice(&MAGIC.to_be_bytes());
+    #[allow(clippy::needless_range_loop)]
     for i in 8..20 {
         p[i] = i as u8;
     }
@@ -25,7 +26,7 @@ fn channel_pkt(sz: usize) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + sz + 3);
     p.extend_from_slice(&0x4001u16.to_be_bytes());
     p.extend_from_slice(&(sz as u16).to_be_bytes());
-    p.extend(std::iter::repeat(0xABu8).take(sz));
+    p.extend(std::iter::repeat_n(0xABu8, sz));
     while p.len() % 4 != 0 {
         p.push(0);
     }
@@ -37,7 +38,7 @@ fn classify(data: &[u8]) -> u8 {
         return 0;
     }
     let f = u16::from_be_bytes([data[0], data[1]]);
-    if f >= 0x4000 && f <= 0x7FFF {
+    if (0x4000..=0x7FFF).contains(&f) {
         return 1;
     }
     if data.len() >= 20

@@ -4,13 +4,13 @@
 //! - tokio (default): multi-threaded async, works everywhere
 //! - io_uring (--features io-uring): io_uring for main socket + tokio for relay sockets
 
+mod af_xdp_listener;
 mod bulk_load;
+mod dtls_listener;
 mod failover;
 mod heartbeat;
-mod writer;
-mod dtls_listener;
-mod af_xdp_listener;
 mod quic_listener;
+mod writer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,7 +58,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let root = TurnaConfig::load(&path)?;
             let health_listen = root.health.listen;
             let tls_cfg = root.tls.clone();
-            (root.turn, root.cluster, health_listen, tls_cfg, root.tenants)
+            (
+                root.turn,
+                root.cluster,
+                health_listen,
+                tls_cfg,
+                root.tenants,
+            )
         }
         None => {
             turna_observability::init();
@@ -109,10 +115,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `NotSupported`; the error is swallowed in the task and the node keeps
     // serving without DTLS while the operator believes it is enabled.
     if config.dtls.enabled && !turna_transport::dtls::DTLS_AVAILABLE {
-        return Err("[turn.dtls] is enabled in the configuration, but this binary \
+        return Err(
+            "[turn.dtls] is enabled in the configuration, but this binary \
                     was built without DTLS support; rebuild with `--features dtls` \
                     or disable [turn.dtls]"
-            .into());
+                .into(),
+        );
     }
 
     let external_ip: std::net::IpAddr = if config.external_ip.is_empty() {
@@ -209,14 +217,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // M1: install the configured peer-filter policy before serving.
     // Default profile is internet-facing (denies RFC1918/ULA); opt into
     // LAN relaying via [turn.peer_filter] profile = "lan".
-    turna_relay::peer_filter::init_peer_policy(
-        turna_relay::peer_filter::PeerPolicy::from_config(
-            &config.peer_filter.profile,
-            config.peer_filter.allow_loopback_peers,
-            &config.peer_filter.denied_peer_ranges,
-            &config.peer_filter.allowed_peer_ranges,
-        ),
-    );
+    turna_relay::peer_filter::init_peer_policy(turna_relay::peer_filter::PeerPolicy::from_config(
+        &config.peer_filter.profile,
+        config.peer_filter.allow_loopback_peers,
+        &config.peer_filter.denied_peer_ranges,
+        &config.peer_filter.allowed_peer_ranges,
+    ));
 
     run_tokio(
         config,
@@ -1014,7 +1020,10 @@ fn build_migration_manager(
     } else {
         cfg.ticket_secret.clone().into_bytes()
     };
-    info!(ttl_secs = cfg.ticket_ttl_secs, "RFC 8016 connection migration enabled");
+    info!(
+        ttl_secs = cfg.ticket_ttl_secs,
+        "RFC 8016 connection migration enabled"
+    );
     Some(MigrationManager::with_ttl(
         secret,
         std::time::Duration::from_secs(cfg.ticket_ttl_secs),

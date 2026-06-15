@@ -104,7 +104,9 @@ fn connect() -> std::io::Result<Handle> {
     let (mut conn, handle, _) = new_connection()?;
     // Strict checking makes RTM_GETROUTE with a destination return the route the
     // kernel would actually use (longest-prefix match done kernel-side).
-    conn.socket_mut().socket_mut().set_netlink_get_strict_chk(true)?;
+    conn.socket_mut()
+        .socket_mut()
+        .set_netlink_get_strict_chk(true)?;
     tokio::spawn(conn);
     Ok(handle)
 }
@@ -200,7 +202,11 @@ const EVICT_MAX_AGE: Duration = Duration::from_secs(300);
 /// it on the discard port. The kernel performs the actual ARP/NS; the
 /// datagram is inert (and dropped even if it arrives).
 fn kick(next_hop: IpAddr) {
-    let bind: &str = if next_hop.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let bind: &str = if next_hop.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
     if let Ok(sock) = std::net::UdpSocket::bind(bind) {
         let _ = sock.set_nonblocking(true);
         let _ = sock.send_to(&[], (next_hop, KICK_PORT));

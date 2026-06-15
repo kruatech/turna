@@ -430,10 +430,7 @@ fn epoll_mod(epfd: RawFd, fd: RawFd, events: u32, tag: u64) -> io::Result<()> {
 }
 
 fn epoll_ctl(epfd: RawFd, fd: RawFd, events: u32, tag: u64, op: libc::c_int) -> io::Result<()> {
-    let mut ev = libc::epoll_event {
-        events,
-        u64: tag,
-    };
+    let mut ev = libc::epoll_event { events, u64: tag };
     // SAFETY: `epfd`/`fd` are open; `ev` is a valid initialized epoll_event living
     // for the call.
     let ret = unsafe { libc::epoll_ctl(epfd, op, fd, &mut ev) };

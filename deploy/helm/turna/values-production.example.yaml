@@ -1,0 +1,63 @@
+# Example production overrides for the turna chart.
+#   helm install turna deploy/helm/turna -f deploy/helm/turna/values-production.example.yaml
+#
+# This file intentionally contains NO secret material. The TURN shared secret
+# is supplied via an existing Kubernetes Secret you create out-of-band:
+#   kubectl create secret generic turna-shared-secret \
+#     --from-literal=shared-secret='<strong-random-value>'
+
+production: true
+
+# Host networking is recommended for production TURN: Service objects cannot
+# compactly expose the relay UDP port range, and ALTERNATE-SERVER redirects
+# need each pod to advertise a client-reachable address.
+hostNetwork: true
+
+turn:
+  realm: "turn.example.com"
+  # Address clients use to reach this deployment (set to your public IP/LB).
+  externalIP: "203.0.113.10"
+  auth:
+    # Provide the secret out-of-band; never inline it here.
+    existingSecret: "turna-shared-secret"
+    existingSecretKey: "shared-secret"
+
+# Run more than one replica so the PodDisruptionBudget and spread constraints
+# are meaningful.
+replicaCount: 3
+
+resources:
+  turn:
+    requests:
+      cpu: "2"
+      memory: "1Gi"
+    limits:
+      cpu: "4"
+      memory: "2Gi"
+
+# Keep health/metrics internal; scrape via the ClusterIP `-internal` service.
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+
+networkPolicy:
+  enabled: true
+  metricsFrom:
+    # Restrict health/metrics scraping to your monitoring namespace.
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: turna

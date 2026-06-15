@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Extract data.turn.toml from a Helm-rendered ConfigMap.
-
-The CI packaging job uses this tiny stdlib-only helper so it does not depend on
-PyYAML/yq being installed on GitHub runners. It intentionally validates the
-shape we need instead of attempting to be a generic YAML parser.
+Stdlib-only helper for the CI packaging job (no PyYAML/yq on runners). Extracts
+the turn.toml block; schema validation is left to turna-config (the cargo test
+that actually parses the file), not duplicated here.
 """
-
 from __future__ import annotations
-
+import re
 import sys
 from pathlib import Path
 
@@ -18,25 +16,34 @@ def fail(message: str) -> None:
 
 
 def extract(rendered_yaml: str) -> str:
-    docs = rendered_yaml.split("\n---")
-    for doc in docs:
-        if "kind: ConfigMap" not in doc:
+    for doc in rendered_yaml.split("\n---"):
+        if "kind: ConfigMap" not in doc or "turn.toml:" not in doc:
             continue
-        if "turn.toml:" not in doc:
-            continue
-
         lines = doc.splitlines()
         for i, line in enumerate(lines):
-            if line.strip() == "turn.toml: |":
-                block: list[str] = []
-                for raw in lines[i + 1 :]:
-                    if not raw.startswith("    "):
-                        break
-                    block.append(raw[4:])
-                text = "\n".join(block).rstrip() + "\n"
-                if "[turn]" not in text or "[turn.auth]" not in text:
-                    fail("extracted turn.toml does not look like the current schema")
-                return text
+            m = re.match(r"^(\s*)turn\.toml:\s*\|", line)
+            if not m:
+                continue
+            key_indent = len(m.group(1))
+            block: list[str] = []
+            for raw in lines[i + 1:]:
+                if raw.strip() == "":
+                    block.append("")
+                    continue
+                indent = len(raw) - len(raw.lstrip())
+                if indent <= key_indent:
+                    break
+                block.append(raw)
+            while block and block[-1] == "":
+                block.pop()
+            if not block:
+                continue
+            indents = [len(b) - len(b.lstrip()) for b in block if b.strip()]
+            d = min(indents) if indents else 0
+            text = "\n".join(b[d:] if b.strip() else "" for b in block).rstrip() + "\n"
+            if not text.strip() or "[" not in text:
+                fail("extracted turn.toml block is empty or not TOML-shaped")
+            return text
     fail("no ConfigMap data.turn.toml block found in rendered manifest")
 
 

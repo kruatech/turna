@@ -48,11 +48,8 @@ pub fn issue_client_nonce(server_key: &[u8], client: &str, ts_ms: u64) -> String
 pub fn verify_client_nonce(server_key: &[u8], client: &str, nonce: &str) -> Option<u64> {
     let (ts_hex, tag_b64) = nonce.split_once(':')?;
     let ts_ms = u64::from_str_radix(ts_hex, 16).ok()?;
-    let tag = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        tag_b64,
-    )
-    .ok()?;
+    let tag =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, tag_b64).ok()?;
     let mut mac = HmacSha1::new_from_slice(server_key).expect("HMAC accepts any key length");
     mac.update(&ts_ms.to_be_bytes());
     mac.update(client.as_bytes());
@@ -106,11 +103,17 @@ mod tests {
         let key = random_key_32();
         let n = issue_client_nonce(&key, "203.0.113.7:51000", 1234);
         // Same client + key verifies and recovers the timestamp.
-        assert_eq!(verify_client_nonce(&key, "203.0.113.7:51000", &n), Some(1234));
+        assert_eq!(
+            verify_client_nonce(&key, "203.0.113.7:51000", &n),
+            Some(1234)
+        );
         // A different client must not validate the same nonce.
         assert_eq!(verify_client_nonce(&key, "203.0.113.8:51000", &n), None);
         // A different key must not validate it.
-        assert_eq!(verify_client_nonce(&random_key_32(), "203.0.113.7:51000", &n), None);
+        assert_eq!(
+            verify_client_nonce(&random_key_32(), "203.0.113.7:51000", &n),
+            None
+        );
     }
 
     #[test]

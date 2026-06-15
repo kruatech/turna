@@ -115,7 +115,7 @@ fn port_allocator_never_exceeds_range() {
     let store = AllocationStore::new(50000, 50009, 100);
     for i in 0..10u16 {
         let port = store.ports.allocate().expect("port must be available");
-        assert!(port >= 50000 && port <= 50009, "port {port} out of range");
+        assert!((50000..=50009).contains(&port), "port {port} out of range");
         store
             .create(client(6000 + i), relay(port), "u".into(), vec![], 600)
             .unwrap();

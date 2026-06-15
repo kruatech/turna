@@ -1,61 +1,37 @@
-# Dependabot version updates — keep Rust deps, CI actions and base images current.
-# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
-#
-# Note: `fuzz/` is a separate workspace, excluded from the root workspace, so it
-# needs its own cargo entry. Docker entry points at `deploy/`, where the
-# Dockerfile lives. Custom labels are created by Dependabot if they don't exist.
 version: 2
-
 updates:
-  # ── Rust: main workspace ────────────────────────────────────────────────
+  # GitHub Actions. Once the workflows are pinned to commit SHAs (e.g. with
+  # `pinact run`), Dependabot bumps both the pinned SHA and the version
+  # comment, keeping the supply chain both pinned and current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  # Cargo dependencies for the main workspace.
   - package-ecosystem: cargo
-    directory: "/"
+    directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    labels:
-      - dependencies
-      - rust
-    groups:
-      # Bundle non-breaking bumps into one PR to cut review noise; majors stay
-      # as individual PRs so they get explicit review.
-      cargo-minor-patch:
-        update-types:
-          - minor
-          - patch
+    commit-message:
+      prefix: deps
 
-  # ── Rust: fuzz workspace (separate, excluded from the root workspace) ────
+  # The fuzz crate is an isolated workspace (excluded from the root one),
+  # so Dependabot needs a separate entry to see it.
   - package-ecosystem: cargo
-    directory: "/fuzz"
+    directory: /fuzz
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - rust
-      - fuzz
-    groups:
-      fuzz-minor-patch:
-        update-types:
-          - minor
-          - patch
+    commit-message:
+      prefix: deps(fuzz)
 
-  # ── GitHub Actions used by workflows in .github/workflows ───────────────
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - ci
-
-  # ── Container base images (deploy/Dockerfile) ───────────────────────────
+  # Base image referenced by deploy/Dockerfile.
   - package-ecosystem: docker
-    directory: "/deploy"
+    directory: /deploy
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
-      - docker
+    commit-message:
+      prefix: deps(docker)

@@ -102,7 +102,7 @@ impl TurnaConfig {
     }
 
     /// Load from string (for testing).
-#[allow(clippy::should_implement_trait)]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_str: &str) -> Result<Self> {
         let expanded = expand_env_vars(toml_str)?;
         let config: TurnaConfig =
@@ -331,7 +331,6 @@ impl TurnaConfig {
 /// `turn.toml`. Anything matching this string is rejected in production.
 /// Centralised so the validator and the default impl stay in sync.
 pub const DEFAULT_SHARED_SECRET: &str = "change-me-in-production";
-
 
 // ---------------------------------------------------------------------------
 // Section configs
@@ -822,7 +821,8 @@ impl ClusterConfig {
                 errors.push("cluster.node_id must be non-empty when cluster_mode = true".into());
             }
             if self.cluster_name.trim().is_empty() {
-                errors.push("cluster.cluster_name must be non-empty when cluster_mode = true".into());
+                errors
+                    .push("cluster.cluster_name must be non-empty when cluster_mode = true".into());
             }
             if self.gossip_interval_secs == 0 {
                 errors.push("cluster.gossip_interval_secs must be > 0".into());
@@ -1579,7 +1579,10 @@ mod tests {
 
     #[test]
     fn io_uring_section_parses_and_defaults() {
-        assert_eq!(IoUringSection::default().relay_socket_capacity_per_worker, 256);
+        assert_eq!(
+            IoUringSection::default().relay_socket_capacity_per_worker,
+            256
+        );
         let toml = r#"
             [turn]
             listen = "0.0.0.0:3478"

@@ -827,11 +827,7 @@ pub async fn serve_with_cluster_routes(
                         serde_json::to_string(&cv.nodes()).unwrap_or_else(|_| "[]".into()),
                         "application/json",
                     ),
-                    None => (
-                        "200 OK",
-                        "[]".to_string(),
-                        "application/json",
-                    ),
+                    None => ("200 OK", "[]".to_string(), "application/json"),
                 },
                 "/health" => {
                     if metrics.is_draining() {

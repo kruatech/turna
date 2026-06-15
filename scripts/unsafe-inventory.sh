@@ -12,6 +12,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Count lines containing a `unsafe` word boundary. Accepts a file or directory.
+# NOTE: this counts matching *lines* (consistent with the historical script),
+# not raw token occurrences — a line with two `unsafe` keywords counts once.
+# Must never fail the script: grep exits 1 on "no match", which would otherwise
+# abort under `set -euo pipefail` when used inside `n=$(...)`.
+count_unsafe() {
+    local target="$1"
+    if [ -d "$target" ]; then
+        grep -rn --include='*.rs' '\bunsafe\b' "$target" 2>/dev/null | wc -l | tr -d ' ' || true
+    else
+        grep -c '\bunsafe\b' "$target" 2>/dev/null || true
+    fi
+}
+
 echo "# Unsafe inventory — auto-generated"
 echo ""
 echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -23,11 +37,29 @@ echo "|---|---|"
 
 for crate_dir in crates/*/; do
     crate=$(basename "$crate_dir")
-    n=$(grep -rn --include='*.rs' '\bunsafe\b' "$crate_dir" 2>/dev/null | wc -l | tr -d ' ')
+    n=$(count_unsafe "$crate_dir")
+    n=${n:-0}
     if [ "$n" -gt 0 ]; then
         printf "| %s | %s |\n" "$crate" "$n"
     fi
 done
+
+echo ""
+echo "## Scoped total (unsafe-inventory.json scope: crates/{transport,relay}/src/)"
+echo ""
+echo "| Path | unsafe occurrences |"
+echo "|---|---|"
+
+scoped_total=0
+for scoped in "crates/transport/src" "crates/relay/src"; do
+    if [ -d "$scoped" ]; then
+        n=$(count_unsafe "$scoped")
+        n=${n:-0}
+        printf "| %s | %s |\n" "$scoped" "$n"
+        scoped_total=$((scoped_total + n))
+    fi
+done
+printf "| **total** | **%s** |\n" "$scoped_total"
 
 echo ""
 echo "## Counts per file (audited crates only)"
@@ -47,6 +79,7 @@ AUDITED_PATHS=(
     "crates/transport/src/bpf_filter.rs"
     "crates/transport/src/buffer.rs"
     "crates/transport/src/af_xdp.rs"
+    "crates/transport/src/tokio_transport.rs"
     "crates/relay/src/processor.rs"
     "crates/relay/src/graceful.rs"
     "crates/relay/src/server.rs"
@@ -55,7 +88,8 @@ AUDITED_PATHS=(
 
 for f in "${AUDITED_PATHS[@]}"; do
     if [ -f "$f" ]; then
-        n=$(grep -c '\bunsafe\b' "$f" 2>/dev/null || echo 0)
+        n=$(count_unsafe "$f")
+        n=${n:-0}
         printf "| %s | %s |\n" "$f" "$n"
     fi
 done
@@ -66,7 +100,7 @@ echo ""
 
 # Find unsafe blocks in files that AREN'T in the audited list — these are
 # either new files added since the audit, or stub crates that gained unsafe.
-all_unsafe_files=$(grep -rl --include='*.rs' '\bunsafe\b' crates/ services/ 2>/dev/null | sort -u)
+all_unsafe_files=$(grep -rl --include='*.rs' '\bunsafe\b' crates/ services/ 2>/dev/null | sort -u || true)
 
 found_new=0
 for f in $all_unsafe_files; do
@@ -84,7 +118,7 @@ for f in $all_unsafe_files; do
             echo ""
             found_new=1
         fi
-        echo "- \`$f\` ($(grep -c '\bunsafe\b' "$f") occurrences)"
+        echo "- \`$f\` ($(count_unsafe "$f") occurrences)"
     fi
 done
 
@@ -98,6 +132,7 @@ echo ""
 echo "| Marker | Count |"
 echo "|---|---|"
 for marker in "SAFETY:" "NEEDS-REVIEW:" "SUSPECT:"; do
-    n=$(grep -r --include='*.rs' "// $marker" crates/ 2>/dev/null | wc -l | tr -d ' ')
+    n=$(grep -r --include='*.rs' "// $marker" crates/ 2>/dev/null | wc -l | tr -d ' ' || true)
+    n=${n:-0}
     printf "| %s | %s |\n" "$marker" "$n"
 done

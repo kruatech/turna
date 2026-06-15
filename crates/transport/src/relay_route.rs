@@ -170,7 +170,12 @@ impl RelayRoutes {
         };
         self.inner.lock().unwrap().insert(
             relay_port,
-            RelayOwner { worker_id, tx, allocation_id, generation },
+            RelayOwner {
+                worker_id,
+                tx,
+                allocation_id,
+                generation,
+            },
         );
         generation
     }
@@ -187,7 +192,9 @@ impl RelayRoutes {
                 true
             }
             _ => {
-                self.stats.owner_cleanup_stale.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .owner_cleanup_stale
+                    .fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -237,7 +244,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    fn sa(s: &str) -> SocketAddr { s.parse().unwrap() }
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
 
     #[test]
     fn register_lookup_and_generation_bump() {
@@ -311,7 +320,13 @@ mod tests {
             RouteDecision::Forward { tx, cmd, .. } => {
                 tx.send(cmd).unwrap();
                 match rx.recv().unwrap() {
-                    WorkerCommand::SendViaRelayOwned { allocation_id, generation, relay_port, peer_addr, payload } => {
+                    WorkerCommand::SendViaRelayOwned {
+                        allocation_id,
+                        generation,
+                        relay_port,
+                        peer_addr,
+                        payload,
+                    } => {
                         assert_eq!(allocation_id, "A");
                         assert_eq!(generation, g);
                         assert_eq!(relay_port, 40004);
@@ -327,10 +342,22 @@ mod tests {
     #[test]
     fn classify_owned_command_outcomes() {
         let local = ("A".to_string(), 5u64);
-        assert!(matches!(classify_owned_command(Some(&local), "A", 5), OwnedSendOutcome::Send));
-        assert!(matches!(classify_owned_command(Some(&local), "A", 4), OwnedSendOutcome::StaleAllocation));
-        assert!(matches!(classify_owned_command(Some(&local), "B", 5), OwnedSendOutcome::StaleAllocation));
-        assert!(matches!(classify_owned_command(None, "A", 5), OwnedSendOutcome::MissingSocket));
+        assert!(matches!(
+            classify_owned_command(Some(&local), "A", 5),
+            OwnedSendOutcome::Send
+        ));
+        assert!(matches!(
+            classify_owned_command(Some(&local), "A", 4),
+            OwnedSendOutcome::StaleAllocation
+        ));
+        assert!(matches!(
+            classify_owned_command(Some(&local), "B", 5),
+            OwnedSendOutcome::StaleAllocation
+        ));
+        assert!(matches!(
+            classify_owned_command(None, "A", 5),
+            OwnedSendOutcome::MissingSocket
+        ));
     }
 
     /// Spec's stub-worker integration test (no io_uring): W1 owns P, W2 gets a
@@ -358,18 +385,29 @@ mod tests {
             // process exactly one command
             let cmd = w1_rx.recv().unwrap();
             match cmd {
-                WorkerCommand::SendViaRelayOwned { allocation_id, generation, relay_port, .. } => {
+                WorkerCommand::SendViaRelayOwned {
+                    allocation_id,
+                    generation,
+                    relay_port,
+                    ..
+                } => {
                     // owner MUST NOT consult the route table for owned commands
                     // (anti-loop). We assert that by counting any (illegal) re-route.
-                    if let RouteDecision::Forward { .. } =
-                        routes_c.route_send(1, relay_port, "0.0.0.0:0".parse().unwrap(), Bytes::new())
-                    {
+                    if let RouteDecision::Forward { .. } = routes_c.route_send(
+                        1,
+                        relay_port,
+                        "0.0.0.0:0".parse().unwrap(),
+                        Bytes::new(),
+                    ) {
                         // this would be a re-forward to self — but worker_id==1==self
                         // so route_send returns SelfOwned, never Forward. Guard anyway:
                         w1_reforwards_c.fetch_add(1, Ordering::Relaxed);
                     }
-                    match classify_owned_command(owned.get(&relay_port), &allocation_id, generation) {
-                        OwnedSendOutcome::Send => { w1_sends_c.fetch_add(1, Ordering::Relaxed); }
+                    match classify_owned_command(owned.get(&relay_port), &allocation_id, generation)
+                    {
+                        OwnedSendOutcome::Send => {
+                            w1_sends_c.fetch_add(1, Ordering::Relaxed);
+                        }
                         _ => {}
                     }
                 }
@@ -379,15 +417,25 @@ mod tests {
         // W2 (non-owner): local miss → route → forward to W1.
         let w2_sends = AtomicU64::new(0);
         match routes.route_send(2, port, sa("5.5.5.5:5"), Bytes::from_static(b"pkt")) {
-            RouteDecision::Forward { tx, cmd, .. } => { tx.send(cmd).unwrap(); }
+            RouteDecision::Forward { tx, cmd, .. } => {
+                tx.send(cmd).unwrap();
+            }
             _ => panic!("W2 should forward to owner"),
         }
         // W2 never sends locally.
         assert_eq!(w2_sends.load(Ordering::Relaxed), 0);
 
         owner.join().unwrap();
-        assert_eq!(w1_sends.load(Ordering::Relaxed), 1, "owner fake_send exactly once");
-        assert_eq!(w1_reforwards.load(Ordering::Relaxed), 0, "owned command must not re-forward");
+        assert_eq!(
+            w1_sends.load(Ordering::Relaxed),
+            1,
+            "owner fake_send exactly once"
+        );
+        assert_eq!(
+            w1_reforwards.load(Ordering::Relaxed),
+            0,
+            "owned command must not re-forward"
+        );
     }
 
     #[test]

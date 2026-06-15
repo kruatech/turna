@@ -622,7 +622,10 @@ impl PacketProcessor {
             let frame_len = (4 + data.len() + 3) & !3; // include 4-byte padding
             let mut buf = BytesMut::with_capacity(frame_len);
             buf.resize(frame_len, 0);
-            let written = encode_or_drop!(message::encode_channel_data(&mut buf, ch, data), vec![Action::None]);
+            let written = encode_or_drop!(
+                message::encode_channel_data(&mut buf, ch, data),
+                vec![Action::None]
+            );
             buf.truncate(written);
 
             return vec![Action::Send {
@@ -808,7 +811,8 @@ impl PacketProcessor {
                 // Lame-duck: hand every new client to the next-best node so this
                 // node can exit cleanly. If we're the only node, fall through to
                 // serving locally (there is nowhere to drain to).
-                ring.get_node_excluding(&key, &routing.local_node_id).cloned()
+                ring.get_node_excluding(&key, &routing.local_node_id)
+                    .cloned()
             } else {
                 ring.get_node(&key).cloned()
             }
@@ -842,8 +846,12 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
-        self.metrics.cluster_redirects.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .cluster_redirects
+            .fetch_add(1, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: src,
@@ -861,13 +869,12 @@ impl PacketProcessor {
                 turna_proto_stun::attribute::Attribute::MessageIntegrity(_)
             )
         });
-        if has_integrity
-            && self.auth_validate(msg, raw).is_err() {
-                self.metrics
-                    .auth_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return self.encode_auth_challenge(msg, src);
-            }
+        if has_integrity && self.auth_validate(msg, raw).is_err() {
+            self.metrics
+                .auth_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return self.encode_auth_challenge(msg, src);
+        }
 
         let mut resp = StunMessage::with_transaction_id(
             Method::Binding,
@@ -880,7 +887,9 @@ impl PacketProcessor {
         let mut buf = [0u8; 256];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: src,
@@ -1031,10 +1040,15 @@ impl PacketProcessor {
             resp.add(Attribute::ReservationToken(tok));
         }
         let mut buf = [0u8; 1024];
-        let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
+        let len = encode_or_drop!(
+            encode_with_integrity_auto(&resp, &mut buf, &key, msg),
+            vec![Action::None]
+        );
         info!(%src, %relay_addr, lifetime, "allocation created");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         // RFC 8016: stamp the relay route with the owning allocation id (looked
         // up once above) so the io_uring worker pool can forward relay sends to
@@ -1098,9 +1112,14 @@ impl PacketProcessor {
                 let mut resp = turn::build_success_response(Method::Refresh, msg.transaction_id);
                 resp.add(Attribute::Lifetime(lifetime));
                 let mut buf = [0u8; 1024];
-                let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
+                let len = encode_or_drop!(
+                    encode_with_integrity_auto(&resp, &mut buf, &key, msg),
+                    vec![Action::None]
+                );
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+                self.metrics
+                    .bytes_sent
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 let mut actions = vec![Action::Send {
                     data: Bytes::copy_from_slice(&buf[..len]),
                     target: src,
@@ -1181,9 +1200,14 @@ impl PacketProcessor {
         resp.add(Attribute::MobilityTicket(new_token.token));
 
         let mut buf = [0u8; 1024];
-        let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, key, msg), Some(vec![Action::None]));
+        let len = encode_or_drop!(
+            encode_with_integrity_auto(&resp, &mut buf, key, msg),
+            Some(vec![Action::None])
+        );
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
         info!(%src, %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
 
         Some(vec![Action::Send {
@@ -1254,9 +1278,14 @@ impl PacketProcessor {
 
         let resp = turn::build_success_response(Method::CreatePermission, msg.transaction_id);
         let mut buf = [0u8; 1024];
-        let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
+        let len = encode_or_drop!(
+            encode_with_integrity_auto(&resp, &mut buf, &key, msg),
+            vec![Action::None]
+        );
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: src,
@@ -1304,18 +1333,21 @@ impl PacketProcessor {
             Ok(_) => {
                 let resp = turn::build_success_response(Method::ChannelBind, msg.transaction_id);
                 let mut buf = [0u8; 1024];
-                let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
+                let len = encode_or_drop!(
+                    encode_with_integrity_auto(&resp, &mut buf, &key, msg),
+                    vec![Action::None]
+                );
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+                self.metrics
+                    .bytes_sent
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 vec![Action::Send {
                     data: Bytes::copy_from_slice(&buf[..len]),
                     target: src,
                 }]
             }
             // A3-H1: a channel/peer uniqueness violation is a client error → 400.
-            Err(SessionError::ChannelConflict) => {
-                self.encode_error(msg, src, 400, "Bad Request")
-            }
+            Err(SessionError::ChannelConflict) => self.encode_error(msg, src, 400, "Bad Request"),
             Err(_) => self.encode_error(msg, src, 437, "Allocation Mismatch"),
         }
     }
@@ -1400,7 +1432,9 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: dst,
@@ -1417,7 +1451,9 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: dst,
@@ -1432,7 +1468,9 @@ impl PacketProcessor {
         let mut buf = [0u8; 512];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: dst,
@@ -1478,7 +1516,12 @@ mod a3_send_indication_tests {
             realm: "turna".into(),
             secret: b"test-secret".to_vec(),
         }));
-        PacketProcessor::new(store, auth, "127.0.0.1".parse().unwrap(), Arc::new(Metrics::new()))
+        PacketProcessor::new(
+            store,
+            auth,
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
     }
 
     /// A3-C1 regression: a Send Indication on an allocation with a matching

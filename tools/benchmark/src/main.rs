@@ -186,7 +186,7 @@ fn build_stun_binding_request() -> Vec<u8> {
     pkt[6] = 0xA4;
     pkt[7] = 0x42;
     // Transaction ID (random)
-#[allow(clippy::needless_range_loop)]
+    #[allow(clippy::needless_range_loop)]
     for i in 8..20 {
         pkt[i] = rand::random();
     }

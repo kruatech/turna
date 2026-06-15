@@ -135,7 +135,9 @@ impl QuicBridge {
                 Some(ctx) => processor.process_slice(&data, ctx.remote),
                 None => Vec::new(),
             },
-            QuicEvent::StreamData { session_id, data, .. } => {
+            QuicEvent::StreamData {
+                session_id, data, ..
+            } => {
                 let mut out = Vec::new();
                 if let Some(ctx) = self.sessions.get_mut(&session_id) {
                     ctx.framer.push(&data);
@@ -206,8 +208,16 @@ mod tests {
 
         let mut f = StreamFramer::default();
         f.push(&wire);
-        assert_eq!(f.next_message(), Some(logical), "ChannelData without padding");
-        assert_eq!(f.next_message(), Some(next), "next message starts after the pad");
+        assert_eq!(
+            f.next_message(),
+            Some(logical),
+            "ChannelData without padding"
+        );
+        assert_eq!(
+            f.next_message(),
+            Some(next),
+            "next message starts after the pad"
+        );
     }
 
     #[test]

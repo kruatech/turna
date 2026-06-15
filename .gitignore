@@ -24,3 +24,7 @@ bench/*.json
 
 bench/results/
 *.bak
+
+# Python bytecode
+__pycache__/
+*.pyc

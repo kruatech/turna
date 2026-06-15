@@ -20,13 +20,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::uring::{CompletionEvent, UringEngine};
 use crate::relay_route::{
     classify_owned_command, OwnedSendOutcome, RelayRoutes, RouteDecision, WorkerCommand,
 };
+use crate::uring::{CompletionEvent, UringEngine};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -165,8 +165,18 @@ where
                 pin_to_core(worker_id);
                 let handler = factory(worker_id);
                 run_worker(
-                    worker_id, addr, bufs, handler, routes, cmd_tx, cmd_rx, poll, shutdown,
-                    drain_grace, ring_stats, relay_cap,
+                    worker_id,
+                    addr,
+                    bufs,
+                    handler,
+                    routes,
+                    cmd_tx,
+                    cmd_rx,
+                    poll,
+                    shutdown,
+                    drain_grace,
+                    ring_stats,
+                    relay_cap,
                 );
             })
             .expect("failed to spawn worker thread");
@@ -236,7 +246,7 @@ fn run_worker<H: PacketHandler>(
             if let Some(agg) = &ring_stats {
                 agg.publish(worker_id, &rs, engine.buffers_available() as u32);
             }
-#[allow(clippy::manual_checked_ops)]
+            #[allow(clippy::manual_checked_ops)]
             let avg = if rs.cqe_batches > 0 {
                 rs.cqe_drained / rs.cqe_batches
             } else {
@@ -298,8 +308,7 @@ fn run_worker<H: PacketHandler>(
                 // to ring teardown — dropping ingress during shutdown is fine.)
                 let drain_cap = Instant::now() + drain_grace;
                 loop {
-                    let relays_reclaimed =
-                        closing.iter().all(|p| !engine.has_relay(*p));
+                    let relays_reclaimed = closing.iter().all(|p| !engine.has_relay(*p));
                     let sends_drained = engine.send_slots_inflight() == 0;
                     if relays_reclaimed && sends_drained {
                         break;
@@ -401,7 +410,10 @@ fn run_worker<H: PacketHandler>(
                         stats.errors += 1;
                     }
                 }
-                CompletionEvent::MainRecvError { msghdr_idx, buf_idx } => {
+                CompletionEvent::MainRecvError {
+                    msghdr_idx,
+                    buf_idx,
+                } => {
                     // Re-arm the main recv slot (reuses the buffer) so a
                     // transient error doesn't permanently shrink the recv ring.
                     stats.errors += 1;
@@ -472,7 +484,10 @@ fn run_worker<H: PacketHandler>(
                             if tx.send(cmd).is_ok() {
                                 routes.stats.send_forwarded.fetch_add(1, Ordering::Relaxed);
                             } else {
-                                routes.stats.send_forward_failed.fetch_add(1, Ordering::Relaxed);
+                                routes
+                                    .stats
+                                    .send_forward_failed
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         RouteDecision::Miss => {
@@ -480,8 +495,10 @@ fn run_worker<H: PacketHandler>(
                             stats.errors += 1;
                         }
                         RouteDecision::SelfOwned => {
-                            warn!(worker_id, port,
-                                "relay route names self but local socket missing (desync)");
+                            warn!(
+                                worker_id,
+                                port, "relay route names self but local socket missing (desync)"
+                            );
                             stats.errors += 1;
                         }
                     }
@@ -509,7 +526,10 @@ fn run_worker<H: PacketHandler>(
                         .map(|(a, g)| (a.to_string(), g));
                     match classify_owned_command(local.as_ref(), &allocation_id, generation) {
                         OwnedSendOutcome::Send => {
-                            if engine.submit_relay_send(relay_port, &payload, peer_addr).is_ok() {
+                            if engine
+                                .submit_relay_send(relay_port, &payload, peer_addr)
+                                .is_ok()
+                            {
                                 routes.stats.send_local.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 stats.errors += 1;
@@ -517,11 +537,16 @@ fn run_worker<H: PacketHandler>(
                         }
                         OwnedSendOutcome::StaleAllocation => {
                             routes.stats.send_stale.fetch_add(1, Ordering::Relaxed);
-                            warn!(worker_id, relay_port, "forwarded relay send stale — dropping");
+                            warn!(
+                                worker_id,
+                                relay_port, "forwarded relay send stale — dropping"
+                            );
                         }
                         OwnedSendOutcome::MissingSocket => {
-                            warn!(worker_id, relay_port,
-                                "forwarded relay send for unknown local socket");
+                            warn!(
+                                worker_id,
+                                relay_port, "forwarded relay send for unknown local socket"
+                            );
                         }
                     }
                 }
@@ -624,7 +649,10 @@ fn process_action(
             // use-after-free. STUN-response paths (ForwardAction::Send) free the
             // buffer immediately and DO re-arm the recv slot.
         }
-        ForwardAction::CreateRelay { port, allocation_id } => {
+        ForwardAction::CreateRelay {
+            port,
+            allocation_id,
+        } => {
             new_relays.push((port, allocation_id));
             if is_main {
                 resubmit_main.push((msghdr_idx, buf_idx));
@@ -656,7 +684,10 @@ fn process_action(
                         has_zc = true;
                         zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
                     }
-                    ForwardAction::CreateRelay { port, allocation_id } => new_relays.push((port, allocation_id)),
+                    ForwardAction::CreateRelay {
+                        port,
+                        allocation_id,
+                    } => new_relays.push((port, allocation_id)),
                     ForwardAction::CloseRelay { port } => close_relays.push(port),
                     _ => {}
                 }

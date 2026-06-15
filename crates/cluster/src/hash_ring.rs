@@ -37,13 +37,11 @@ impl HashRing {
         // node_id sorts, so adding a node whose id lands "in the middle" no
         // longer reshuffles unrelated keys. Ties (astronomically unlikely with
         // 64-bit scores) break on node_id for determinism across the cluster.
-        self.nodes
-            .iter()
-            .max_by(|a, b| {
-                let sa = hrw_score(&a.node_id, key);
-                let sb = hrw_score(&b.node_id, key);
-                sa.cmp(&sb).then_with(|| a.node_id.cmp(&b.node_id))
-            })
+        self.nodes.iter().max_by(|a, b| {
+            let sa = hrw_score(&a.node_id, key);
+            let sb = hrw_score(&b.node_id, key);
+            sa.cmp(&sb).then_with(|| a.node_id.cmp(&b.node_id))
+        })
     }
 
     pub fn update_nodes(&mut self, new_nodes: Vec<ClusterNode>) {

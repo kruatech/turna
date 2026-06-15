@@ -90,7 +90,7 @@ impl TurnCoreImpl {
     }
 
     /// Configure initial values from node config.
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         self,
         realm: impl Into<String>,
@@ -102,7 +102,10 @@ impl TurnCoreImpl {
         max_lifetime: u32,
     ) -> Self {
         {
-            let mut cfg = self.config.write().unwrap();
+            let mut cfg = self
+                .config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cfg.realm = realm.into();
             cfg.external_ipv4 = external_ip.into();
             cfg.listen_addresses = listen_addrs;
@@ -133,7 +136,12 @@ impl TurnCoreImpl {
             .map(|a| AllocationInfo {
                 id: a.relay_addr.to_string(),
                 username: a.username.clone(),
-                realm: self.config.read().unwrap().realm.clone(),
+                realm: self
+                    .config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .realm
+                    .clone(),
                 client_address: a.client_addr,
                 relay_address: a.relay_addr,
                 created_at_ms: instant_to_ms(a.created_at),
@@ -288,7 +296,10 @@ impl TurnCore for TurnCoreImpl {
     }
 
     async fn update_config(&self, update: ConfigUpdate) -> Result<(), CoreError> {
-        let mut cfg = self.config.write().unwrap();
+        let mut cfg = self
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(v) = update.max_lifetime {
             cfg.max_lifetime = v;
         }
@@ -388,7 +399,10 @@ impl TurnCore for TurnCoreImpl {
     }
 
     fn get_config(&self) -> CurrentConfig {
-        let cfg = self.config.read().unwrap();
+        let cfg = self
+            .config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         CurrentConfig {
             realm: cfg.realm.clone(),
             min_port: cfg.min_port,

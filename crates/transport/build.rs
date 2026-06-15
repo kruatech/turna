@@ -17,6 +17,18 @@ fn main() {
         return;
     }
 
+    // AF_XDP is a Linux-kernel facility; the BPF object only makes sense there.
+    // Fail early with a clear message instead of a cryptic clang error when the
+    // feature is enabled on a non-Linux target (e.g. `--all-features` on macOS).
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "linux" {
+        panic!(
+            "the `af-xdp` feature is Linux-only (AF_XDP is a Linux kernel facility), \
+             but the target OS is `{target_os}`. Build without `--all-features` and \
+             without the `af-xdp` feature on non-Linux targets, or cross-compile for Linux."
+        );
+    }
+
     let src = PathBuf::from("src/bpf/xdp_turn.c");
     println!("cargo:rerun-if-changed={}", src.display());
 

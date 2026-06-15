@@ -146,8 +146,7 @@ pub(crate) fn spawn_relay_egress(
                                 Err(_) => break,
                             };
                             let relay_addr = SocketAddr::new(ext_ip, port);
-                            let actions =
-                                proc.process_relay_recv(&buf[..n], peer_addr, relay_addr);
+                            let actions = proc.process_relay_recv(&buf[..n], peer_addr, relay_addr);
                             for action in actions {
                                 if let Action::Send { data, target } = action {
                                     // Route to a TURNS/DTLS/QUIC client if a sink is
@@ -470,7 +469,8 @@ impl RelayServer {
             let relay_tx = send_tx.clone();
             let sinks = self.client_sinks.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::tls_bridge::run_tls_bridge(tls_cfg, proc, relay_tx, sinks).await
+                if let Err(e) =
+                    crate::tls_bridge::run_tls_bridge(tls_cfg, proc, relay_tx, sinks).await
                 {
                     error!(error = %e, "TURNS bridge exited");
                 }
@@ -529,7 +529,7 @@ impl RelayServer {
                     };
 
                     let mut replies: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(n);
-#[allow(clippy::needless_range_loop)]
+                    #[allow(clippy::needless_range_loop)]
                     for k in 0..n {
                         let (len, src) = metas[k];
                         let chunk = arena.split_to(MAX_UDP_PACKET);
@@ -539,16 +539,17 @@ impl RelayServer {
                         // &self over Arc/lock-free state (DashMap + atomics +
                         // parking_lot, which has no poisoning), so dropping the
                         // offending packet and continuing leaves no torn state.
-                        let actions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            || processor.process(raw, src),
-                        ))
-                        .unwrap_or_else(|_| {
-                            processor
-                                .metrics()
-                                .processor_panics
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            Vec::new()
-                        });
+                        let actions =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                processor.process(raw, src)
+                            }))
+                            .unwrap_or_else(|_| {
+                                processor
+                                    .metrics()
+                                    .processor_panics
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                Vec::new()
+                            });
                         for action in actions {
                             match action {
                                 Action::Send { data, target } => {

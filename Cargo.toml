@@ -48,10 +48,14 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kruatech/turna"
+homepage = "https://github.com/kruatech/turna"
+readme = "README.md"
+keywords = ["turn", "stun", "webrtc", "relay", "rfc8656"]
+categories = ["network-programming"]
 # publish = false убран: крейты должны быть доступны как git-зависимость
 # (для crates.io потребуется дополнительно description у каждого крейта)
 
@@ -83,10 +87,10 @@ uuid = { version = "1", features = ["v4"] }
 # наблюдаемость
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = "0.23"
-opentelemetry_sdk = { version = "0.23", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.16", features = ["grpc-tonic"] }
-tracing-opentelemetry = "0.24"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.33"
 hostname = "0.3"
 
 # структуры данных

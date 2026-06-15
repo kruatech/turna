@@ -190,7 +190,7 @@ impl Allocation {
     }
 
     /// Check if bandwidth quota is exceeded. Returns current bps.
-#[allow(clippy::result_unit_err)]
+    #[allow(clippy::result_unit_err)]
     pub fn check_bandwidth(&self, max_bytes_per_sec: u64) -> Result<u64, ()> {
         let mut start = self.bandwidth_window_start.lock();
         let now = Instant::now();
@@ -207,7 +207,11 @@ impl Allocation {
             // Enforce the completed window too (L6): previously a window
             // boundary always returned Ok, letting one packet per second slip
             // past the quota.
-            return if bps > max_bytes_per_sec { Err(()) } else { Ok(bps) };
+            return if bps > max_bytes_per_sec {
+                Err(())
+            } else {
+                Ok(bps)
+            };
         }
 
         let current = self.bandwidth_window_bytes.load(Ordering::Relaxed);
@@ -903,7 +907,7 @@ impl AllocationStore {
     ///   skipped, port not reserved. Not an error.
     /// - `Err(_)`    — record was malformed, port unavailable, or quota
     ///   exceeded. Caller logs and continues with next record.
-#[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn rehydrate(
         &self,
         client_addr: SocketAddr,
@@ -1910,7 +1914,11 @@ mod tests_write_behind {
         let id = store.get(&old).unwrap().allocation_id.clone();
 
         // Pre-conditions.
-        assert_eq!(store.get(&old).unwrap().migration_epoch, 0, "epoch starts at 0");
+        assert_eq!(
+            store.get(&old).unwrap().migration_epoch,
+            0,
+            "epoch starts at 0"
+        );
         assert_eq!(store.get_by_relay(&r), Some(old));
         assert_eq!(store.get_by_channel(40000, 0x4000), Some(old));
         assert_eq!(store.get_by_id(&id), Some(old));
@@ -1924,7 +1932,11 @@ mod tests_write_behind {
         assert!(store.get(&new).is_some());
         assert_eq!(store.get(&new).unwrap().client_addr, new);
         // Epoch bumped exactly once (anti-replay handle).
-        assert_eq!(store.get(&new).unwrap().migration_epoch, 1, "epoch bumps on re_key");
+        assert_eq!(
+            store.get(&new).unwrap().migration_epoch,
+            1,
+            "epoch bumps on re_key"
+        );
         // id is preserved and now points to the new address.
         assert_eq!(store.get(&new).unwrap().allocation_id, id);
         assert_eq!(store.get_by_id(&id), Some(new));
@@ -2053,14 +2065,33 @@ mod tenant_pool_tests {
 
     #[tokio::test]
     async fn per_tenant_allocation_cap_enforced() {
-        let store = AllocationStore::new(40000, 40999, 10_000)
-            .with_tenant_pool("acme", 50000, 50999, 2, BandwidthQuota::default()); // cap = 2
+        let store = AllocationStore::new(40000, 40999, 10_000).with_tenant_pool(
+            "acme",
+            50000,
+            50999,
+            2,
+            BandwidthQuota::default(),
+        ); // cap = 2
 
         store
-            .create_for_tenant(addr(1000), addr(50000), "u".into(), vec![], 600, Some("acme".into()))
+            .create_for_tenant(
+                addr(1000),
+                addr(50000),
+                "u".into(),
+                vec![],
+                600,
+                Some("acme".into()),
+            )
             .unwrap();
         store
-            .create_for_tenant(addr(1001), addr(50001), "u".into(), vec![], 600, Some("acme".into()))
+            .create_for_tenant(
+                addr(1001),
+                addr(50001),
+                "u".into(),
+                vec![],
+                600,
+                Some("acme".into()),
+            )
             .unwrap();
         // Third allocation for the same tenant must hit the per-tenant cap.
         let third = store.create_for_tenant(
@@ -2081,12 +2112,24 @@ mod tenant_pool_tests {
 
     #[tokio::test]
     async fn release_returns_port_to_tenant_pool() {
-        let store = AllocationStore::new(40000, 40099, 10_000)
-            .with_tenant_pool("acme", 50000, 50001, 0, BandwidthQuota::default()); // 2-port range
+        let store = AllocationStore::new(40000, 40099, 10_000).with_tenant_pool(
+            "acme",
+            50000,
+            50001,
+            0,
+            BandwidthQuota::default(),
+        ); // 2-port range
 
         let p = store.pool(Some("acme")).allocate().unwrap();
         store
-            .create_for_tenant(addr(1000), addr(p), "u".into(), vec![], 600, Some("acme".into()))
+            .create_for_tenant(
+                addr(1000),
+                addr(p),
+                "u".into(),
+                vec![],
+                600,
+                Some("acme".into()),
+            )
             .unwrap();
         // The port is taken in acme's pool; re-reserving must fail.
         assert!(store.pool_for_port(p).reserve(p).is_err());
@@ -2111,11 +2154,30 @@ mod tenant_quota_tests {
     #[tokio::test]
     async fn bandwidth_limit_resolves_tenant_then_global() {
         let store = AllocationStore::new(40000, 40099, 10_000)
-            .with_quota(BandwidthQuota { max_bytes_per_sec: 1000, max_per_user: 0 })
-            .with_tenant_pool("acme", 50000, 50099, 0,
-                BandwidthQuota { max_bytes_per_sec: 500, max_per_user: 0 })
-            .with_tenant_pool("beta", 51000, 51099, 0,
-                BandwidthQuota { max_bytes_per_sec: 0, max_per_user: 0 });
+            .with_quota(BandwidthQuota {
+                max_bytes_per_sec: 1000,
+                max_per_user: 0,
+            })
+            .with_tenant_pool(
+                "acme",
+                50000,
+                50099,
+                0,
+                BandwidthQuota {
+                    max_bytes_per_sec: 500,
+                    max_per_user: 0,
+                },
+            )
+            .with_tenant_pool(
+                "beta",
+                51000,
+                51099,
+                0,
+                BandwidthQuota {
+                    max_bytes_per_sec: 0,
+                    max_per_user: 0,
+                },
+            );
 
         assert_eq!(store.bandwidth_limit_for(Some("acme")), 500); // tenant override
         assert_eq!(store.bandwidth_limit_for(Some("beta")), 1000); // 0 → inherit global
@@ -2127,24 +2189,54 @@ mod tenant_quota_tests {
     async fn per_tenant_max_per_user_overrides_global() {
         // Global per-user cap disabled; acme caps at 2 per user.
         let store = AllocationStore::new(40000, 40999, 10_000)
-            .with_quota(BandwidthQuota { max_bytes_per_sec: 0, max_per_user: 0 })
-            .with_tenant_pool("acme", 50000, 50999, 0,
-                BandwidthQuota { max_bytes_per_sec: 0, max_per_user: 2 });
+            .with_quota(BandwidthQuota {
+                max_bytes_per_sec: 0,
+                max_per_user: 0,
+            })
+            .with_tenant_pool(
+                "acme",
+                50000,
+                50999,
+                0,
+                BandwidthQuota {
+                    max_bytes_per_sec: 0,
+                    max_per_user: 2,
+                },
+            );
 
         assert_eq!(store.effective_max_per_user(Some("acme")), 2);
         assert_eq!(store.effective_max_per_user(None), 0); // base → global (0)
 
-        let mk = |c: u16, r: u16| store.create_for_tenant(
-            addr(c), addr(r), "sameuser".into(), vec![], 600, Some("acme".into()));
+        let mk = |c: u16, r: u16| {
+            store.create_for_tenant(
+                addr(c),
+                addr(r),
+                "sameuser".into(),
+                vec![],
+                600,
+                Some("acme".into()),
+            )
+        };
         mk(1000, 50000).unwrap();
         mk(1001, 50001).unwrap();
         // Third allocation for the same user in acme hits the per-tenant cap.
-        assert!(matches!(mk(1002, 50002), Err(SessionError::MaxAllocationsPerUser)));
+        assert!(matches!(
+            mk(1002, 50002),
+            Err(SessionError::MaxAllocationsPerUser)
+        ));
 
         // Base tenant (global cap = 0) is unlimited for the same volume.
         for i in 0..5u16 {
-            store.create_for_tenant(addr(2000 + i), addr(40000 + i),
-                "baseuser".into(), vec![], 600, None).unwrap();
+            store
+                .create_for_tenant(
+                    addr(2000 + i),
+                    addr(40000 + i),
+                    "baseuser".into(),
+                    vec![],
+                    600,
+                    None,
+                )
+                .unwrap();
         }
     }
 
@@ -2154,7 +2246,14 @@ mod tenant_quota_tests {
         let client = addr(5000);
         let relay = addr(40000);
         store
-            .create_for_tenant(client, relay, "u".into(), vec![1, 2, 3], 600, Some("acme".into()))
+            .create_for_tenant(
+                client,
+                relay,
+                "u".into(),
+                vec![1, 2, 3],
+                600,
+                Some("acme".into()),
+            )
             .unwrap();
 
         // Relay some traffic; each add_bytes also bumps the packet counter.
@@ -2183,7 +2282,9 @@ mod tenant_quota_tests {
         let store = AllocationStore::new(40000, 40099, 10_000);
         let client = addr(5001);
         let relay = addr(40001);
-        store.create(client, relay, "u".into(), vec![1], 600).unwrap(); // tenant_id = None
+        store
+            .create(client, relay, "u".into(), vec![1], 600)
+            .unwrap(); // tenant_id = None
         {
             let a = store.allocations.get(&client).unwrap();
             a.add_bytes(999);
@@ -2200,7 +2301,9 @@ mod tenant_quota_tests {
         let store = AllocationStore::new(40000, 40099, 10_000);
         let client = addr(6000);
         let relay = addr(40000);
-        store.create(client, relay, "u".into(), vec![1], 600).unwrap();
+        store
+            .create(client, relay, "u".into(), vec![1], 600)
+            .unwrap();
         let peer_a = addr(7000);
         let peer_b = addr(7001);
 

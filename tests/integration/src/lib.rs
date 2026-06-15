@@ -121,10 +121,7 @@ fn spawn_hermetic() -> TestServer {
         })
         .expect("spawn hermetic node thread");
     match rx.recv() {
-        Ok(Ok(addr)) => TestServer {
-            addr,
-            _child: None,
-        },
+        Ok(Ok(addr)) => TestServer { addr, _child: None },
         Ok(Err(e)) => panic!("hermetic node: {e}"),
         Err(_) => panic!("hermetic node boot thread exited before reporting"),
     }
@@ -196,16 +193,13 @@ fn boot_node() -> Result<(SocketAddr, std::process::Child), String> {
 
 fn http_ready(health: &SocketAddr) -> bool {
     use std::io::{Read, Write};
-    let mut s = match std::net::TcpStream::connect_timeout(
-        health,
-        std::time::Duration::from_millis(300),
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    let mut s =
+        match std::net::TcpStream::connect_timeout(health, std::time::Duration::from_millis(300)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
     let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(300)));
-    if s
-        .write_all(b"GET /ready HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    if s.write_all(b"GET /ready HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .is_err()
     {
         return false;
@@ -553,25 +547,27 @@ fn extract_error_code(data: &[u8]) -> Option<(u16, String)> {
 /// Parse ALTERNATE-SERVER (0x0003), encoded as a plain MAPPED-ADDRESS
 /// (RFC 5389 §15.5 — NOT XOR'd). Returns None if absent or malformed.
 fn extract_alternate_server(data: &[u8]) -> Option<SocketAddr> {
-    iter_attrs(data).find(|(t, _)| *t == 0x0003).and_then(|(_, v)| {
-        if v.len() < 8 {
-            return None;
-        }
-        let family = v[1];
-        let port = u16::from_be_bytes([v[2], v[3]]);
-        match family {
-            0x01 => {
-                let ip = std::net::Ipv4Addr::new(v[4], v[5], v[6], v[7]);
-                Some(SocketAddr::new(ip.into(), port))
+    iter_attrs(data)
+        .find(|(t, _)| *t == 0x0003)
+        .and_then(|(_, v)| {
+            if v.len() < 8 {
+                return None;
             }
-            0x02 if v.len() >= 20 => {
-                let mut o = [0u8; 16];
-                o.copy_from_slice(&v[4..20]);
-                Some(SocketAddr::new(std::net::Ipv6Addr::from(o).into(), port))
+            let family = v[1];
+            let port = u16::from_be_bytes([v[2], v[3]]);
+            match family {
+                0x01 => {
+                    let ip = std::net::Ipv4Addr::new(v[4], v[5], v[6], v[7]);
+                    Some(SocketAddr::new(ip.into(), port))
+                }
+                0x02 if v.len() >= 20 => {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(&v[4..20]);
+                    Some(SocketAddr::new(std::net::Ipv6Addr::from(o).into(), port))
+                }
+                _ => None,
             }
-            _ => None,
-        }
-    })
+        })
 }
 
 fn extract_realm(data: &[u8]) -> Option<String> {
@@ -1462,7 +1458,10 @@ mod cluster_tests {
 
             if is_error(&resp) {
                 let (code, _) = extract_error_code(&resp).unwrap_or((0, String::new()));
-                assert_eq!(code, 300, "unexpected error code {code} for a brand-new client");
+                assert_eq!(
+                    code, 300,
+                    "unexpected error code {code} for a brand-new client"
+                );
                 let alt = extract_alternate_server(&resp)
                     .expect("300 Try Alternate must carry a parseable ALTERNATE-SERVER");
                 assert!(
@@ -1474,7 +1473,10 @@ mod cluster_tests {
             } else if is_success(&resp) {
                 local += 1;
             } else {
-                panic!("unexpected response class for Binding: {:02x} {:02x}", resp[0], resp[1]);
+                panic!(
+                    "unexpected response class for Binding: {:02x} {:02x}",
+                    resp[0], resp[1]
+                );
             }
         }
 
@@ -1532,7 +1534,9 @@ mod cluster_tests {
     const ATTR_MOBILITY_TICKET: u16 = 0x8030;
 
     fn extract_attr(data: &[u8], typ: u16) -> Option<Vec<u8>> {
-        iter_attrs(data).find(|(t, _)| *t == typ).map(|(_, v)| v.to_vec())
+        iter_attrs(data)
+            .find(|(t, _)| *t == typ)
+            .map(|(_, v)| v.to_vec())
     }
 
     /// Authenticated Allocate with the RFC 8016 opt-in (empty MOBILITY-TICKET).
@@ -1632,9 +1636,11 @@ mod cluster_tests {
             is_error(&replay),
             "replaying the stale ticket must be rejected (anti-replay)"
         );
-        eprintln!("✓ stale-ticket replay rejected: {:?}", extract_error_code(&replay));
+        eprintln!(
+            "✓ stale-ticket replay rejected: {:?}",
+            extract_error_code(&replay)
+        );
     }
-
 }
 
 // ── DTL-5: TURN-over-DTLS (RFC 7350) end-to-end client ──────────────────
@@ -1683,8 +1689,7 @@ mod dtls_e2e {
     #[ignore = "requires a live server built/configured with --features dtls"]
     async fn stun_binding_over_dtls() {
         let target = dtls_target();
-        let conn = match tokio::time::timeout(Duration::from_secs(5), dtls_connect(target)).await
-        {
+        let conn = match tokio::time::timeout(Duration::from_secs(5), dtls_connect(target)).await {
             Ok(c) => c,
             Err(_) => {
                 eprintln!("skip: DTLS handshake to {target} timed out (no DTLS server?)");
@@ -1708,7 +1713,11 @@ mod dtls_e2e {
             response[0],
             response[1]
         );
-        assert_eq!(&response[4..8], &[0x21, 0x12, 0xA4, 0x42], "magic cookie mismatch");
+        assert_eq!(
+            &response[4..8],
+            &[0x21, 0x12, 0xA4, 0x42],
+            "magic cookie mismatch"
+        );
         assert_eq!(&response[8..20], &request[8..20], "transaction ID mismatch");
         assert!(
             extract_xor_mapped_address(response).is_some(),

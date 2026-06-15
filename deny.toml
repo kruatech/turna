@@ -52,14 +52,11 @@ deny = [
 ]
 
 skip = [
-    { crate = "thiserror", reason = "transitive dependency version conflict v1/v2" },
-    { crate = "thiserror-impl", reason = "transitive dependency version conflict v1/v2" },
     { crate = "getrandom", reason = "ubiquitous 0.2/0.3 split across transitive deps" },
     { crate = "hashbrown", reason = "multiple versions across transitive deps" },
-]
-
-skip-tree = [
-    { crate = "opentelemetry-otlp", reason = "0.16 brings an older tonic 0.11 / http 0.2 stack; bump planned separately" },
+    { crate = "rand", reason = "workspace runtime rand is 0.8; opentelemetry_sdk 0.32 (runtime) and proptest (dev) pull rand 0.9 -- independent, benign" },
+    { crate = "rand_chacha", reason = "transitive leaf of the rand 0.8/0.9 split" },
+    { crate = "rand_core", reason = "transitive leaf of the rand 0.8/0.9 split (also argon2/password-hash on 0.6)" },
 ]
 
 [sources]

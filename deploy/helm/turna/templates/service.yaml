@@ -10,6 +10,8 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
+  # Public service: TURN/STUN only. Health, metrics and management are NOT
+  # exposed here — see the internal ClusterIP service below.
   type: {{ .Values.service.type }}
   ports:
     - name: stun-udp
@@ -20,6 +22,22 @@ spec:
       port: {{ .Values.turn.listenPort }}
       targetPort: stun-tcp
       protocol: TCP
+  selector:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+# Internal service: health + Prometheus metrics, cluster-internal only.
+# Point any ServiceMonitor at this service, not the public LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-internal
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  ports:
     - name: health
       port: {{ .Values.turn.healthPort }}
       targetPort: health

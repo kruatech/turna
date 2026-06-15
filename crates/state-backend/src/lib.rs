@@ -325,7 +325,6 @@ pub enum BackendConfig {
 /// `BackendConfig::Tarantool::pool_size`.
 pub const DEFAULT_POOL_SIZE: usize = 8;
 
-
 pub async fn create_backend(config: &BackendConfig) -> Result<Backend> {
     match config {
         BackendConfig::Memory => {

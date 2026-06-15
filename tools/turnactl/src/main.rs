@@ -198,7 +198,11 @@ fn print_formatted(command: &str, data: &Option<serde_json::Value>) {
                         "{:<28} {:<24} {}",
                         n["node_id"].as_str().unwrap_or("?"),
                         n["turn_addr"].as_str().unwrap_or("?"),
-                        if n["is_self"].as_bool().unwrap_or(false) { "*" } else { "" }
+                        if n["is_self"].as_bool().unwrap_or(false) {
+                            "*"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 println!("({} node(s))", nodes.len());

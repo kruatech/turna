@@ -144,8 +144,10 @@ where
         "cluster gossip started"
     );
     if cfg.secret.is_none() {
-        warn!("cluster gossip has no shared secret; any host that can reach the \
-               gossip port can inject nodes into the ring. Set cluster.secret.");
+        warn!(
+            "cluster gossip has no shared secret; any host that can reach the \
+               gossip port can inject nodes into the ring. Set cluster.secret."
+        );
     }
 
     publish_topology(&cfg, &peers, &mut last_topology, &on_change);
@@ -456,7 +458,14 @@ mod tests {
         let mut peers = HashMap::new();
         let mut tomb = HashMap::new();
         let changed = observe_peer(
-            "node-a", &mut peers, &mut tomb, "node-c", addr(3480), addr(7948), 5, false,
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-c",
+            addr(3480),
+            addr(7948),
+            5,
+            false,
         );
         assert!(changed);
         assert!(peers.contains_key("node-c"));
@@ -467,7 +476,14 @@ mod tests {
         let mut peers = HashMap::new();
         let mut tomb = HashMap::new();
         let changed = observe_peer(
-            "node-a", &mut peers, &mut tomb, "node-a", addr(3478), addr(7946), 9, true,
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-a",
+            addr(3478),
+            addr(7946),
+            9,
+            true,
         );
         assert!(!changed);
         assert!(peers.is_empty());
@@ -477,10 +493,28 @@ mod tests {
     fn stale_indirect_seq_does_not_refresh() {
         let mut peers = HashMap::new();
         let mut tomb = HashMap::new();
-        observe_peer("node-a", &mut peers, &mut tomb, "node-b", addr(3479), addr(7947), 10, true);
+        observe_peer(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            10,
+            true,
+        );
         let first_seen = peers["node-b"].last_seen;
         std::thread::sleep(Duration::from_millis(5));
-        observe_peer("node-a", &mut peers, &mut tomb, "node-b", addr(3479), addr(7947), 7, false);
+        observe_peer(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            7,
+            false,
+        );
         assert_eq!(peers["node-b"].last_seen, first_seen);
         assert_eq!(peers["node-b"].seq, 10);
     }
@@ -489,14 +523,31 @@ mod tests {
     fn tombstone_blocks_indirect_resurrection_but_allows_direct_rejoin() {
         let mut peers = HashMap::new();
         let mut tomb = HashMap::new();
-        tomb.insert("node-b".to_string(), Instant::now() + Duration::from_secs(60));
+        tomb.insert(
+            "node-b".to_string(),
+            Instant::now() + Duration::from_secs(60),
+        );
         let c1 = observe_peer(
-            "node-a", &mut peers, &mut tomb, "node-b", addr(3479), addr(7947), 12, false,
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            12,
+            false,
         );
         assert!(!c1);
         assert!(peers.is_empty());
         let c2 = observe_peer(
-            "node-a", &mut peers, &mut tomb, "node-b", addr(3479), addr(7947), 1, true,
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            1,
+            true,
         );
         assert!(c2);
         assert!(peers.contains_key("node-b"));
@@ -510,38 +561,74 @@ mod tests {
         let grace = Duration::from_secs(5);
 
         // Node B is known at seq=100.
-        observe_peer("node-a", &mut peers, &mut tomb, "node-b", addr(3479), addr(7947), 100, true);
+        observe_peer(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            100,
+            true,
+        );
         assert_eq!(peers["node-b"].seq, 100);
 
         // A replayed (stale) leaving must NOT evict it and must NOT tombstone.
         let changed = apply_leaving("node-a", &mut peers, &mut tomb, "node-b", 50, grace);
         assert!(!changed, "stale leaving must not change topology");
-        assert!(peers.contains_key("node-b"), "stale leaving must not evict the peer");
-        assert!(!tomb.contains_key("node-b"), "stale leaving must not plant a tombstone");
+        assert!(
+            peers.contains_key("node-b"),
+            "stale leaving must not evict the peer"
+        );
+        assert!(
+            !tomb.contains_key("node-b"),
+            "stale leaving must not plant a tombstone"
+        );
 
         // A fresh leaving (seq > stored) evicts and tombstones.
         let changed = apply_leaving("node-a", &mut peers, &mut tomb, "node-b", 101, grace);
         assert!(changed, "fresh leaving must change topology");
-        assert!(!peers.contains_key("node-b"), "fresh leaving must evict the peer");
-        assert!(tomb.contains_key("node-b"), "fresh leaving must plant a tombstone");
+        assert!(
+            !peers.contains_key("node-b"),
+            "fresh leaving must evict the peer"
+        );
+        assert!(
+            tomb.contains_key("node-b"),
+            "fresh leaving must plant a tombstone"
+        );
     }
 
     #[test]
     fn leaving_for_unknown_node_is_ignored() {
         let mut peers = HashMap::new();
         let mut tomb = HashMap::new();
-        let changed =
-            apply_leaving("node-a", &mut peers, &mut tomb, "node-x", 999, Duration::from_secs(5));
+        let changed = apply_leaving(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-x",
+            999,
+            Duration::from_secs(5),
+        );
         assert!(!changed);
-        assert!(tomb.is_empty(), "an unknown-node leaving must not plant a tombstone");
+        assert!(
+            tomb.is_empty(),
+            "an unknown-node leaving must not plant a tombstone"
+        );
     }
 
     #[test]
     fn leaving_for_own_id_is_ignored() {
         let mut peers = HashMap::new();
         let mut tomb = HashMap::new();
-        let changed =
-            apply_leaving("node-a", &mut peers, &mut tomb, "node-a", 999, Duration::from_secs(5));
+        let changed = apply_leaving(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-a",
+            999,
+            Duration::from_secs(5),
+        );
         assert!(!changed);
         assert!(tomb.is_empty());
     }

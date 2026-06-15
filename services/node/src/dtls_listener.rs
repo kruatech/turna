@@ -151,8 +151,7 @@ pub fn spawn_dtls(
                         .ok()
                         .and_then(|g| g.get(&session_id).cloned());
                     if let Some(out_tx) = out_tx {
-                        let (sink_tx, mut sink_rx) =
-                            tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
                         client_sinks.insert(remote, sink_tx);
                         let sid = session_id.clone();
                         let pump_stats = bridge_stats.clone();
@@ -164,7 +163,9 @@ pub fn spawn_dtls(
                                 }) {
                                     Ok(()) => {}
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        pump_stats.outbound_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        pump_stats
+                                            .outbound_dropped
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                         break; // session writer gone
@@ -205,7 +206,9 @@ pub fn spawn_dtls(
                                 }) {
                                     Ok(()) => {}
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                        bridge_stats.outbound_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        bridge_stats
+                                            .outbound_dropped
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                                 }

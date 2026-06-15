@@ -93,11 +93,7 @@ completed or validated from the source alone.
   cluster.
 
 ### Upstream dependency track
-- **tonic 0.12.3 → 0.14.x.** Unblocks removing the RUSTSEC ignores
-  (`rustls-pemfile`, webpki) and enables a real client-certificate CRL for #9
-  (currently mitigated by documentation only). Requires the
-  `tonic-build` → `tonic-prost-build` split and the TLS API move; keep the
-  `deny.toml` ignores until it compiles.
+- **tonic 0.12.3 → 0.14.x — done.** Upgraded (codegen → `tonic-prost-build`, TLS API moved). The `deny.toml` RUSTSEC ignores were removed and `cargo deny check advisories` is green. Note: `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) is **not** fully removed — it stays a direct dep of `turna-transport` (`tls`/`quic`) and transitive via `wtransport` (`web-transport`), so it cannot be dropped while QUIC/WebTransport are offered; cargo-deny does not surface the unmaintained advisory under the current config. Planned cleanup: migrate PEM parsing to `rustls-pki-types`. A real client-certificate CRL for #9 remains a follow-up (currently documentation-mitigated).
 
 ---
 

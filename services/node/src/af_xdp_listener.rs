@@ -134,8 +134,12 @@ pub fn run_af_xdp(
         metrics
             .afxdp_umem_free_frames
             .store(dp.free_frames() as u64, Relaxed);
-        metrics.afxdp_arp_replies_total.store(dp.arp_replies(), Relaxed);
-        metrics.afxdp_ndp_replies_total.store(dp.ndp_replies(), Relaxed);
+        metrics
+            .afxdp_arp_replies_total
+            .store(dp.arp_replies(), Relaxed);
+        metrics
+            .afxdp_ndp_replies_total
+            .store(dp.ndp_replies(), Relaxed);
         metrics
             .afxdp_neighbor_unresolved
             .store(if dp.neighbor_resolved() { 0 } else { 1 }, Relaxed);
@@ -168,7 +172,9 @@ pub fn run_af_xdp(
                     Action::Send { data, target } => match dp.send_to(&data, target) {
                         Ok(()) => {
                             metrics.afxdp_tx_frames_total.fetch_add(1, Relaxed);
-                            metrics.afxdp_tx_bytes_total.fetch_add(data.len() as u64, Relaxed);
+                            metrics
+                                .afxdp_tx_bytes_total
+                                .fetch_add(data.len() as u64, Relaxed);
                         }
                         Err(e) => {
                             metrics.afxdp_tx_drops_total.fetch_add(1, Relaxed);
@@ -189,7 +195,9 @@ pub fn run_af_xdp(
                         match dp.send_to_from(relay_port, &data, target) {
                             Ok(()) => {
                                 metrics.afxdp_tx_frames_total.fetch_add(1, Relaxed);
-                                metrics.afxdp_tx_bytes_total.fetch_add(data.len() as u64, Relaxed);
+                                metrics
+                                    .afxdp_tx_bytes_total
+                                    .fetch_add(data.len() as u64, Relaxed);
                             }
                             Err(e) => {
                                 metrics.afxdp_tx_drops_total.fetch_add(1, Relaxed);

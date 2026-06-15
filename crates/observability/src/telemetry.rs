@@ -8,20 +8,20 @@
 //!
 //! ```toml
 //! thiserror.workspace = true
-//! opentelemetry          = "0.23"
-//! opentelemetry_sdk      = { version = "0.23", features = ["rt-tokio"] }
-//! opentelemetry-otlp     = { version = "0.16", features = ["grpc-tonic"] }
-//! tracing-opentelemetry  = "0.24"
+//! opentelemetry          = "0.32"
+//! opentelemetry_sdk      = "0.32"
+//! opentelemetry-otlp     = { version = "0.32", features = ["grpc-tonic"] }
+//! tracing-opentelemetry  = "0.33"
 //! hostname               = "0.3"
 //! ```
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use opentelemetry::trace::TraceId;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::trace::{SamplingDecision, SamplingResult, TraceId};
 use opentelemetry::KeyValue;
-use opentelemetry_sdk::trace::{Sampler, ShouldSample};
+use opentelemetry_sdk::trace::{Sampler, SamplingDecision, SamplingResult, ShouldSample};
 use thiserror::Error;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -227,11 +227,16 @@ pub mod buckets {
 // Init
 // ---------------------------------------------------------------------------
 
-pub struct TelemetryGuard;
+pub struct TelemetryGuard {
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        opentelemetry::global::shutdown_tracer_provider();
+        // opentelemetry 0.32: no global shutdown fn — flush via the provider.
+        if let Some(provider) = self.provider.take() {
+            let _ = provider.shutdown();
+        }
         info!("telemetry shutdown");
     }
 }
@@ -252,6 +257,7 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
     // Build OTel layer first (needs bare Registry as subscriber type).
     // Wrap in Option so we can choose whether to include it.
     let otlp_enabled = !config.otlp_endpoint.is_empty();
+    let mut guard_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider> = None;
 
     // FIX: apply layers in correct order — OTel → filter → fmt.
     // This ensures the OTel layer sees Registry as its subscriber type.
@@ -272,7 +278,8 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
     }
 
     if otlp_enabled {
-        let otel_layer = build_otel_layer(&config)?;
+        let (otel_layer, provider) = build_otel_layer(&config)?;
+        guard_provider = Some(provider);
         // Registry → OTel → EnvFilter → fmt
         let base = tracing_subscriber::registry().with(otel_layer).with(filter);
         try_init_with_fmt!(base)?;
@@ -292,7 +299,9 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         "telemetry initialized"
     );
 
-    Ok(TelemetryGuard)
+    Ok(TelemetryGuard {
+        provider: guard_provider,
+    })
 }
 
 /// Build a `tracing_opentelemetry` layer backed by an OTLP gRPC exporter.
@@ -301,53 +310,50 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
 /// applied BEFORE any other layers in the subscriber chain.
 fn build_otel_layer(
     config: &TelemetryConfig,
-) -> Result<
-    tracing_opentelemetry::OpenTelemetryLayer<
-        tracing_subscriber::Registry,
-        opentelemetry_sdk::trace::Tracer,
-    >,
-> {
+) -> Result<(
+    impl tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+    opentelemetry_sdk::trace::SdkTracerProvider,
+)> {
     use opentelemetry_otlp::WithExportConfig;
 
-    let resource = opentelemetry_sdk::Resource::new(vec![
-        KeyValue::new("service.name", config.service_name.clone()),
-        KeyValue::new("service.version", config.service_version.clone()),
-        KeyValue::new("service.instance.id", config.instance_id.clone()),
-        KeyValue::new(
-            "deployment.environment",
-            std::env::var("DEPLOYMENT_ENV").unwrap_or_else(|_| "production".into()),
-        ),
-    ]);
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(config.service_name.clone())
+        .with_attributes([
+            KeyValue::new("service.version", config.service_version.clone()),
+            KeyValue::new("service.instance.id", config.instance_id.clone()),
+            KeyValue::new(
+                "deployment.environment",
+                std::env::var("DEPLOYMENT_ENV").unwrap_or_else(|_| "production".into()),
+            ),
+        ])
+        .build();
 
     let sampler = TurnaSampler::new(config.sampling.clone());
 
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
         .with_endpoint(&config.otlp_endpoint)
-        .build_span_exporter()
+        .build()
         .map_err(|e| TelemetryError::Tracer(format!("OTLP exporter: {e}")))?;
 
-    // FIX: in opentelemetry_sdk 0.23, sampler is set via Config, not via
-    // builder method. `builder().with_sampler()` does not exist in this version.
-    let trace_config = opentelemetry_sdk::trace::Config::default()
-        .with_sampler(
-            // ParentBased: respect parent span's decision for child spans;
-            // use TurnaSampler for root spans.
-            opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(sampler)),
-        )
-        .with_resource(resource);
-
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_config(trace_config)
+    // opentelemetry_sdk 0.32: sampler/resource go on the provider builder
+    // (trace::Config was removed) and the batch exporter takes no runtime arg.
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_sampler(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+            sampler,
+        )))
+        .with_resource(resource)
+        .with_batch_exporter(exporter)
         .build();
 
     let tracer = provider.tracer(config.service_name.clone());
-    opentelemetry::global::set_tracer_provider(provider);
+    // Clone for the global provider; keep the original for the guard to
+    // shut down on drop.
+    opentelemetry::global::set_tracer_provider(provider.clone());
 
     info!(endpoint = %config.otlp_endpoint, "OTLP tracer provider installed");
 
-    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
+    Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }
 
 /// Span macro для обработки STUN-запроса.

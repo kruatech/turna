@@ -275,7 +275,7 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             ..
         } => {
             let pb = batch.entry(port).or_insert_with(PortBatch::new_touched);
-            
+
             pb.perms.insert(peer_ip, expires_at_ms).is_some()
         }
         WriteOp::Channel {
@@ -285,9 +285,8 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             ..
         } => {
             let pb = batch.entry(port).or_insert_with(PortBatch::new_touched);
-            
-            pb
-                .chans
+
+            pb.chans
                 .insert(number, (peer_addr, expires_at_ms))
                 .is_some()
         }
@@ -606,6 +605,16 @@ mod tests {
     use std::net::Ipv4Addr;
     use turna_state_backend::{create_backend, BackendConfig};
 
+    /// Handles returned by `spawn_writer`: op sender, shutdown sender,
+    /// counters, metrics, and the task join handle.
+    type SpawnedWriter = (
+        mpsc::Sender<WriteOp>,
+        watch::Sender<bool>,
+        Arc<WriterCounters>,
+        Arc<Metrics>,
+        tokio::task::JoinHandle<()>,
+    );
+
     fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port)
     }
@@ -623,13 +632,7 @@ mod tests {
         store: Arc<AllocationStore>,
         batch_max: usize,
         delay_ms: u64,
-    ) -> (
-        mpsc::Sender<WriteOp>,
-        watch::Sender<bool>,
-        Arc<WriterCounters>,
-        Arc<Metrics>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> SpawnedWriter {
         let (tx, rx) = mpsc::channel(1024);
         let (sd_tx, sd_rx) = watch::channel(false);
         let counters = Arc::new(WriterCounters::default());
@@ -905,7 +908,10 @@ mod tests {
             "relay binding must be unchanged by migration"
         );
         assert_eq!(after.user_id, "mobile");
-        assert_eq!(after.migration_epoch, 1, "persisted epoch must track the re-key bump");
+        assert_eq!(
+            after.migration_epoch, 1,
+            "persisted epoch must track the re-key bump"
+        );
 
         sd.send(true).unwrap();
         handle.await.unwrap();

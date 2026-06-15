@@ -1,0 +1,20 @@
+# Build artifacts — the image runs `cargo build --release` itself,
+# so the host target/ must never enter the build context (huge + races
+# with a running cargo writing the incremental cache).
+target/
+**/target/
+
+# VCS metadata. Remove this line if any build.rs embeds git info at build time.
+.git/
+.gitignore
+
+# CI / Docker / editor / OS junk — not needed to build the binaries
+.github/
+.dockerignore
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local archives / scratch
+*.zip
