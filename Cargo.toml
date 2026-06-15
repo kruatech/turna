@@ -80,7 +80,7 @@ rand = "0.8"
 base64 = "0.22"
 
 # auth
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 argon2 = "0.5"
 uuid = { version = "1", features = ["v4"] }
 
