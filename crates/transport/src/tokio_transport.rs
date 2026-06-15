@@ -83,6 +83,7 @@ impl TokioTransport {
             self.socket.readable().await?;
             let res = self.socket.try_io(tokio::io::Interest::READABLE, || {
                 let n = bufs.len();
+                // SAFETY: sockaddr_storage is a C POD type; all-zeroes is a valid value.
                 let mut addrs: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; n];
                 let mut iovecs: Vec<libc::iovec> = bufs
                     .iter_mut()
@@ -93,6 +94,7 @@ impl TokioTransport {
                     .collect();
                 let mut hdrs: Vec<libc::mmsghdr> = (0..n)
                     .map(|k| {
+                        // SAFETY: libc::mmsghdr is a C POD type; all-zeroes is valid.
                         let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
                         h.msg_hdr.msg_iov = &mut iovecs[k];
                         h.msg_hdr.msg_iovlen = 1;
@@ -102,6 +104,8 @@ impl TokioTransport {
                         h
                     })
                     .collect();
+                // SAFETY: `fd` is open; `hdrs` is a valid array of `n` initialized
+                // mmsghdr; null timeout means block per MSG_DONTWAIT semantics.
                 let r = unsafe {
                     libc::recvmmsg(
                         fd,
@@ -117,6 +121,8 @@ impl TokioTransport {
                 let r = r as usize;
                 for k in 0..r {
                     let sa =
+                        // SAFETY: addrs[k] was filled by recvmmsg with namelen bytes,
+                        // a valid initialized sockaddr.
                         unsafe { socket2::SockAddr::new(addrs[k], hdrs[k].msg_hdr.msg_namelen) };
                     let src = sa.as_socket().ok_or_else(|| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "non-IP source addr")
@@ -172,6 +178,7 @@ impl TokioTransport {
                     .collect();
                 let mut hdrs: Vec<libc::mmsghdr> = (0..n)
                     .map(|k| {
+                        // SAFETY: libc::mmsghdr is a C POD type; all-zeroes is valid.
                         let mut h: libc::mmsghdr = unsafe { std::mem::zeroed() };
                         h.msg_hdr.msg_iov = &mut iovecs[k];
                         h.msg_hdr.msg_iovlen = 1;
@@ -180,6 +187,8 @@ impl TokioTransport {
                         h
                     })
                     .collect();
+                // SAFETY: `fd` is open; `hdrs` is a valid array of `n` initialized
+                // mmsghdr describing buffers that outlive the call.
                 let r = unsafe {
                     libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as libc::c_uint, libc::MSG_DONTWAIT)
                 };

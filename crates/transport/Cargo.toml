@@ -13,9 +13,9 @@ quic = ["dep:quinn", "dep:rustls", "dep:rustls-pemfile"]
 web-transport = ["quic", "dep:wtransport"]
 # AF_XDP zero-copy datapath (Linux). Pure L2-L4 stack is dependency-free; the
 # ring/mmap datapath should adopt xsk-rs (see docs/design/af-xdp-datapath.md).
-af-xdp = ["dep:xsk-rs"]
+af-xdp = ["dep:xsk-rs", "dep:rtnetlink", "dep:netlink-packet-route", "dep:futures-util", "dep:libxdp-sys", "dep:libbpf-sys"]
 # TURN over DTLS (RFC 7350), pure-Rust DTLS 1.2 via webrtc-dtls.
-dtls = ["dep:webrtc-dtls", "dep:webrtc-util"]
+dtls = ["dep:webrtc-dtls", "dep:webrtc-util", "dep:rustls"]
 
 [dependencies]
 tokio.workspace = true
@@ -59,3 +59,14 @@ io-uring = { version = "0.7", optional = true }
 # Umem::new / Socket::new return shapes and the queue methods
 # (fill / poll_and_consume / produce_and_wakeup / consume) are version-sensitive.
 xsk-rs = { version = "0.6", optional = true }
+# Per-destination neighbor resolution (feature: af-xdp). rtnetlink 0.21 pulls
+# netlink-packet-route 0.30 — pin the same to avoid type-version skew.
+rtnetlink = { version = "0.21", optional = true }
+netlink-packet-route = { version = "0.30", optional = true }
+futures-util = { version = "0.3", optional = true }
+# 1.1: embedded XDP program load/attach + xskmap/ports maps. libxdp-sys already
+# enters the tree transitively via xsk-rs; declaring it directly exposes its FFI
+# (xdp_program__*, bpf_*) to this crate. libbpf-sys (pinned =1.5.1 by libxdp-sys)
+# is declared too so its bpf headers reach build.rs via DEP_BPF_INCLUDE.
+libxdp-sys = { version = "0.2", optional = true }
+libbpf-sys = { version = "1.5", optional = true }

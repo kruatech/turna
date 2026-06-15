@@ -1,116 +1,81 @@
 # syntax=docker/dockerfile:1
 #
-# Turna TURN — Multi-arch Docker image (amd64 + arm64)
+# Turna TURN/STUN server image.
 #
-# Build:
-#   docker buildx build --platform linux/amd64,linux/arm64 -t turna .
+# Build from repository root:
+#   docker build -f deploy/Dockerfile -t turna:local .
 #
 # Run:
-#   docker run -p 3478:3478/udp -p 8080:8080 -p 9090:9090 turna
+#   docker run --rm \
+#     -p 3478:3478/udp -p 3478:3478/tcp -p 9090:9090/tcp \
+#     -v "$PWD/deploy/turn.toml:/etc/turna/turn.toml:ro" \
+#     turna:local
 
-# ============================================================================
+# =============================================================================
 # Stage 1: Build
-# ============================================================================
-FROM rust:1.82-bookworm AS builder
+# =============================================================================
+FROM rust:1.95.0-bookworm AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     cmake \
-    pkg-config \
     libclang-dev \
+    pkg-config \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-# Cache dependencies: copy only Cargo files first
-COPY Cargo.toml Cargo.lock ./
-COPY crates/protocol/proto-stun/Cargo.toml crates/protocol/proto-stun/
-COPY crates/protocol/proto-turn/Cargo.toml crates/protocol/proto-turn/
-COPY crates/protocol/proto-ice/Cargo.toml crates/protocol/proto-ice/
-COPY crates/protocol/proto-rtp/Cargo.toml crates/protocol/proto-rtp/
-COPY crates/transport/Cargo.toml crates/transport/
-COPY crates/packet/Cargo.toml crates/packet/
-COPY crates/relay/Cargo.toml crates/relay/
-COPY crates/session/Cargo.toml crates/session/
-COPY crates/auth/Cargo.toml crates/auth/
-COPY crates/crypto/Cargo.toml crates/crypto/
-COPY crates/qos/Cargo.toml crates/qos/
-COPY crates/discovery/Cargo.toml crates/discovery/
-COPY crates/control/Cargo.toml crates/control/
-COPY crates/config/Cargo.toml crates/config/
-COPY crates/observability/Cargo.toml crates/observability/
-COPY crates/health/Cargo.toml crates/health/
-COPY crates/sfu/Cargo.toml crates/sfu/
-COPY crates/rtp-analyzer/Cargo.toml crates/rtp-analyzer/
-COPY crates/rest-api/Cargo.toml crates/rest-api/
-COPY services/node/Cargo.toml services/node/
-COPY services/signaling/Cargo.toml services/signaling/
-COPY services/control-plane/Cargo.toml services/control-plane/
-COPY tools/load-test/Cargo.toml tools/load-test/
-
-# Create dummy src files for dependency caching
-RUN find . -name "Cargo.toml" -path "*/crates/*" -exec sh -c \
-    'dir=$(dirname {})/src && mkdir -p $dir && echo "// dummy" > $dir/lib.rs' \;
-RUN find . -name "Cargo.toml" -path "*/services/*" -exec sh -c \
-    'dir=$(dirname {})/src && mkdir -p $dir && echo "fn main(){}" > $dir/main.rs' \;
-RUN find . -name "Cargo.toml" -path "*/tools/*" -exec sh -c \
-    'dir=$(dirname {})/src && mkdir -p $dir && echo "fn main(){}" > $dir/main.rs' \;
-
-# Build dependencies only (cached layer)
-RUN cargo build --release --workspace 2>/dev/null || true
-
-# Copy actual source
+# Copy the full workspace. This intentionally avoids stale per-crate COPY lists:
+# the workspace is the source of truth and the image must not reference removed
+# crates/binaries that are no longer members of the current workspace.
 COPY . .
 
-# Touch all source files to invalidate build cache
-RUN find . -name "*.rs" -exec touch {} +
+# Build only binaries that exist in the current workspace.
+RUN cargo build --locked --release \
+    --bin turna-node \
+    --bin turna-control-plane \
+    --bin turnactl
 
-# Build release binaries
-RUN cargo build --release --bin turna-node --bin turna-signaling
-
-# ============================================================================
+# =============================================================================
 # Stage 2: Runtime
-# ============================================================================
+# =============================================================================
 FROM debian:bookworm-slim AS runtime
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN groupadd -r turna && useradd -r -g turna -d /etc/turna -s /sbin/nologin turna
+RUN groupadd -r turna \
+    && useradd -r -g turna -d /etc/turna -s /usr/sbin/nologin turna
 
-# Copy binaries
 COPY --from=builder /build/target/release/turna-node /usr/local/bin/
-COPY --from=builder /build/target/release/turna-signaling /usr/local/bin/
-
-# Default config
+COPY --from=builder /build/target/release/turna-control-plane /usr/local/bin/
+COPY --from=builder /build/target/release/turnactl /usr/local/bin/
 COPY deploy/turn.toml /etc/turna/turn.toml
 
-# Create directories
 RUN mkdir -p /etc/turna/tls /etc/turna/ebpf /var/run/turna \
     && chown -R turna:turna /etc/turna /var/run/turna
 
 # Ports:
 #   3478/udp  - TURN/STUN
 #   3478/tcp  - TURN over TCP
-#   5349/tcp  - TURNS (TLS)
-#   8080/tcp  - Signaling (WebSocket)
-#   9090/tcp  - Health + REST API + Metrics
-EXPOSE 3478/udp 3478/tcp 5349/tcp 8080/tcp 9090/tcp
+#   5349/tcp  - TURNS (TLS), when enabled in config
+#   5350/tcp  - gRPC management API, when enabled/bound externally
+#   9090/tcp  - health + Prometheus metrics
+EXPOSE 3478/udp 3478/tcp 5349/tcp 5350/tcp 9090/tcp
 
-# Relay port range
+# Relay UDP ports. Publish a narrower range in compose/dev when needed.
 EXPOSE 49152-65535/udp
 
-# Health check
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:9090/health || exit 1
+    CMD curl -fsS http://127.0.0.1:9090/health >/dev/null || exit 1
 
 USER turna
 
-# Environment
 ENV RUST_LOG=info,turna=debug
-ENV VOX_WORKERS=0
+ENV TURNA_WORKERS=0
 
 ENTRYPOINT ["turna-node"]
 CMD ["/etc/turna/turn.toml"]

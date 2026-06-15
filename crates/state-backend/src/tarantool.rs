@@ -32,7 +32,7 @@
 //! Response format difference:
 //! - EVAL: `{data: [v1, v2, ...]}` — direct array of return values.
 //! - CALL: `{data: [[v1, v2, ...]]}` — wrapped in an outer array.
-//! `parse_call_data()` handles the unwrapping.
+//!   `parse_call_data()` handles the unwrapping.
 //!
 //! # Connection pool
 //!
@@ -94,10 +94,10 @@ use crate::*;
 
 // ── Schema init ───────────────────────────────────────────────────────────────
 
-/// Legacy embedded schema script — kept for reference only.
-/// **Not executed automatically.** Run `deploy/tarantool/init.lua` once on
-/// the Tarantool host instead: it creates spaces, indexes, stored functions,
-/// and the `turna_app` role with per-function execute grants.
+// Legacy embedded schema script — kept for reference only.
+// **Not executed automatically.** Run `deploy/tarantool/init.lua` once on
+// the Tarantool host instead: it creates spaces, indexes, stored functions,
+// and the `turna_app` role with per-function execute grants.
 
 // ── TarantoolBackend ──────────────────────────────────────────────────────────
 
@@ -489,9 +489,8 @@ impl TarantoolBackend {
             BackendError::Connection(e.to_string())
         })?;
 
-        let resp_size = read_msgpack_uint(conn).await.map_err(|e| {
+        let resp_size = read_msgpack_uint(conn).await.inspect_err(|_e| {
             self.slot_state[slot_idx].store(2, Ordering::Relaxed);
-            e
         })?;
         if resp_size > 16 * 1024 * 1024 {
             *conn_guard = None;
@@ -540,7 +539,7 @@ impl TarantoolBackend {
     /// slots are unaffected.
     // Generic Lua-eval entry point retained for forthcoming backend ops; the
     // shipped code paths use the typed helpers instead, so it's unused today.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reserved Tarantool eval path (reconnect wrapper); not yet wired to the backend
     async fn eval(&self, lua: &str, args: &[&str]) -> Result<Vec<u8>> {
         let slot_idx = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.pool.len();
         match self.eval_once(slot_idx, lua, args).await {
@@ -563,7 +562,7 @@ impl TarantoolBackend {
     }
 
     // Single-slot variant backing `eval`; transitively unused while `eval` is.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reserved Tarantool eval path (iproto request); not yet wired to the backend
     async fn eval_once(&self, slot_idx: usize, lua: &str, args: &[&str]) -> Result<Vec<u8>> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -628,9 +627,8 @@ impl TarantoolBackend {
         // Tarantool sends: [size: msgpack_uint][header_map][body_map]
         // The size encodes the combined byte length of header_map + body_map.
 
-        let resp_size = read_msgpack_uint(conn).await.map_err(|e| {
+        let resp_size = read_msgpack_uint(conn).await.inspect_err(|_e| {
             self.slot_state[slot_idx].store(2, Ordering::Relaxed);
-            e
         })?;
         if resp_size > 16 * 1024 * 1024 {
             // Drop the connection — we have no way to skip the body.
@@ -805,16 +803,6 @@ fn call_bool(resp: &[u8]) -> Result<bool> {
 
 // iproto response decoders kept as a complete typed set alongside the ones in
 // active use (data_to_*); these two shapes aren't decoded by current callers.
-#[allow(dead_code)]
-fn parse_list<T: serde::de::DeserializeOwned>(resp: &[u8]) -> Result<Vec<T>> {
-    data_to_list(parse_iproto_data(resp)?)
-}
-
-#[allow(dead_code)]
-fn parse_u64(resp: &[u8]) -> Option<u64> {
-    data_to_u64(&parse_iproto_data(resp).unwrap_or_default())
-}
-
 // ── TCP + auth helpers ────────────────────────────────────────────────────────
 
 /// Open a TCP connection to Tarantool, read the greeting (extracting the
@@ -1322,5 +1310,143 @@ mod tests {
         // remove
         backend.remove_allocation(19999).await.unwrap();
         assert!(backend.get_allocation(19999).await.unwrap().is_none());
+    }
+
+    // ── Failover / CAS scenarios (audit-2 §9.2 #7) ────────────────────────────
+    //
+    // These exercise the takeover primitive (`claim_allocation`) that the
+    // failover sweep relies on, against a real Tarantool. They skip when
+    // `TARANTOOL_URI` is unset (same convention as `integration_round_trip`),
+    // so `cargo test` stays green without a backend; CI provides one (see the
+    // `failover-integration` job in .github/workflows/ci.yml, which loads
+    // `deploy/tarantool/init.lua` first).
+
+    /// Build a stored allocation owned by `node_id`, expiring at `expires_at_ms`.
+    fn owned_alloc(relay_port: u16, node_id: &str, expires_at_ms: u64) -> StoredAllocation {
+        StoredAllocation {
+            id: format!("fo-{relay_port}"),
+            relay_port,
+            client_addr: "1.2.3.4:5000".into(),
+            relay_addr: format!("5.6.7.8:{relay_port}"),
+            user_id: "failover-user".into(),
+            realm: "turna".into(),
+            node_id: node_id.into(),
+            allocation_id: format!("alloc-{relay_port}"),
+            migration_epoch: 0,
+            created_at_ms: now_ms(),
+            expires_at_ms,
+            bytes_in: 0,
+            bytes_out: 0,
+            packets_in: 0,
+            packets_out: 0,
+            permissions: vec![],
+            channels: vec![],
+        }
+    }
+
+    async fn connect_test_backend() -> Option<TarantoolBackend> {
+        let uri = std::env::var("TARANTOOL_URI").ok()?;
+        let user = std::env::var("TARANTOOL_USER").ok();
+        let pw = std::env::var("TARANTOOL_PASSWORD").ok();
+        let backend = TarantoolBackend::connect_pool(&uri, user.as_deref(), pw.as_deref(), 4)
+            .await
+            .unwrap();
+        backend.init_schema().await.unwrap();
+        Some(backend)
+    }
+
+    /// CAS takeover: once an allocation has moved to a new owner, a late sweep
+    /// that still expects the *original* owner must be rejected — no
+    /// double-takeover (split-brain).
+    #[tokio::test]
+    async fn integration_failover_stale_claim_rejected() {
+        let Some(backend) = connect_test_backend().await else {
+            return;
+        };
+        let port = 19990;
+        backend.remove_allocation(port).await.ok(); // clean slate
+        backend
+            .store_allocation(&owned_alloc(port, "node-a", now_ms() + 600_000))
+            .await
+            .unwrap();
+
+        // node-b takes over from node-a.
+        assert!(backend
+            .claim_allocation(port, "node-a", "node-b")
+            .await
+            .unwrap());
+        // A late sweep still believing node-a owns it must fail.
+        assert!(!backend
+            .claim_allocation(port, "node-a", "node-c")
+            .await
+            .unwrap());
+
+        let owner = backend.get_allocation(port).await.unwrap().unwrap().node_id;
+        assert_eq!(owner, "node-b");
+        let by_b = backend.find_by_node("node-b").await.unwrap();
+        assert!(by_b.iter().any(|a| a.relay_port == port));
+        let by_a = backend.find_by_node("node-a").await.unwrap();
+        assert!(by_a.iter().all(|a| a.relay_port != port));
+
+        backend.remove_allocation(port).await.unwrap();
+    }
+
+    /// Concurrent race: two sweepers claim the same allocation from the same
+    /// expected owner simultaneously. Tarantool serializes the CAS, so exactly
+    /// one wins — the invariant that prevents split-brain under simultaneous
+    /// failover.
+    #[tokio::test]
+    async fn integration_failover_claim_is_atomic() {
+        let Some(backend) = connect_test_backend().await else {
+            return;
+        };
+        let backend = std::sync::Arc::new(backend);
+        let port = 19991;
+        backend.remove_allocation(port).await.ok();
+        backend
+            .store_allocation(&owned_alloc(port, "old", now_ms() + 600_000))
+            .await
+            .unwrap();
+
+        let b1 = backend.clone();
+        let b2 = backend.clone();
+        let (r1, r2) = tokio::join!(
+            async move { b1.claim_allocation(port, "old", "new-1").await.unwrap() },
+            async move { b2.claim_allocation(port, "old", "new-2").await.unwrap() },
+        );
+        assert!(r1 ^ r2, "exactly one claim must win (got r1={r1}, r2={r2})");
+
+        let owner = backend.get_allocation(port).await.unwrap().unwrap().node_id;
+        assert!(owner == "new-1" || owner == "new-2");
+
+        backend.remove_allocation(port).await.unwrap();
+    }
+
+    /// Sweep flow: an allocation left behind by a dead node is enumerated via
+    /// `find_by_node` and reassigned with `claim_allocation`.
+    #[tokio::test]
+    async fn integration_failover_sweep_reassigns_dead_node() {
+        let Some(backend) = connect_test_backend().await else {
+            return;
+        };
+        let port = 19992;
+        backend.remove_allocation(port).await.ok();
+        // A "dead" node owns an allocation whose lease has already expired.
+        backend
+            .store_allocation(&owned_alloc(port, "dead", now_ms().saturating_sub(1)))
+            .await
+            .unwrap();
+
+        // The sweeper enumerates the dead node's allocations…
+        let orphans = backend.find_by_node("dead").await.unwrap();
+        assert!(orphans.iter().any(|a| a.relay_port == port));
+        // …and claims each for itself.
+        assert!(backend.claim_allocation(port, "dead", "live").await.unwrap());
+        assert_eq!(
+            backend.get_allocation(port).await.unwrap().unwrap().node_id,
+            "live"
+        );
+
+        backend.remove_allocation(port).await.unwrap();
     }
 }

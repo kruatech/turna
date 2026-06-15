@@ -18,6 +18,7 @@
 //!   TURNA_TEST_PASS=testpass           (default; or 'pass' for static-users mode)
 //!   TURNA_TEST_SECRET=<secret>         (enables coturn-style time-limited creds)
 //!   TURNA_TEST_DEBUG=1                 (prints hex of HMAC inputs/outputs)
+//!   TURNA_TEST_REQUIRE_SERVER=1        (turns reachability skips into failures)
 //!
 //! Two server auth modes are supported:
 //!
@@ -45,11 +46,177 @@ use tokio::net::UdpSocket;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-fn target_addr() -> SocketAddr {
-    std::env::var("TURNA_TEST_TARGET")
-        .unwrap_or_else(|_| "127.0.0.1:3478".into())
+// -- Hermetic test server (F-5 #2) ------------------------------------------
+// target_addr() resolves to a reachable turna-node. With TURNA_TEST_TARGET set,
+// that external server is used (and the TURNA_TEST_REQUIRE_SERVER guard in
+// skip_if_no_server! applies). Otherwise a single node is spawned per test
+// binary on ephemeral ports with a temp tokio config, made ready before any
+// test runs, and killed when the test process exits (PR_SET_PDEATHSIG on Linux).
+use std::sync::OnceLock;
+
+struct TestServer {
+    addr: SocketAddr,
+    _child: Option<std::process::Child>,
+}
+
+static SERVER: OnceLock<TestServer> = OnceLock::new();
+
+fn shared_server() -> &'static TestServer {
+    SERVER.get_or_init(|| {
+        if let Ok(t) = std::env::var("TURNA_TEST_TARGET") {
+            return TestServer {
+                addr: t.parse().expect("invalid TURNA_TEST_TARGET"),
+                _child: None,
+            };
+        }
+        spawn_hermetic()
+    })
+}
+
+fn free_port(udp: bool) -> u16 {
+    if udp {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("free udp port")
+            .port()
+    } else {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("free tcp port")
+            .port()
+    }
+}
+
+fn node_binary() -> std::path::PathBuf {
+    // current_exe = <target>/<profile>/deps/<bin>-<hash>;
+    // turna-node lives at <target>/<profile>/turna-node.
+    let exe = std::env::current_exe().expect("current_exe");
+    let profile_dir = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("target/<profile> dir");
+    profile_dir.join("turna-node")
+}
+
+fn spawn_hermetic() -> TestServer {
+    // The node must outlive every #[tokio::test] runtime. PR_SET_PDEATHSIG tracks
+    // the *parent thread*, not the process, so the node is spawned from a
+    // dedicated thread that parks for the whole process lifetime. Otherwise a
+    // tokio worker thread from the first test's runtime would terminate at test
+    // end and SIGKILL the node, leaving later tests with no server.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
+    std::thread::Builder::new()
+        .name("turna-hermetic-node".into())
+        .spawn(move || match boot_node() {
+            Ok((addr, child)) => {
+                let _ = tx.send(Ok(addr));
+                let _child = child; // hold the handle so it is not dropped
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        })
+        .expect("spawn hermetic node thread");
+    match rx.recv() {
+        Ok(Ok(addr)) => TestServer {
+            addr,
+            _child: None,
+        },
+        Ok(Err(e)) => panic!("hermetic node: {e}"),
+        Err(_) => panic!("hermetic node boot thread exited before reporting"),
+    }
+}
+
+fn boot_node() -> Result<(SocketAddr, std::process::Child), String> {
+    let bin = node_binary();
+    if !bin.exists() {
+        return Err(format!(
+            "node binary not found at {bin:?} -- build it first: cargo build -p turna-node \
+             (or set TURNA_TEST_TARGET to an external server)"
+        ));
+    }
+    let turn_port = free_port(true);
+    let health_port = free_port(false);
+    let dir = std::env::temp_dir().join(format!("turna-it-{}-{turn_port}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+    let cfg_path = dir.join("turn.toml");
+    let cfg = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{turn_port}\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 49152\n\
+         max_port = 49500\n\
+         [health]\n\
+         listen = \"127.0.0.1:{health_port}\"\n"
+    );
+    std::fs::write(&cfg_path, cfg).map_err(|e| format!("write config: {e}"))?;
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg(&cfg_path);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: pre_exec runs in the forked child before exec; prctl is a single
+        // async-signal-safe syscall. PR_SET_PDEATHSIG delivers SIGKILL when the
+        // *spawning thread* dies; that thread parks for the whole process lifetime
+        // (see spawn_hermetic), so the node dies only when the test process exits.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
+    let child = cmd.spawn().map_err(|e| format!("spawn {bin:?}: {e}"))?;
+
+    let health: SocketAddr = format!("127.0.0.1:{health_port}")
         .parse()
-        .expect("invalid TURNA_TEST_TARGET")
+        .map_err(|e| format!("health addr: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !http_ready(&health) {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("node not ready on {health} within 15s"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let addr = format!("127.0.0.1:{turn_port}")
+        .parse()
+        .map_err(|e| format!("turn addr: {e}"))?;
+    Ok((addr, child))
+}
+
+fn http_ready(health: &SocketAddr) -> bool {
+    use std::io::{Read, Write};
+    let mut s = match std::net::TcpStream::connect_timeout(
+        health,
+        std::time::Duration::from_millis(300),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+    if s
+        .write_all(b"GET /ready HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).contains(" 200 ")
+}
+
+fn target_addr() -> SocketAddr {
+    shared_server().addr
 }
 
 fn test_user() -> String {
@@ -63,6 +230,13 @@ fn test_secret() -> Option<String> {
 }
 fn test_debug() -> bool {
     std::env::var("TURNA_TEST_DEBUG").is_ok()
+}
+
+fn require_server() -> bool {
+    matches!(
+        std::env::var("TURNA_TEST_REQUIRE_SERVER"),
+        Ok(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    )
 }
 
 // ── Debug helpers ─────────────────────────────────────────────────────────────
@@ -123,9 +297,15 @@ macro_rules! skip_if_no_server {
         match $result {
             Some(v) => v,
             None => {
-                eprintln!("SKIP: turna-node not reachable on {}", $target);
-                eprintln!("  Start with: cargo run --bin turna-node");
-                eprintln!("  Or set TURNA_TEST_TARGET=host:port");
+                let msg = format!(
+                    "turna-node not reachable on {}; start with: cargo run --bin turna-node \
+                     or set TURNA_TEST_TARGET=host:port",
+                    $target
+                );
+                if require_server() {
+                    panic!("{msg}; TURNA_TEST_REQUIRE_SERVER=1 turns this skip into a failure");
+                }
+                eprintln!("SKIP: {msg}");
                 return;
             }
         }
@@ -774,13 +954,7 @@ mod tests {
         let target = target_addr();
 
         // Allocate first
-        let (realm, nonce) = match get_realm_nonce(&socket, target).await {
-            Some(v) => v,
-            None => {
-                eprintln!("SKIP: turna-node not running on {target}");
-                return;
-            }
-        };
+        let (realm, nonce) = skip_if_no_server!(get_realm_nonce(&socket, target).await, target);
 
         let (username, password) = effective_credentials();
         let key = long_term_key(&username, &realm, &password);
@@ -826,7 +1000,7 @@ mod tests {
         eprintln!("✓ Refresh: new lifetime={}s", lifetime);
 
         // Delete: Refresh with lifetime=0
-        let nonce3 = extract_nonce(&resp2).unwrap_or_default();
+        let nonce3 = extract_nonce(&resp2).unwrap_or(nonce2);
         let mut del = TurnMsg::request(0x0004);
         del.add_lifetime(0);
         del.add_username(&username);
@@ -854,13 +1028,7 @@ mod tests {
         let socket = bind_socket().await;
         let target = target_addr();
 
-        let (realm, nonce) = match get_realm_nonce(&socket, target).await {
-            Some(v) => v,
-            None => {
-                eprintln!("SKIP: turna-node not running on {target}");
-                return;
-            }
-        };
+        let (realm, nonce) = skip_if_no_server!(get_realm_nonce(&socket, target).await, target);
 
         let (username, password) = effective_credentials();
         let key = long_term_key(&username, &realm, &password);
@@ -922,13 +1090,7 @@ mod tests {
         let socket = bind_socket().await;
         let target = target_addr();
 
-        let (realm, nonce) = match get_realm_nonce(&socket, target).await {
-            Some(v) => v,
-            None => {
-                eprintln!("SKIP: turna-node not running on {target}");
-                return;
-            }
-        };
+        let (realm, nonce) = skip_if_no_server!(get_realm_nonce(&socket, target).await, target);
 
         let (username, password) = effective_credentials();
         let key = long_term_key(&username, &realm, &password);
@@ -1015,13 +1177,7 @@ mod tests {
 
         let peer_addr = peer.local_addr().unwrap();
 
-        let (realm, nonce) = match get_realm_nonce(&client, target).await {
-            Some(v) => v,
-            None => {
-                eprintln!("SKIP: turna-node not running on {target}");
-                return;
-            }
-        };
+        let (realm, nonce) = skip_if_no_server!(get_realm_nonce(&client, target).await, target);
 
         let (username, password) = effective_credentials();
         let key = long_term_key(&username, &realm, &password);
@@ -1255,9 +1411,7 @@ fn build_channel_data(channel: u16, payload: &[u8]) -> Vec<u8> {
     pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     pkt.extend_from_slice(payload);
     let pad = (4 - payload.len() % 4) % 4;
-    for _ in 0..pad {
-        pkt.push(0);
-    }
+    pkt.extend(std::iter::repeat_n(0u8, pad));
     pkt
 }
 
@@ -1481,4 +1635,84 @@ mod cluster_tests {
         eprintln!("✓ stale-ticket replay rejected: {:?}", extract_error_code(&replay));
     }
 
+}
+
+// ── DTL-5: TURN-over-DTLS (RFC 7350) end-to-end client ──────────────────
+//
+// Mirrors the UDP `stun_binding` test but runs the STUN Binding exchange over a
+// real DTLS 1.2 session against the server's DTLS listener (default
+// 127.0.0.1:5349; override with TURNA_TEST_DTLS_TARGET). Requires a server
+// built + configured with the `dtls` feature. Gated behind the `dtls` cargo
+// feature AND #[ignore] so it never runs in a plain `cargo test`:
+//
+//   cargo test -p turna-integration-tests --features dtls -- --ignored dtls
+//
+// Uses the webrtc-dtls 0.10 client API: DTLSConn::new(conn, config, is_client,
+// initial_state). Compiles/builds under `--features dtls` (verified 2026-06-11);
+// the live exchange requires a server built/configured with the feature.
+#[cfg(feature = "dtls")]
+mod dtls_e2e {
+    use super::*;
+    use std::sync::Arc;
+    use webrtc_util::conn::Conn;
+
+    fn dtls_target() -> SocketAddr {
+        std::env::var("TURNA_TEST_DTLS_TARGET")
+            .unwrap_or_else(|_| "127.0.0.1:5349".into())
+            .parse()
+            .expect("invalid TURNA_TEST_DTLS_TARGET")
+    }
+
+    /// Connected UDP socket + DTLS client handshake against `target`.
+    /// `insecure_skip_verify = true`: the test server uses a self-signed cert.
+    async fn dtls_connect(target: SocketAddr) -> Arc<dyn Conn + Send + Sync> {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        socket.connect(target).await.unwrap();
+        let config = webrtc_dtls::config::Config {
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        Arc::new(
+            webrtc_dtls::conn::DTLSConn::new(socket, config, true, None)
+                .await
+                .expect("DTLS client handshake failed"),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live server built/configured with --features dtls"]
+    async fn stun_binding_over_dtls() {
+        let target = dtls_target();
+        let conn = match tokio::time::timeout(Duration::from_secs(5), dtls_connect(target)).await
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("skip: DTLS handshake to {target} timed out (no DTLS server?)");
+                return;
+            }
+        };
+
+        let request = build_binding_request();
+        conn.send(&request).await.expect("DTLS send failed");
+
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.recv(&mut buf))
+            .await
+            .expect("DTLS recv timed out")
+            .expect("DTLS recv failed");
+        let response = &buf[..n];
+
+        assert!(
+            is_stun_success(response),
+            "expected Binding Success over DTLS, got {:02x} {:02x}",
+            response[0],
+            response[1]
+        );
+        assert_eq!(&response[4..8], &[0x21, 0x12, 0xA4, 0x42], "magic cookie mismatch");
+        assert_eq!(&response[8..20], &request[8..20], "transaction ID mismatch");
+        assert!(
+            extract_xor_mapped_address(response).is_some(),
+            "missing XOR-MAPPED-ADDRESS in DTLS Binding response"
+        );
+    }
 }

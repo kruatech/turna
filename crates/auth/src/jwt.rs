@@ -12,6 +12,11 @@ use crate::user::UserRole;
 /// Issuer claim — проверяется при каждой верификации.
 pub const JWT_ISSUER: &str = "turna-auth";
 
+/// Minimum acceptable HS256 secret length, in bytes. A short shared secret is
+/// brute-forceable offline against an observed token, so we reject it at both
+/// the sign and verify boundaries rather than trusting the caller (L2).
+pub const MIN_HS256_SECRET_LEN: usize = 32;
+
 /// JWT claims embedded in every access token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -58,6 +63,9 @@ impl Claims {
 
 /// Sign a JWT with HS256.
 pub fn sign_jwt(claims: &Claims, secret: &[u8]) -> Result<String, JwtError> {
+    if secret.len() < MIN_HS256_SECRET_LEN {
+        return Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into());
+    }
     encode(
         &Header::new(Algorithm::HS256),
         claims,
@@ -67,9 +75,12 @@ pub fn sign_jwt(claims: &Claims, secret: &[u8]) -> Result<String, JwtError> {
 
 /// Verify and decode a JWT.
 ///
-/// Проверяет: подпись, exp, iss == JWT_ISSUER.
+/// Проверяет: длину секрета, подпись, exp, iss == JWT_ISSUER.
 /// Проверку jti против blacklist делает `UserStore::verify_token`.
 pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
+    if secret.len() < MIN_HS256_SECRET_LEN {
+        return Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into());
+    }
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_issuer(&[JWT_ISSUER]);
     validation.validate_exp = true;
@@ -136,8 +147,19 @@ mod tests {
         let mut claims = make_claims("u1");
         claims.exp = now - 10;
         claims.iat = now - 100;
-        let token = sign_jwt(&claims, b"secret").unwrap();
-        assert!(verify_jwt(&token, b"secret").is_err());
+        let secret = b"test-secret-key-32-bytes-minimum";
+        let token = sign_jwt(&claims, secret).unwrap();
+        assert!(verify_jwt(&token, secret).is_err());
+    }
+
+    #[test]
+    fn rejects_short_secret() {
+        // < 32 bytes must be refused at both boundaries (L2).
+        assert!(sign_jwt(&make_claims("u1"), b"short").is_err());
+        // A token minted elsewhere must not verify under a weak secret either.
+        let good = b"test-secret-key-32-bytes-minimum";
+        let token = sign_jwt(&make_claims("u1"), good).unwrap();
+        assert!(verify_jwt(&token, b"short").is_err());
     }
 
     #[test]

@@ -147,6 +147,19 @@ pub(crate) async fn run_tls_bridge(
                         Action::CloseRelay { port } => {
                             let _ = relay_tx.send(OutMsg::CloseRelay { port }).await;
                         }
+                        Action::ForwardZeroCopy { .. } => {
+                            // Emitted only by `process_slice` on borrowed-slice
+                            // ingress (io_uring / AF_XDP). The TLS bridge uses
+                            // `process()`, which emits `Forward { data }`, and the
+                            // original recv buffer is moved into `process()`, so the
+                            // payload cannot be reconstructed from offset/len here.
+                            // Unreachable on this path; drop defensively (a hit
+                            // would be a logic error) rather than panic.
+                            tracing::warn!(
+                                %peer_addr,
+                                "TURNS bridge: unexpected ForwardZeroCopy on process() path; dropping"
+                            );
+                        }
                         Action::None => {}
                     }
                 }

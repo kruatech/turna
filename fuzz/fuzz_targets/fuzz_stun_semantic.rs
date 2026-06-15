@@ -60,7 +60,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
             msg.add(Attribute::Software("fuzz".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
@@ -71,7 +71,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             msg.add(Attribute::Realm("realm".into()));
             msg.add(Attribute::Nonce("nonce".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
             buf[..n].to_vec()
         }
 
@@ -79,7 +79,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
             msg.add(Attribute::Username("user".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
             let mut raw = buf[..n].to_vec();
             // Флипаем бит в последних 20 байтах (HMAC-SHA1)
             if n >= 20 {
@@ -93,7 +93,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
             msg.add(Attribute::Fingerprint(*fp)); // произвольный CRC
             let mut buf = [0u8; 512];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
@@ -104,7 +104,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             msg.add(Attribute::MessageIntegrity([0u8; 20]));
             msg.add(Attribute::Username("user".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
@@ -113,7 +113,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
             msg.add(Attribute::Software("X".repeat(1500)));
             let mut buf = vec![0u8; 4096];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
@@ -138,7 +138,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             );
             msg.add(Attribute::Software("zero-tid".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
@@ -148,7 +148,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             );
             msg.add(Attribute::Software("max-tid".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
@@ -159,7 +159,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             msg.add(Attribute::Realm("r".into()));
             msg.add(Attribute::Nonce("n".into()));
             let mut buf = [0u8; 512];
-            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
             buf[..n].to_vec()
         }
 
@@ -187,7 +187,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             msg.add(Attribute::Realm("r".into()));
             msg.add(Attribute::Nonce("n".into()));
             let mut buf = vec![0u8; 8192];
-            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+            let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
             buf[..n].to_vec()
         }
 
@@ -197,7 +197,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             msg.add(Attribute::XorPeerAddress(peer));
             msg.add(Attribute::Data(vec![]));
             let mut buf = [0u8; 512];
-            let n = msg.encode(&mut buf);
+            let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
     }

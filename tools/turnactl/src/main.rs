@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   turnactl status                     # node status
+//!   turnactl failover status            # failover takeover counters
 //!   turnactl allocations list           # list allocations
 //!   turnactl allocations count          # count allocations
 //!   turnactl allocations get 50000      # get allocation by relay port
@@ -78,6 +79,13 @@ fn parse_command(args: &[String]) -> (String, serde_json::Value) {
     match args.first().map(|s| s.as_str()) {
         Some("ping") => ("ping".into(), serde_json::json!({})),
         Some("status") => ("node.status".into(), serde_json::json!({})),
+        Some("failover") => match args.get(1).map(|s| s.as_str()) {
+            Some("status") | None => ("failover.status".into(), serde_json::json!({})),
+            other => {
+                eprintln!("Unknown: failover {}", other.unwrap_or(""));
+                std::process::exit(1);
+            }
+        },
         Some("drain") => ("node.drain".into(), serde_json::json!({})),
         Some("undrain") => ("node.undrain".into(), serde_json::json!({})),
         Some("allocations") => match args.get(1).map(|s| s.as_str()) {
@@ -157,11 +165,34 @@ fn print_formatted(command: &str, data: &Option<serde_json::Value>) {
         }
         "node.drain" => println!("Drain mode enabled"),
         "node.undrain" => println!("Drain mode disabled"),
+        "failover.status" => {
+            println!("Failover (this node):");
+            println!(
+                "  Allocations claimed: {}",
+                data["claimed_total"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  Races lost:          {}",
+                data["lost_race_total"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  Errors:              {}",
+                data["errors_total"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  Last sweep:          {} us",
+                data["last_sweep_us"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  Draining:            {}",
+                data["draining"].as_bool().unwrap_or(false)
+            );
+        }
         "allocations.count" => println!("{}", data["count"].as_u64().unwrap_or(0)),
         "allocations.kill" => println!("Killed allocation on port {}", data["killed"]),
         "cluster.nodes" => {
             if let Some(nodes) = data.as_array() {
-                println!("{:<28} {:<24} {}", "NODE_ID", "TURN_ADDR", "SELF");
+                println!("{:<28} {:<24} SELF", "NODE_ID", "TURN_ADDR");
                 for n in nodes {
                     println!(
                         "{:<28} {:<24} {}",
@@ -185,6 +216,7 @@ fn print_help() {
     println!("Commands:");
     println!("  ping                     Health check");
     println!("  status                   Node status");
+    println!("  failover status          Failover takeover counters (this node)");
     println!("  drain                    Enable drain mode");
     println!("  undrain                  Disable drain mode");
     println!("  allocations list         List allocations");

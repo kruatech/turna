@@ -171,6 +171,8 @@ mod sys {
             len: filter.len() as u16,
             filter: filter.as_ptr(),
         };
+        // SAFETY: `fd` is the caller's open socket; `prog` is a valid initialized
+        // sock_fprog living for the call, with matching optlen.
         let result = unsafe {
             libc::setsockopt(
                 fd,
@@ -189,6 +191,8 @@ mod sys {
 
     pub fn detach(fd: RawFd) -> io::Result<()> {
         let optval: libc::c_int = 0;
+        // SAFETY: `fd` is the caller's open socket; `optval` is a c_int living for
+        // the call, with matching optlen.
         let result = unsafe {
             libc::setsockopt(
                 fd,
@@ -322,9 +326,10 @@ mod tests {
     #[test]
     fn drops_non_stun_non_channel() {
         let f = build_stun_filter(65535);
-        // STUN-shaped but wrong magic at offset 4
+        // STUN-shaped but wrong magic: corrupt the cookie at message offset 4,
+        // i.e. packet offset 12 (after the 8-byte UDP header)
         let mut bad = stun(20);
-        bad[4] = 0xDE;
+        bad[12] = 0xDE;
         assert_eq!(simulate(&f, &bad), DROP);
         // reserved channel 0x7FFF and below-range 0x3FFF
         assert_eq!(simulate(&f, &channel(0x7FFF, 8)), DROP);

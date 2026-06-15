@@ -63,6 +63,22 @@ impl RelayHandler {
                 relay_port,
             },
 
+            // P1: zero-copy forward — the payload still lives in the registered
+            // recv buffer, so hand the worker the offset/len and let it send
+            // straight from that buffer (it holds the buffer until the send
+            // completes, then releases it).
+            Action::ForwardZeroCopy {
+                offset,
+                len,
+                target,
+                relay_port,
+            } => ForwardAction::ZeroCopyViaRelay {
+                offset,
+                len,
+                target,
+                relay_port,
+            },
+
             Action::SendViaRelay {
                 data,
                 target,

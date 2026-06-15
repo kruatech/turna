@@ -4,12 +4,35 @@ use crate::error::{Result, StunError};
 use crate::header::MAGIC_COOKIE;
 use std::net::SocketAddr;
 
+/// Bounds-check helper for the encoders (M2): verify `buf` can hold `need`
+/// bytes before writing, returning a structured `BufferTooShort` error rather
+/// than panicking. Callers are still expected to size buffers correctly; this
+/// turns a latent panic-on-overflow into a recoverable error on the hot path.
+#[inline]
+pub(crate) fn ensure(have: usize, need: usize) -> Result<()> {
+    if have < need {
+        Err(StunError::BufferTooShort { need, have })
+    } else {
+        Ok(())
+    }
+}
+
 // Comprehension-required attributes
 pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 /// RFC 5389 §15.5: alternate server for 300 Try Alternate redirects.
 pub const ATTR_ALTERNATE_SERVER: u16 = 0x0003;
 pub const ATTR_USERNAME: u16 = 0x0006;
 pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+/// RFC 8489 §14.6 MESSAGE-INTEGRITY-SHA256 (HMAC-SHA-256; 16..=32 bytes).
+pub const ATTR_MESSAGE_INTEGRITY_SHA256: u16 = 0x001C;
+/// RFC 8489 §14.10 PASSWORD-ALGORITHM (the algorithm chosen by the client).
+pub const ATTR_PASSWORD_ALGORITHM: u16 = 0x001D;
+/// RFC 8489 §14.11 PASSWORD-ALGORITHMS (algorithms the server supports).
+pub const ATTR_PASSWORD_ALGORITHMS: u16 = 0x8002;
+
+/// RFC 8489 §18.5.1 password-algorithm identifiers.
+pub const PASSWORD_ALGORITHM_MD5: u16 = 0x0001;
+pub const PASSWORD_ALGORITHM_SHA256: u16 = 0x0002;
 pub const ATTR_ERROR_CODE: u16 = 0x0009;
 pub const ATTR_UNKNOWN_ATTRIBUTES: u16 = 0x000A;
 pub const ATTR_REALM: u16 = 0x0014;
@@ -27,7 +50,9 @@ pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 pub const ATTR_DATA: u16 = 0x0013;
 pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+pub const ATTR_EVEN_PORT: u16 = 0x0018;
 pub const ATTR_DONT_FRAGMENT: u16 = 0x001A;
+pub const ATTR_RESERVATION_TOKEN: u16 = 0x0022;
 
 // Comprehension-optional (>= 0x8000)
 // RFC 8016 "Mobility with TURN": opaque, server-issued ticket. Issued in an
@@ -76,6 +101,10 @@ pub enum Attribute {
     ChannelNumber(u16),
     Data(Vec<u8>),
     DontFragment,
+    /// RFC 8656 §18.7 EVEN-PORT. `true` = also reserve the next-higher port (R=1).
+    EvenPort(bool),
+    /// RFC 8656 §18.10 RESERVATION-TOKEN (8 opaque bytes).
+    ReservationToken([u8; 8]),
     /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
     MobilityTicket(Vec<u8>),
     Unknown { attr_type: u16, value: Vec<u8> },
@@ -101,13 +130,17 @@ impl Attribute {
             Self::ChannelNumber(_) => ATTR_CHANNEL_NUMBER,
             Self::Data(_) => ATTR_DATA,
             Self::DontFragment => ATTR_DONT_FRAGMENT,
+            Self::EvenPort(_) => ATTR_EVEN_PORT,
+            Self::ReservationToken(_) => ATTR_RESERVATION_TOKEN,
             Self::MobilityTicket(_) => ATTR_MOBILITY_TICKET,
             Self::Unknown { attr_type, .. } => *attr_type,
         }
     }
 
-    /// Encode attribute value into buffer. Returns bytes written.
-    pub fn encode_value(&self, buf: &mut [u8], transaction_id: &[u8; 12]) -> usize {
+    /// Encode attribute value into buffer. Returns bytes written, or
+    /// `StunError::BufferTooShort` if `buf` cannot hold the value. Previously
+    /// this wrote unconditionally and panicked on a short buffer (M2).
+    pub fn encode_value(&self, buf: &mut [u8], transaction_id: &[u8; 12]) -> Result<usize> {
         match self {
             Self::XorMappedAddress(addr)
             | Self::XorPeerAddress(addr)
@@ -115,62 +148,80 @@ impl Attribute {
             // RFC 5389 §15.5: ALTERNATE-SERVER is encoded like MAPPED-ADDRESS
             // (plain, NOT XOR). Encoding it as XOR breaks spec-compliant
             // clients (pion, libnice) parsing the 300 Try Alternate redirect.
-            Self::MappedAddress(addr) | Self::AlternateServer(addr) => {
-                encode_address(buf, addr)
-            }
+            Self::MappedAddress(addr) | Self::AlternateServer(addr) => encode_address(buf, addr),
             Self::Username(s) | Self::Realm(s) | Self::Nonce(s) | Self::Software(s) => {
                 let b = s.as_bytes();
+                ensure(buf.len(), b.len())?;
                 buf[..b.len()].copy_from_slice(b);
-                b.len()
+                Ok(b.len())
             }
             Self::MessageIntegrity(hmac) => {
+                ensure(buf.len(), 20)?;
                 buf[..20].copy_from_slice(hmac);
-                20
+                Ok(20)
             }
             Self::Fingerprint(fp) => {
+                ensure(buf.len(), 4)?;
                 buf[..4].copy_from_slice(&fp.to_be_bytes());
-                4
+                Ok(4)
             }
             Self::ErrorCode { code, reason } => {
+                let rb = reason.as_bytes();
+                ensure(buf.len(), 4 + rb.len())?;
                 let class = (*code / 100) as u8;
                 let number = (*code % 100) as u8;
                 buf[0] = 0;
                 buf[1] = 0;
                 buf[2] = class;
                 buf[3] = number;
-                let rb = reason.as_bytes();
                 buf[4..4 + rb.len()].copy_from_slice(rb);
-                4 + rb.len()
+                Ok(4 + rb.len())
             }
             Self::Lifetime(secs) => {
+                ensure(buf.len(), 4)?;
                 buf[..4].copy_from_slice(&secs.to_be_bytes());
-                4
+                Ok(4)
             }
             Self::RequestedTransport(proto) => {
+                ensure(buf.len(), 4)?;
                 buf[0] = *proto;
                 buf[1] = 0;
                 buf[2] = 0;
                 buf[3] = 0;
-                4
+                Ok(4)
             }
             Self::ChannelNumber(ch) => {
+                ensure(buf.len(), 4)?;
                 buf[..2].copy_from_slice(&ch.to_be_bytes());
                 buf[2] = 0;
                 buf[3] = 0;
-                4
+                Ok(4)
             }
             Self::Data(data) => {
+                ensure(buf.len(), data.len())?;
                 buf[..data.len()].copy_from_slice(data);
-                data.len()
+                Ok(data.len())
             }
-            Self::DontFragment => 0,
+            Self::DontFragment => Ok(0),
+            Self::EvenPort(reserve) => {
+                ensure(buf.len(), 1)?;
+                buf[0] = if *reserve { 0x80 } else { 0x00 };
+                Ok(1)
+            }
+            Self::ReservationToken(tok) => {
+                ensure(buf.len(), 8)?;
+                buf[..8].copy_from_slice(tok);
+                Ok(8)
+            }
             Self::MobilityTicket(t) => {
+                ensure(buf.len(), t.len())?;
                 buf[..t.len()].copy_from_slice(t);
-                t.len()
+                Ok(t.len())
             }
             Self::Unknown { value, .. } => {
+                ensure(buf.len(), value.len())?;
                 buf[..value.len()].copy_from_slice(value);
-                value.len()
+                Ok(value.len())
             }
         }
     }
@@ -214,18 +265,25 @@ pub fn decode_xor_address(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Socke
     }
 }
 
-pub fn encode_xor_address(buf: &mut [u8], addr: &SocketAddr, transaction_id: &[u8; 12]) -> usize {
+pub fn encode_xor_address(
+    buf: &mut [u8],
+    addr: &SocketAddr,
+    transaction_id: &[u8; 12],
+) -> Result<usize> {
     let port = addr.port() ^ (MAGIC_COOKIE >> 16) as u16;
-    buf[0] = 0;
     match addr {
         SocketAddr::V4(v4) => {
+            ensure(buf.len(), 8)?;
+            buf[0] = 0;
             buf[1] = 0x01;
             buf[2..4].copy_from_slice(&port.to_be_bytes());
             let ip = u32::from_be_bytes(v4.ip().octets()) ^ MAGIC_COOKIE;
             buf[4..8].copy_from_slice(&ip.to_be_bytes());
-            8
+            Ok(8)
         }
         SocketAddr::V6(v6) => {
+            ensure(buf.len(), 20)?;
+            buf[0] = 0;
             buf[1] = 0x02;
             buf[2..4].copy_from_slice(&port.to_be_bytes());
             let mut ip_bytes = v6.ip().octets();
@@ -236,25 +294,28 @@ pub fn encode_xor_address(buf: &mut [u8], addr: &SocketAddr, transaction_id: &[u
                 ip_bytes[i] ^= cookie_tid[i];
             }
             buf[4..20].copy_from_slice(&ip_bytes);
-            20
+            Ok(20)
         }
     }
 }
 
-pub fn encode_address(buf: &mut [u8], addr: &SocketAddr) -> usize {
-    buf[0] = 0;
+pub fn encode_address(buf: &mut [u8], addr: &SocketAddr) -> Result<usize> {
     match addr {
         SocketAddr::V4(v4) => {
+            ensure(buf.len(), 8)?;
+            buf[0] = 0;
             buf[1] = 0x01;
             buf[2..4].copy_from_slice(&addr.port().to_be_bytes());
             buf[4..8].copy_from_slice(&v4.ip().octets());
-            8
+            Ok(8)
         }
         SocketAddr::V6(v6) => {
+            ensure(buf.len(), 20)?;
+            buf[0] = 0;
             buf[1] = 0x02;
             buf[2..4].copy_from_slice(&addr.port().to_be_bytes());
             buf[4..20].copy_from_slice(&v6.ip().octets());
-            20
+            Ok(20)
         }
     }
 }
@@ -330,7 +391,16 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
             ATTR_XOR_MAPPED_ADDRESS => {
                 Attribute::XorMappedAddress(decode_xor_address(value, transaction_id)?)
             }
-            ATTR_USERNAME => Attribute::Username(String::from_utf8_lossy(value).into()),
+            ATTR_USERNAME => {
+                // A3-Q4: USERNAME is a UTF-8 string (RFC 8489 §14.3) and feeds
+                // credential lookup *and* long-term key derivation. Reject
+                // invalid UTF-8 instead of silently repairing it with
+                // from_utf8_lossy — a repaired name diverges from the bytes the
+                // client signed over, so treat a non-UTF-8 USERNAME as malformed.
+                let name = std::str::from_utf8(value)
+                    .map_err(|_| StunError::AttributeParse("USERNAME is not valid UTF-8".into()))?;
+                Attribute::Username(name.to_string())
+            }
             ATTR_MESSAGE_INTEGRITY => {
                 if value.len() != 20 {
                     return Err(StunError::AttributeParse(format!(
@@ -364,7 +434,13 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 let reason = String::from_utf8_lossy(&value[4..]).into();
                 Attribute::ErrorCode { code, reason }
             }
-            ATTR_REALM => Attribute::Realm(String::from_utf8_lossy(value).into()),
+            ATTR_REALM => {
+                // A3-Q4: REALM also participates in the long-term key, so reject
+                // invalid UTF-8 rather than repairing it.
+                let realm = std::str::from_utf8(value)
+                    .map_err(|_| StunError::AttributeParse("REALM is not valid UTF-8".into()))?;
+                Attribute::Realm(realm.to_string())
+            }
             ATTR_NONCE => Attribute::Nonce(String::from_utf8_lossy(value).into()),
             ATTR_SOFTWARE => Attribute::Software(String::from_utf8_lossy(value).into()),
             ATTR_LIFETIME => {
@@ -401,6 +477,16 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
             }
             ATTR_DATA => Attribute::Data(value.to_vec()),
             ATTR_DONT_FRAGMENT => Attribute::DontFragment,
+            ATTR_EVEN_PORT => {
+                ensure(value.len(), 1)?;
+                Attribute::EvenPort(value[0] & 0x80 != 0)
+            }
+            ATTR_RESERVATION_TOKEN => {
+                ensure(value.len(), 8)?;
+                let mut t = [0u8; 8];
+                t.copy_from_slice(&value[..8]);
+                Attribute::ReservationToken(t)
+            }
             ATTR_MOBILITY_TICKET => Attribute::MobilityTicket(value.to_vec()),
             _ => Attribute::Unknown {
                 attr_type,
@@ -528,6 +614,40 @@ mod tests {
     }
 
     #[test]
+    fn username_and_realm_reject_invalid_utf8() {
+        // A3-Q4: non-UTF-8 USERNAME / REALM must be rejected, not repaired.
+        let bad_user = build_attr(ATTR_USERNAME, &[0xff, 0xfe, b'x']);
+        assert!(matches!(
+            parse_attributes(&bad_user, &TID).unwrap_err(),
+            StunError::AttributeParse(_)
+        ));
+        let bad_realm = build_attr(ATTR_REALM, &[0xff, 0x28, 0x80]);
+        assert!(matches!(
+            parse_attributes(&bad_realm, &TID).unwrap_err(),
+            StunError::AttributeParse(_)
+        ));
+
+        // Valid UTF-8 still parses, byte-for-byte.
+        let ok = build_attr(ATTR_USERNAME, b"1700000000:testuser");
+        let attrs = parse_attributes(&ok, &TID).expect("valid username parses");
+        assert!(matches!(attrs.as_slice(), [Attribute::Username(u)] if u == "1700000000:testuser"));
+    }
+
+    #[test]
+    fn even_port_and_reservation_token_roundtrip() {
+        // EVEN-PORT R=1 (reserve next) and R=0.
+        let r1 = parse_attributes(&build_attr(ATTR_EVEN_PORT, &[0x80]), &TID).unwrap();
+        assert!(matches!(r1.as_slice(), [Attribute::EvenPort(true)]));
+        let r0 = parse_attributes(&build_attr(ATTR_EVEN_PORT, &[0x00]), &TID).unwrap();
+        assert!(matches!(r0.as_slice(), [Attribute::EvenPort(false)]));
+
+        // RESERVATION-TOKEN round-trips its 8 bytes.
+        let tok = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let rt = parse_attributes(&build_attr(ATTR_RESERVATION_TOKEN, &tok), &TID).unwrap();
+        assert!(matches!(rt.as_slice(), [Attribute::ReservationToken(t)] if *t == tok));
+    }
+
+    #[test]
     fn normal_message_still_parses() {
         // A realistic Allocate request: REQUESTED-TRANSPORT + LIFETIME +
         // USERNAME + REALM + NONCE + MESSAGE-INTEGRITY. All within bounds.
@@ -548,7 +668,7 @@ mod tests {
         let addr: SocketAddr = "192.0.2.10:3478".parse().unwrap();
         let attr = Attribute::AlternateServer(addr);
         let mut value = [0u8; 32];
-        let len = attr.encode_value(&mut value, &TID);
+        let len = attr.encode_value(&mut value, &TID).unwrap();
         assert_eq!(len, 8);
 
         // RFC 5389 §15.5: must be plain MAPPED-ADDRESS, i.e. NOT XOR'd.
@@ -567,7 +687,7 @@ mod tests {
         let addr: SocketAddr = "[2001:db8::1]:3478".parse().unwrap();
         let attr = Attribute::AlternateServer(addr);
         let mut value = [0u8; 32];
-        let len = attr.encode_value(&mut value, &TID);
+        let len = attr.encode_value(&mut value, &TID).unwrap();
         assert_eq!(len, 20);
         assert_eq!(value[1], 0x02, "IPv6 family");
         assert_eq!(u16::from_be_bytes([value[2], value[3]]), 3478, "plain port");
@@ -586,7 +706,7 @@ mod tests {
 
         // encode → frame → parse → compare.
         let mut value = [0u8; 256];
-        let len = attr.encode_value(&mut value, &TID);
+        let len = attr.encode_value(&mut value, &TID).unwrap();
         assert_eq!(len, token.len());
 
         let buf = build_attr(ATTR_MOBILITY_TICKET, &value[..len]);

@@ -1,6 +1,7 @@
 # Benchmark results
 
-Fill this in after running `bench/run.sh` on your hardware.
+Template only: fill this in after running `bench/run.sh` on your hardware.
+Do not use placeholder rows as a performance claim.
 
 ## Run YYYY-MM-DD
 
@@ -17,9 +18,9 @@ network: loopback_
 
 | Run | RPS | p50 (µs) | p95 (µs) | p99 (µs) | Errors |
 |---|---:|---:|---:|---:|---:|
-| turna-bpf-on  | _xxx_ | _xxx_ | _xxx_ | _xxx_ | _xxx_ |
-| turna-bpf-off | _xxx_ | _xxx_ | _xxx_ | _xxx_ | _xxx_ |
-| coturn      | _xxx_ | _xxx_ | _xxx_ | _xxx_ | _xxx_ |
+| turna-bpf-on  | <fill-in> | <fill-in> | <fill-in> | <fill-in> | <fill-in> |
+| turna-bpf-off | <fill-in> | <fill-in> | <fill-in> | <fill-in> | <fill-in> |
+| coturn      | <fill-in> | <fill-in> | <fill-in> | <fill-in> | <fill-in> |
 
 **Observations / notes:**
 

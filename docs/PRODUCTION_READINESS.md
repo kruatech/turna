@@ -1,214 +1,182 @@
-# Production Readiness & Known Limitations
+# Production readiness and known limitations
 
-This document is the operational risk register for turna: what is safe to run
-today, what is experimental, and the configuration that keeps you on the
-well-tested path. It complements the product positioning in
-[`why-turna.md`](why-turna.md) and the security material in
-[`security/`](security/).
+This document is the operational risk register for Turna: what is safe to run
+today, what is experimental, and which configuration keeps you on the most
+verified path.
 
-Each risk is rated for **severity** (impact if it bites) and **likelihood**
-(how easily you hit it). These are engineering judgements, not guarantees.
+## Recommended production profile
 
----
+Use this profile unless you are deliberately testing an experimental datapath:
 
-## Recommended production configuration
+```toml
+production = true
 
-Stay on this profile unless you are deliberately testing the experimental
-datapaths:
+[turn]
+external_ip = "203.0.113.10"
+transport = "tokio"
 
-- **`transport = "tokio"`** — the epoll + `recvmmsg`/`sendmmsg` datapath. It is
-  the most exercised backend and has a fully-verified graceful drain. The
-  io_uring backend now has a lame-duck drain too (R2), but it is experimental
-  and runtime-unverified (R2, R5).
-- **Set `turn.auth.shared_secret`** explicitly (`openssl rand -hex 32`). The
-  placeholder default is refused in production.
-- **Pin `turn.migration.ticket_secret`** and use the **same value on every
-  node** when clustering. With `cluster_mode = true` an empty secret is now a
-  hard configuration error (R-A).
-- **Enable the BPF socket pre-filter** on Linux (`TURNA_BPF_FILTER=1`) to drop
-  non-STUN/ChannelData garbage in the kernel before it reaches userspace.
-- **Use mTLS for the gRPC management plane** — see [`MTLS.md`](MTLS.md).
-- **For clustering**, run Tarantool replicated (2+ nodes) and set
-  `cluster.persistence.mode = "write_behind"`.
-- **Run the `bench/` suite** against your target configuration before rollout.
+[turn.auth]
+shared_secret = "file:///etc/turna/secrets/shared_secret"
 
-### Metrics to watch
+[turn.relay.quota]
+max_per_user = 100
+max_bytes_per_sec = 0
 
-- `tarantool_writes_dropped_total` — write-behind backpressure / data loss risk.
-- `failover_errors_total` — backend errors during failover sweeps.
-- `turna_relay_route_forwarded_ratio` — cost of migration on the io_uring
-  datapath (see R-D); 0.0 when every relay send is handled locally.
+[health]
+listen = "0.0.0.0:9090"
 
----
+[management]
+listen = "127.0.0.1:5350"
+```
+
+Production checklist:
+
+- Generate `turn.auth.shared_secret` with `openssl rand -hex 32`.
+- Set `turn.external_ip` to a concrete IPv4/IPv6 address. Empty values are
+  refused in production; invalid strings are refused once validation includes
+  the P0 external-IP patch.
+- Prefer `transport = "tokio"` for the public production path.
+- Keep `/health`, `/status`, `/metrics`, and the gRPC management port off the
+  public Internet.
+- Use mTLS when the gRPC control plane is reachable from anywhere except
+  loopback.
+- In cluster mode, set a unique `cluster.node_id` per host and the same
+  `cluster.cluster_name`, `cluster.cluster_secret`, shared TURN secret, and
+  migration ticket secret on every node.
+- For Tarantool persistence, set `[cluster.backend] user/password` and monitor
+  writer drops.
+
+## Support tiers
+
+| Area | Status | Production guidance |
+|---|---|---|
+| UDP TURN/STUN over tokio | Mainline | Recommended baseline. |
+| TURNS / TLS-over-TCP | Implemented, feature-dependent | Test with your clients and certificates before relying on it. |
+| RFC 6062 TCP relay allocations | Implemented path exists | Treat as less exercised than UDP until covered by your interop tests. |
+| DTLS | Optional feature | Experimental; enable only after local load and interop tests. |
+| QUIC / WebTransport | Optional feature | Experimental; product semantics are still evolving. |
+| io_uring | Optional backend | Experimental; not the default production recommendation. |
+| AF_XDP | Explicit opt-in backend | Experimental Linux/NIC-specific path; never auto-selected. |
+| Cluster redirect/gossip | Implemented path | Useful for new-client distribution; secure gossip with `cluster_secret`. |
+| Tarantool allocation persistence/failover | Implemented path | Monitor writer drops/errors; validate failover in your environment. |
+| Runtime user CRUD over gRPC | Not implemented | Static users in config or shared-secret credentials only. |
 
 ## Risk register
 
-### R1 — io_uring datapath is experimental (correctness vs. tokio)
+### R1 — `transport = "auto"` can select a backend you did not intend
 
-After a client migration (RFC 8016) the client's main-socket traffic can
-reshard onto a different io_uring worker than the one that owns its relay
-socket. The relay path is **no longer lost**: sharded ownership forwards the
-send to the owning worker over a command channel, and the owner never
-re-forwards (anti-loop). However this has so far been verified **only
-statically** (syn parse + `cargo check` of the worker logic against
-`relay_route.rs`), not against a live io_uring ring.
+The config enum supports `auto`, `tokio`, `io_uring`, and `af_xdp`. `auto` is
+convenient for development and benchmark hosts, but production should be
+explicit so a kernel/build capability does not silently change the datapath.
 
-- **Severity:** Medium · **Likelihood:** Medium (io_uring + migration only)
-- **Mitigation:** run `transport = "tokio"`. Runtime verification of the
-  io_uring path is tracked as a Linux-only task (`cargo test --features
-  io-uring` + a migration load run).
+- **Severity:** Medium
+- **Mitigation:** set `transport = "tokio"` in production configs and Helm
+  values unless you are intentionally validating another backend.
 
-### R2 — io_uring worker drain is implemented, runtime-unverified
+### R2 — io_uring is experimental
 
-The tokio datapath drains gracefully: the `DrainOrchestrator`
-(`crates/common/src/drain.rs`) stops accepting new allocations, notifies
-signaling, waits for sessions to expire, then force-closes; FD-passing
-graceful **restart** (`crates/relay/src/graceful.rs`) hands live sockets to a
-successor process.
+The io_uring datapath contains sharded ownership and drain logic, but it needs
+runtime verification on the same kernel/NIC/load profile you plan to operate.
+It is not the recommended default for a first production rollout.
 
-The io_uring worker pool now has a **true graceful drain**. On the shutdown
-signal the node sets `metrics.set_draining(true)` (and, on a cluster,
-`ClusterRouting::begin_drain()`), so the already-tested processor path rejects
-**new** allocations with `508 Server Draining` — or `300 Try Alternate` to
-another node when clustered. Each worker keeps its main socket armed, so
-existing clients' `Send`/`ChannelData` and all established relay flows continue
-through the grace window (`cluster.drain_grace_secs`); only new allocations are
-turned away. At the deadline the worker drops its routes from the shared table,
-closes its relay sockets, and runs a bounded **wait-until-reclaimed** loop
-(≤250 ms) that drives the ring until the in-flight cancellations complete and
-the registered buffer/msghdr blocks return to their pools, then exits. The node
-`join`s the worker threads instead of abandoning them. This reuses the proven
-drain-rejection logic; the io_uring-specific teardown is **verified statically
-only** — it has not run against a live ring.
+- **Severity:** Medium
+- **Mitigation:** use `tokio`; validate io_uring separately with
+  `cargo test --features io-uring` and a drain-under-load run.
 
-- **Severity:** Low–Medium (down from High once verified) · **Likelihood:**
-  High on any restart
-- **Mitigation:** run `transport = "tokio"` until the io_uring drain is
-  exercised on Linux (`cargo test --features io-uring` + a drain-under-load
-  run: `kill -TERM` under traffic, confirm `buffers_available` recovers, the
-  `turna_relay_route_*` counters quiesce, and established media survives grace).
+### R3 — AF_XDP is opt-in and environment-sensitive
 
-### R3 — AF_XDP is not a usable backend
+`transport = "af_xdp"` is wired as an explicit backend when built on Linux with
+`--features af-xdp`. The active path uses the XSK datapath from
+`turna_transport::af_xdp::xsk`. The older `AfXdpTransport` wrapper in
+`crates/transport/src/af_xdp.rs` remains a loud non-functional stub and is not
+the runtime path.
 
-AF_XDP is **not wired into the transport**. `select.rs` exposes only
-`Auto` / `IoUring` / `Tokio` (there is no AF_XDP preference), and the
-`af_xdp` module is not even declared in `crates/transport/src/lib.rs`, so it is
-not compiled into the build. The file `af_xdp.rs` contains real low-level
-scaffolding (UMEM allocation, socket/bind, ring setup, poll, frame-ownership
-protocol) behind a `--features af-xdp` intent, but the **datapath itself is a
-placeholder**: `recv_batch` returns an empty `Vec` and `send_to` is a no-op.
+AF_XDP requires privileges, NIC/queue setup, XDP redirect plumbing, IPv4-only
+Phase-1 assumptions, and correct source/destination MAC configuration.
 
-Note this is distinct from the **eBPF socket pre-filter** (`bpf_filter.rs`),
-which *is* real and recommended (`TURNA_BPF_FILTER=1`).
+- **Severity:** High if enabled without a hardware-specific validation run.
+- **Mitigation:** keep it disabled for normal production. Validate in a lab with
+  veth/copy-mode and then the target NIC before exposing traffic.
 
-- **Severity:** Informational (no operational hazard; it is simply absent)
-- **Likelihood:** N/A — it is never on the runtime path.
-- **Status:** scaffolding only; do not expect AF_XDP throughput today.
+### R4 — Optional encrypted transports are less exercised than UDP
 
-### R4 — Separate the two "TCP/TLS" features (they are both implemented)
+TURNS, DTLS, QUIC and WebTransport are valuable for blocked networks, but their
+coverage is thinner than the core UDP TURN path.
 
-Earlier write-ups conflated two independent things. They are different and
-both exist in the tree:
+- **Severity:** Low–Medium depending on client population.
+- **Mitigation:** run explicit interop tests for every client stack you support,
+  and keep UDP/tokio as the fallback path.
 
-- **TURN over TCP/TLS (client↔server transport, TURNS).** Implemented:
-  `crates/transport/src/tcp_tls.rs` (rustls acceptor, ALPN, STUN/ChannelData
-  framing over TCP/TLS, certificate hot-reload, connection limits, idle
-  timeout) bridged to the transport-agnostic `PacketProcessor` via
-  `crates/relay/src/tls_bridge.rs`. Gated behind the `tls` feature; default
-  port 5349. DTLS (TLS over UDP) is **not** implemented.
-- **RFC 6062 TCP relay allocations (TCP relayed *through* the server).**
-  Implemented: `crates/relay/src/tcp_relay.rs` — the
-  Connect → WaitingForBind → ConnectionBind → Bound state machine for
-  CONNECT / CONNECTION-BIND.
+### R5 — Cluster gossip must be authenticated on any shared network
 
-- **Severity:** Low–Medium · **Likelihood:** depends on use
-- **Caveat:** both paths have **limited test coverage** relative to the UDP
-  datapath. Exercise them under your own load before relying on them.
+An empty `cluster.cluster_secret` leaves gossip unauthenticated. That is useful
+for local development but unsafe on any network where untrusted hosts can reach
+the gossip port.
 
-### R5 — Sharded-ownership routing is experimental (static-checked only)
+- **Severity:** High in shared networks.
+- **Mitigation:** set the same strong `cluster_secret` on every node and limit
+  UDP 7946 to the private cluster network.
 
-The relay-affinity forwarding (R1) has been validated by syn parse and
-`cargo check` of the worker logic, **not** by a live io_uring ring. The
-current wake-up mechanism is polling (`cmd_poll_timeout = 500µs`, a
-CPU↔forward-latency trade-off); an eventfd-based v2 is deferred.
+### R6 — Tarantool write-behind can drop events under overload
 
-- **Severity:** Medium · **Likelihood:** Medium (io_uring + migration only)
-- **Mitigation:** `transport = "tokio"`; runtime verification on Linux pending.
+Persistence is write-behind: the datapath does not block on every backend write.
+If the bounded writer channel fills, events are dropped and the metric
+`tarantool_writes_dropped_total` increases.
 
-**Follow-up — eventfd wakeup (design, not yet implemented).** The cross-worker
-forward path currently relies on the worker loop unparking every
-`cmd_poll_timeout` (500 µs) to drain its command channel — a CPU↔latency
-trade-off. A v2 would register an `eventfd` per worker in its io_uring ring
-(an `IORING_OP_POLL_ADD` / read on the eventfd) and have a forwarding worker
-`write(8 bytes)` to the owner's eventfd right after `tx.send(cmd)`. The owner
-then wakes immediately on the eventfd completion, drains the channel, and
-re-arms the poll. This removes the polling tax and cuts forward latency to a
-wakeup. It is deliberately **not** implemented blind here: it touches the ring
-setup (`uring.rs`) and the hot forward path (section-0 core) and can only be
-validated against a live ring, so it belongs on the Linux box with a
-forward-latency benchmark.
+- **Severity:** High for HA/failover correctness.
+- **Mitigation:** alert on any non-zero write drops, monitor
+  `tarantool_writer_errors_total`, and size Tarantool/pool/batches for your
+  allocation churn.
 
-### R6 — No runtime user management over gRPC
+### R7 — Cross-node migration requires identical ticket secrets
 
-`TurnCore::add_user` returns `CoreError::Unimplemented`
-(`crates/control/src/turn_core_impl.rs`) by design: LongTerm users are defined
-in config and SharedSecret/REST mode keeps no per-user records, so the call
-fails honestly instead of pretending a user was created.
+When `[turn.migration] enabled = true`, mobility tickets are signed by
+`ticket_secret`. A cluster where nodes use different values cannot validate one
+another's tickets.
 
-- **Severity:** Low · **Likelihood:** Low
-- **Workaround:** configure LongTerm users in `turn.toml`, or use
-  SharedSecret/REST credentials. Runtime CRUD is a future item.
+- **Severity:** High if mobility is required.
+- **Mitigation:** set the same non-empty `turn.migration.ticket_secret` on every
+  node. Empty is a hard validation error when migration and cluster mode are
+  both enabled.
 
-### R-A — Cross-node migration requires an identical `ticket_secret` (mitigated)
+### R8 — gRPC user management is not runtime CRUD
 
-Connection migration mints mobility tickets keyed by `ticket_secret`. With an
-empty secret each node derives an **independent random per-process key**, so a
-ticket minted on node A is invalid on node B and cross-node migration silently
-fails. This previously only produced a `warn!`.
+`TurnCore::add_user` currently returns an explicit unimplemented error.
+Long-term users are configured in `turn.toml`; shared-secret credentials are
+validated statelessly.
 
-- **Severity:** High (for clusters) → **now mitigated**: configuration
-  validation hard-errors when `turn.migration.enabled` is set, `cluster_mode =
-  true`, and `ticket_secret` is empty (single non-production nodes still get a
-  warning, since a random key only costs them tickets across a restart).
-- **Residual:** Low — operators must still set the **same** value on every
-  node; a per-node mismatch is not (and cannot be) detected locally.
+- **Severity:** Low operationally if documented.
+- **Mitigation:** manage users through config/static users or issue
+  coturn-compatible time-limited credentials from your own credential service.
 
-### R-B — io_uring restart: data-plane bindings still close at exit
+## Metrics to watch first
 
-See R2 — the drain now rejects new allocations (508/300), keeps existing
-client↔peer media flowing through the grace window, unregisters a departing
-worker's routes from the shared table, waits (bounded) for in-flight ops to
-reclaim, and joins the threads. What it still does **not** do is hand the live
-UDP relay socket bindings to a successor process: at the end of grace they are
-closed. State in Tarantool persists; live io_uring relay bindings do not
-survive the restart (unlike the tokio path's FD-passing restart).
+| Metric | Why it matters |
+|---|---|
+| `turna_active_allocations` | Capacity and load. |
+| `turna_total_allocations` | Allocation creation rate. |
+| `turna_auth_failures` / `turna_auth_failures_by_reason_total` | Bad credentials, brute force, clock/secret mismatch. |
+| `turna_peer_rejected_total` | Peer-filter blocks; useful for SSRF/private-address probing. |
+| `turna_quota_exceeded_total` | Abuse or too-tight quota. |
+| `turna_send_queue_dropped_total` | Internal backpressure. |
+| `tarantool_writer_errors_total` | Backend write failures. |
+| `tarantool_writes_dropped_total` | HA correctness risk; page on any sustained increase. |
+| `failover_errors_total` | Failover sweeps failing. |
+| `failover_sweep_duration_us` | Slow failover scans. |
+| `turna_relay_route_forwarded_ratio` | io_uring migration forwarding cost; should be zero on tokio. |
 
-- **Severity:** Low–Medium (down from High once R2 is verified) · **Likelihood:**
-  High on restart
-- **Mitigation:** `transport = "tokio"` (FD-passing restart preserves live
-  bindings); verify the io_uring drain on Linux. FD-passing for the io_uring
-  pool is a larger future item.
-
-### R-C — Migration cost was previously invisible (mitigated)
-
-The relay forward-path counters (`RelayRouteStats`: `send_local`,
-`send_forwarded`, `send_forward_failed`, `send_stale`, `route_miss`,
-`owner_cleanup_stale`) were not exported, so the price of migration on the
-io_uring datapath could not be seen in production.
-
-- **Severity:** Medium → **now mitigated**: `/metrics` exposes all six counters
-  as `turna_relay_route_*_total`, plus the derived
-  `turna_relay_route_forwarded_ratio` gauge (forwarded / (local + forwarded)).
-  Present only on io_uring builds, where the route table exists.
-
----
+See [OBSERVABILITY.md](OBSERVABILITY.md) and `docs/alerts/turna.yml` for the
+starter alert set.
 
 ## Verification status
 
-| Area | How verified |
+| Area | Current verification expectation |
 |---|---|
-| Config validation (R-A), relay-route metrics (R-C), worker routing logic (R1/R5), io_uring lame-duck drain (R2, Fix 4) | Static: unit tests + syn parse + `cargo check` |
-| io_uring runtime (sharded ownership, lame-duck drain) | **Not yet** — needs Linux + `cargo test --features io-uring` and a drain-under-load run |
-| UDP datapath, auth, session, parsers | Unit + integration + fuzz + soak (see `tests/`, `fuzz/`) |
+| Config schema and deploy template | `cargo test -p turna-config`; render Helm and parse extracted config. |
+| UDP TURN/STUN path | Unit/integration/fuzz tests plus local `stunclient`/TURN allocation tests. |
+| Docker/Helm packaging | `docker build -f deploy/Dockerfile .`, `helm lint`, `helm template`. |
+| Tarantool cluster path | Run the smoke config and an induced node-death/failover test. |
+| Experimental datapaths | Require host-specific Linux tests; do not infer production readiness from static compilation alone. |
 
-When in doubt, prefer the tokio datapath and the metrics above.
+When in doubt, choose the explicit `tokio` transport and prove every additional
+feature before enabling it in front of users.

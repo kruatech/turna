@@ -86,10 +86,13 @@ json_logs            = false
 max_spans_per_second = 1000
 
 # =============================================================================
-# [signaling] — coturn-style HTTP credentials server (optional)
+# [signaling] — compatibility section in the shared root config
 # =============================================================================
+# The current workspace does not ship a turna-signaling binary. Keep this
+# section populated because the shared root config validates it; future/external
+# credential services can reuse the same values.
 [signaling]
-listen             = "${TURNA_SIGNALING_ADDR:-0.0.0.0:9001}"
+listen             = "${TURNA_SIGNALING_ADDR:-127.0.0.1:9001}"
 turn_url           = "${TURNA_TURN_URL:-turn:127.0.0.1:3478}"
 turn_shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
 

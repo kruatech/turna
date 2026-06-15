@@ -35,6 +35,10 @@ pub struct DtlsConfig {
     pub mtu: usize,
     pub max_sessions: usize,
     pub idle_timeout: Duration,
+    /// DTL-3: bounded per-session outbound queue; full => drop newest.
+    pub outbound_queue_capacity: usize,
+    /// DTL-9: max concurrent sessions per source IP (0 = unlimited).
+    pub max_sessions_per_ip: usize,
 }
 
 /// Events surfaced from established DTLS sessions. `session_id` is the client's
@@ -68,7 +72,7 @@ pub struct DtlsOutbound {
 #[cfg(feature = "dtls")]
 pub type OutboundRegistry = std::sync::Arc<
     std::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<DtlsOutbound>>,
+        std::collections::HashMap<String, tokio::sync::mpsc::Sender<DtlsOutbound>>,
     >,
 >;
 
@@ -89,11 +93,15 @@ pub struct DtlsStats {
     pub idle_timeouts: std::sync::atomic::AtomicU64,
     pub bytes_rx: std::sync::atomic::AtomicU64,
     pub bytes_tx: std::sync::atomic::AtomicU64,
+    /// DTL-3: outbound datagrams dropped (session egress queue full).
+    pub outbound_dropped: std::sync::atomic::AtomicU64,
+    /// DTL-9: sessions refused because the source IP hit max_sessions_per_ip.
+    pub rejected_per_ip: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "dtls")]
 impl DtlsStats {
-    pub fn snapshot(&self) -> (usize, u64, u64, u64, u64, u64, u64) {
+    pub fn snapshot(&self) -> (usize, u64, u64, u64, u64, u64, u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (
             self.active.load(Relaxed),
@@ -103,6 +111,8 @@ impl DtlsStats {
             self.idle_timeouts.load(Relaxed),
             self.bytes_rx.load(Relaxed),
             self.bytes_tx.load(Relaxed),
+            self.outbound_dropped.load(Relaxed),
+            self.rejected_per_ip.load(Relaxed),
         )
     }
 }
@@ -116,6 +126,18 @@ pub enum DtlsError {
 }
 
 type Result<T> = std::result::Result<T, DtlsError>;
+
+/// Whether this build actually supports DTLS, i.e. was compiled with the
+/// `dtls` feature.
+///
+/// Used by the node for a startup fail-fast: enabling `[turn.dtls]` in config
+/// on a binary built **without** the feature would otherwise make
+/// `DtlsServer::run` return [`DtlsError::NotSupported`] inside a spawned task
+/// and the listener would silently never start, while the operator believes
+/// TURN-over-DTLS is being served. The const lives here (not in the node) so
+/// the `cfg!` is evaluated in the crate that actually declares the `dtls`
+/// feature — keeping the node free of an unexpected-`cfg` lint.
+pub const DTLS_AVAILABLE: bool = cfg!(feature = "dtls");
 
 pub struct DtlsServer {
     config: DtlsConfig,
@@ -139,10 +161,11 @@ impl DtlsServer {
             std::sync::Mutex<
                 std::collections::HashMap<
                     String,
-                    tokio::sync::mpsc::UnboundedSender<DtlsOutbound>,
+                    tokio::sync::mpsc::Sender<DtlsOutbound>,
                 >,
             >,
         >,
+        _shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         Err(DtlsError::NotSupported)
     }
@@ -161,6 +184,7 @@ impl DtlsServer {
         event_tx: tokio::sync::mpsc::Sender<DtlsEvent>,
         outbound: OutboundRegistry,
         stats: std::sync::Arc<DtlsStats>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         use webrtc_dtls::config::Config;
@@ -196,11 +220,22 @@ impl DtlsServer {
 
         let mtu = self.config.mtu;
         let max_sessions = self.config.max_sessions;
+        let max_per_ip = self.config.max_sessions_per_ip;
+        let per_ip: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         loop {
-            let (conn, remote) = listener
-                .accept()
-                .await
-                .map_err(|e| DtlsError::Other(format!("accept: {e}")))?;
+            // DTL-4: stop accepting new handshakes on shutdown. accept() is
+            // cancel-safe (dropped if shutdown wins); the listener is released
+            // when this function returns.
+            if *shutdown.borrow() {
+                break;
+            }
+            let (conn, remote) = tokio::select! {
+                _ = shutdown.changed() => break,
+                accepted = listener.accept() => {
+                    accepted.map_err(|e| DtlsError::Other(format!("accept: {e}")))?
+                }
+            };
 
             // Post-handshake admission control. `max_sessions == 0` = unlimited.
             if max_sessions != 0 && stats.active.load(Relaxed) >= max_sessions {
@@ -217,16 +252,36 @@ impl DtlsServer {
                 continue;
             }
 
+            // DTL-9: per-source-IP concurrent session cap (anti slot-exhaustion).
+            {
+                let ip = remote.ip();
+                let mut m = per_ip.lock().unwrap();
+                let n = *m.get(&ip).unwrap_or(&0);
+                if max_per_ip != 0 && n as usize >= max_per_ip {
+                    drop(m);
+                    stats.rejected_per_ip.fetch_add(1, Relaxed);
+                    tracing::warn!(%remote, max_per_ip, "DTLS session refused: per-IP cap reached");
+                    drop(conn);
+                    continue;
+                }
+                *m.entry(ip).or_insert(0) += 1;
+            }
             stats.active.fetch_add(1, Relaxed);
             stats.accepted.fetch_add(1, Relaxed);
             let tx = event_tx.clone();
             let reg = outbound.clone();
             let st = stats.clone();
             let idle = self.config.idle_timeout;
+            let cap = self.config.outbound_queue_capacity;
+            let sd = shutdown.clone();
+            let pip = per_ip.clone();
             tokio::spawn(async move {
-                handle_dtls_session(conn, remote, tx, reg, mtu, idle, st).await;
+                handle_dtls_session(conn, remote, tx, reg, mtu, idle, cap, st, pip, sd).await;
             });
         }
+
+        tracing::info!("DTLS listener draining: shutdown signalled, no new handshakes");
+        Ok(())
     }
 }
 
@@ -238,7 +293,8 @@ fn spawn_stats_logger(stats: std::sync::Arc<DtlsStats>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let (active, accepted, rejected, closed, idle, rx, tx) = stats.snapshot();
+            let (active, accepted, rejected, closed, idle, rx, tx, dropped, rejected_ip) =
+                stats.snapshot();
             tracing::info!(
                 active,
                 accepted,
@@ -247,6 +303,8 @@ fn spawn_stats_logger(stats: std::sync::Arc<DtlsStats>) {
                 idle_timeouts = idle,
                 bytes_rx = rx,
                 bytes_tx = tx,
+                outbound_dropped = dropped,
+                rejected_per_ip = rejected_ip,
                 "DTLS stats"
             );
         }
@@ -268,13 +326,16 @@ async fn handle_dtls_session(
     outbound: OutboundRegistry,
     mtu: usize,
     idle_timeout: Duration,
+    capacity: usize,
     stats: std::sync::Arc<DtlsStats>,
+    per_ip: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
 
     let session_id = remote.to_string();
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<DtlsOutbound>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<DtlsOutbound>(capacity.max(1));
     if let Ok(mut g) = outbound.lock() {
         g.insert(session_id.clone(), out_tx);
     }
@@ -294,6 +355,10 @@ async fn handle_dtls_session(
 
     loop {
         tokio::select! {
+            _ = shutdown.changed() => {
+                tracing::debug!(%remote, "DTLS session draining on shutdown");
+                break;
+            }
             _ = &mut idle => {
                 stats.idle_timeouts.fetch_add(1, Relaxed);
                 tracing::debug!(%remote, ?idle_timeout, "DTLS session idle timeout");
@@ -346,6 +411,16 @@ async fn handle_dtls_session(
     let _ = conn.close().await;
     stats.active.fetch_sub(1, Relaxed);
     stats.closed.fetch_add(1, Relaxed);
+    {
+        let ip = remote.ip();
+        let mut m = per_ip.lock().unwrap();
+        if let Some(n) = m.get_mut(&ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&ip);
+            }
+        }
+    }
     let _ = tx.send(DtlsEvent::SessionClosed { session_id }).await;
 }
 

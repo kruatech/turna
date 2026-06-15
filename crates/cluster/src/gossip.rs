@@ -205,11 +205,10 @@ where
 
                 let mut changed = false;
                 if msg.leaving {
-                    if msg.node_id != cfg.node_id && peers.remove(&msg.node_id).is_some() {
-                        info!(node_id = %msg.node_id, "cluster gossip peer left");
-                        changed = true;
-                    }
-                    tombstones.insert(msg.node_id.clone(), Instant::now() + tombstone_grace);
+                    changed |= apply_leaving(
+                        &cfg.node_id, &mut peers, &mut tombstones,
+                        &msg.node_id, msg.seq, tombstone_grace,
+                    );
                 } else {
                     changed |= observe_peer(
                         &cfg.node_id, &mut peers, &mut tombstones,
@@ -333,6 +332,7 @@ async fn broadcast(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe_peer(
     local_id: &str,
     peers: &mut HashMap<String, GossipNode>,
@@ -384,6 +384,41 @@ fn observe_peer(
             true
         }
     }
+}
+
+/// Handle a `leaving` frame with replay protection (F-8). Returns whether the
+/// topology changed.
+///
+/// The frame is HMAC-signed, so this is not about forgery — it is replay
+/// protection. A `leaving` is honoured only when its `seq` is strictly newer
+/// than the last sequence recorded for the node. A node's final frame carries
+/// `last_seq + 1`, so a genuine leaving is strictly greater than the seq we last
+/// stored; a replayed (but genuine) stale `leaving` must not evict a node that
+/// has since advanced past it.
+///
+/// An unknown node (no stored seq) is not acted on: there is nothing to drop,
+/// and planting an unvalidatable tombstone would itself be a replay vector. A
+/// stale indirect entry self-heals via the `last_seen` reaper in `run_gossip`.
+fn apply_leaving(
+    local_id: &str,
+    peers: &mut HashMap<String, GossipNode>,
+    tombstones: &mut HashMap<String, Instant>,
+    node_id: &str,
+    seq: u64,
+    tombstone_grace: Duration,
+) -> bool {
+    if node_id == local_id {
+        return false;
+    }
+    let fresh = peers.get(node_id).is_some_and(|node| seq > node.seq);
+    if !fresh {
+        debug!(%node_id, seq, "ignoring stale or unknown gossip leaving");
+        return false;
+    }
+    peers.remove(node_id);
+    tombstones.insert(node_id.to_string(), Instant::now() + tombstone_grace);
+    info!(%node_id, seq, "cluster gossip peer left");
+    true
 }
 
 fn publish_topology(
@@ -466,6 +501,49 @@ mod tests {
         assert!(c2);
         assert!(peers.contains_key("node-b"));
         assert!(!tomb.contains_key("node-b"));
+    }
+
+    #[test]
+    fn leaving_with_stale_seq_is_ignored_but_fresh_seq_evicts() {
+        let mut peers = HashMap::new();
+        let mut tomb = HashMap::new();
+        let grace = Duration::from_secs(5);
+
+        // Node B is known at seq=100.
+        observe_peer("node-a", &mut peers, &mut tomb, "node-b", addr(3479), addr(7947), 100, true);
+        assert_eq!(peers["node-b"].seq, 100);
+
+        // A replayed (stale) leaving must NOT evict it and must NOT tombstone.
+        let changed = apply_leaving("node-a", &mut peers, &mut tomb, "node-b", 50, grace);
+        assert!(!changed, "stale leaving must not change topology");
+        assert!(peers.contains_key("node-b"), "stale leaving must not evict the peer");
+        assert!(!tomb.contains_key("node-b"), "stale leaving must not plant a tombstone");
+
+        // A fresh leaving (seq > stored) evicts and tombstones.
+        let changed = apply_leaving("node-a", &mut peers, &mut tomb, "node-b", 101, grace);
+        assert!(changed, "fresh leaving must change topology");
+        assert!(!peers.contains_key("node-b"), "fresh leaving must evict the peer");
+        assert!(tomb.contains_key("node-b"), "fresh leaving must plant a tombstone");
+    }
+
+    #[test]
+    fn leaving_for_unknown_node_is_ignored() {
+        let mut peers = HashMap::new();
+        let mut tomb = HashMap::new();
+        let changed =
+            apply_leaving("node-a", &mut peers, &mut tomb, "node-x", 999, Duration::from_secs(5));
+        assert!(!changed);
+        assert!(tomb.is_empty(), "an unknown-node leaving must not plant a tombstone");
+    }
+
+    #[test]
+    fn leaving_for_own_id_is_ignored() {
+        let mut peers = HashMap::new();
+        let mut tomb = HashMap::new();
+        let changed =
+            apply_leaving("node-a", &mut peers, &mut tomb, "node-a", 999, Duration::from_secs(5));
+        assert!(!changed);
+        assert!(tomb.is_empty());
     }
 
     #[test]

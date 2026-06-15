@@ -133,7 +133,7 @@ fn build_allocate(step: &Step) -> Vec<u8> {
     add_auth_attrs(&mut msg, &step.mutation);
 
     let mut buf = [0u8; 4096];
-    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
     buf[..len].to_vec()
 }
 
@@ -157,7 +157,7 @@ fn build_create_permission(step: &Step) -> Vec<u8> {
     add_auth_attrs(&mut msg, &step.mutation);
 
     let mut buf = [0u8; 4096];
-    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
     buf[..len].to_vec()
 }
 
@@ -177,7 +177,7 @@ fn build_channel_bind(step: &Step) -> Vec<u8> {
     add_auth_attrs(&mut msg, &step.mutation);
 
     let mut buf = [0u8; 4096];
-    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
     buf[..len].to_vec()
 }
 
@@ -190,7 +190,7 @@ fn build_send_indication(step: &Step) -> Vec<u8> {
     msg.add(Attribute::Data(b"fuzz_payload".to_vec()));
 
     let mut buf = [0u8; 4096];
-    let len = msg.encode(&mut buf);
+    let len = msg.encode(&mut buf).unwrap();
     buf[..len].to_vec()
 }
 
@@ -202,7 +202,7 @@ fn build_refresh(step: &Step, lifetime: u32) -> Vec<u8> {
     add_auth_attrs(&mut msg, &step.mutation);
 
     let mut buf = [0u8; 4096];
-    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY);
+    let len = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
     buf[..len].to_vec()
 }
 
@@ -211,7 +211,7 @@ fn build_channel_data(channel: u16, payload_len: usize) -> Vec<u8> {
     let payload = vec![0xABu8; payload_len];
     let padded_len = (4 + payload_len + 3) & !3;
     let mut buf = vec![0u8; padded_len];
-    turna_proto_stun::message::encode_channel_data(&mut buf, channel, &payload);
+    turna_proto_stun::message::encode_channel_data(&mut buf, channel, &payload).unwrap();
     buf
 }
 

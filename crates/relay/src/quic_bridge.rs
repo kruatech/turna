@@ -12,8 +12,8 @@
 //!       - ChannelData: 4-byte header + length (bytes 2..4), **padded to a
 //!         4-byte boundary** over the stream (RFC 5766 §11.5). The padding is
 //!         consumed off the wire but not handed to the processor.
-//!     [`StreamFramer`] reassembles whole messages from arbitrarily-chunked
-//!     stream data, then each goes to `process_slice`.
+//!         [`StreamFramer`] reassembles whole messages from arbitrarily-chunked
+//!         stream data, then each goes to `process_slice`.
 //!   * **Datagrams** carry exactly one TURN message each (datagram-bounded — no
 //!     length prefix, no padding), handed straight to `process_slice`.
 //!   * **Outbound**: `Action::Send` for control responses is written back on

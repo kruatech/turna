@@ -18,10 +18,10 @@
 //!    a. `find_by_node(dead_id)` → list of orphan allocations.
 //!    b. For each orphan: `claim_allocation(port, dead_id, my_id)`.
 //!    c. On a successful claim, refetch the now-updated `StoredAllocation`
-//!       and call `bulk_load::apply_one` to rehydrate it locally.
+//!    and call `bulk_load::apply_one` to rehydrate it locally.
 //!    d. If rehydrate fails (e.g. our own port range conflict), revert
-//!       the claim via `claim_allocation(port, my_id, dead_id)`. Better
-//!       to leave the orphan in place than corrupt local state.
+//!    the claim via `claim_allocation(port, my_id, dead_id)`. Better
+//!    to leave the orphan in place than corrupt local state.
 //!
 //! # What this does NOT do
 //!

@@ -11,8 +11,9 @@ thiserror.workspace  = true
 serde.workspace      = true
 serde_json.workspace = true
 async-trait          = "0.1"
-tonic                = { version = "0.12", features = ["tls"] }
-prost                = "0.13"
+tonic                = { version = "0.14", features = ["server", "tls-ring"] }
+tonic-prost          = "0.14"
+prost                = "0.14"
 tokio-stream         = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 futures              = "0.3"
@@ -23,4 +24,4 @@ turna-health.workspace   = true
 turna-auth.workspace     = true
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"

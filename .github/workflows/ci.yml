@@ -34,7 +34,125 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
-      - run: cargo test --workspace
+      - name: cargo test workspace
+        env:
+          TURNA_TEST_REQUIRE_SERVER: "1"
+        run: cargo test --workspace
+
+  integration-hermetic:
+    name: integration tests (hermetic turna-node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Build the node binary explicitly: the hermetic integration harness looks
+      # for target/<profile>/turna-node and then starts it on ephemeral ports.
+      - run: cargo build -p turna-node --locked
+      - name: Run TURN integration tests against hermetic node
+        env:
+          TURNA_TEST_REQUIRE_SERVER: "1"
+        run: cargo test -p turna-integration-tests --locked -- --nocapture
+
+  all-features-linux:
+    name: check workspace --all-features (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `--all-features` enables the Linux-only AF_XDP dependency graph.
+      # libxdp-sys/libbpf-sys need these native build inputs even for
+      # `cargo check`; runtime AF_XDP tests still require real NIC/kernel setup
+      # and are intentionally not run here.
+      - name: Install AF_XDP native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libelf-dev zlib1g-dev pkg-config make
+      - run: cargo check --workspace --all-targets --all-features --locked
+
+  feature-matrix:
+    name: check ${{ matrix.package }}:${{ matrix.features }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Cross-platform transport surfaces. Run them on Linux and macOS so
+          # target-gating mistakes are caught before merge.
+          - os: ubuntu-latest
+            package: turna-node
+            features: tls
+          - os: macos-latest
+            package: turna-node
+            features: tls
+          - os: ubuntu-latest
+            package: turna-node
+            features: dtls
+          - os: macos-latest
+            package: turna-node
+            features: dtls
+          - os: ubuntu-latest
+            package: turna-node
+            features: quic
+          - os: macos-latest
+            package: turna-node
+            features: quic
+          - os: ubuntu-latest
+            package: turna-node
+            features: web-transport
+          - os: macos-latest
+            package: turna-node
+            features: web-transport
+
+          # Linux-only datapaths. These are compile gates only; io_uring and
+          # AF_XDP runtime coverage belongs to dedicated Linux/hardware jobs.
+          - os: ubuntu-latest
+            package: turna-node
+            features: io-uring
+          - os: ubuntu-latest
+            package: turna-node
+            features: af-xdp
+          - os: ubuntu-latest
+            package: turna-transport
+            features: io-uring
+          - os: ubuntu-latest
+            package: turna-transport
+            features: af-xdp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install AF_XDP native build dependencies
+        if: runner.os == 'Linux' && contains(matrix.features, 'af-xdp')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libelf-dev zlib1g-dev pkg-config make
+      - name: cargo check selected feature
+        run: cargo check -p ${{ matrix.package }} --all-targets --features ${{ matrix.features }} --locked
+
+  packaging:
+    name: docker + helm packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+      - name: Helm lint
+        run: helm lint deploy/helm/turna
+      - name: Render Helm config and parse with turna-config
+        run: |
+          helm template turna deploy/helm/turna > /tmp/turna-rendered.yaml
+          python3 scripts/extract_helm_config.py /tmp/turna-rendered.yaml /tmp/turn.toml
+          TURNA_CONFIG_TEST_FILE=/tmp/turn.toml \
+            cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
+      - name: Docker build
+        run: docker build -f deploy/Dockerfile -t turna:ci .
 
   deny:
     name: cargo-deny (лицензии, advisories)
@@ -59,6 +177,86 @@ jobs:
       # короткий smoke-прогон каждой цели, 30 секунд
       - run: |
           cd fuzz
-          for t in fuzz_stun fuzz_turn fuzz_stun_semantic fuzz_turn_lifecycle; do
+          for t in fuzz_stun fuzz_turn fuzz_stun_semantic fuzz_turn_lifecycle fuzz_encode; do
             cargo +nightly fuzz run $t -- -max_total_time=30
           done
+
+  miri:
+    name: miri (UB in pure-memory unsafe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Miri executes tests on its abstract machine and flags UB and data races
+      # in unsafe code. It runs only on crates whose unsafe is pure-memory
+      # (parsing / packet manipulation). The transport datapath's unsafe is
+      # syscall-bound (mmap/io_uring/AF_XDP) and cannot run under Miri — it is
+      # covered by the hardware soak/bench instead.
+      - name: cargo miri test
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: |
+          cargo +nightly miri test -p turna-proto-stun -p turna-packet
+
+  loom:
+    name: loom (lock-free concurrency model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Loom exhaustively explores thread interleavings for the lock-free
+      # primitives. Gated behind --cfg loom so it is never part of a normal
+      # build. LOOM_MAX_PREEMPTIONS bounds the state space for CI wall-clock.
+      - name: cargo test --cfg loom
+        env:
+          LOOM_MAX_PREEMPTIONS: "3"
+        run: |
+          RUSTFLAGS="--cfg loom" cargo test -p turna-qos --lib loom_bucket
+          RUSTFLAGS="--cfg loom" cargo test -p turna-relay --test loom_nonce
+
+  failover-integration:
+    name: failover (Tarantool CAS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Provision Tarantool with the turna schema + stored functions, then run
+      # the backend failover/CAS integration tests against it. The tests skip
+      # themselves when TARANTOOL_URI is unset (so the cross-platform `test`
+      # job above stays backend-free); this job is the one place they execute.
+      #
+      # ADJUST TO YOUR DEPLOYMENT:
+      #  * Image tag: pin to the Tarantool major you target (2 vs 3).
+      #  * `deploy/tarantool/init.lua` must, when run as the instance script,
+      #    call box.cfg{listen=3301}, create the schema/functions, and keep the
+      #    instance running. If your init.lua is meant to be applied to an
+      #    already-listening instance instead, start a vanilla instance here and
+      #    pipe the script in via `tt connect`/console rather than as the entrypoint.
+      #  * Auth: if init.lua provisions the `turna_app` role with a password,
+      #    set TARANTOOL_USER / TARANTOOL_PASSWORD below to match.
+      - name: Start Tarantool with turna schema
+        run: |
+          docker run -d --name turna-tnt -p 3301:3301 \
+            -v "$PWD/deploy/tarantool:/opt/turna:ro" \
+            tarantool/tarantool:2 tarantool /opt/turna/init.lua
+          echo "waiting for iproto on :3301"
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/3301) 2>/dev/null; then
+              echo "tarantool is up"; exec 3>&- ; break
+            fi
+            sleep 1
+          done
+      - name: Run backend + failover integration tests
+        env:
+          TARANTOOL_URI: 127.0.0.1:3301
+          # TARANTOOL_USER: turna
+          # TARANTOOL_PASSWORD: turna
+        run: cargo test -p turna-state-backend integration_ -- --test-threads=1 --nocapture
+      - name: Tarantool logs (on failure)
+        if: failure()
+        run: docker logs turna-tnt || true

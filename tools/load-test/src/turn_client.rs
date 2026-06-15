@@ -86,7 +86,7 @@ pub fn long_term_key(user: &str, realm: &str, pass: &str) -> [u8; 16] {
 /// Standard base64 (with padding), hand-rolled to avoid a dependency.
 fn base64_std(data: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
             chunk[0],
@@ -145,7 +145,7 @@ impl Msg {
         self.buf
             .extend_from_slice(&(val.len() as u16).to_be_bytes());
         self.buf.extend_from_slice(val);
-        while self.buf.len() % 4 != 0 {
+        while !self.buf.len().is_multiple_of(4) {
             self.buf.push(0);
         }
         self.set_len();
@@ -263,7 +263,7 @@ pub fn is_error(buf: &[u8]) -> bool {
     buf.len() >= 20 && (u16::from_be_bytes([buf[0], buf[1]]) & 0x0110) == 0x0110
 }
 
-pub fn get_attr<'a>(buf: &'a [u8], want: u16) -> Option<&'a [u8]> {
+pub fn get_attr(buf: &[u8], want: u16) -> Option<&[u8]> {
     if buf.len() < 20 {
         return None;
     }

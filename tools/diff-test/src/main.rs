@@ -176,7 +176,7 @@ fn build_tests() -> Vec<TestCase> {
 
     let msg = StunMessage::new(Method::Binding, MessageClass::Request);
     let mut buf = [0u8; 512];
-    let n = msg.encode(&mut buf);
+    let n = msg.encode(&mut buf).expect("diff-test: STUN encode overflowed buffer");
     tests.push(TestCase {
         name: "binding_request_minimal",
         description: "Minimal Binding Request — both must respond with SuccessResponse",
@@ -186,7 +186,7 @@ fn build_tests() -> Vec<TestCase> {
     let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
     msg.add(Attribute::Software("diff-test/1.0".into()));
     let mut buf = [0u8; 512];
-    let n = msg.encode(&mut buf);
+    let n = msg.encode(&mut buf).expect("diff-test: STUN encode overflowed buffer");
     tests.push(TestCase {
         name: "binding_request_with_software",
         description: "Binding Request with SOFTWARE attr",
@@ -270,7 +270,7 @@ fn build_tests() -> Vec<TestCase> {
         msg.add(Attribute::Software("x".into()));
     }
     let mut buf = vec![0u8; 8192];
-    let n = msg.encode(&mut buf);
+    let n = msg.encode(&mut buf).expect("diff-test: STUN encode overflowed buffer");
     tests.push(TestCase {
         name: "too_many_attributes",
         description: "33 SOFTWARE attrs — turna rejects (MAX=32, security limit), coturn accepts [KNOWN DIFFERENCE]",
@@ -282,7 +282,7 @@ fn build_tests() -> Vec<TestCase> {
     let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
     msg.add(Attribute::Username("diff-test-user".into()));
     let mut buf = [0u8; 512];
-    let n = msg.encode_with_integrity(&mut buf, key);
+    let n = msg.encode_with_integrity(&mut buf, key).expect("diff-test: STUN encode overflowed buffer");
     tests.push(TestCase {
         name: "binding_with_integrity_no_auth_coturn",
         description: "Binding Request with MESSAGE-INTEGRITY — turna validates (RFC compliant), coturn ignores in no-auth mode [KNOWN DIFFERENCE]",
@@ -305,7 +305,7 @@ fn build_tests() -> Vec<TestCase> {
     let payload = b"hello differential test";
     let padded = (4 + payload.len() + 3) & !3;
     let mut ch_buf = vec![0u8; padded];
-    encode_channel_data(&mut ch_buf, 0x4001, payload);
+    encode_channel_data(&mut ch_buf, 0x4001, payload).expect("diff-test: STUN encode overflowed buffer");
     tests.push(TestCase {
         name: "channel_data_no_alloc",
         description: "ChannelData for non-existent allocation — both should silently drop",
@@ -346,7 +346,7 @@ fn build_tests() -> Vec<TestCase> {
     msg.add(Attribute::XorPeerAddress(peer));
     msg.add(Attribute::Data(b"test".to_vec()));
     let mut buf = [0u8; 512];
-    let n = msg.encode(&mut buf);
+    let n = msg.encode(&mut buf).expect("diff-test: STUN encode overflowed buffer");
     tests.push(TestCase {
         name: "send_indication_no_alloc",
         description: "Send Indication without allocation — both should silently drop (Indication, no response expected)",
@@ -375,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Warm-up ping to both servers
     let ping_msg = StunMessage::new(Method::Binding, MessageClass::Request);
     let mut ping_buf = [0u8; 64];
-    let ping_n = ping_msg.encode(&mut ping_buf);
+    let ping_n = ping_msg.encode(&mut ping_buf).expect("diff-test: STUN encode overflowed buffer");
 
     let turna_up = matches!(
         send_recv(&turna_sock, cli.turna, &ping_buf[..ping_n], 1000).await,
@@ -433,8 +433,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n## Differential Test Results\n");
         println!("Servers: turna={} coturn={}\n", cli.turna, cli.coturn);
         println!(
-            "{:<40} {:<20} {:<20} {}",
-            "Test", "turna", "coturn", "Status"
+            "{:<40} {:<20} {:<20} Status",
+            "Test", "turna", "coturn"
         );
         println!("{}", "─".repeat(100));
 

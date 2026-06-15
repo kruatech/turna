@@ -73,7 +73,7 @@ impl Priority {
         let first_two = u16::from_be_bytes([data[0], data[1]]);
 
         // ChannelData (0x4000-0x7FFF) → нужно смотреть RTP внутри
-        if first_two >= 0x4000 && first_two <= 0x7FFF {
+        if (0x4000..=0x7FFF).contains(&first_two) {
             // ChannelData header = 4 bytes, потом RTP
             if data.len() >= 16 {
                 return classify_rtp(&data[4..]);

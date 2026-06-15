@@ -1,5 +1,7 @@
 //! Transport backend selection: configuration preference + runtime probe.
 //!
+//! The configuration default is `tokio` (the safest, most predictable backend
+//! on every platform). `io_uring`, `af_xdp` and `auto` are explicit opt-ins.
 //! In `Auto` mode, io_uring is used when the runtime probe reports it usable,
 //! otherwise the tokio (epoll + recvmmsg/sendmmsg) backend is used. The
 //! preference can be forced either way via config.
@@ -9,7 +11,8 @@ use crate::probe::{probe_io_uring, IoUringProbe};
 /// Backend preference as requested by configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportPreference {
-    /// Use io_uring if available at runtime, otherwise tokio. (default)
+    /// Use io_uring if available at runtime, otherwise tokio. Convenience /
+    /// dev / benchmark mode -- opt in explicitly; the config default is tokio.
     Auto,
     /// Force io_uring; fail fast if it is not usable/ready.
     IoUring,

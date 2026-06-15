@@ -6,14 +6,14 @@
 //! `ZeroCopyForward` (the name was misleading — it still called `.to_vec()`).
 //!
 //! New approach:
-//! 1. `recv_from` fills a pooled `BytesMut`.
+//! 1. `recv_from` fills a per-worker `BytesMut`.
 //! 2. `BytesMut::freeze()` produces a `Bytes` — an Arc-backed slice,
 //!    zero allocation cost after the initial recv.
 //! 3. `Action::Forward` carries a `Bytes::slice()` of that buffer —
 //!    pointer arithmetic + AtomicAdd, no memcpy.
 //! 4. `OutMsg` fields are all `Bytes`, so the send task also avoids copies.
 //!
-//! Result: **1 allocation per packet** (recv buffer from pool) instead of
+//! Result: **1 allocation per packet** (per-worker recv buffer) instead of
 //! the previous **2-3 allocations + 2 memcpy** for ChannelData.
 
 use bytes::Bytes;
@@ -26,7 +26,7 @@ use tracing::{error, info};
 use turna_auth::AuthRegistry;
 use turna_health::Metrics;
 use turna_session::AllocationStore;
-use turna_transport::buffer::{BytesPool, MAX_UDP_PACKET};
+use turna_transport::buffer::MAX_UDP_PACKET;
 use turna_transport::migration::MigrationManager;
 use turna_transport::{TokioTransport, Transport};
 
@@ -218,6 +218,12 @@ impl RelayEgress {
             Action::CloseRelay { port } => {
                 let _ = self.tx.send(OutMsg::CloseRelay { port }).await;
             }
+            // The tokio path never produces ForwardZeroCopy — `process()` emits
+            // `Forward { data: Bytes }`. It is an io_uring / AF_XDP-only action.
+            // Handle it defensively so the match stays exhaustive.
+            Action::ForwardZeroCopy { .. } => {
+                debug_assert!(false, "ForwardZeroCopy reached the tokio dispatch path");
+            }
             Action::None => {}
         }
         None
@@ -296,10 +302,6 @@ pub struct RelayServer {
     /// TURNS (TLS) listener config; `None` disables it.
     #[cfg(feature = "tls")]
     tls_config: Option<turna_transport::tcp_tls::TlsTransportConfig>,
-    /// Не используется в hot path: общий Mutex-пул на 8 воркеров создавал
-    /// контеншн хуже самого malloc. Буферы берутся per-worker.
-    #[allow(dead_code)]
-    pool: BytesPool,
 }
 
 impl RelayServer {
@@ -340,14 +342,6 @@ impl RelayServer {
             PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
                 .with_migration(migration),
         );
-        // Pool size configurable via TURNA_BUFFER_POOL_SIZE (default 4096).
-        // At 100k pps each buffer lives ~10µs → pool of 4096 is enough,
-        // but raise to 16384 for high-throughput benchmarks.
-        let pool_size = std::env::var("TURNA_BUFFER_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4096);
-        let pool = BytesPool::new(pool_size, MAX_UDP_PACKET);
         Self {
             transport,
             processor,
@@ -356,7 +350,6 @@ impl RelayServer {
             client_sinks: Arc::new(DashMap::new()),
             #[cfg(feature = "tls")]
             tls_config: None,
-            pool,
         }
     }
 
@@ -536,11 +529,27 @@ impl RelayServer {
                     };
 
                     let mut replies: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(n);
+#[allow(clippy::needless_range_loop)]
                     for k in 0..n {
                         let (len, src) = metas[k];
                         let chunk = arena.split_to(MAX_UDP_PACKET);
                         let raw: Bytes = chunk.freeze().slice(..len);
-                        for action in processor.process(raw, src) {
+                        // A3-O1: isolate per-packet panics so a single bad packet
+                        // can't take down the whole worker task. `processor` is
+                        // &self over Arc/lock-free state (DashMap + atomics +
+                        // parking_lot, which has no poisoning), so dropping the
+                        // offending packet and continuing leaves no torn state.
+                        let actions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || processor.process(raw, src),
+                        ))
+                        .unwrap_or_else(|_| {
+                            processor
+                                .metrics()
+                                .processor_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Vec::new()
+                        });
+                        for action in actions {
                             match action {
                                 Action::Send { data, target } => {
                                     replies.push((data, target));
@@ -584,6 +593,15 @@ impl RelayServer {
                                         break;
                                     }
                                 }
+                                // io_uring / AF_XDP-only; never produced by the
+                                // tokio `process()` path. Defensive, keeps the
+                                // match exhaustive.
+                                Action::ForwardZeroCopy { .. } => {
+                                    debug_assert!(
+                                        false,
+                                        "ForwardZeroCopy reached the tokio recvmmsg path"
+                                    );
+                                }
                                 Action::None => {}
                             }
                         }
@@ -621,7 +639,7 @@ impl RelayServer {
     async fn drain(&self) {
         let store = self.processor.store();
         let timeout = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while store.len() > 0 && tokio::time::Instant::now() < timeout {
+        while !store.is_empty() && tokio::time::Instant::now() < timeout {
             let removed = store.cleanup_expired();
             if removed > 0 {
                 self.processor
@@ -632,7 +650,7 @@ impl RelayServer {
             info!(remaining = store.len(), "draining...");
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
-        if store.len() > 0 {
+        if !store.is_empty() {
             info!(remaining = store.len(), "drain timeout — forcing shutdown");
         } else {
             info!("all allocations drained");

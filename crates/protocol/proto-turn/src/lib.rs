@@ -24,7 +24,7 @@ pub const CHANNEL_MIN: u16 = 0x4000;
 pub const CHANNEL_MAX: u16 = 0x7FFE;
 
 pub fn is_valid_channel(ch: u16) -> bool {
-    ch >= CHANNEL_MIN && ch <= CHANNEL_MAX
+    (CHANNEL_MIN..=CHANNEL_MAX).contains(&ch)
 }
 
 /// Build an Allocate request.
@@ -117,14 +117,66 @@ pub fn build_redirect_response(
 }
 
 /// Build a 401 Unauthorized response with REALM and NONCE (for auth challenge).
+///
+/// Also advertises PASSWORD-ALGORITHMS (RFC 8489) so an RFC 8489 client may
+/// choose MESSAGE-INTEGRITY-SHA256. The attribute is comprehension-optional
+/// (0x8002), so RFC 5389 clients ignore it and continue with HMAC-SHA-1.
 pub fn build_auth_challenge(
     method: Method,
     tid: [u8; 12],
     realm: &str,
     nonce: &str,
 ) -> StunMessage {
+    use turna_proto_stun::attribute::{
+        ATTR_PASSWORD_ALGORITHMS, PASSWORD_ALGORITHM_MD5, PASSWORD_ALGORITHM_SHA256,
+    };
     let mut msg = build_error_response(method, tid, 401, "Unauthorized");
     msg.add(Attribute::Realm(realm.to_string()));
     msg.add(Attribute::Nonce(nonce.to_string()));
+
+    // Each entry: {algorithm: u16, params-length: u16, params...}. MD5 and
+    // SHA-256 carry no parameters, so each entry is 4 bytes.
+    let mut algos = Vec::with_capacity(8);
+    for algo in [PASSWORD_ALGORITHM_MD5, PASSWORD_ALGORITHM_SHA256] {
+        algos.extend_from_slice(&algo.to_be_bytes());
+        algos.extend_from_slice(&0u16.to_be_bytes());
+    }
+    msg.add(Attribute::Unknown {
+        attr_type: ATTR_PASSWORD_ALGORITHMS,
+        value: algos,
+    });
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_challenge_advertises_password_algorithms() {
+        let msg = build_auth_challenge(Method::Allocate, [0u8; 12], "realm", "nonce");
+        let value = msg
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                Attribute::Unknown { attr_type, value }
+                    if *attr_type == turna_proto_stun::attribute::ATTR_PASSWORD_ALGORITHMS =>
+                {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .expect("challenge must carry PASSWORD-ALGORITHMS");
+        // MD5 (0x0001, len 0) then SHA-256 (0x0002, len 0).
+        assert_eq!(value, vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00]);
+        // REALM and NONCE are still present.
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Realm(r) if r == "realm")));
+        assert!(msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Nonce(n) if n == "nonce")));
+    }
 }

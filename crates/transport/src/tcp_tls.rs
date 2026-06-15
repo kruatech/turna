@@ -6,8 +6,8 @@
 //!     (RFC 5389/8489 §7.2.2 / §6.2.2; тело уже кратно 4).
 //!   * ChannelData — длина (байты 2..4) + 4-байтовый заголовок, с паддингом
 //!     до кратности 4 поверх TCP/TLS (RFC 5766/8656 §11.5).
-//!   НЕ RFC 4571 (тот — про RTP-over-TCP): стандартные TURN-клиенты
-//!   (браузерный WebRTC, coturn) не добавляют 2-байтовый префикс длины.
+//!     НЕ RFC 4571 (тот — про RTP-over-TCP): стандартные TURN-клиенты
+//!     (браузерный WebRTC, coturn) не добавляют 2-байтовый префикс длины.
 //! - Certificate hot-reload по mtime
 //! - Connection limit, idle timeout
 //! - События совместимы с UDP-транспортом (PacketProcessor не знает о типе)
@@ -292,7 +292,7 @@ async fn handle_conn(
     let tls_stream = timeout(cfg.handshake_timeout, tls.accept(stream))
         .await
         .map_err(|_| TlsError::HandshakeTimeout(cfg.handshake_timeout))?
-        .map_err(|e| TlsError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+        .map_err(|e| TlsError::Io(io::Error::other(e)))?;
 
     let _ = etx.send(TcpTransportEvent::ConnectionOpened { conn_id: id, peer_addr: peer }).await;
 

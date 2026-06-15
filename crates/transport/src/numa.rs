@@ -165,6 +165,8 @@ impl WorkerPlacement {
 /// on this thread come from local NUMA memory.
 pub fn bind_memory_to_node(node: u32) -> bool {
     let mask: u64 = 1u64 << node;
+    // SAFETY: set_mempolicy syscall with MPOL_BIND and a valid `mask`/maxnode living
+    // for the call; failure is reported, never UB.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_set_mempolicy,
@@ -184,6 +186,8 @@ pub fn bind_memory_to_node(node: u32) -> bool {
 
 /// Pin current thread to a specific CPU core.
 pub fn pin_to_cpu(cpu: u32) -> bool {
+    // SAFETY: cpu_set_t is a C POD type (all-zeroes valid); CPU_SET/sched_setaffinity
+    // operate on the local `cpuset` with correct size.
     unsafe {
         let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu as usize, &mut cpuset);

@@ -62,6 +62,8 @@ impl Default for GsoConfig {
 #[cfg(target_os = "linux")]
 pub fn enable_gro(fd: RawFd) -> std::io::Result<bool> {
     let val: libc::c_int = 1;
+    // SAFETY: `fd` is the caller's open socket; `val` is a c_int living for the
+    // call, optlen = size_of::<c_int>().
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -192,15 +194,23 @@ pub fn parse_gro_cmsg(cmsg_buf: &[u8]) -> Option<u16> {
 /// Prepare GSO cmsg for sendmsg.
 #[cfg(target_os = "linux")]
 pub fn build_gso_cmsg(segment_size: u16) -> Vec<u8> {
+    // SAFETY: CMSG_SPACE is a pure size computation over a constant; no memory access.
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
     let mut buf = vec![0u8; cmsg_space];
 
+    // SAFETY: `buf` is sized via CMSG_SPACE for one cmsghdr and suitably aligned;
+    // the reference is used only within `buf`'s lifetime.
     let hdr = unsafe { &mut *(buf.as_mut_ptr() as *mut libc::cmsghdr) };
     hdr.cmsg_level = libc::SOL_UDP;
     hdr.cmsg_type = UDP_SEGMENT;
+    // SAFETY: CMSG_LEN is a pure size computation over a constant; no memory access.
     hdr.cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) } as usize;
 
+    // SAFETY: `hdr` points into `buf` sized for the cmsg; CMSG_DATA returns a
+    // pointer to the data area within those bounds.
     let data_ptr = unsafe { libc::CMSG_DATA(hdr) } as *mut u16;
+    // SAFETY: `data_ptr` is the cmsg data slot within `buf` (>= size_of::<u16>()),
+    // aligned and writable.
     unsafe { *data_ptr = segment_size };
 
     buf

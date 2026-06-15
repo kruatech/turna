@@ -20,9 +20,9 @@
   DTLS-SRTP end-to-end. For non-WebRTC clients, use DTLS/your own
   app-level encryption.
 - **DDoS at the network layer.** Sustained volumetric attacks need
-  upstream mitigation (CloudFlare, AWS Shield, etc.). `turna` does
-  have an in-process BPF filter for STUN format validation (planned —
-  see TODO.md), but that doesn't help against pure traffic floods.
+  upstream mitigation (Cloudflare, AWS Shield, provider filtering, etc.). On
+  Linux, `TURNA_BPF_FILTER=1` can cheaply reject some malformed STUN/ChannelData
+  garbage before userspace, but it does not stop volumetric floods.
 - **Compromise of the host.** If an attacker gets shell on the
   `turna-node` machine, they can read secrets from memory and from
   `/etc/turna/`. Standard server hardening applies.
@@ -33,8 +33,8 @@
 |---|---|---|
 | Random Internet host with no credentials | Allocate a relay | HMAC check fails → no allocation |
 | Random Internet host that guessed/leaked `shared_secret` | Allocate a relay, burn your bandwidth | Rotate `shared_secret`; restrict credential lifetime via `token_ttl` |
-| User with valid credentials | Allocate many relays to exhaust ports | `[turn.relay] max_allocations` + per-user quota in `BandwidthQuota` (planned wire-through to config — see TODO.md) |
-| Operator on the same private network as Tarantool | Read/modify allocation records | Network-level access control + (planned) Tarantool user/password — see TODO.md |
+| User with valid credentials | Allocate many relays to exhaust ports | `[turn.relay].max_allocations` + `[turn.relay.quota].max_per_user` and optional bandwidth cap |
+| Operator on the same private network as Tarantool | Read/modify allocation records | Tarantool user/password in `[cluster.backend]` + network-level access control |
 | Operator who got a valid client cert for the gRPC API | Drain nodes, list allocations | mTLS reduces blast radius to known operators; rotate CA if a cert leaks |
 
 ## Production checklist
@@ -45,7 +45,7 @@ Before exposing to the Internet:
 - [ ] `shared_secret` set to a strong random value (`openssl rand -hex 32`).
       Not committed to git. Not in shell history (`unset HISTFILE` or use
       a secret store).
-- [ ] `external_ip` set to your actual public IP.
+- [ ] `external_ip` set to your actual public IPv4/IPv6 address, not a hostname or placeholder.
 - [ ] `/etc/turna/secrets.env` (or equivalent) is `chmod 0600` and owned
       by `root` or the `turna` user — not world-readable.
 - [ ] Health/metrics port 9090 is **not** open to the public Internet.
@@ -54,6 +54,10 @@ Before exposing to the Internet:
       Either bind to `127.0.0.1` or limit by firewall.
 - [ ] gRPC management TLS: `mTLS` if reachable from anywhere off-host;
       `disabled` (with 127.0.0.1 binding) only for single-machine ops.
+- [ ] Peer filter reviewed: default `internet-facing` profile is correct for
+      public TURN. Use `lan` only when relaying to private addresses is intended.
+- [ ] Tarantool, if used, has a dedicated user/password and is not reachable
+      from the public Internet.
 - [ ] Run the server as a non-root user (`turna`).
 - [ ] systemd hardening directives applied (see [DEPLOY.md](DEPLOY.md)).
 - [ ] You know how to rotate the `shared_secret` (see below).

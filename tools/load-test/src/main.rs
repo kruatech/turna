@@ -235,6 +235,7 @@ impl Stats {
                 }
             },
             lat_max_us: self.lat_max.load(Ordering::Relaxed),
+#[allow(clippy::manual_checked_ops)]
             lat_avg_us: if recv > 0 {
                 self.lat_sum.load(Ordering::Relaxed) / recv
             } else {
@@ -313,6 +314,7 @@ impl Snapshot {
         ];
         let mx_b = self.lat_buckets.iter().max().copied().unwrap_or(1);
         for (l, &c) in labels.iter().zip(self.lat_buckets.iter()) {
+#[allow(clippy::manual_checked_ops)]
             let bar = "█".repeat(if mx_b > 0 {
                 (c * 40 / mx_b) as usize
             } else {

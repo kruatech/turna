@@ -2,13 +2,37 @@
 //!
 //! Minimal HTTP server on a separate port. No external HTTP framework.
 //! - GET /health  → 200 OK / 503 draining
+//! - GET /ready   → 200 OK / 503 (not ready or draining)
 //! - GET /status  → JSON with node stats
 //! - GET /metrics → Prometheus text format
 pub mod load_reporter;
 
 use serde::Serialize;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+
+/// 2.4 process readiness state. Surfaced on `/ready` and as the
+/// `turna_backend_readiness` gauge (0=starting, 1=ready, 2=degraded, 3=draining).
+/// NOTE: single process-level state machine; true per-backend readiness
+/// (separate state per tokio/io_uring/dtls/af_xdp) is not yet wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Starting = 0,
+    Ready = 1,
+    Degraded = 2,
+    Draining = 3,
+}
+
+impl Readiness {
+    fn from_u8(v: u8) -> Readiness {
+        match v {
+            1 => Readiness::Ready,
+            2 => Readiness::Degraded,
+            3 => Readiness::Draining,
+            _ => Readiness::Starting,
+        }
+    }
+}
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -34,6 +58,13 @@ pub trait ClusterView: Send + Sync {
 /// Shared metrics that are updated by relay workers.
 pub struct Metrics {
     pub is_draining: AtomicBool,
+    /// 2.4 readiness: traffic path usable (set once listeners are up).
+    pub readiness: AtomicU8,
+    /// 2.4 per-backend readiness (observability). With fail-fast startup these
+    /// are all-or-nothing at boot; `Degraded` is reserved for future
+    /// non-fatal backend failures.
+    pub transport_readiness: AtomicU8,
+    pub dtls_readiness: AtomicU8,
     pub packets_received: AtomicU64,
     pub packets_sent: AtomicU64,
     pub bytes_received: AtomicU64,
@@ -54,6 +85,10 @@ pub struct Metrics {
     /// Permission/ChannelBind/Send requests refused because the peer address
     /// is in a denied (special-use) range — see relay::peer_filter.
     pub peer_rejected: AtomicU64,
+    /// A3-O1: packet-processing panics caught by the worker's panic guard.
+    /// A non-zero rate means a packet tripped a bug in `PacketProcessor`; the
+    /// worker survived (the offending packet was dropped). Alert on rate > 0.
+    pub processor_panics: AtomicU64,
     // RTP quality (updated periodically)
     pub rtp_streams: AtomicU64,
     pub rtp_avg_loss_pct_x100: AtomicU64, // loss% * 100 (e.g. 250 = 2.50%)
@@ -136,6 +171,7 @@ pub struct Metrics {
     pub auth_fail_invalid_credentials: AtomicU64,
     pub auth_fail_expired: AtomicU64,
     pub auth_fail_integrity: AtomicU64,
+    pub auth_fail_bad_request: AtomicU64,
 
     // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
     // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
@@ -156,6 +192,8 @@ pub struct Metrics {
     pub dtls_idle_timeouts: AtomicU64,
     pub dtls_bytes_rx: AtomicU64,
     pub dtls_bytes_tx: AtomicU64,
+    pub dtls_outbound_dropped: AtomicU64,
+    pub dtls_rejected_per_ip: AtomicU64,
 
     // ── io_uring worker-pool ring utilisation (Linux io-uring backend) ───────
     // Summed across workers by a periodic copy task in the node's io_uring arm.
@@ -170,6 +208,25 @@ pub struct Metrics {
     pub uring_sq_capacity: AtomicU64,
     pub uring_cq_len: AtomicU64,
     pub uring_buffers_available: AtomicU64,
+    pub uring_relay_capacity_exhausted_total: AtomicU64,
+    /// 2.2 (D5): currently-occupied io_uring send slots (main + relay, summed).
+    pub uring_inflight_send_slots: AtomicU64,
+    /// 2.2 (D4): main send slots seen stalled >5s without a SendMsg CQE (summed).
+    pub uring_send_slot_stalled_total: AtomicU64,
+    // ── AF_XDP datapath (Linux af-xdp backend; loop-level counters) ──────────
+    pub afxdp_rx_frames_total: AtomicU64,
+    pub afxdp_rx_bytes_total: AtomicU64,
+    pub afxdp_tx_frames_total: AtomicU64,
+    pub afxdp_tx_bytes_total: AtomicU64,
+    pub afxdp_parse_drops_total: AtomicU64,
+    pub afxdp_tx_drops_total: AtomicU64,
+    pub afxdp_relay_ports_registered: AtomicU64,
+    pub afxdp_umem_free_frames: AtomicU64,
+    pub afxdp_arp_replies_total: AtomicU64,
+    pub afxdp_ndp_replies_total: AtomicU64,
+    pub afxdp_neighbor_unresolved: AtomicU64,
+    pub afxdp_tx_inflight: AtomicU64,
+    pub afxdp_neighbor_cache_entries: AtomicU64,
 
     // ── Latency histograms ─────────────────────────────────────────────────────
     /// Request-latency histograms (STUN/relay/auth/allocation-lifetime). The
@@ -188,6 +245,9 @@ impl Metrics {
     pub fn new() -> Self {
         Self {
             is_draining: AtomicBool::new(false),
+            readiness: AtomicU8::new(Readiness::Starting as u8),
+            transport_readiness: AtomicU8::new(Readiness::Starting as u8),
+            dtls_readiness: AtomicU8::new(Readiness::Starting as u8),
             packets_received: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
@@ -202,6 +262,7 @@ impl Metrics {
             malformed_packets: AtomicU64::new(0),
             quota_exceeded: AtomicU64::new(0),
             peer_rejected: AtomicU64::new(0),
+            processor_panics: AtomicU64::new(0),
             rtp_streams: AtomicU64::new(0),
             rtp_avg_loss_pct_x100: AtomicU64::new(0),
             rtp_max_loss_pct_x100: AtomicU64::new(0),
@@ -237,6 +298,7 @@ impl Metrics {
             auth_fail_invalid_credentials: AtomicU64::new(0),
             auth_fail_expired: AtomicU64::new(0),
             auth_fail_integrity: AtomicU64::new(0),
+            auth_fail_bad_request: AtomicU64::new(0),
             quic_active: AtomicU64::new(0),
             quic_sessions_total: AtomicU64::new(0),
             quic_closed_total: AtomicU64::new(0),
@@ -252,6 +314,8 @@ impl Metrics {
             dtls_idle_timeouts: AtomicU64::new(0),
             dtls_bytes_rx: AtomicU64::new(0),
             dtls_bytes_tx: AtomicU64::new(0),
+            dtls_outbound_dropped: AtomicU64::new(0),
+            dtls_rejected_per_ip: AtomicU64::new(0),
             uring_workers: AtomicU64::new(0),
             uring_cqe_drained_total: AtomicU64::new(0),
             uring_cqe_batches_total: AtomicU64::new(0),
@@ -261,6 +325,22 @@ impl Metrics {
             uring_sq_capacity: AtomicU64::new(0),
             uring_cq_len: AtomicU64::new(0),
             uring_buffers_available: AtomicU64::new(0),
+            uring_relay_capacity_exhausted_total: AtomicU64::new(0),
+            uring_inflight_send_slots: AtomicU64::new(0),
+            uring_send_slot_stalled_total: AtomicU64::new(0),
+            afxdp_rx_frames_total: AtomicU64::new(0),
+            afxdp_rx_bytes_total: AtomicU64::new(0),
+            afxdp_tx_frames_total: AtomicU64::new(0),
+            afxdp_tx_bytes_total: AtomicU64::new(0),
+            afxdp_parse_drops_total: AtomicU64::new(0),
+            afxdp_tx_drops_total: AtomicU64::new(0),
+            afxdp_relay_ports_registered: AtomicU64::new(0),
+            afxdp_umem_free_frames: AtomicU64::new(0),
+            afxdp_arp_replies_total: AtomicU64::new(0),
+            afxdp_ndp_replies_total: AtomicU64::new(0),
+            afxdp_neighbor_unresolved: AtomicU64::new(0),
+            afxdp_tx_inflight: AtomicU64::new(0),
+            afxdp_neighbor_cache_entries: AtomicU64::new(0),
             histograms: histogram::HistogramRegistry::new(),
             tenant_allocations_total: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -272,6 +352,26 @@ impl Metrics {
 
     pub fn is_draining(&self) -> bool {
         self.is_draining.load(Ordering::SeqCst)
+    }
+
+    pub fn set_readiness(&self, r: Readiness) {
+        self.readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_transport_readiness(&self, r: Readiness) {
+        self.transport_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_dtls_readiness(&self, r: Readiness) {
+        self.dtls_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn readiness(&self) -> Readiness {
+        Readiness::from_u8(self.readiness.load(Ordering::SeqCst))
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness() == Readiness::Ready
     }
 
     /// Record one allocation for a tenant (multi-tenancy observability).
@@ -316,11 +416,13 @@ impl Metrics {
              turna_auth_failures_by_reason_total{{reason=\"missing_credentials\"}} {}\n\
              turna_auth_failures_by_reason_total{{reason=\"invalid_credentials\"}} {}\n\
              turna_auth_failures_by_reason_total{{reason=\"expired\"}} {}\n\
-             turna_auth_failures_by_reason_total{{reason=\"integrity_failed\"}} {}\n",
+             turna_auth_failures_by_reason_total{{reason=\"integrity_failed\"}} {}\n\
+             turna_auth_failures_by_reason_total{{reason=\"bad_request\"}} {}\n",
             self.auth_fail_missing_credentials.load(Ordering::Relaxed),
             self.auth_fail_invalid_credentials.load(Ordering::Relaxed),
             self.auth_fail_expired.load(Ordering::Relaxed),
             self.auth_fail_integrity.load(Ordering::Relaxed),
+            self.auth_fail_bad_request.load(Ordering::Relaxed),
         )
     }
 
@@ -375,6 +477,12 @@ impl Metrics {
              # HELP turna_dtls_bytes_tx_total Bytes encrypted+sent over DTLS\n\
              # TYPE turna_dtls_bytes_tx_total counter\n\
              turna_dtls_bytes_tx_total {}\n\
+             # HELP turna_dtls_outbound_dropped_total Outbound DTLS datagrams dropped because a session egress queue was full (DTL-3 drop-newest)\n\
+             # TYPE turna_dtls_outbound_dropped_total counter\n\
+             turna_dtls_outbound_dropped_total {}\n\
+             # HELP turna_dtls_rejected_per_ip_total DTLS sessions refused because the source IP hit max_sessions_per_ip (DTL-9)\n\
+             # TYPE turna_dtls_rejected_per_ip_total counter\n\
+             turna_dtls_rejected_per_ip_total {}\n\
              # HELP turna_uring_workers io_uring worker threads in the pool\n\
              # TYPE turna_uring_workers gauge\n\
              turna_uring_workers {}\n\
@@ -401,7 +509,64 @@ impl Metrics {
              turna_uring_cq_len {}\n\
              # HELP turna_uring_buffers_available Free registered RX buffers (summed over workers)\n\
              # TYPE turna_uring_buffers_available gauge\n\
-             turna_uring_buffers_available {}\n",
+             turna_uring_buffers_available {}\n\
+             # HELP turna_uring_relay_capacity_exhausted_total Relay allocations rejected because the per-worker relay msghdr pool was full (summed)\n\
+             # TYPE turna_uring_relay_capacity_exhausted_total counter\n\
+             turna_uring_relay_capacity_exhausted_total {}\n\
+             # HELP turna_uring_inflight_send_slots Currently-occupied io_uring send slots, main + relay (summed over workers)\n\
+             # TYPE turna_uring_inflight_send_slots gauge\n\
+             turna_uring_inflight_send_slots {}\n\
+             # HELP turna_uring_send_slot_stalled_total Main send slots seen stalled >5s without a SendMsg completion; not reused (summed)\n\
+             # TYPE turna_uring_send_slot_stalled_total counter\n\
+             turna_uring_send_slot_stalled_total {}\n\
+             # HELP turna_afxdp_rx_frames_total AF_XDP frames received off the queue\n\
+             # TYPE turna_afxdp_rx_frames_total counter\n\
+             turna_afxdp_rx_frames_total {}\n\
+             # HELP turna_afxdp_rx_bytes_total AF_XDP bytes received (TURN payloads)\n\
+             # TYPE turna_afxdp_rx_bytes_total counter\n\
+             turna_afxdp_rx_bytes_total {}\n\
+             # HELP turna_afxdp_tx_frames_total AF_XDP frames sent\n\
+             # TYPE turna_afxdp_tx_frames_total counter\n\
+             turna_afxdp_tx_frames_total {}\n\
+             # HELP turna_afxdp_tx_bytes_total AF_XDP bytes sent\n\
+             # TYPE turna_afxdp_tx_bytes_total counter\n\
+             turna_afxdp_tx_bytes_total {}\n\
+             # HELP turna_afxdp_parse_drops_total Frames received that matched no TURN/relay port (undemuxable)\n\
+             # TYPE turna_afxdp_parse_drops_total counter\n\
+             turna_afxdp_parse_drops_total {}\n\
+             # HELP turna_afxdp_tx_drops_total AF_XDP send failures\n\
+             # TYPE turna_afxdp_tx_drops_total counter\n\
+             turna_afxdp_tx_drops_total {}\n\
+             # HELP turna_afxdp_relay_ports_registered Relay ports currently demuxed by the AF_XDP datapath\n\
+             # TYPE turna_afxdp_relay_ports_registered gauge\n\
+             turna_afxdp_relay_ports_registered {}\n\
+             # HELP turna_afxdp_umem_free_frames Free UMEM frames available for RX/TX\n\
+             # TYPE turna_afxdp_umem_free_frames gauge\n\
+             turna_afxdp_umem_free_frames {}\n\
+             # HELP turna_afxdp_arp_replies_total ARP replies sent by the AF_XDP datapath for its own IP\n\
+             # TYPE turna_afxdp_arp_replies_total counter\n\
+             turna_afxdp_arp_replies_total {}\n\
+             # HELP turna_afxdp_ndp_replies_total IPv6 Neighbour Advertisements sent by the AF_XDP datapath for its own IP\n\
+             # TYPE turna_afxdp_ndp_replies_total counter\n\
+             turna_afxdp_ndp_replies_total {}\n\
+             # HELP turna_afxdp_neighbor_unresolved Next-hop TX MAC unresolved (1=zero placeholder, TX will not deliver; 0=resolved)\n\
+             # TYPE turna_afxdp_neighbor_unresolved gauge\n\
+             turna_afxdp_neighbor_unresolved {}\n\
+             # HELP turna_afxdp_tx_inflight Frames submitted to the AF_XDP TX ring but not yet completed\n\
+             # TYPE turna_afxdp_tx_inflight gauge\n\
+             turna_afxdp_tx_inflight {}\n\
+             # HELP turna_afxdp_neighbor_cache_entries Resolved next-hop MAC entries currently cached\n\
+             # TYPE turna_afxdp_neighbor_cache_entries gauge\n\
+             turna_afxdp_neighbor_cache_entries {}\n\
+             # HELP turna_backend_readiness Process readiness (0=starting,1=ready,2=degraded,3=draining)\n\
+             # TYPE turna_backend_readiness gauge\n\
+             turna_backend_readiness {}\n\
+             # HELP turna_transport_readiness Primary UDP transport backend readiness (0=starting,1=ready,2=degraded,3=draining)\n\
+             # TYPE turna_transport_readiness gauge\n\
+             turna_transport_readiness {}\n\
+             # HELP turna_dtls_readiness DTLS listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if DTLS disabled)\n\
+             # TYPE turna_dtls_readiness gauge\n\
+             turna_dtls_readiness {}\n",
             l(&self.quic_active),
             l(&self.quic_sessions_total),
             l(&self.quic_closed_total),
@@ -417,6 +582,8 @@ impl Metrics {
             l(&self.dtls_idle_timeouts),
             l(&self.dtls_bytes_rx),
             l(&self.dtls_bytes_tx),
+            l(&self.dtls_outbound_dropped),
+            l(&self.dtls_rejected_per_ip),
             l(&self.uring_workers),
             l(&self.uring_cqe_drained_total),
             l(&self.uring_cqe_batches_total),
@@ -426,6 +593,25 @@ impl Metrics {
             l(&self.uring_sq_capacity),
             l(&self.uring_cq_len),
             l(&self.uring_buffers_available),
+            l(&self.uring_relay_capacity_exhausted_total),
+            l(&self.uring_inflight_send_slots),
+            l(&self.uring_send_slot_stalled_total),
+            l(&self.afxdp_rx_frames_total),
+            l(&self.afxdp_rx_bytes_total),
+            l(&self.afxdp_tx_frames_total),
+            l(&self.afxdp_tx_bytes_total),
+            l(&self.afxdp_parse_drops_total),
+            l(&self.afxdp_tx_drops_total),
+            l(&self.afxdp_relay_ports_registered),
+            l(&self.afxdp_umem_free_frames),
+            l(&self.afxdp_arp_replies_total),
+            l(&self.afxdp_ndp_replies_total),
+            l(&self.afxdp_neighbor_unresolved),
+            l(&self.afxdp_tx_inflight),
+            l(&self.afxdp_neighbor_cache_entries),
+            self.readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.transport_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
         )
     }
 }
@@ -525,6 +711,59 @@ fn render_relay_route_metrics(s: &RelayRouteMetrics) -> String {
     )
 }
 
+/// Pulls a per-tenant relayed-traffic snapshot on each `/metrics` scrape:
+/// `(tenant, bytes, packets, closed_allocations)`. Supplied by the node from
+/// `AllocationStore::tenant_traffic_snapshot`. `None` omits
+/// the block (single-tenant deployments never populate it).
+pub type TenantTrafficProvider = Arc<dyn Fn() -> Vec<(String, u64, u64, u64)> + Send + Sync>;
+
+/// Render cumulative per-tenant relayed traffic in Prometheus text format,
+/// grouped one metric family at a time (Prometheus requires a family's samples
+/// to be contiguous). Empty when no tenant traffic has been recorded, so
+/// single-tenant output is unchanged.
+fn render_tenant_traffic_metrics(samples: &[(String, u64, u64, u64)]) -> String {
+    if samples.is_empty() {
+        return String::new();
+    }
+    let esc = |t: &str| t.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut out = String::new();
+
+    out.push_str(
+        "# HELP turna_tenant_bytes_relayed_total Bytes relayed per tenant (accrued at allocation close)\n\
+         # TYPE turna_tenant_bytes_relayed_total counter\n",
+    );
+    for (t, bytes, _, _) in samples {
+        out.push_str(&format!(
+            "turna_tenant_bytes_relayed_total{{tenant=\"{}\"}} {bytes}\n",
+            esc(t)
+        ));
+    }
+
+    out.push_str(
+        "# HELP turna_tenant_packets_relayed_total Packets relayed per tenant (accrued at allocation close)\n\
+         # TYPE turna_tenant_packets_relayed_total counter\n",
+    );
+    for (t, _, packets, _) in samples {
+        out.push_str(&format!(
+            "turna_tenant_packets_relayed_total{{tenant=\"{}\"}} {packets}\n",
+            esc(t)
+        ));
+    }
+
+    out.push_str(
+        "# HELP turna_tenant_allocations_closed_total Allocations closed per tenant\n\
+         # TYPE turna_tenant_allocations_closed_total counter\n",
+    );
+    for (t, _, _, closed) in samples {
+        out.push_str(&format!(
+            "turna_tenant_allocations_closed_total{{tenant=\"{}\"}} {closed}\n",
+            esc(t)
+        ));
+    }
+
+    out
+}
+
 /// Start health check HTTP server.
 pub async fn serve(addr: SocketAddr, metrics: Arc<Metrics>) -> std::io::Result<()> {
     serve_with_cluster(addr, metrics, None).await
@@ -540,7 +779,7 @@ pub async fn serve_with_cluster(
     metrics: Arc<Metrics>,
     cluster: Option<Arc<dyn ClusterView>>,
 ) -> std::io::Result<()> {
-    serve_with_cluster_routes(addr, metrics, cluster, None).await
+    serve_with_cluster_routes(addr, metrics, cluster, None, None).await
 }
 
 /// Like [`serve_with_cluster`], but also exposes the io_uring relay-route
@@ -555,6 +794,7 @@ pub async fn serve_with_cluster_routes(
     metrics: Arc<Metrics>,
     cluster: Option<Arc<dyn ClusterView>>,
     relay_routes: Option<RelayRouteMetricsProvider>,
+    tenant_traffic: Option<TenantTrafficProvider>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "health check server started");
@@ -564,6 +804,7 @@ pub async fn serve_with_cluster_routes(
         let metrics = metrics.clone();
         let cluster = cluster.clone();
         let relay_routes = relay_routes.clone();
+        let tenant_traffic = tenant_traffic.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
@@ -601,6 +842,26 @@ pub async fn serve_with_cluster_routes(
                         )
                     } else {
                         ("200 OK", "ok".to_string(), "text/plain")
+                    }
+                }
+                "/ready" => {
+                    // 2.4 readiness: `/health` is liveness; `/ready` also gates
+                    // on startup completion and flips to 503 on drain so a load
+                    // balancer stops sending new clients during shutdown.
+                    if metrics.is_draining() {
+                        (
+                            "503 Service Unavailable",
+                            "draining".to_string(),
+                            "text/plain",
+                        )
+                    } else if metrics.is_ready() {
+                        ("200 OK", "ready".to_string(), "text/plain")
+                    } else {
+                        (
+                            "503 Service Unavailable",
+                            "not ready".to_string(),
+                            "text/plain",
+                        )
                     }
                 }
                 "/status" => {
@@ -816,11 +1077,20 @@ pub async fn serve_with_cluster_routes(
                         m.cluster_nodes.load(Ordering::Relaxed),
                     );
                     body.push_str(&m.render_tenant_metrics());
+                    body.push_str(&format!(
+                        "# HELP turna_processor_panics_total Packet-processing panics caught by the worker guard\n\
+                         # TYPE turna_processor_panics_total counter\n\
+                         turna_processor_panics_total {}\n",
+                        m.processor_panics.load(Ordering::Relaxed)
+                    ));
                     body.push_str(&m.render_auth_reason_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.histograms.render_prometheus());
                     if let Some(provider) = &relay_routes {
                         body.push_str(&render_relay_route_metrics(&provider()));
+                    }
+                    if let Some(provider) = &tenant_traffic {
+                        body.push_str(&render_tenant_traffic_metrics(&provider()));
                     }
                     ("200 OK", body, "text/plain; version=0.0.4")
                 }

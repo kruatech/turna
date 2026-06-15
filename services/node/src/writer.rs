@@ -275,8 +275,8 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             ..
         } => {
             let pb = batch.entry(port).or_insert_with(PortBatch::new_touched);
-            let coalesced = pb.perms.insert(peer_ip, expires_at_ms).is_some();
-            coalesced
+            
+            pb.perms.insert(peer_ip, expires_at_ms).is_some()
         }
         WriteOp::Channel {
             number,
@@ -285,11 +285,11 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             ..
         } => {
             let pb = batch.entry(port).or_insert_with(PortBatch::new_touched);
-            let coalesced = pb
+            
+            pb
                 .chans
                 .insert(number, (peer_addr, expires_at_ms))
-                .is_some();
-            coalesced
+                .is_some()
         }
     }
 }
@@ -497,6 +497,7 @@ fn sync_metrics(metrics: &Metrics, counters: &WriterCounters, dropped: u64) {
 
 /// Run the writer task to completion. Returns when the channel is closed
 /// (sender dropped) or when `shutdown_rx` flips to `true`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_writer(
     backend: Arc<Backend>,
     store: Arc<AllocationStore>,

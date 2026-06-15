@@ -118,6 +118,8 @@ pub fn sendmmsg_batch(fd: RawFd, packets: &[PendingPacket]) -> std::io::Result<u
             msgs[i].msg_hdr.msg_namelen = addr_lens[i];
         }
     }
+    // SAFETY: `fd` is open; `msgs` is a valid array of `count` initialized mmsghdr
+    // whose iov/name pointers were set above; sendmmsg reads them only for the call.
     let sent = unsafe {
         libc::syscall(
             libc::SYS_sendmmsg,
@@ -137,10 +139,13 @@ pub fn sendmmsg_batch(fd: RawFd, packets: &[PendingPacket]) -> std::io::Result<u
 
 #[cfg(target_os = "linux")]
 fn sockaddr_to_raw(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: sockaddr_storage is a C POD type; all-zeroes is a valid value.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(v4) => {
             let sin: &mut libc::sockaddr_in =
+                // SAFETY: `storage` is a zeroed sockaddr_storage, large enough and aligned
+                // for sockaddr_in; the reference lives only within this block.
                 unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
             sin.sin_family = libc::AF_INET as libc::sa_family_t;
             sin.sin_port = v4.port().to_be();
@@ -152,6 +157,8 @@ fn sockaddr_to_raw(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_
         }
         SocketAddr::V6(v6) => {
             let sin6: &mut libc::sockaddr_in6 =
+                // SAFETY: `storage` is a zeroed sockaddr_storage, large enough and aligned
+                // for sockaddr_in6; the reference lives only within this block.
                 unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
             sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sin6.sin6_port = v6.port().to_be();

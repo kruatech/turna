@@ -1,5 +1,7 @@
 replicaCount: 1
 
+production: false
+
 image:
   repository: turna
   tag: "0.1.0"
@@ -9,20 +11,23 @@ turn:
   realm: "turna"
   listenPort: 3478
   healthPort: 9090
-  externalIP: ""  # Required for production: your server's public IP
+  managementPort: 5350
+  externalIP: "" # Required when production=true or cluster.enabled=true without hostNetwork announce override
+  transport: "tokio" # tokio | auto | io_uring
+  turnUrl: "turn:127.0.0.1:3478"
   relayPortRange:
     min: 49152
     max: 65535
   maxAllocations: 50000
+  quota:
+    maxBytesPerSec: 0
+    maxPerUser: 100
   auth:
     sharedSecret: "change-me-in-production"
     staticUsers: []
-  workers: 0  # 0 = auto-detect CPU count
-
-signaling:
-  enabled: true
-  listenPort: 8080
-  replicaCount: 1
+    # - username: alice
+    #   password: secret
+  workers: 0 # 0 = auto-detect CPU count
 
 resources:
   turn:
@@ -32,13 +37,6 @@ resources:
     limits:
       cpu: "4"
       memory: "2Gi"
-  signaling:
-    requests:
-      cpu: "250m"
-      memory: "128Mi"
-    limits:
-      cpu: "1"
-      memory: "512Mi"
 
 service:
   type: LoadBalancer
@@ -52,7 +50,8 @@ tolerations: []
 
 affinity: {}
 
-# Host networking for UDP performance (recommended for production)
+# Host networking is recommended for production TURN because Kubernetes Service
+# objects cannot compactly expose arbitrary relay UDP port ranges.
 hostNetwork: false
 
 # Prometheus ServiceMonitor
@@ -67,7 +66,8 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# Sysctls for network performance
+# Sysctls for network performance. Some managed clusters disallow net.core
+# sysctls; disable this block if the pod is rejected by admission control.
 sysctls:
   enabled: true
   values:
@@ -81,14 +81,13 @@ sysctls:
 # node_id) with a headless Service for gossip, instead of a Deployment.
 cluster:
   enabled: false
-  name: "turna"            # cluster identity; MUST match across all pods
+  name: "turna" # cluster identity; MUST match across all pods
   replicas: 3
   gossipPort: 7946
   gossipIntervalSecs: 2
   gossipTimeoutSecs: 30
   drainGraceSecs: 5
-  # Shared HMAC secret for gossip authentication. Strongly recommended in any
-  # shared network. Prefer `existingSecret` (a Secret containing key
-  # `cluster-secret`) over the inline `secret`.
+  # Shared HMAC secret for gossip authentication. Prefer existingSecret (a
+  # Secret containing key `cluster-secret`) over the inline `secret`.
   secret: ""
   existingSecret: ""

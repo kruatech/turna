@@ -259,10 +259,7 @@ where
     futures::stream::unfold((Box::pin(inner), guard), |(mut s, g)| async move {
         // Use fully-qualified syntax to avoid ambiguity between
         // tokio_stream::StreamExt and futures::StreamExt.
-        match futures::StreamExt::next(&mut s).await {
-            Some(item) => Some((item, (s, g))),
-            None => None, // `g` drops here → counter decrements
-        }
+        futures::StreamExt::next(&mut s).await.map(|item| (item, (s, g)))
     })
 }
 
@@ -444,11 +441,10 @@ impl TurnaManagement for TurnaManagementService {
                     if !user_filter.is_empty() && ev.allocation.username != user_filter {
                         return None;
                     }
-                    if !org_filter.is_empty() {
-                        if ev.allocation.organization.as_deref() != Some(&org_filter) {
+                    if !org_filter.is_empty()
+                        && ev.allocation.organization.as_deref() != Some(&org_filter) {
                             return None;
                         }
-                    }
                     Some(Ok(AllocationEvent_ {
                         event_type: event_type_to_proto(ev.event_type),
                         allocation: Some(alloc_to_proto(ev.allocation)),
@@ -663,7 +659,13 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         _req: Request<SetUserLimitsRequest>,
     ) -> Result<Response<SetUserLimitsResponse>, Status> {
-        Ok(Response::new(SetUserLimitsResponse { success: true }))
+        // The per-user rate limiter this RPC was meant to drive was dead code
+        // (never wired to the datapath) and has been removed (M3). Returning a
+        // fake `success: true` created a false sense of enforcement; report it
+        // honestly as unimplemented instead.
+        Err(Status::unimplemented(
+            "per-user rate limits are not implemented",
+        ))
     }
 
     // ── Server control ────────────────────────────────────────────────────────
@@ -848,7 +850,7 @@ mod tests {
     fn remaining_secs_future() {
         let future_ms = now_ms() + 60_000;
         let r = remaining_secs(future_ms);
-        assert!(r >= 59 && r <= 60, "expected ~60s remaining, got {r}");
+        assert!((59..=60).contains(&r), "expected ~60s remaining, got {r}");
     }
 
     #[test]

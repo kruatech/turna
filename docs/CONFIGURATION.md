@@ -1,175 +1,163 @@
-# Configuration reference
+# Turna configuration reference
 
-Every section of `turn.toml` and every `TURNA_*` env variable explained.
+`turna-node` takes a single TOML config path as its first argument:
 
-## How values are resolved
+```bash
+turna-node /etc/turna/turn.toml
+```
 
-1. `turn.toml` is read from disk.
-2. **`${VAR}`** placeholders are replaced with the named env variable.
-   `${VAR:-default}` provides a fallback if the env var is unset.
-3. **`file:///path`** values are replaced with the trimmed contents of
-   that file. Useful for systemd `LoadCredential`, Kubernetes mounted
-   secret volumes, or HashiCorp Vault agent files.
-4. The resulting TOML is parsed and validated.
-5. If validation fails, the process exits with a non-zero code and a
-   message explaining what's wrong.
+Every section uses `#[serde(deny_unknown_fields)]` — an unknown key is a hard
+error, not a warning. All sections have defaults, so a minimal config is short.
+Secrets support `${VAR}` / `${VAR:-default}` and `file:///path` substitution.
 
-The same `turn.toml` file can therefore serve dev (no env, defaults
-used) and production (env overrides + `production = true`).
+This document covers the transport-relevant sections. Keys, defaults and
+constraints below are taken from `crates/config/src/lib.rs`.
 
-## Top-level
-
-| TOML key       | Type | Default | Notes |
-|----------------|------|---------|-------|
-| `production`   | bool | `false` | When `true`, validation refuses placeholder secrets and empty `external_ip`. Can also be set via `TURNA_PRODUCTION=true|1|yes|on`. |
+---
 
 ## `[turn]`
 
-| TOML key      | ENV               | Default          | Notes |
-|---------------|-------------------|------------------|-------|
-| `listen`      | `TURNA_LISTEN_ADDR` | `0.0.0.0:3478`   | UDP and TCP bind. |
-| `external_ip` | `TURNA_EXTERNAL_IP` | `""`             | Public IP advertised to clients. **Required** in production. |
-| `realm`       | `TURNA_REALM`       | `"turna"`     | Auth realm. Must match clients' realm. |
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `listen` | socket addr | `0.0.0.0:3478` | UDP listen address (IANA STUN/TURN port). |
+| `external_ip` | string | `""` | Public IP advertised to clients. **Required in production** and must parse as a valid IPv4/IPv6 address. |
+| `realm` | string | `"turna"` | Authentication realm. |
+| `transport` | enum | `tokio` | Datapath backend: `tokio` \| `io_uring` \| `af_xdp` \| `auto` (see below). |
 
-### `[turn.auth]`
+### `transport` values
 
-| Key             | ENV                  | Default                    | Notes |
-|-----------------|----------------------|----------------------------|-------|
-| `shared_secret` | `TURNA_SHARED_SECRET`  | `"change-me-in-production"` | Used for time-limited credentials. Fatal in production if left at default. |
-| `token_ttl`     | —                    | `86400`                    | Max lifetime of a time-limited credential (seconds). |
-| `static_users`  | per-user             | `[]`                       | Array of `{username, password}`. When non-empty, `AuthMode::LongTerm` is used instead of shared-secret. |
+- `tokio` — epoll + `recvmmsg`/`sendmmsg`. Default, safest, all platforms.
+- `io_uring` — Linux io_uring datapath. Requires a binary built with
+  `--features io-uring`; fails fast at startup if io_uring is unavailable.
+- `af_xdp` — AF_XDP ring datapath. Requires `--features af-xdp`, Linux,
+  `CAP_NET_RAW`, and an external XDP program steering traffic to the bound NIC
+  queue. Never auto-selected.
+- `auto` — io_uring when available at runtime, else tokio. Opt-in (dev/bench).
 
-### `[turn.relay]`
+---
 
-| Key               | Default | Notes |
-|-------------------|---------|-------|
-| `min_port`        | `49152` | Lower bound of the relay port range. |
-| `max_port`        | `65535` | Upper bound. |
-| `max_allocations` | `50000` | Hard cap on simultaneous allocations. |
+## `[turn.auth]`
 
-### `[turn.observability]`
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `shared_secret` | string | (built-in placeholder) | coturn-style `lt-cred-mech` (time-limited credentials). |
+| `token_ttl` | u64 | `86400` | Token lifetime, seconds. |
+| `static_users` | array of `{ username, password }` | `[]` | Long-term static credentials. |
 
-| Key                    | ENV                | Default | Notes |
-|------------------------|--------------------|---------|-------|
-| `otlp_endpoint`        | `TURNA_OTLP_ENDPOINT`| `""`    | OTLP gRPC endpoint, e.g. `http://otel-collector:4317`. Empty disables OTel export. |
-| `trace_sample_rate`    | —                  | `0.01`  | Fraction of spans sampled. Errors and `Allocate` are always sampled. |
-| `json_logs`            | —                  | `false` | Structured JSON logs (recommended for production log ingestion). |
-| `max_spans_per_second` | —                  | `1000`  | Hard cap on tracing throughput. |
+Use **one** of: `static_users` (long-term) or `shared_secret` (time-limited).
 
-## `[signaling]`
+```toml
+[turn.auth]
+static_users = [{ username = "alice", password = "s3cret" }]
+# or:
+# shared_secret = "${TURNA_SHARED_SECRET}"
+```
 
-The coturn-style HTTP credentials server. Only needed if your client
-SDK uses that protocol.
-
-| Key                  | ENV                  | Default              |
-|----------------------|----------------------|----------------------|
-| `listen`             | `TURNA_SIGNALING_ADDR` | `0.0.0.0:9001`       |
-| `turn_url`           | `TURNA_TURN_URL`       | `turn:127.0.0.1:3478` |
-| `turn_shared_secret` | `TURNA_SHARED_SECRET`  | (same as `[turn.auth]`) |
+---
 
 ## `[health]`
 
-| Key      | ENV               | Default          |
-|----------|-------------------|------------------|
-| `listen` | `TURNA_HEALTH_ADDR` | `0.0.0.0:9090`   |
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `listen` | socket addr | `0.0.0.0:9090` | Serves `/health`, `/ready`, `/metrics`, `/status`, `/cluster`. |
 
-Exposes `GET /health`, `/status`, `/metrics`.
+The startup validator rejects a `[health].listen` port that collides with
+another service (e.g. a management port already bound to `9090`); pick a free
+port such as `9091` in that case.
 
-## `[cluster]`
+### Endpoints
 
-Multi-node mode. Leave at defaults for single-node operation.
+- `GET /health` — liveness. `200 ok`, or `503` while draining.
+- `GET /ready` — readiness. `200 ready` only when the node is in the `Ready`
+  state and not draining; `503` otherwise (`not ready` / `draining`).
+- `GET /metrics` — Prometheus text exposition.
 
-| Key           | ENV            | Default     |
-|---------------|----------------|-------------|
-| `node_id`     | `TURNA_NODE_ID`  | `"node-1"`  |
-| `gossip_port` | —              | `7946`      |
-| `seeds`       | —              | `[]`        |
+---
 
-### `[cluster.backend]`
+## `[turn.io_uring]`
 
-| Key      | ENV                | Default   | Notes |
-|----------|--------------------|-----------|-------|
-| `type`   | `TURNA_BACKEND_TYPE` | `"memory"` | `memory` or `tarantool`. |
-| `uri`    | `TURNA_BACKEND_URI`  | `""`      | `host:port` for Tarantool. |
+Used only when `transport = "io_uring"`.
 
-**Tarantool authentication is not yet wired through this config.** See
-the TODO note in `deploy/turn.toml` and in `TODO.md`. Workaround: place
-Tarantool on a private network and rely on network-level access
-controls.
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `relay_socket_capacity_per_worker` | usize | `256` | Max relay sockets (allocations) per io_uring worker. Hard-capped at **1024** (16-bit msghdr index packed into the CQE user_data). |
 
-### `[cluster.persistence]`
+---
 
-Write-behind persistence of allocation state. See [CLUSTER.md](CLUSTER.md)
-for the conceptual model.
+## `[turn.dtls]`
 
-| Key                | ENV                     | Default      | Notes |
-|--------------------|-------------------------|--------------|-------|
-| `mode`             | `TURNA_PERSISTENCE_MODE`  | `"disabled"` | `"disabled"` or `"write_behind"`. |
-| `channel_capacity` | —                       | `65536`      | Bounded mpsc; drops on overflow. |
-| `batch_max_size`   | —                       | `256`        | Flush after this many events. |
-| `batch_max_delay_ms` | —                     | `100`        | Flush at most this often. |
+TURN over DTLS (RFC 7350). Disabled by default. Requires `--features dtls`.
 
-## `[management]`
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Enable the DTLS listener. |
+| `listen` | socket addr | `0.0.0.0:5349` | IANA TURNS/DTLS port. |
+| `cert_path` | path | `/etc/turna/tls/cert.pem` | PEM certificate. Must be **readable** — an unreadable path aborts startup (fail-fast). |
+| `key_path` | path | `/etc/turna/tls/key.pem` | PEM private key. Must be readable. |
+| `max_sessions` | usize | `10000` | Post-handshake admission cap (`0` = unlimited). |
+| `idle_timeout_secs` | u64 | `300` | Per-session idle timeout. |
+| `mtu` | usize | `1200` | Application record MTU; caps outbound TURN responses to avoid IP fragmentation. |
+| `outbound_queue_capacity` | usize | `1024` | Bounded per-session egress queue. When full, the **newest** outbound datagram is dropped (counted as `turna_dtls_outbound_dropped_total`) rather than blocking the relay path. |
 
-| Key      | ENV             | Default            |
-|----------|-----------------|--------------------|
-| `listen` | `TURNA_GRPC_ADDR` | `127.0.0.1:5350`   |
+### Certificate requirements
 
-gRPC ops API. Bound to localhost by default. Expose via firewall only
-to operators / dashboard hosts.
+The DTLS stack negotiates `ECDHE-ECDSA-*` cipher suites, so the certificate
+key **must be ECDSA (P-256)** — an RSA key will load but no cipher will
+negotiate. Generate one with:
 
-## `[grpc]` (TLS for the management API)
-
-TLS configuration for the gRPC API served by `turna-control-plane`.
-
-```toml
-[grpc]
-tls_mode = "disabled"   # "disabled" | "tls" | "mtls"
-tls_cert = ""           # path to server cert PEM (required for tls/mtls)
-tls_key  = ""           # path to server private-key PEM (required for tls/mtls)
-tls_ca   = ""           # path to CA cert PEM (required for mtls)
+```bash
+openssl ecparam -name prime256v1 -genkey -noout -out key.pem
+openssl req -new -x509 -key key.pem -out cert.pem -days 365 -subj "/CN=turn.local"
 ```
 
-| Key        | ENV                  | Default      | Notes |
-|------------|----------------------|--------------|-------|
-| `tls_mode` | `TURNA_GRPC_TLS_MODE`  | `"disabled"` | `"disabled" \| "tls" \| "mtls"`. |
-| `tls_cert` | `TURNA_GRPC_TLS_CERT`  | `""`         | Path to server cert PEM. Required when `tls_mode != "disabled"`. |
-| `tls_key`  | `TURNA_GRPC_TLS_KEY`   | `""`         | Path to server private-key PEM. Required when `tls_mode != "disabled"`. |
-| `tls_ca`   | `TURNA_GRPC_TLS_CA`    | `""`         | Path to CA cert PEM. Required for `tls_mode = "mtls"`. |
+---
 
-Resolution order: **env wins when non-empty**, otherwise the value
-from `turn.toml`, otherwise the default. This lets you ship a
-committed `turn.toml` with the TLS *shape* (mode + CA path) and
-override only per-host paths via env at deploy time.
+## `[turn.af_xdp]`
 
-**Never** put PEM contents into env variables. The cells above are
-file paths, not PEM bodies.
+AF_XDP ring datapath. Used only when `transport = "af_xdp"`. Requires
+`--features af-xdp`, Linux, `CAP_NET_RAW`, and an external XDP program steering
+the chosen NIC queue (see `docs/runbooks/af-xdp.md`). **Experimental** — see the
+support tier in `docs/compatibility/transport-backends.md`.
 
-Mode meanings:
+| key | type | notes |
+|-----|------|-------|
+| `interface` | string | NIC name, e.g. `eth0`. |
+| `queue_id` | u32 | NIC queue id to bind the AF_XDP socket to. |
+| `frame_count` | u32 | UMEM frame count. |
+| `frame_size` | u32 | UMEM frame size, bytes. Must be ≥ 2048 and ≥ MTU+14. |
+| `fill_ring_size` | u32 | Fill ring size (power of two). |
+| `comp_ring_size` | u32 | Completion ring size. |
+| `rx_ring_size` | u32 | RX ring size. |
+| `tx_ring_size` | u32 | TX ring size. |
+| `zero_copy` | bool | Zero-copy mode (requires driver support). |
+| `need_wakeup` | bool | Use the `NEED_WAKEUP` flag. |
+| `src_mac` | string | Source MAC for TX frames. Empty → placeholder until neighbor resolution lands. |
+| `dst_mac` | string | Next-hop (gateway) MAC. Empty → placeholder. |
 
-- **`disabled`** — plaintext. The production validator refuses this
-  combination unless `management.listen` is bound to `127.0.0.1` /
-  `::1`. Use only when the gRPC API is reachable from the local host.
-- **`tls`** — server presents a cert; clients verify the server.
-  Adequate when the network is trusted but you want encryption in
-  transit.
-- **`mtls`** — both server and client present certs signed by `tls_ca`.
-  Recommended for any deployment where the control plane is reachable
-  beyond `localhost`. See [MTLS.md](MTLS.md) for the full setup guide.
+A startup preflight validates ring geometry (power-of-two, `frame_size ≥ 2048`),
+that the interface exists and is up, that the queue exists, `frame_size ≥ MTU+14`,
+and `CAP_NET_RAW`. Any failure aborts startup.
 
-The control-plane checks that the configured PEM files exist at
-startup. A missing file is fatal, not a silent fall-through to
-plaintext.
+---
 
-## How to inspect the loaded config
+## Metrics (Prometheus)
 
-There's no built-in `--dump-config` flag today (planned — see TODO.md).
-For now, the easiest way to see what got loaded is the startup log:
+Exposed on `[health].listen` `/metrics`. Transport-relevant series:
 
-```
-INFO turna_config: config loaded and validated path=/etc/turna/turn.toml
-INFO turna: starting listen=0.0.0.0:3478 realm=turna
-```
+- io_uring: `turna_uring_workers`, `turna_uring_cqe_drained_total`,
+  `turna_uring_cqe_batches_total`, `turna_uring_cqe_max_batch`,
+  `turna_uring_sq_push_failed_total`, `turna_uring_sq_len`,
+  `turna_uring_sq_capacity`, `turna_uring_cq_len`,
+  `turna_uring_buffers_available`, `turna_uring_relay_capacity_exhausted_total`.
+- AF_XDP: `turna_afxdp_rx_frames_total`, `turna_afxdp_tx_frames_total`,
+  `turna_afxdp_rx_bytes_total`, `turna_afxdp_tx_bytes_total`,
+  `turna_afxdp_parse_drops_total`, `turna_afxdp_tx_drops_total`,
+  `turna_afxdp_relay_ports_registered`, `turna_afxdp_umem_free_frames`.
+- DTLS: `turna_dtls_active_sessions`, `turna_dtls_sessions_total`,
+  `turna_dtls_rejected_over_cap_total`, `turna_dtls_closed_total`,
+  `turna_dtls_idle_timeouts_total`, `turna_dtls_bytes_rx_total`,
+  `turna_dtls_bytes_tx_total`, `turna_dtls_outbound_dropped_total`.
+- Readiness: `turna_backend_readiness` (`0`=starting, `1`=ready, `2`=degraded,
+  `3`=draining).
 
-If you see `WARN` lines about defaults, something in the file or env is
-not what you expected.
+Alert rules: `docs/alerts/transport-backends.yml`.

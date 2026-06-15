@@ -8,3 +8,15 @@ edition.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
+dashmap.workspace = true
+
+# Concurrency model checking for the lock-free token bucket (P4). Only compiled
+# under `--cfg loom`; never part of a normal build.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# Tell rustc that `loom` is a known cfg, otherwise the `#[cfg(loom)]` gates in
+# src/lib.rs trip the `unexpected_cfgs` lint (Rust ≥1.80) and fail CI under
+# `-D warnings`. Mirrors the relay crate's lint config.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

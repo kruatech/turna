@@ -11,7 +11,7 @@
 //!   loudly instead of silently falling back to defaults.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 /// Root configuration — loaded from TOML, ENV-substituted, validated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct TurnaConfig {
     /// Production-mode flag.
     ///
@@ -101,6 +102,7 @@ impl TurnaConfig {
     }
 
     /// Load from string (for testing).
+#[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_str: &str) -> Result<Self> {
         let expanded = expand_env_vars(toml_str)?;
         let config: TurnaConfig =
@@ -171,6 +173,11 @@ impl TurnaConfig {
             } else {
                 warn!("turn.external_ip is empty — NAT traversal may not work");
             }
+        } else if self.turn.external_ip.parse::<IpAddr>().is_err() {
+            errors.push(format!(
+                "turn.external_ip must be a valid IPv4 or IPv6 address, got {:?}",
+                self.turn.external_ip
+            ));
         }
 
         // Connection Migration (RFC 8016). A random per-process ticket secret
@@ -239,6 +246,9 @@ impl TurnaConfig {
         // We feed the production flag through so prod can demand TLS unless
         // the management listener is bound to loopback.
         errors.extend(self.grpc.validate(prod, self.management.listen));
+
+        // Peer-filter policy validation (M1): known profile + parseable CIDRs.
+        errors.extend(self.turn.peer_filter.validate());
 
         // Multi-tenancy validation (P1): unique ids/realms, sane and disjoint
         // relay-port ranges (disjointness is the whole point — isolation),
@@ -322,23 +332,6 @@ impl TurnaConfig {
 /// Centralised so the validator and the default impl stay in sync.
 pub const DEFAULT_SHARED_SECRET: &str = "change-me-in-production";
 
-impl Default for TurnaConfig {
-    fn default() -> Self {
-        Self {
-            production: false,
-            turn: TurnConfig::default(),
-            sfu: SfuConfig::default(),
-            signaling: SignalingConfig::default(),
-            cluster: ClusterConfig::default(),
-            health: HealthConfig::default(),
-            management: ManagementConfig::default(),
-            recording: RecordingConfig::default(),
-            grpc: GrpcConfigSection::default(),
-            tls: TlsConfig::default(),
-            tenants: Vec::new(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Section configs
@@ -354,15 +347,21 @@ impl Default for TurnaConfig {
 /// Maps to `turna_transport::TransportPreference` in the node binary. The
 /// actual backend is chosen at startup by a runtime io_uring probe (see
 /// `turna-transport::select`); this only expresses the operator's preference.
+///
+/// The default is `tokio` -- the safest, most predictable backend on every
+/// platform. `io_uring` and `af_xdp` are explicit opt-ins; `auto` is a
+/// convenience/dev/benchmark mode that may pick io_uring when the runtime
+/// probe reports it usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportSelection {
-    /// Use io_uring when available at runtime, otherwise tokio. (default)
-    #[default]
+    /// Use io_uring when available at runtime, otherwise tokio. Convenience /
+    /// dev / benchmark mode -- opt in explicitly; it is not the default.
     Auto,
     /// Force io_uring (Linux + `--features io-uring`); fails fast if not ready.
     IoUring,
-    /// Force the tokio backend (epoll + recvmmsg/sendmmsg).
+    /// Force the tokio backend (epoll + recvmmsg/sendmmsg). Safest default.
+    #[default]
     Tokio,
     /// Force the AF_XDP ring datapath (Linux + `--features af-xdp`; needs
     /// CAP_NET_RAW and a bound NIC queue). Opt-in only — never auto-selected.
@@ -375,7 +374,8 @@ pub struct TurnConfig {
     pub listen: SocketAddr,
     pub external_ip: String,
     pub realm: String,
-    /// Transport backend preference (`auto` | `io_uring` | `tokio`).
+    /// Transport backend preference. Default `tokio` (safest); `io_uring`,
+    /// `af_xdp` and `auto` are explicit opt-ins.
     pub transport: TransportSelection,
     pub auth: AuthConfig,
     pub relay: RelayConfig,
@@ -387,6 +387,9 @@ pub struct TurnConfig {
     /// `quic` (raw QUIC) and/or `web-transport` (browser H3) features.
     #[serde(default)]
     pub quic: QuicConfigSection,
+    /// io_uring datapath tuning (used only when `transport = "io_uring"`).
+    #[serde(default)]
+    pub io_uring: IoUringSection,
     /// AF_XDP ring-datapath parameters (used only when `transport = "af_xdp"`).
     /// Requires a Linux build with `--features af-xdp`, CAP_NET_RAW, and a NIC
     /// queue dedicated via an XDP program.
@@ -396,6 +399,11 @@ pub struct TurnConfig {
     /// Requires the node binary built with `--features dtls`.
     #[serde(default)]
     pub dtls: DtlsSection,
+    /// Peer-address filtering policy (M1). Defaults to `internet-facing`
+    /// (denies RFC 1918 / ULA peers). Set `profile = "lan"` to allow private
+    /// relaying. See `docs/security/peer-filter.md`.
+    #[serde(default)]
+    pub peer_filter: PeerFilterConfig,
 }
 
 impl Default for TurnConfig {
@@ -410,8 +418,10 @@ impl Default for TurnConfig {
             observability: ObservabilityConfig::default(),
             migration: MigrationConfig::default(),
             quic: QuicConfigSection::default(),
+            io_uring: IoUringSection::default(),
             af_xdp: AfXdpSection::default(),
             dtls: DtlsSection::default(),
+            peer_filter: PeerFilterConfig::default(),
         }
     }
 }
@@ -421,6 +431,87 @@ impl TurnConfig {
         let config = TurnaConfig::load(path)?;
         Ok(config.turn)
     }
+}
+
+/// Peer-address filter policy (M1). Lives under `[turn.peer_filter]`.
+///
+/// Closes the SSRF-into-private-network vector: the `internet-facing` profile
+/// (default) denies RFC 1918 / ULA relay peers. Operators that legitimately
+/// relay to a LAN opt in with `profile = "lan"`. `allowed_peer_ranges` /
+/// `denied_peer_ranges` refine the decision (allow wins over deny); neither
+/// can re-enable the always-denied special-use ranges (loopback, link-local
+/// incl. cloud metadata, multicast, broadcast, 0.0.0.0/8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PeerFilterConfig {
+    /// `"internet-facing"` (default; denies RFC 1918 / ULA) or `"lan"`
+    /// (allows private relaying). `"trusted"` is an alias for `"lan"`.
+    pub profile: String,
+    /// Permit relaying to loopback peers (dev/test only). Also honoured via
+    /// `TURNA_ALLOW_LOOPBACK_PEERS=1` for backward compatibility.
+    pub allow_loopback_peers: bool,
+    /// Extra CIDR ranges to deny on top of the profile (e.g. `"100.64.0.0/10"`).
+    pub denied_peer_ranges: Vec<String>,
+    /// CIDR ranges to allow even if the profile/deny list would block them
+    /// (e.g. allow one internal subnet on an internet-facing node).
+    pub allowed_peer_ranges: Vec<String>,
+}
+
+impl Default for PeerFilterConfig {
+    fn default() -> Self {
+        Self {
+            // Secure by default: deny private peers unless the operator opts in.
+            profile: "internet-facing".into(),
+            allow_loopback_peers: false,
+            denied_peer_ranges: Vec::new(),
+            allowed_peer_ranges: Vec::new(),
+        }
+    }
+}
+
+impl PeerFilterConfig {
+    /// Returns a list of validation issues (empty == valid).
+    pub(crate) fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        match self.profile.trim().to_ascii_lowercase().as_str() {
+            "internet-facing" | "lan" | "trusted" => {}
+            other => errors.push(format!(
+                "turn.peer_filter.profile = {other:?} is invalid; \
+                 use \"internet-facing\" or \"lan\""
+            )),
+        }
+        for (label, ranges) in [
+            ("denied_peer_ranges", &self.denied_peer_ranges),
+            ("allowed_peer_ranges", &self.allowed_peer_ranges),
+        ] {
+            for r in ranges {
+                if let Err(why) = validate_cidr(r) {
+                    errors.push(format!("turn.peer_filter.{label}: {why}"));
+                }
+            }
+        }
+        errors
+    }
+}
+
+/// Lightweight CIDR syntax check (the relay does the authoritative parse).
+fn validate_cidr(s: &str) -> std::result::Result<(), String> {
+    let Some((ip_str, pfx_str)) = s.trim().split_once('/') else {
+        return Err(format!("{s:?} is not in <ip>/<prefix> form"));
+    };
+    let ip: std::net::IpAddr = ip_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("{ip_str:?} is not a valid IP address"))?;
+    let prefix: u8 = pfx_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("{pfx_str:?} is not a valid prefix length"))?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return Err(format!("prefix /{prefix} exceeds /{max} for {s:?}"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,6 +1041,25 @@ impl Default for QuicConfigSection {
     }
 }
 
+/// io_uring datapath tuning (used only when `transport = "io_uring"` and the
+/// node is built with `--features io-uring`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IoUringSection {
+    /// Max relay sockets (allocations) one io_uring worker services
+    /// concurrently. Each consumes a fixed msghdr block; the 16-bit msghdr
+    /// index packed into the CQE user_data caps this at 1024 per worker.
+    pub relay_socket_capacity_per_worker: usize,
+}
+
+impl Default for IoUringSection {
+    fn default() -> Self {
+        Self {
+            relay_socket_capacity_per_worker: 256,
+        }
+    }
+}
+
 /// AF_XDP ring-datapath parameters. Mirrors the transport-layer `AfXdpConfig`;
 /// kept in the config crate so it stays free of a `turna-transport` dependency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1022,6 +1132,13 @@ pub struct DtlsSection {
     /// Application record MTU (caps outbound TURN responses to avoid IP
     /// fragmentation). Default 1200, matching the QUIC datagram default.
     pub mtu: usize,
+    /// DTL-3: bounded per-session outbound (egress) queue capacity. When full,
+    /// the newest datagram is dropped (turna_dtls_outbound_dropped_total)
+    /// rather than blocking the relay return path. Default 1024.
+    pub outbound_queue_capacity: usize,
+    /// DTL-9: max concurrent DTLS sessions from one source IP (anti
+    /// slot-exhaustion). 0 = unlimited.
+    pub max_sessions_per_ip: usize,
 }
 
 impl Default for DtlsSection {
@@ -1034,6 +1151,8 @@ impl Default for DtlsSection {
             max_sessions: 10_000,
             idle_timeout_secs: 300,
             mtu: 1200,
+            outbound_queue_capacity: 1024,
+            max_sessions_per_ip: 0,
         }
     }
 }
@@ -1179,6 +1298,21 @@ impl GrpcConfigSection {
                 }
                 if self.tls_key.is_empty() {
                     errs.push("grpc.tls_mode = \"tls\" but grpc.tls_key is empty".into());
+                }
+                // M4: server-only TLS encrypts the channel but does NOT
+                // authenticate the *client*. Anyone who can reach the port and
+                // speak TLS can invoke admin RPCs (shutdown, add_user,
+                // update_config, delete_allocation, …). In production a
+                // non-loopback management listener must therefore use mutual
+                // TLS — server-only TLS is acceptable only behind a trusted
+                // perimeter (loopback / private network you already control).
+                if prod && !management_listen.ip().is_loopback() {
+                    errs.push(format!(
+                        "grpc.tls_mode = \"tls\" (server-only) but management.listen \
+                         ({management_listen}) is not loopback — refusing in production: \
+                         it does not authenticate clients. Set tls_mode = \"mtls\", or bind \
+                         management.listen to 127.0.0.1 / ::1."
+                    ));
                 }
             }
             "mtls" => {
@@ -1420,6 +1554,42 @@ mod tests {
         assert!(!cfg.turn.quic.enable_datagrams, "explicit override applied");
         // Untouched fields fall back to defaults.
         assert_eq!(cfg.turn.quic.max_bi_streams, 256);
+    }
+
+    #[test]
+    fn default_transport_is_tokio() {
+        // 2.2: tokio is the safe default; io_uring/af_xdp/auto are opt-ins.
+        assert!(matches!(
+            TransportSelection::default(),
+            TransportSelection::Tokio
+        ));
+        assert!(matches!(
+            TurnConfig::default().transport,
+            TransportSelection::Tokio
+        ));
+
+        // A [turn] section that omits `transport` resolves to tokio, not auto.
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("minimal turn section parses");
+        assert!(matches!(cfg.turn.transport, TransportSelection::Tokio));
+    }
+
+    #[test]
+    fn io_uring_section_parses_and_defaults() {
+        assert_eq!(IoUringSection::default().relay_socket_capacity_per_worker, 256);
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+            transport = "io_uring"
+
+            [turn.io_uring]
+            relay_socket_capacity_per_worker = 512
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("io_uring section parses");
+        assert_eq!(cfg.turn.io_uring.relay_socket_capacity_per_worker, 512);
     }
 
     #[test]
@@ -1817,6 +1987,21 @@ turn_shared_secret = "another-one"
 "#
     }
 
+    fn prod_config_invalid_external_ip() -> &'static str {
+        r#"
+production = true
+
+[turn]
+external_ip = "not-an-ip"
+
+[turn.auth]
+shared_secret = "a-real-secret-12345"
+
+[signaling]
+turn_shared_secret = "another-one"
+"#
+    }
+
     fn prod_config_clean() -> &'static str {
         r#"
 production = true
@@ -1883,9 +2068,18 @@ turn_shared_secret = "another-not-placeholder"
             "scenario 5: expected external_ip error, got: {err}"
         );
 
-        // Scenario 6: real secrets in prod mode → all good.
+        // Scenario 6: external_ip must be parseable, not merely non-empty.
+        let err = TurnaConfig::from_str(prod_config_invalid_external_ip())
+            .expect_err("scenario 6: invalid external_ip must be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("external_ip") && (msg.contains("valid") || msg.contains("ip")),
+            "scenario 6: expected invalid external_ip error, got: {err}"
+        );
+
+        // Scenario 7: real secrets in prod mode → all good.
         let cfg = TurnaConfig::from_str(prod_config_clean())
-            .expect("scenario 6: clean prod config must validate");
+            .expect("scenario 7: clean prod config must validate");
         assert!(cfg.is_production());
 
         // Restore the caller's environment instead of leaking test state.

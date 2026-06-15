@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path: Option<String> = args.get(1).cloned();
 
     if let Some(mode) = dump_mode {
-        let _ = turna_observability::init();
+        turna_observability::init();
         let path = config_path.ok_or_else(|| -> Box<dyn std::error::Error> {
             "--dump-config requires a config file path".into()
         })?;
@@ -96,12 +96,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _telemetry_guard =
         turna_observability::init_with_config(telemetry_config).unwrap_or_else(|e| {
             eprintln!("telemetry init failed: {e} — falling back to basic logging");
-            let _ = turna_observability::init();
+            turna_observability::init();
             turna_observability::init_with_config(Default::default())
                 .expect("fallback telemetry init")
         });
 
     info!(listen = %config.listen, realm = %config.realm, "starting turna");
+
+    // #3 (audit-2 §9.1): fail fast if DTLS is requested in config but this
+    // binary was built without the `dtls` feature. Otherwise `spawn_dtls`
+    // launches a task whose `DtlsServer::run` immediately returns
+    // `NotSupported`; the error is swallowed in the task and the node keeps
+    // serving without DTLS while the operator believes it is enabled.
+    if config.dtls.enabled && !turna_transport::dtls::DTLS_AVAILABLE {
+        return Err("[turn.dtls] is enabled in the configuration, but this binary \
+                    was built without DTLS support; rebuild with `--features dtls` \
+                    or disable [turn.dtls]"
+            .into());
+    }
 
     let external_ip: std::net::IpAddr = if config.external_ip.is_empty() {
         let ip = config.listen.ip();
@@ -194,6 +206,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
+    // M1: install the configured peer-filter policy before serving.
+    // Default profile is internet-facing (denies RFC1918/ULA); opt into
+    // LAN relaying via [turn.peer_filter] profile = "lan".
+    turna_relay::peer_filter::init_peer_policy(
+        turna_relay::peer_filter::PeerPolicy::from_config(
+            &config.peer_filter.profile,
+            config.peer_filter.allow_loopback_peers,
+            &config.peer_filter.denied_peer_ranges,
+            &config.peer_filter.allowed_peer_ranges,
+        ),
+    );
+
     run_tokio(
         config,
         cluster,
@@ -225,6 +249,7 @@ fn build_tls_transport_config(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tokio(
     config: TurnConfig,
     cluster: ClusterConfig,
@@ -367,12 +392,22 @@ fn run_tokio(
             #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
             let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = None;
 
+            // Per-tenant traffic provider: snapshot the store's cumulative
+            // per-tenant counters (accrued at allocation teardown) on each
+            // scrape. Empty until tenant-scoped allocations have closed, so
+            // single-tenant deployments see no extra output.
+            let tenant_traffic: Option<turna_health::TenantTrafficProvider> = {
+                let store = store.clone();
+                Some(Arc::new(move || store.tenant_traffic_snapshot()))
+            };
+
             tokio::spawn(async move {
                 let _ = turna_health::serve_with_cluster_routes(
                     health_listen,
                     health_metrics,
                     Some(cluster_view),
                     relay_route_metrics,
+                    tenant_traffic,
                 )
                 .await;
             });
@@ -526,7 +561,7 @@ fn run_tokio(
             turna_config::TransportSelection::AfXdp => turna_transport::TransportPreference::AfXdp,
         };
         let transport_decision = turna_transport::resolve(transport_pref)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         info!(
             backend = ?transport_decision.backend,
             reason  = %transport_decision.reason,
@@ -548,6 +583,9 @@ fn run_tokio(
             mode,
             "turna ready"
         );
+        // 2.4: startup validation passed and listeners are coming up -> mark
+        // the node ready so `/ready` returns 200 (flips to 503 on drain).
+        metrics.set_readiness(turna_health::Readiness::Ready);
 
         // Signal handler → shutdown (shared by both backends).
         let drain_routing = cluster_routing.clone();
@@ -575,6 +613,7 @@ fn run_tokio(
             // another node during the grace window. Existing sessions keep
             // running until they expire / the worker drain tears them down.
             drain_metrics.set_draining(true);
+            drain_metrics.set_readiness(turna_health::Readiness::Draining);
             if let Some(routing) = &drain_routing {
                 if drain_grace > 0 {
                     routing.begin_drain();
@@ -598,8 +637,10 @@ fn run_tokio(
                 ));
                 let af_cfg = config.af_xdp.clone();
                 let listen = config.listen;
+                let af_shutdown = shutdown_rx.clone();
+                let af_metrics = metrics.clone();
                 match tokio::task::spawn_blocking(move || {
-                    af_xdp_listener::run_af_xdp(af_cfg, processor, listen)
+                    af_xdp_listener::run_af_xdp(af_cfg, processor, listen, af_shutdown, af_metrics)
                 })
                 .await
                 {
@@ -664,7 +705,8 @@ fn run_tokio(
                             server.client_sinks(),
                             metrics.clone(),
                             egress.clone(),
-                        );
+                            shutdown_rx.clone(),
+                        )?;
                     }
                 }
                 server.run(shutdown_rx).await
@@ -748,7 +790,8 @@ fn run_tokio(
                                 qd_sinks.clone(),
                                 metrics.clone(),
                                 egress.clone(),
-                            );
+                                shutdown_rx.clone(),
+                            )?;
                         }
                         info!("QUIC/DTLS listeners started alongside io_uring datapath");
                     }
@@ -760,9 +803,18 @@ fn run_tokio(
                     let ring_agg = Arc::new(
                         turna_transport::uring::RingStatsAggregate::new(num_workers),
                     );
+                    let relay_cap = config.io_uring.relay_socket_capacity_per_worker;
+                    if relay_cap == 0 || relay_cap > 1024 {
+                        return Err(format!(
+                            "[turn.io_uring] relay_socket_capacity_per_worker must be 1..=1024 \
+                             (16-bit msghdr index limit), got {relay_cap}"
+                        )
+                        .into());
+                    }
                     let pool_cfg = WorkerPoolConfig {
                         listen_addr: config.listen,
                         num_workers,
+                        relay_capacity_per_worker: relay_cap,
                         buffers_per_worker: 2048,
                         external_ip,
                         relay_routes,
@@ -840,6 +892,15 @@ fn run_tokio(
                                 metrics
                                     .uring_buffers_available
                                     .store(t.buffers_available, Relaxed);
+                                metrics
+                                    .uring_relay_capacity_exhausted_total
+                                    .store(t.relay_capacity_exhausted, Relaxed);
+                                metrics
+                                    .uring_inflight_send_slots
+                                    .store(t.send_slots_inflight, Relaxed);
+                                metrics
+                                    .uring_send_slot_stalled_total
+                                    .store(t.send_slot_stalled, Relaxed);
                             }
                         });
                     }

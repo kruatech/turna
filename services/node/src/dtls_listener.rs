@@ -21,6 +21,27 @@
 //! Sessions are keyed by client address, so an `Action::Send { target }` maps
 //! to a session via `target.to_string()` -- a direct registry lookup, no map.
 
+/// Fatal DTLS startup error (DTL-1). Returned by [`spawn_dtls`] when
+/// `[turn.dtls]` is enabled but the configuration is invalid; the caller
+/// turns this into a non-zero process exit instead of starting partially.
+#[derive(Debug)]
+pub struct DtlsStartupError {
+    pub problems: Vec<String>,
+}
+
+impl std::fmt::Display for DtlsStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[turn.dtls] invalid configuration ({} problem(s)): {}",
+            self.problems.len(),
+            self.problems.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for DtlsStartupError {}
+
 #[cfg(feature = "dtls")]
 use std::sync::Arc;
 
@@ -43,22 +64,22 @@ pub fn spawn_dtls(
     client_sinks: turna_relay::ClientSinks,
     metrics: Arc<turna_health::Metrics>,
     egress: turna_relay::RelayEgress,
-) {
-    // Phase 3: preflight validation at startup (spawn_dtls runs before
-    // RelayServer::run). On a fatal misconfiguration we log loudly and decline
-    // to start the listener instead of failing silently inside the spawned
-    // task. The rest of the server keeps running (DTLS is an optional
-    // transport). For hard fail-fast, have `main` treat a disabled-but-enabled
-    // DTLS as fatal.
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), DtlsStartupError> {
+    // DTL-1 fail-fast: spawn_dtls runs before RelayServer::run. When
+    // [turn.dtls].enabled is set, any invalid configuration aborts startup
+    // (the caller propagates this error and the process exits non-zero)
+    // instead of logging and letting the server run without the requested
+    // DTLS transport -- "enabled but not started" is exactly the trap we remove.
     if let Err(problems) = validate_dtls(cfg) {
         for p in &problems {
             tracing::error!(problem = %p, "[turn.dtls] invalid configuration");
         }
         tracing::error!(
             count = problems.len(),
-            "[turn.dtls] enabled but misconfigured -> DTLS listener NOT started"
+            "[turn.dtls] enabled but misconfigured -> aborting startup"
         );
-        return;
+        return Err(DtlsStartupError { problems });
     }
 
     let dcfg = DtlsConfig {
@@ -68,6 +89,8 @@ pub fn spawn_dtls(
         mtu: cfg.mtu,
         max_sessions: cfg.max_sessions,
         idle_timeout: std::time::Duration::from_secs(cfg.idle_timeout_secs),
+        outbound_queue_capacity: cfg.outbound_queue_capacity,
+        max_sessions_per_ip: cfg.max_sessions_per_ip,
     };
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DtlsEvent>(1024);
@@ -93,6 +116,8 @@ pub fn spawn_dtls(
                 metrics.dtls_idle_timeouts.store(s.4, Relaxed);
                 metrics.dtls_bytes_rx.store(s.5, Relaxed);
                 metrics.dtls_bytes_tx.store(s.6, Relaxed);
+                metrics.dtls_outbound_dropped.store(s.7, Relaxed);
+                metrics.dtls_rejected_per_ip.store(s.8, Relaxed);
             }
         });
     }
@@ -102,7 +127,7 @@ pub fn spawn_dtls(
     let reg = outbound.clone();
     let st = stats.clone();
     tokio::spawn(async move {
-        if let Err(e) = server.run(event_tx, reg, st).await {
+        if let Err(e) = server.run(event_tx, reg, st, shutdown).await {
             tracing::error!(%e, "DTLS listener exited");
         }
     });
@@ -111,6 +136,7 @@ pub fn spawn_dtls(
     //   * Datagram      -> process_slice -> encrypt response back (client<->server)
     //   * NewSession    -> register a client_sink (enables peer->client egress)
     //   * SessionClosed -> drop the client_sink
+    let bridge_stats = stats.clone();
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
             match ev {
@@ -129,16 +155,20 @@ pub fn spawn_dtls(
                             tokio::sync::mpsc::channel::<Vec<u8>>(256);
                         client_sinks.insert(remote, sink_tx);
                         let sid = session_id.clone();
+                        let pump_stats = bridge_stats.clone();
                         tokio::spawn(async move {
                             while let Some(bytes) = sink_rx.recv().await {
-                                if out_tx
-                                    .send(DtlsOutbound {
-                                        session_id: sid.clone(),
-                                        data: bytes,
-                                    })
-                                    .is_err()
-                                {
-                                    break; // session writer gone
+                                match out_tx.try_send(DtlsOutbound {
+                                    session_id: sid.clone(),
+                                    data: bytes,
+                                }) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        pump_stats.outbound_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        break; // session writer gone
+                                    }
                                 }
                             }
                         });
@@ -169,10 +199,16 @@ pub fn spawn_dtls(
                             .and_then(|g| g.get(&target.to_string()).cloned());
                         match sender {
                             Some(tx) => {
-                                let _ = tx.send(DtlsOutbound {
+                                match tx.try_send(DtlsOutbound {
                                     session_id: target.to_string(),
                                     data: data.to_vec(),
-                                });
+                                }) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        bridge_stats.outbound_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                                }
                             }
                             None => {
                                 // Not a DTLS session: a cross-transport send the
@@ -186,6 +222,8 @@ pub fn spawn_dtls(
         }
         tracing::info!("DTLS bridge consumer stopped (listener closed)");
     });
+
+    Ok(())
 }
 
 /// Phase 3 preflight checks for `[turn.dtls]`. Returns the list of problems
@@ -239,6 +277,8 @@ pub fn spawn_dtls(
     _client_sinks: turna_relay::ClientSinks,
     _metrics: std::sync::Arc<turna_health::Metrics>,
     _egress: turna_relay::RelayEgress,
-) {
+    _shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), DtlsStartupError> {
     tracing::warn!("[turn.dtls] enabled in config but binary built without the `dtls` feature");
+    Ok(())
 }

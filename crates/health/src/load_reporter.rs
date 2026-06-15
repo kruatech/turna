@@ -77,6 +77,12 @@ pub struct AtomicMetrics {
     pub bandwidth_bps: AtomicU64,
 }
 
+impl Default for AtomicMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AtomicMetrics {
     pub fn new() -> Self {
         Self {

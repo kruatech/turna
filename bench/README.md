@@ -64,8 +64,9 @@ table you can paste into a doc:
 | coturn      | 38217 |  500 |  5000 | 10000 | 12 |
 ```
 
-The example numbers above are made up — fill in actual values from
-your machine in `bench/RESULTS.md` once you've run it.
+The example numbers above are illustrative only. Do not quote them as a
+performance claim; fill in actual values from your machine in
+`bench/RESULTS.md` once you have run the suite.
 
 Raw per-run JSON lives in `bench/results/`, e.g. `turna-bpf-on.json`.
 Server logs in `/tmp/turna-bench.log` and `/tmp/coturn-bench*.log`.
@@ -138,10 +139,9 @@ script readable for the "is it in the ballpark" use case.
   we regress the parsing path" but not for "how many calls can we
   serve from this VM".
 - **STUN Binding only.** TURN Allocate/Refresh/Send paths are different
-  in both servers. The `turna-load-test` Allocate and ChannelData modes
-  are currently stubs that fall back to Binding — they exist as a CLI
-  surface but don't yet exercise the Allocate state machine. Wider
-  protocol coverage is on the roadmap (see `TODO.md`).
+  in both servers. This benchmark is focused on Binding unless the load-test mode you choose
+  explicitly exercises Allocate/ChannelData in your current checkout. Treat
+  Binding results as parser/control-path data, not as full TURN relay capacity.
 - **Single host.** A real TURN node lives behind a NAT/firewall and
   receives off-network traffic. We aren't measuring that here.
 

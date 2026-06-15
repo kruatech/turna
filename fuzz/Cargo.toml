@@ -47,3 +47,9 @@ name = "fuzz_stun_semantic"
 path = "fuzz_targets/fuzz_stun_semantic.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_encode"
+path = "fuzz_targets/fuzz_encode.rs"
+test = false
+doc = false

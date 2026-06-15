@@ -50,22 +50,3 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
 ---
 {{- end }}
-{{- if .Values.signaling.enabled }}
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ .Release.Name }}-signaling
-  labels:
-    app.kubernetes.io/name: turna-signaling
-    app.kubernetes.io/instance: {{ .Release.Name }}
-spec:
-  type: ClusterIP
-  ports:
-    - name: ws
-      port: {{ .Values.signaling.listenPort }}
-      targetPort: ws
-      protocol: TCP
-  selector:
-    app.kubernetes.io/name: turna-signaling
-    app.kubernetes.io/instance: {{ .Release.Name }}
-{{- end }}

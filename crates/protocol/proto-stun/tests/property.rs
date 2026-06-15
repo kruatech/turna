@@ -80,7 +80,7 @@ proptest! {
     ) {
         let msg = StunMessage::with_transaction_id(method, class, tid);
         let mut buf = [0u8; 512];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
 
         let decoded = StunMessage::decode(&buf[..len])
             .expect("encode must produce decodable output");
@@ -110,7 +110,7 @@ proptest! {
         msg.add(Attribute::Username(s.clone()));
 
         let mut buf = [0u8; 1024];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         let got = decoded.get_username().unwrap_or("").to_string();
@@ -123,7 +123,7 @@ proptest! {
         msg.add(Attribute::Realm(s.clone()));
 
         let mut buf = [0u8; 1024];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         let got = decoded.attributes.iter().find_map(|a| match a {
@@ -139,7 +139,7 @@ proptest! {
         msg.add(Attribute::Nonce(s.clone()));
 
         let mut buf = [0u8; 1024];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         let got = decoded.get_nonce().unwrap_or("").to_string();
@@ -156,7 +156,7 @@ proptest! {
         msg.add(Attribute::Lifetime(lifetime));
 
         let mut buf = [0u8; 256];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         prop_assert_eq!(decoded.get_lifetime(), Some(lifetime));
@@ -172,7 +172,7 @@ proptest! {
         msg.add(Attribute::ChannelNumber(channel));
 
         let mut buf = [0u8; 256];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         prop_assert_eq!(decoded.get_channel_number(), Some(channel));
@@ -190,7 +190,7 @@ proptest! {
         msg.add(Attribute::XorMappedAddress(addr));
 
         let mut buf = [0u8; 256];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         let got = decoded.attributes.iter().find_map(|a| match a {
@@ -206,7 +206,7 @@ proptest! {
         msg.add(Attribute::XorPeerAddress(addr));
 
         let mut buf = [0u8; 256];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
         let got = decoded.get_xor_peer_address();
@@ -230,7 +230,7 @@ proptest! {
         }
 
         let mut buf = vec![0u8; 8192];
-        let len = msg.encode(&mut buf);
+        let len = msg.encode(&mut buf).unwrap();
 
         // Длина должна быть кратна 4 (после header)
         let attr_len = len - 20; // HEADER_SIZE = 20
@@ -255,7 +255,7 @@ proptest! {
 
         let key = key.into_bytes();
         let mut buf = [0u8; 2048];
-        let len = msg.encode_with_integrity(&mut buf, &key);
+        let len = msg.encode_with_integrity(&mut buf, &key).unwrap();
 
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
@@ -267,5 +267,75 @@ proptest! {
         let bad_key = b"wrong_key_xxxxx";
         prop_assert!(!decoded.verify_integrity(&buf[..len], bad_key),
             "integrity must NOT verify with wrong key");
+    }
+}
+
+// ── Property: raw ChannelData frame codec ────────────────────────────────────
+//
+// Взаимная обратимость encode_channel_data / decode_channel_data, корректность
+// 4-байтового паддинга и согласованность классификатора is_channel_data с
+// диапазоном номеров каналов 0x4000..=0x7FFE.
+
+use turna_proto_stun::message::{decode_channel_data, encode_channel_data, is_channel_data};
+
+fn arb_channel_data_payload() -> impl Strategy<Value = Vec<u8>> {
+    prop::collection::vec(any::<u8>(), 0..=2048)
+}
+
+proptest! {
+    /// decode(encode(channel, data)) == (channel, data) для валидного канала.
+    #[test]
+    fn prop_channel_data_roundtrip(
+        channel in arb_channel(),
+        data    in arb_channel_data_payload(),
+    ) {
+        let mut buf = vec![0u8; 4 + data.len() + 4];
+        let len = encode_channel_data(&mut buf, channel, &data)
+            .expect("buffer is large enough for the padded frame");
+
+        // Кадр кратен 4 и покрывает заголовок + данные, паддинг < 4 байт.
+        prop_assert_eq!(len % 4, 0, "channel-data frame must be 4-byte aligned");
+        prop_assert!(len >= 4 + data.len());
+        prop_assert!(len - (4 + data.len()) < 4, "padding must be < 4 bytes");
+
+        // Встроенная длина == длине данных (без паддинга).
+        let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        prop_assert_eq!(declared, data.len());
+
+        // Паддинг-байты нулевые.
+        for &b in &buf[4 + data.len()..len] {
+            prop_assert_eq!(b, 0u8, "padding bytes must be zero");
+        }
+
+        // Roundtrip: канал и данные восстанавливаются точно.
+        let (got_channel, got_data) =
+            decode_channel_data(&buf[..len]).expect("encoded frame must decode");
+        prop_assert_eq!(got_channel, channel);
+        prop_assert_eq!(got_data, &data[..]);
+    }
+
+    /// Классификатор принимает ровно валидный диапазон каналов 0x4000..=0x7FFE.
+    #[test]
+    fn prop_is_channel_data_matches_range(
+        channel in any::<u16>(),
+        data    in arb_channel_data_payload(),
+    ) {
+        let mut buf = vec![0u8; 4 + data.len() + 4];
+        let len = encode_channel_data(&mut buf, channel, &data).unwrap();
+
+        let in_range = (0x4000..=0x7FFE).contains(&channel);
+        prop_assert_eq!(is_channel_data(&buf[..len]), in_range);
+    }
+
+    /// encode возвращает ошибку, если буфер меньше паддированного кадра.
+    #[test]
+    fn prop_channel_data_buffer_too_short(
+        channel in arb_channel(),
+        data    in prop::collection::vec(any::<u8>(), 1..=512),
+    ) {
+        let total = 4 + data.len();
+        let padded = (total + 3) & !3;
+        let mut small = vec![0u8; padded - 1];
+        prop_assert!(encode_channel_data(&mut small, channel, &data).is_err());
     }
 }

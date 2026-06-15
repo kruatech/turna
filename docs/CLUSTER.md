@@ -5,7 +5,9 @@ beefy server can handle thousands of concurrent allocations. You need
 cluster mode when **any** of these is true:
 
 - You want **failover**: if one node dies, surviving nodes pick up its
-  allocations within ~40 seconds.
+  allocations after the configured failure-detection window, roughly 5 seconds
+  with current defaults (`live_window_secs=3`, `suspicion_ticks=2`,
+  `sweep_interval_secs=1`).
 - You want **rolling upgrades** without dropping calls: drain one node,
   re-deploy, repeat.
 - You're scaling beyond what one box can carry (~100k concurrent
@@ -29,11 +31,11 @@ cluster mode when **any** of these is true:
 ```
 
 Each `turna-node` writes its allocation state to Tarantool (write-behind,
-non-blocking) and publishes a heartbeat every 5 seconds. Each node also
-sweeps every 10 seconds: if a peer's last heartbeat is older than 30
-seconds, that peer is presumed dead and its allocations become eligible
-for claim. The first surviving node to win a CAS on a record takes
-ownership and rehydrates it locally.
+non-blocking) and publishes heartbeats. Current config defaults publish a
+heartbeat every 1 second, consider a peer stale after 3 seconds, sweep every 1
+second, and require 2 consecutive stale sweeps before claiming. The first
+surviving node to win a CAS on a record takes ownership and rehydrates it
+locally.
 
 Detailed design is in `docs/design/allocation-store-persistence.md`.
 
@@ -79,12 +81,18 @@ gossip_timeout_secs = 30
 turn_announce_addr = "10.0.0.11:3478"
 cluster_secret = "change-me-shared-across-nodes"  # HMAC auth for gossip
 drain_grace_secs = 5                  # lame-duck window on shutdown
+
+[cluster.failure_detection]
+heartbeat_interval_secs = 1
+live_window_secs = 3
+sweep_interval_secs = 1
+suspicion_ticks = 2
 ```
 
 The same `cluster_name` and `cluster_secret` must be set on every node. An
-empty `cluster_secret` leaves gossip unauthenticated (a warning is logged); set
-it before exposing the gossip port to any untrusted network, otherwise a host
-that can reach the port can inject a node and redirect clients to it.
+empty `cluster_secret` leaves gossip unauthenticated; set it before exposing the
+gossip port to any untrusted network, otherwise a host that can reach the port
+can inject a node and redirect clients to it.
 
 On the second node, use a different `node_id`, swap the seed, and set
 `turn_announce_addr` to that node's externally reachable TURN address.
@@ -180,7 +188,12 @@ shared_secret = "${TURNA_SHARED_SECRET}"
 
 [cluster]
 node_id = "${TURNA_NODE_ID}"        # e.g. "node-east-1", unique per host
-seeds   = []                       # not used yet — set for future gossip
+cluster_mode = true
+cluster_name = "prod"
+gossip_bind = "0.0.0.0:7946"
+gossip_seeds = ["10.0.0.12:7946"]      # swap per host
+gossip_advertise_addr = "10.0.0.11:7946"
+cluster_secret = "${TURNA_CLUSTER_SECRET}"
 
 [cluster.backend]
 type      = "tarantool"
@@ -190,7 +203,7 @@ password  = "${TURNA_BACKEND_PASSWORD}"
 pool_size = 0                      # 0 = library default (8)
 
 [cluster.persistence]
-mode = "write_behind"              # this is what flips cluster mode on
+mode = "write_behind"              # enables allocation persistence
 ```
 
 Per-host environment:
@@ -228,8 +241,8 @@ INFO state backend: tarantool user="turna" pool_size=8
 INFO connected to Tarantool uri=... user="turna" pool_size=8
 INFO Tarantool schema initialized
 INFO bulk-load: fetched records from backend node_id="node-east-1" count=0
-INFO heartbeat task starting node_id="node-east-1" interval=5s
-INFO failover task starting sweep_interval=10s live_window=30s
+INFO heartbeat task starting node_id="node-east-1" interval=1s
+INFO failover task starting sweep_interval=1s live_window=3s suspicion_ticks=2
 ```
 
 After both nodes are up, query Tarantool to confirm they see each other:
@@ -245,19 +258,15 @@ $ tt connect turna:<password>@tarantool.internal:3301
 
 ```
 T=0       Node-A dies (kernel panic, kill -9, anything)
-T=0..5    Node-A stops sending heartbeats
-T=5..30   Node-A's last_seen_ms is < 30s ago — peers still consider it live
-T=30      Node-B's failover sweep tick: get_live_nodes(max_age=30s)
-          excludes node-A; allocations stamped node_id=node-A become orphans
-T=30..40  Node-B claims them via CAS, rehydrates into local store
-T=40      Client retries hit node-B, get matched to rehydrated allocations
+T=0..3    Peers still consider node-A live while its last heartbeat is fresh
+T=3..5    Node-A is stale for consecutive sweep ticks
+T≈5       Node-B excludes node-A, claims its allocations via CAS, and rehydrates
+          them into its local store
 ```
 
-The window is configurable: `failover::DEFAULT_LIVE_WINDOW` (30s) and
-`failover::DEFAULT_SWEEP_INTERVAL` (10s) in `services/node/src/failover.rs`.
-Tighter windows = faster failover, but more false positives during
-brief network blips. 30s is a reasonable default; we don't currently
-expose it through `turn.toml`.
+The window is configurable under `[cluster.failure_detection]`. Tighter windows
+produce faster failover but increase false positives during network blips; widen
+`live_window_secs` and/or `suspicion_ticks` on jittery WAN links.
 
 ## Rolling upgrade
 
@@ -273,20 +282,20 @@ sudo systemctl start turna-node       # restarts, bulk-loads from Tarantool,
                                     # reclaims its own allocations
 ```
 
-The window between stop and start should be < 30s to avoid triggering
-failover on other nodes. If it's longer, other nodes will claim
-allocations — which is also fine, just costs the affected clients a
-brief reconnect.
+The window between stop and start should be shorter than your configured
+failure-detection window if you want to avoid other nodes claiming allocations.
+If it is longer, other nodes will claim them — correctness is preserved, but
+affected clients may briefly reconnect.
 
-For a longer-running upgrade (e.g. major version with schema migration),
-manually mark the node as draining first:
+For a planned removal or long upgrade, put the node in drain mode first:
 
 ```sh
-turnactl drain node-east-1          # (TODO — currently you SIGTERM)
+turnactl drain
+# or send SIGTERM and let the node enter its lame-duck drain path
 ```
 
-This sets `draining = true` in the next heartbeat, signalling peers to
-preemptively claim — no 30-second wait.
+Drain mode stops new allocations locally and, in cluster mode, lets peers route
+new clients elsewhere during the grace window.
 
 ## Adding a node
 
@@ -298,7 +307,7 @@ preemptively claim — no 30-second wait.
 ## Removing a node
 
 1. Stop `turna-node` on that host.
-2. After `live_window` (default 30s) other nodes consider it dead and
+2. After the configured failure-detection window other nodes consider it dead and
    reclaim its allocations.
 3. Optionally clean up its row in `turna_nodes`:
    ```

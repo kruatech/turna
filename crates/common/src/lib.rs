@@ -70,7 +70,7 @@ pub fn hex_encode(data: &[u8]) -> String {
 
 /// Hex-decode string to bytes. Returns None on invalid hex.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -134,7 +134,7 @@ pub fn is_valid_relay_port(port: u16) -> bool {
 
 /// Check if a port is in valid channel number range.
 pub fn is_valid_channel(channel: u16) -> bool {
-    channel >= 0x4000 && channel <= 0x7FFF
+    (0x4000..=0x7FFF).contains(&channel)
 }
 
 // ---------------------------------------------------------------------------

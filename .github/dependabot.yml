@@ -1,0 +1,61 @@
+# Dependabot version updates — keep Rust deps, CI actions and base images current.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+#
+# Note: `fuzz/` is a separate workspace, excluded from the root workspace, so it
+# needs its own cargo entry. Docker entry points at `deploy/`, where the
+# Dockerfile lives. Custom labels are created by Dependabot if they don't exist.
+version: 2
+
+updates:
+  # ── Rust: main workspace ────────────────────────────────────────────────
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    groups:
+      # Bundle non-breaking bumps into one PR to cut review noise; majors stay
+      # as individual PRs so they get explicit review.
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ── Rust: fuzz workspace (separate, excluded from the root workspace) ────
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+      - fuzz
+    groups:
+      fuzz-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ── GitHub Actions used by workflows in .github/workflows ───────────────
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+
+  # ── Container base images (deploy/Dockerfile) ───────────────────────────
+  - package-ecosystem: docker
+    directory: "/deploy"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker

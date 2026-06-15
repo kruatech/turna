@@ -57,7 +57,6 @@ pub struct ManagementIntegration {
     // Reserved metric: incremented once the management RPC layer is wired to
     // record per-integration request counts. Kept to avoid churn in the
     // struct + its constructor when that lands.
-    #[allow(dead_code)]
     request_count: AtomicU64,
 }
 

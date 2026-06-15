@@ -1,8 +1,8 @@
 # Quickstart
 
-Get Turna running locally in about 5 minutes.
+Get the current Turna workspace running locally as a TURN/STUN server.
 
-**Prerequisites:** Rust toolchain ≥ 1.74 (`cargo --version`), a modern browser.
+**Prerequisites:** Rust toolchain from `rust-toolchain.toml` (`cargo --version`).
 
 ## Build
 
@@ -10,56 +10,32 @@ Get Turna running locally in about 5 minutes.
 cargo build --release
 ```
 
-Key binaries:
+Key binaries in the current workspace:
 
 - `target/release/turna-node` — TURN/STUN server (media relay)
-- `target/release/turna-signaling` — WebSocket signaling server
 - `target/release/turna-control-plane` — gRPC ops API (optional)
+- `target/release/turnactl` — management CLI (optional)
+
+There is currently no `turna-signaling` binary or bundled browser demo in this
+workspace. The quickstart is intentionally TURN-only so the documented path
+matches the repository.
 
 ---
 
-## Option A — Video call in the browser (full stack)
+## Run the TURN/STUN server
 
-This is the fastest way to see everything working together.
-
-**Terminal 1 — TURN server:**
 ```sh
 ./target/release/turna-node deploy/turn.toml
 ```
 
 You'll see expected dev warnings about `shared_secret` and `external_ip`.
-That's fine for local use.
-
-**Terminal 2 — Signaling server:**
-```sh
-./target/release/turna-signaling deploy/turn.toml
-```
-
-Listens on `ws://localhost:9001` by default.
-
-**Browser — Web client:**
-
-Open `services/web-client/index.html` in your browser (just drag the file
-into a browser tab, or `open services/web-client/index.html` on macOS).
-
-Open it in **two tabs**. In each tab:
-- Enter different names
-- Use the same room (e.g. `test-room`)
-- Signaling server: `ws://localhost:9001`
-- Click **Join call →**
-
-Allow camera and microphone when prompted. The two tabs will connect and you'll
-see each other's video.
+That's fine for local use. In production, set `production = true`, provide a
+real `TURNA_SHARED_SECRET`, and set `TURNA_EXTERNAL_IP` to the public IP that
+clients can reach.
 
 ---
 
-## Option B — TURN server only (verify relay works)
-
-If you just want to verify STUN/TURN without the video call UI:
-
-```sh
-./target/release/turna-node deploy/turn.toml
-```
+## Verify health and metrics
 
 ```sh
 # Health check
@@ -68,10 +44,35 @@ curl -sS http://127.0.0.1:9090/health
 
 # Prometheus metrics
 curl -sS http://127.0.0.1:9090/metrics | head -20
+```
 
-# STUN binding test (requires coturn-utils or similar)
+## Verify STUN/TURN behaviour
+
+With coturn tools installed, run a STUN Binding check:
+
+```sh
 stunclient 127.0.0.1 -p 3478
-# → Binding test: success
+```
+
+For an authenticated TURN allocation, use the static user commented in your
+config or generate coturn-style time-limited credentials from
+`TURNA_SHARED_SECRET`.
+
+---
+
+## Docker Compose
+
+From the repository root:
+
+```sh
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+Then verify:
+
+```sh
+curl -sS http://127.0.0.1:9090/health
+curl -sS http://127.0.0.1:9091/-/healthy  # Prometheus, optional
 ```
 
 ---
@@ -84,7 +85,7 @@ All defaults are safe for local development. For reference:
 |---|---|---|
 | TURN/STUN port | `0.0.0.0:3478` | `TURNA_LISTEN_ADDR` |
 | Health/metrics port | `0.0.0.0:9090` | `TURNA_HEALTH_ADDR` |
-| Signaling WebSocket | `0.0.0.0:9001` | `TURNA_SIGNALING_ADDR` |
+| gRPC management port | `127.0.0.1:5350` | `TURNA_GRPC_ADDR` |
 | Shared secret | `change-me-in-production` | `TURNA_SHARED_SECRET` |
 | External IP | _(empty, warns)_ | `TURNA_EXTERNAL_IP` |
 | Persistence | disabled | `[cluster.persistence] mode = "write_behind"` |
@@ -112,26 +113,21 @@ Another TURN server (coturn?) is running.
 **"address already in use" on port 9090.**
 Set `TURNA_HEALTH_ADDR=0.0.0.0:9091` and retry.
 
-**"address already in use" on port 9001.**
-Set `TURNA_SIGNALING_ADDR=0.0.0.0:9002` and update the WS URL in the browser.
+**TURN allocation succeeds but peers cannot exchange media.**
+Make sure the relay UDP port range is reachable. For local Docker bridge tests,
+keep `deploy/docker-compose.yml` port range in sync with `[turn.relay]`. For
+production, prefer host networking or a load balancer/firewall rule that exposes
+the full relay range.
 
-**Browser says "Camera denied".**
-Allow camera/microphone in the browser permission prompt. On macOS,
-check System Settings → Privacy → Camera/Microphone.
-
-**WebSocket connection failed in browser.**
-Check the signaling server is running and the WS URL matches the port.
-The default is `ws://localhost:9001` — not 8080.
-
-**Call connects but no video/audio.**
-ICE negotiation likely failed. On localhost this usually works with just
-STUN. If testing across different machines, make sure `TURNA_EXTERNAL_IP`
-is set to the public IP of the machine running turna-node.
+**Remote clients receive an unusable relay address.**
+Set `TURNA_EXTERNAL_IP` or `[turn].external_ip` to the public IP of the machine
+running `turna-node`.
 
 **"validation: turn.auth.shared_secret is empty".**
-You set `TURNA_SHARED_SECRET` to an empty string. Either unset it or set
-a real value.
+You set `TURNA_SHARED_SECRET` to an empty string. Either unset it or set a real
+value.
 
-**Process exits with "validation" error.**
-You set `TURNA_PRODUCTION=true` without real secrets. Either generate them
-(`openssl rand -hex 32`) or remove `TURNA_PRODUCTION` for dev.
+**Process exits with a "validation" error.**
+You set `TURNA_PRODUCTION=true` without real secrets and/or `external_ip`.
+Generate a secret with `openssl rand -hex 32`, set `TURNA_EXTERNAL_IP`, or unset
+`TURNA_PRODUCTION` for local development.

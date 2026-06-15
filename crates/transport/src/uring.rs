@@ -100,6 +100,12 @@ pub struct MsgHdrStorage {
     send_buf: Vec<u8>,
 }
 
+impl Default for MsgHdrStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MsgHdrStorage {
     pub fn new() -> Self {
         Self {
@@ -107,8 +113,10 @@ impl MsgHdrStorage {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             },
+            // SAFETY: sockaddr_storage is a C POD type; all-zeroes is a valid value.
             addr: unsafe { std::mem::zeroed() },
             addr_len: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+            // SAFETY: libc::msghdr is a C POD type; all-zeroes is a valid value.
             msghdr: unsafe { std::mem::zeroed() },
             send_buf: Vec::with_capacity(MAX_UDP_PACKET),
         }
@@ -118,8 +126,9 @@ impl MsgHdrStorage {
         self.msgvec.iov_base = buf_ptr as *mut _;
         self.msgvec.iov_len = buf_len;
         self.addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: sockaddr_storage is a C POD type; all-zeroes is a valid value.
         self.addr = unsafe { std::mem::zeroed() };
-        // SAFETY (self-referential): `msghdr.msg_name` and `msg_iov` are set to
+        // SAFETY: (self-referential) `msghdr.msg_name` and `msg_iov` are set to
         // point into `self` (the `addr` / `msgvec` fields). This is sound because
         // every `MsgHdrStorage` lives inside the `Box<[MsgHdrStorage]>` owned by
         // `UringEngine` (see USF-003 / SUSPECT #3 fix, documented below): a boxed
@@ -142,6 +151,8 @@ impl MsgHdrStorage {
         self.send_buf.extend_from_slice(data);
         self.msgvec.iov_base = self.send_buf.as_ptr() as *mut _;
         self.msgvec.iov_len = self.send_buf.len();
+        // SAFETY: src/dst are valid for `target.len()` bytes and non-overlapping
+        // (distinct allocations); len comes from the source slice.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 target.as_ptr() as *const u8,
@@ -160,6 +171,8 @@ impl MsgHdrStorage {
     }
 
     pub fn source_addr(&self) -> Option<SocketAddr> {
+        // SAFETY: `self.addr`/`self.addr_len` were filled by a completed recvmsg,
+        // so they describe a valid initialized sockaddr.
         let sa = unsafe { SockAddr::new(self.addr, self.addr_len) };
         sa.as_socket()
     }
@@ -223,6 +236,11 @@ pub struct RingStats {
     pub sq_len: u32,
     pub sq_capacity: u32,
     pub cq_len: u32,
+    pub relay_capacity_exhausted: u64,
+    /// 2.2 (D5): currently-occupied send slots (main + relay) in this engine.
+    pub send_slots_inflight: u64,
+    /// 2.2 (D4): cumulative stall-scan hits for main send slots (>5s no CQE).
+    pub send_slot_stalled: u64,
 }
 
 /// One worker's slot in [`RingStatsAggregate`]. Each io_uring worker owns its
@@ -239,6 +257,9 @@ pub struct PerWorkerRing {
     pub sq_capacity: std::sync::atomic::AtomicU64,
     pub cq_len: std::sync::atomic::AtomicU64,
     pub buffers_available: std::sync::atomic::AtomicU64,
+    pub relay_capacity_exhausted: std::sync::atomic::AtomicU64,
+    pub send_slots_inflight: std::sync::atomic::AtomicU64,
+    pub send_slot_stalled: std::sync::atomic::AtomicU64,
 }
 
 /// Summed view across all workers, read by the node's Prometheus copy task.
@@ -253,6 +274,9 @@ pub struct RingTotals {
     pub sq_capacity: u64,
     pub cq_len: u64,
     pub buffers_available: u64,
+    pub relay_capacity_exhausted: u64,
+    pub send_slots_inflight: u64,
+    pub send_slot_stalled: u64,
 }
 
 /// Shared per-worker ring-stats publisher. Created by the node with one slot
@@ -282,6 +306,10 @@ impl RingStatsAggregate {
         w.sq_capacity.store(rs.sq_capacity as u64, Relaxed);
         w.cq_len.store(rs.cq_len as u64, Relaxed);
         w.buffers_available.store(buffers_available as u64, Relaxed);
+        w.relay_capacity_exhausted
+            .store(rs.relay_capacity_exhausted, Relaxed);
+        w.send_slots_inflight.store(rs.send_slots_inflight, Relaxed);
+        w.send_slot_stalled.store(rs.send_slot_stalled, Relaxed);
     }
 
     /// Sum counters / occupancy across all workers; `cqe_max_batch` is a max.
@@ -300,6 +328,9 @@ impl RingStatsAggregate {
             t.sq_capacity += w.sq_capacity.load(Relaxed);
             t.cq_len += w.cq_len.load(Relaxed);
             t.buffers_available += w.buffers_available.load(Relaxed);
+            t.relay_capacity_exhausted += w.relay_capacity_exhausted.load(Relaxed);
+            t.send_slots_inflight += w.send_slots_inflight.load(Relaxed);
+            t.send_slot_stalled += w.send_slot_stalled.load(Relaxed);
         }
         t
     }
@@ -341,6 +372,21 @@ pub struct UringEngine {
     sq_capacity: u32,
     /// Last observed completion-queue pending count at drain entry.
     last_cq_len: u32,
+    /// IOU-2b: relay creations rejected because the relay msghdr pool was full
+    /// (surfaced as turna_uring_relay_capacity_exhausted_total).
+    relay_capacity_exhausted: u64,
+    /// 2.2 (D5): currently-occupied send slots (main + relay). Incremented when
+    /// a send slot is successfully submitted, decremented on its completion.
+    /// Plain counter — single owner, no atomics needed.
+    send_slots_inflight: u64,
+    /// 2.2 (D4): cumulative count of stall-scan hits (a main send slot occupied
+    /// >5s with no SendMsg CQE). Never frees the slot; this is an alert canary.
+    send_slot_stalled: u64,
+    /// 2.2 (D4): arm-time per main send slot, written on submit, read by the
+    /// stall scan. Indexed by send slot (0..MAIN_SEND_SLOTS).
+    main_send_armed: Box<[std::time::Instant]>,
+    /// 2.2 (D4): rate-limiter for `scan_stalled_send_slots` (once per second).
+    last_stall_scan: std::time::Instant,
 }
 
 /// Completion event.
@@ -377,7 +423,12 @@ pub enum CompletionEvent {
 }
 
 impl UringEngine {
-    pub fn new(addr: SocketAddr, reuse_port: bool, buf_count: u16) -> std::io::Result<Self> {
+    pub fn new(
+        addr: SocketAddr,
+        reuse_port: bool,
+        buf_count: u16,
+        relay_capacity_per_worker: usize,
+    ) -> std::io::Result<Self> {
         let domain = if addr.is_ipv4() {
             Domain::IPV4
         } else {
@@ -427,7 +478,26 @@ impl UringEngine {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        let relay_pool_size = 512;
+        // IOU-2: relay msghdr pool sized from config. Each relay socket uses one
+        // RELAY_BLOCK (32 recv + 32 send) of msghdr storage. `msghdr_idx` is
+        // packed into 16 bits of the CQE user_data, so the pool cannot exceed
+        // u16::MAX + 1 entries -> at most that many / RELAY_BLOCK relay sockets
+        // per worker. Reject an over-large request instead of truncating.
+        const RELAY_BLOCK: usize = RELAY_RECV_BATCH as usize * 2;
+        let cap = relay_capacity_per_worker.max(1);
+        let relay_pool_size = cap.saturating_mul(RELAY_BLOCK);
+        if relay_pool_size > u16::MAX as usize + 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "io_uring relay_socket_capacity_per_worker={cap} needs {relay_pool_size} \
+                     msghdr slots, exceeding the {} addressable by the 16-bit msghdr index \
+                     (max {} relay sockets per worker)",
+                    u16::MAX as usize + 1,
+                    (u16::MAX as usize + 1) / RELAY_BLOCK
+                ),
+            ));
+        }
         let relay_msghdrs = (0..relay_pool_size)
             .map(|_| MsgHdrStorage::new())
             .collect::<Vec<_>>()
@@ -445,8 +515,9 @@ impl UringEngine {
             main_send_msghdrs,
             relay_sockets: HashMap::new(),
             relay_msghdrs,
-            relay_free_blocks: (0..relay_pool_size as u16)
+            relay_free_blocks: (0..relay_pool_size)
                 .step_by(RELAY_RECV_BATCH as usize * 2)
+                .map(|b| b as u16)
                 .collect(),
             // All MAIN_SEND_SLOTS slots start free. MAIN_SEND_SLOTS == 64, so
             // the full u64 is "all free"; if it ever shrinks below 64, mask.
@@ -458,6 +529,12 @@ impl UringEngine {
             last_sq_len: 0,
             sq_capacity: 0,
             last_cq_len: 0,
+            relay_capacity_exhausted: 0,
+            send_slots_inflight: 0,
+            send_slot_stalled: 0,
+            main_send_armed: vec![std::time::Instant::now(); MAIN_SEND_SLOTS as usize]
+                .into_boxed_slice(),
+            last_stall_scan: std::time::Instant::now(),
         })
     }
 
@@ -485,32 +562,48 @@ impl UringEngine {
         let entry = opcode::RecvMsg::new(types::Fd(self.main_fd), &mut msghdr.msghdr as *mut _)
             .build()
             .user_data(ud);
-        // NEEDS-REVIEW: io_uring submission requires that everything the
-        // SQE references (msghdr, iovec, sockaddr, buffer) lives until the
-        // kernel completes the operation. The msghdr is held in a Vec slot
-        // indexed by `slot`; there is currently no mechanism marking a slot
-        // as 'busy until completion'. If a slot index is reused before the
-        // CQE arrives, the kernel will write through dangling msghdr.
+        // INVARIANT (2.2 / D1 — closes the former review marker here): a recv
+        // msghdr slot is never referenced by two concurrent SQEs, so there is no
+        // reuse-before-completion hazard and no extra synchronisation is needed:
+        //   1. `main_recv_msghdrs` is `Box<[MsgHdrStorage]>` (SUSPECT #3 fix) —
+        //      a fixed heap allocation, so the self-referential pointers inside
+        //      each msghdr stay valid for the engine's lifetime.
+        //   2. Each slot is armed exactly once at startup (submit_initial_recvs)
+        //      and afterwards re-armed ONLY in response to its own MainRecv /
+        //      MainRecvError completion (resubmit_main_recv uses the same
+        //      msghdr_idx carried in the CQE user_data). The single-owner worker
+        //      loop never re-arms a slot whose CQE it has not yet reaped.
+        // SAFETY: `entry` references buffers/fds that stay valid until the matching
+        // completion is reaped; the SQ has a single owner (no concurrent access).
         unsafe {
             self.ring
                 .submission()
                 .push(&entry)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+                .map_err(|_| std::io::Error::other("SQ full"))?;
         }
         Ok(())
     }
 
     pub fn resubmit_main_recv(&mut self, msghdr_idx: u16, buf_idx: u16) -> std::io::Result<()> {
+        // Called only from the worker on this exact slot's own completion, so it
+        // upholds the one-in-flight-per-slot invariant documented in
+        // `submit_main_recv` (no reuse-before-completion).
         self.submit_main_recv(msghdr_idx, buf_idx)
     }
 
     /// Submit a send on the main socket.
     ///
-    /// Acquires a free send slot internally and returns it; the slot is
-    /// released when the matching `MainSend` completion arrives (see
-    /// `collect_completions`). Returns `WouldBlock` if every send slot is still
-    /// in flight — the caller should flush/drain completions and retry rather
-    /// than overwriting an in-flight slot (which would be a use-after-free).
+    /// Acquires a free send slot from `main_send_free` (bit set = free) and
+    /// returns it; the slot is released ONLY when its `MainSend` completion
+    /// arrives (see `collect_completions`). This bitmap is the slot-reuse guard
+    /// (2.2 / D2): a slot is never reused while its SendMsg is in flight, so the
+    /// kernel never reads a msghdr/send_buf we have overwritten. On a kernel
+    /// 5.5+ `IORING_FEAT_NODROP` guarantees the releasing CQE is not silently
+    /// dropped, so the bitmap stays balanced.
+    ///
+    /// Returns `WouldBlock` when every slot is in flight. The caller (worker)
+    /// drops the packet on `WouldBlock`/SQ-full and counts it — acceptable for
+    /// UDP (2.2 / D3); it does NOT retry, to avoid spinning the loop.
     pub fn submit_main_send(&mut self, data: &[u8], target: SocketAddr) -> std::io::Result<u16> {
         let slot = alloc_bit_u64(&mut self.main_send_free).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::WouldBlock, "main send slots exhausted")
@@ -522,13 +615,19 @@ impl UringEngine {
         let entry = opcode::SendMsg::new(types::Fd(self.main_fd), &msghdr.msghdr as *const _)
             .build()
             .user_data(ud);
+        // SAFETY: `entry`'s buffers/fds stay valid until completion is reaped;
+        // single-owner SQ, no concurrent access.
         let pushed = unsafe { self.ring.submission().push(&entry) };
         if pushed.is_err() {
             self.sq_push_failed += 1;
             // Roll the slot back so a full SQ doesn't leak it forever.
             free_bit_u64(&mut self.main_send_free, slot);
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"));
+            return Err(std::io::Error::other("SQ full"));
         }
+        // Slot is now truly in flight: record arm-time (D4 stall canary) and
+        // bump the inflight gauge (D5). Both undone on the MainSend completion.
+        self.main_send_armed[slot as usize] = std::time::Instant::now();
+        self.send_slots_inflight += 1;
         Ok(slot)
     }
 
@@ -554,13 +653,13 @@ impl UringEngine {
         // a relay's in-flight ops fully drain (see remove_relay /
         // collect_completions).
         let Some(recv_base) = self.relay_free_blocks.pop() else {
+            self.relay_capacity_exhausted += 1;
             warn!(
                 port,
                 cap = self.relay_msghdrs.len(),
                 "io_uring relay msghdr pool exhausted — rejecting relay"
             );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "io_uring relay msghdr pool exhausted",
             ));
         };
@@ -610,11 +709,13 @@ impl UringEngine {
         let entry = opcode::RecvMsg::new(types::Fd(fd), &mut msghdr.msghdr as *mut _)
             .build()
             .user_data(ud);
+        // SAFETY: `entry` references buffers/fds that stay valid until the matching
+        // completion is reaped; the SQ has a single owner (no concurrent access).
         unsafe {
             self.ring
                 .submission()
                 .push(&entry)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+                .map_err(|_| std::io::Error::other("SQ full"))?;
         }
         if let Some(relay) = self.relay_sockets.get_mut(&port) {
             relay.inflight += 1; // recv in flight
@@ -675,17 +776,23 @@ impl UringEngine {
         let entry = opcode::SendMsg::new(types::Fd(fd), &msghdr.msghdr as *const _)
             .build()
             .user_data(ud);
+        // SAFETY: `entry`'s buffers/fds stay valid until completion is reaped;
+        // single-owner SQ, no concurrent access.
         let pushed = unsafe { self.ring.submission().push(&entry) };
         if pushed.is_err() {
             self.sq_push_failed += 1;
             if let Some(relay) = self.relay_sockets.get_mut(&port) {
                 free_bit_u32(&mut relay.send_free, slot);
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "SQ full"));
+            return Err(std::io::Error::other("SQ full"));
         }
         if let Some(relay) = self.relay_sockets.get_mut(&port) {
             relay.inflight += 1; // send in flight
         }
+        // D5 inflight gauge: relay send slot now in flight (released on the
+        // RelaySend completion). Relay slots feed the gauge but NOT the stall
+        // canary (scan_stalled_send_slots is main-only by design).
+        self.send_slots_inflight += 1;
         Ok(slot)
     }
 
@@ -715,8 +822,42 @@ impl UringEngine {
         }
     }
 
+    /// 2.2 (D4): detect — but never reuse — main send slots whose `SendMsg` CQE
+    /// has not arrived within 5s. On a kernel >= 5.5 `IORING_FEAT_NODROP`
+    /// guarantees CQEs are not silently dropped, so a genuinely stuck slot means
+    /// a logic/kernel bug. We warn and bump `send_slot_stalled`, but do NOT free
+    /// the slot — freeing one the kernel may still read is a use-after-free.
+    /// Main slots only (relay slots get the inflight gauge, not this scan, to
+    /// avoid a per-relay timestamp table on the hot path). Rate-limited to once
+    /// per second; occupied = bit cleared in `main_send_free`. The counter rises
+    /// once per scan tick while a slot stays stuck (stall-seconds), which is the
+    /// intended behaviour for an alert canary.
+    fn scan_stalled_send_slots(&mut self) {
+        if self.last_stall_scan.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.last_stall_scan = now;
+        for slot in 0..MAIN_SEND_SLOTS {
+            let occupied = (self.main_send_free & (1u64 << slot)) == 0;
+            if occupied
+                && now.duration_since(self.main_send_armed[slot as usize])
+                    >= std::time::Duration::from_secs(5)
+            {
+                self.send_slot_stalled += 1;
+                warn!(
+                    slot,
+                    "io_uring main send slot stalled >5s — SendMsg CQE not received; \
+                     NOT reusing slot (possible kernel/logic bug)"
+                );
+            }
+        }
+    }
+
     /// Collect all completions into a Vec (avoids borrow issues).
     pub fn collect_completions(&mut self) -> Vec<CompletionEvent> {
+        // D4: cheap, rate-limited canary for send slots whose CQE never came.
+        self.scan_stalled_send_slots();
         let mut events = Vec::new();
         // Sample submission-queue occupancy before draining completions
         // (disjoint-field borrow: `sq` borrows only `self.ring`).
@@ -763,6 +904,7 @@ impl UringEngine {
                     // Send completed → the slot's msghdr/buffer are no longer
                     // read by the kernel, so the slot can be reused safely.
                     free_bit_u64(&mut self.main_send_free, buf_or_slot);
+                    self.send_slots_inflight = self.send_slots_inflight.saturating_sub(1);
                     CompletionEvent::MainSend {
                         send_slot: buf_or_slot,
                         result,
@@ -821,6 +963,10 @@ impl UringEngine {
                             reclaim_base = Some(relay.recv_msghdr_base);
                         }
                     }
+                    // D5: this relay send slot is now free — decrement always,
+                    // including the reclaim path below which `continue`s. Also
+                    // covers -ECANCELED completions from remove_relay's cancel.
+                    self.send_slots_inflight = self.send_slots_inflight.saturating_sub(1);
                     if let Some(base) = reclaim_base {
                         self.relay_sockets.remove(&relay_port);
                         self.relay_free_blocks.push(base);
@@ -867,6 +1013,9 @@ impl UringEngine {
             sq_len: self.last_sq_len,
             sq_capacity: self.sq_capacity,
             cq_len: self.last_cq_len,
+            relay_capacity_exhausted: self.relay_capacity_exhausted,
+            send_slots_inflight: self.send_slots_inflight,
+            send_slot_stalled: self.send_slot_stalled,
         }
     }
 
@@ -882,6 +1031,13 @@ impl UringEngine {
     }
     pub fn buffers_available(&self) -> usize {
         self.buffers.available()
+    }
+    /// 2.6: in-flight send slots (main + relay) whose SendMsg CQE has not
+    /// yet been reaped. Graceful shutdown drains this to zero before dropping
+    /// the engine so queued responses are transmitted, not cancelled by ring
+    /// teardown.
+    pub fn send_slots_inflight(&self) -> u64 {
+        self.send_slots_inflight
     }
     /// Begin closing a relay: mark it draining and drop its `Socket` (closing
     /// the fd, so the kernel completes any in-flight recvs). The msghdr block
@@ -915,6 +1071,8 @@ impl UringEngine {
         let entry = opcode::AsyncCancel2::new(CancelBuilder::fd(types::Fd(fd)).all())
             .build()
             .user_data(ud);
+        // SAFETY: `entry`'s buffers/fds stay valid until completion is reaped;
+        // single-owner SQ, no concurrent access.
         if unsafe { self.ring.submission().push(&entry) }.is_err() {
             // SQ full: stay closing (nothing new is armed); a later close/drain
             // pass can re-issue. The block stays reserved until drained.

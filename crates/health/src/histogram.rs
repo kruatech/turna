@@ -108,6 +108,39 @@ impl Histogram {
             self.sum_seconds() / c as f64
         }
     }
+
+    /// Estimate a quantile (`q` in `0.0..=1.0`) in seconds via linear
+    /// interpolation across the cumulative bucket counts — the same approach as
+    /// Prometheus `histogram_quantile`. Returns `0.0` when there are no
+    /// observations. A quantile that falls in the open-ended `+Inf` bucket is
+    /// clamped to the highest finite boundary, since a bucketed histogram cannot
+    /// resolve a value above its last boundary.
+    pub fn percentile(&self, q: f64) -> f64 {
+        let total = self.count.load(Ordering::Relaxed);
+        if total == 0 || self.buckets.is_empty() {
+            return 0.0;
+        }
+        let rank = q.clamp(0.0, 1.0) * total as f64;
+
+        // `counts[i]` is cumulative: the number of observations <= buckets[i].
+        let mut prev_cum = 0.0_f64;
+        let mut prev_bound = 0.0_f64;
+        for (i, &bound) in self.buckets.iter().enumerate() {
+            let cum = self.counts[i].load(Ordering::Relaxed) as f64;
+            if cum >= rank {
+                let in_bucket = cum - prev_cum;
+                if in_bucket <= 0.0 {
+                    return bound;
+                }
+                let frac = (rank - prev_cum) / in_bucket;
+                return prev_bound + (bound - prev_bound) * frac;
+            }
+            prev_cum = cum;
+            prev_bound = bound;
+        }
+        // Rank is in the +Inf bucket: clamp to the highest finite boundary.
+        *self.buckets.last().unwrap()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,5 +347,40 @@ mod tests {
         h.observe(Duration::from_secs(4));
         let avg = h.avg_seconds();
         assert!((avg - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn percentile_empty_is_zero() {
+        let h = Histogram::new("t", "h", vec![0.001, 0.01, 0.1]);
+        assert_eq!(h.percentile(0.99), 0.0);
+    }
+
+    #[test]
+    fn percentile_interpolates_within_bucket() {
+        // Boundaries 1s and 2s. Ten observations of 0.5s land in the first
+        // bucket; ten of 1.5s land in the second bucket. p99 at rank 19.8 sits in
+        // the second bucket and interpolates between 1.0 and 2.0.
+        let h = Histogram::new("t", "h", vec![1.0, 2.0]);
+        for _ in 0..10 {
+            h.observe(Duration::from_millis(500));
+        }
+        for _ in 0..10 {
+            h.observe(Duration::from_millis(1500));
+        }
+        let p99 = h.percentile(0.99);
+        assert!((1.0..=2.0).contains(&p99), "p99 must fall in the second bucket, got {p99}");
+
+        // p50 (rank 10) sits exactly at the first boundary.
+        let p50 = h.percentile(0.50);
+        assert!((p50 - 1.0).abs() < 0.001, "p50 should be ~1.0s, got {p50}");
+    }
+
+    #[test]
+    fn percentile_above_last_boundary_clamps() {
+        // A single huge observation falls in the +Inf bucket; p99 clamps to the
+        // highest finite boundary rather than returning infinity.
+        let h = Histogram::new("t", "h", vec![0.001, 0.01]);
+        h.observe(Duration::from_secs(5));
+        assert_eq!(h.percentile(0.99), 0.01);
     }
 }

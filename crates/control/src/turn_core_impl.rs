@@ -90,6 +90,7 @@ impl TurnCoreImpl {
     }
 
     /// Configure initial values from node config.
+#[allow(clippy::too_many_arguments)]
     pub fn with_config(
         self,
         realm: impl Into<String>,
@@ -244,8 +245,16 @@ impl TurnCore for TurnCoreImpl {
             allocated_ports: self.store.allocated_port_count() as u32,
             available_ports: self.store.available_port_count() as u32,
             draining: m.is_draining(),
-            avg_latency_us: 0, // TODO: wire histogram
-            p99_latency_us: 0,
+            avg_latency_us: m
+                .histograms
+                .get("turna_stun_request_duration_seconds")
+                .map(|h| (h.avg_seconds() * 1_000_000.0) as u64)
+                .unwrap_or(0),
+            p99_latency_us: m
+                .histograms
+                .get("turna_stun_request_duration_seconds")
+                .map(|h| (h.percentile(0.99) * 1_000_000.0) as u64)
+                .unwrap_or(0),
             blocked_ips: 0,
         }
     }
@@ -269,10 +278,10 @@ impl TurnCore for TurnCoreImpl {
 
         let mut talkers: Vec<_> = by_user.into_values().collect();
         match sort_by {
-            "bytes" | "" => talkers.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes)),
-            "allocations" => talkers.sort_by(|a, b| b.allocations.cmp(&a.allocations)),
-            "bandwidth" => talkers.sort_by(|a, b| b.bandwidth_bps.cmp(&a.bandwidth_bps)),
-            _ => talkers.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes)),
+            "bytes" | "" => talkers.sort_by_key(|b| std::cmp::Reverse(b.total_bytes)),
+            "allocations" => talkers.sort_by_key(|b| std::cmp::Reverse(b.allocations)),
+            "bandwidth" => talkers.sort_by_key(|b| std::cmp::Reverse(b.bandwidth_bps)),
+            _ => talkers.sort_by_key(|b| std::cmp::Reverse(b.total_bytes)),
         }
         talkers.truncate(limit);
         talkers
@@ -317,25 +326,36 @@ impl TurnCore for TurnCoreImpl {
     }
 
     async fn remove_user(&self, user: &str, force: bool) -> Result<u32, CoreError> {
-        let mut deleted = 0u32;
-        if force {
-            let allocs: Vec<_> = self
-                .all_allocations()
-                .into_iter()
-                .filter(|a| a.username == user)
-                .collect();
-            for a in allocs {
-                self.store.force_remove(&a.client_address);
-                self.metrics
-                    .active_allocations
-                    .fetch_sub(1, Ordering::Relaxed);
-                deleted += 1;
-            }
-            info!(
-                username = user,
-                deleted, "user allocations force-deleted via gRPC"
-            );
+        // There is no runtime user store to delete a user record from (see
+        // add_user), so without `force` this RPC has nothing to do. Report that
+        // honestly as Unimplemented instead of returning a misleading success.
+        // With `force` we drop the user's *active allocations* (not a user
+        // record); the response's allocations_deleted conveys what happened.
+        if !force {
+            return Err(CoreError::Unimplemented(
+                "runtime user removal is not supported; pass force to drop the user's \
+                 active allocations, or manage LongTerm users in turn.toml"
+                    .into(),
+            ));
         }
+
+        let allocs: Vec<_> = self
+            .all_allocations()
+            .into_iter()
+            .filter(|a| a.username == user)
+            .collect();
+        let mut deleted = 0u32;
+        for a in allocs {
+            self.store.force_remove(&a.client_address);
+            self.metrics
+                .active_allocations
+                .fetch_sub(1, Ordering::Relaxed);
+            deleted += 1;
+        }
+        info!(
+            username = user,
+            deleted, "user allocations force-dropped via gRPC"
+        );
         Ok(deleted)
     }
 

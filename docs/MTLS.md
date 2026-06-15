@@ -203,8 +203,7 @@ breaking active connections:
 
 1. Generate a new server cert, sign with the same CA.
 2. Replace `server.crt` and `server.key` on disk.
-3. **Restart** the control plane. (Hot reload is on the roadmap, see
-   TODO.md.)
+3. **Restart** the control plane. Hot reload is not implemented yet.
 4. Existing clients keep working because they verify against the CA,
    which hasn't changed.
 

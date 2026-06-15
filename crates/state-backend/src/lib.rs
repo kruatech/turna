@@ -284,8 +284,10 @@ impl Backend {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[derive(Default)]
 pub enum BackendConfig {
     #[serde(rename = "memory")]
+    #[default]
     Memory,
     #[serde(rename = "tarantool")]
     Tarantool {
@@ -323,11 +325,6 @@ pub enum BackendConfig {
 /// `BackendConfig::Tarantool::pool_size`.
 pub const DEFAULT_POOL_SIZE: usize = 8;
 
-impl Default for BackendConfig {
-    fn default() -> Self {
-        Self::Memory
-    }
-}
 
 pub async fn create_backend(config: &BackendConfig) -> Result<Backend> {
     match config {

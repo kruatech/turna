@@ -36,6 +36,8 @@ pub enum UserAuthError {
     TokenRevoked,
     #[error("password error: {0}")]
     PasswordError(String),
+    #[error("invalid configuration: {0}")]
+    Config(String),
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -48,28 +50,47 @@ pub struct UserStoreConfig {
     pub token_ttl_secs: u64,
 }
 
-impl Default for UserStoreConfig {
-    fn default() -> Self {
-        Self {
-            jwt_secret: b"change-me-use-TURNA_JWT_SECRET-env-var".to_vec(),
-            token_ttl_secs: 86400,
-        }
+/// The build-time placeholder secret that must never be accepted at runtime.
+const PLACEHOLDER_JWT_SECRET: &[u8] = b"change-me-use-TURNA_JWT_SECRET-env-var";
+/// Minimum acceptable HS256 secret length, in bytes.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Reject empty, placeholder, or too-short JWT secrets (F-9).
+fn validate_jwt_secret(secret: &[u8]) -> Result<(), UserAuthError> {
+    if secret == PLACEHOLDER_JWT_SECRET {
+        return Err(UserAuthError::Config(
+            "TURNA_JWT_SECRET is still the build-time placeholder; set a real secret".into(),
+        ));
     }
+    if secret.len() < MIN_JWT_SECRET_LEN {
+        return Err(UserAuthError::Config(format!(
+            "TURNA_JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} bytes, got {}",
+            secret.len()
+        )));
+    }
+    Ok(())
 }
 
 impl UserStoreConfig {
-    pub fn from_env() -> Self {
+    /// Build the config from the environment, refusing to start with a missing,
+    /// placeholder, or too-short JWT secret (F-9). There is deliberately no
+    /// silent fallback: an unset or weak `TURNA_JWT_SECRET` is a hard error, so
+    /// a service can never come up signing tokens with a publicly-known key.
+    pub fn try_from_env() -> Result<Self, UserAuthError> {
         let jwt_secret = std::env::var("TURNA_JWT_SECRET")
-            .unwrap_or_else(|_| "change-me-use-TURNA_JWT_SECRET-env-var".into())
+            .map_err(|_| UserAuthError::Config("TURNA_JWT_SECRET is not set".into()))?
             .into_bytes();
+        validate_jwt_secret(&jwt_secret)?;
+
         let token_ttl_secs = std::env::var("TURNA_TOKEN_TTL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(86400);
-        Self {
+
+        Ok(Self {
             jwt_secret,
             token_ttl_secs,
-        }
+        })
     }
 }
 
@@ -270,7 +291,7 @@ impl UserStore {
         Ok(())
     }
 
-    /// Очищает истёкшие записи в blacklist. Вызывать периодически.
+    // Очищает истёкшие записи в blacklist. Вызывать периодически.
 
     /// Прогрев blacklist при старте из персистентного хранилища.
     /// Вызывается для каждой записи полученной из Backend::load_active_revocations().
@@ -282,6 +303,30 @@ impl UserStore {
         let remaining = std::time::Duration::from_millis(expires_at_ms - now_ms);
         let expires_at = std::time::Instant::now() + remaining;
         self.blacklist.insert(jti, expires_at);
+    }
+
+    /// Warm the revocation blacklist from a persistent backend at startup.
+    ///
+    /// Without this, an in-memory `UserStore` starts with an empty blacklist
+    /// after every restart, so a token revoked *before* the restart — but whose
+    /// `exp` has not yet passed — would pass `verify_token` again (a revocation
+    /// bypass window until the token's natural expiry). Call this once during
+    /// startup with the entries from `Backend::load_active_revocations(now_ms)`.
+    /// Already-expired entries are skipped by `warm_blacklist_entry`. Returns the
+    /// number of live entries loaded.
+    pub fn warm_revocations<I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (String, u64)>,
+    {
+        let before = self.blacklist.len();
+        for (jti, expires_at_ms) in entries {
+            self.warm_blacklist_entry(jti, expires_at_ms);
+        }
+        let loaded = self.blacklist.len().saturating_sub(before);
+        if loaded > 0 {
+            info!(count = loaded, "revocation blacklist warmed from backend");
+        }
+        loaded
     }
 
     pub fn cleanup_blacklist(&self) -> usize {
@@ -444,6 +489,44 @@ mod tests {
     }
 
     #[test]
+    fn warmed_revocation_survives_restart() {
+        let cfg = UserStoreConfig {
+            jwt_secret: b"test-secret-32-bytes-padding-ok!".to_vec(),
+            token_ttl_secs: 3600,
+        };
+
+        // Process 1: a user logs in, the token is revoked and (in production)
+        // persisted to the backend.
+        let s1 = UserStore::new(cfg.clone());
+        s1.register("kate", "kate@a.com", "pass12345", None).unwrap();
+        let (_, token) = s1.login("kate", "pass12345").unwrap();
+        let claims = s1.verify_token(&token).unwrap();
+        s1.revoke_token(&token).unwrap();
+        assert!(matches!(
+            s1.verify_token(&token).unwrap_err(),
+            UserAuthError::TokenRevoked
+        ));
+        // What the backend would have stored: (jti, token exp in ms).
+        let persisted = vec![(claims.jti.clone(), claims.exp as u64 * 1000)];
+
+        // Process 2 (after a restart): a fresh store starts with an EMPTY
+        // blacklist, so the already-revoked token verifies again — the bug.
+        let s2 = UserStore::new(cfg);
+        assert!(
+            s2.verify_token(&token).is_ok(),
+            "fresh store accepts a revoked token before warm-up — the regression we guard"
+        );
+
+        // Warming from the persisted revocations restores enforcement.
+        let loaded = s2.warm_revocations(persisted);
+        assert_eq!(loaded, 1);
+        assert!(matches!(
+            s2.verify_token(&token).unwrap_err(),
+            UserAuthError::TokenRevoked
+        ));
+    }
+
+    #[test]
     fn second_user_is_regular_user() {
         let s = store();
         s.register("usr1", "usr1@a.com", "pass12345", None).unwrap();
@@ -468,5 +551,47 @@ mod tests {
         // С ttl=0 revoke_token добавит expires_at = now(), cleanup сразу всё уберёт
         let removed = s.cleanup_blacklist();
         assert_eq!(removed, 0); // ничего не было
+    }
+
+    #[test]
+    fn validate_jwt_secret_rejects_weak_and_accepts_strong() {
+        assert!(validate_jwt_secret(b"").is_err(), "empty must be rejected");
+        assert!(validate_jwt_secret(b"short").is_err(), "too short must be rejected");
+        assert!(
+            validate_jwt_secret(PLACEHOLDER_JWT_SECRET).is_err(),
+            "placeholder must be rejected"
+        );
+        assert!(
+            validate_jwt_secret(b"a-proper-32-byte-long-secret!!!!").is_ok(),
+            "a 32-byte secret must be accepted"
+        );
+    }
+
+    #[test]
+    fn try_from_env_requires_a_real_secret() {
+        // One test owns the env var so set/remove can't race other tests.
+        std::env::remove_var("TURNA_JWT_SECRET");
+        assert!(
+            matches!(UserStoreConfig::try_from_env(), Err(UserAuthError::Config(_))),
+            "missing secret must be a hard error"
+        );
+
+        std::env::set_var("TURNA_JWT_SECRET", "change-me-use-TURNA_JWT_SECRET-env-var");
+        assert!(
+            UserStoreConfig::try_from_env().is_err(),
+            "placeholder secret must be rejected"
+        );
+
+        std::env::set_var("TURNA_JWT_SECRET", "too-short");
+        assert!(
+            UserStoreConfig::try_from_env().is_err(),
+            "short secret must be rejected"
+        );
+
+        std::env::set_var("TURNA_JWT_SECRET", "a-proper-32-byte-long-secret!!!!");
+        let cfg = UserStoreConfig::try_from_env().expect("valid secret must be accepted");
+        assert_eq!(cfg.jwt_secret, b"a-proper-32-byte-long-secret!!!!");
+
+        std::env::remove_var("TURNA_JWT_SECRET");
     }
 }

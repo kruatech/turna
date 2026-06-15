@@ -7,29 +7,52 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 data:
   turn.toml: |
+    production = {{ .Values.production }}
+
+    [turn]
     listen = "0.0.0.0:{{ .Values.turn.listenPort }}"
-    realm = {{ .Values.turn.realm | quote }}
-    {{- if .Values.turn.externalIP }}
     external_ip = {{ .Values.turn.externalIP | quote }}
-    {{- end }}
-    relay_port_range = [{{ .Values.turn.relayPortRange.min }}, {{ .Values.turn.relayPortRange.max }}]
-    max_allocations = {{ .Values.turn.maxAllocations }}
+    realm = {{ .Values.turn.realm | quote }}
+    transport = {{ .Values.turn.transport | quote }}
 
-    [health]
-    # Bind to all interfaces so kubelet liveness/readiness probes (and Prometheus)
-    # can reach it; the config default is loopback-only.
-    listen = "0.0.0.0:{{ .Values.turn.healthPort }}"
-
-    [auth]
+    [turn.auth]
     shared_secret = {{ .Values.turn.auth.sharedSecret | quote }}
+    token_ttl = 86400
     {{- range .Values.turn.auth.staticUsers }}
 
-    [[auth.static_users]]
+    [[turn.auth.static_users]]
     username = {{ .username | quote }}
     password = {{ .password | quote }}
     {{- end }}
-    {{- if .Values.cluster.enabled }}
 
+    [turn.relay]
+    min_port = {{ .Values.turn.relayPortRange.min }}
+    max_port = {{ .Values.turn.relayPortRange.max }}
+    max_allocations = {{ .Values.turn.maxAllocations }}
+
+    [turn.relay.quota]
+    max_bytes_per_sec = {{ .Values.turn.quota.maxBytesPerSec }}
+    max_per_user = {{ .Values.turn.quota.maxPerUser }}
+
+    [health]
+    # Bind to all interfaces so kubelet probes and Prometheus can reach it.
+    listen = "0.0.0.0:{{ .Values.turn.healthPort }}"
+
+    [management]
+    # Keep the management API loopback-only by default. This also avoids a
+    # validation conflict with the health port, because the config default is
+    # 127.0.0.1:9090 while this chart exposes health on 9090.
+    listen = "127.0.0.1:{{ .Values.turn.managementPort }}"
+    enabled = false
+
+    [signaling]
+    # There is no turna-signaling binary in the current workspace. The section
+    # is still present because the shared root config validates it.
+    listen = "127.0.0.1:9001"
+    turn_url = {{ .Values.turn.turnUrl | quote }}
+    turn_shared_secret = {{ .Values.turn.auth.sharedSecret | quote }}
+
+    {{- if .Values.cluster.enabled }}
     [cluster]
     cluster_mode = true
     # node_id and gossip_advertise_addr are per-pod, injected via env by the
@@ -43,6 +66,7 @@ data:
     gossip_seeds = ["{{ .Release.Name }}-turn-0.{{ .Release.Name }}-gossip.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.cluster.gossipPort }}"]
     gossip_interval_secs = {{ .Values.cluster.gossipIntervalSecs }}
     gossip_timeout_secs = {{ .Values.cluster.gossipTimeoutSecs }}
+    turn_announce_addr = "${TURNA_TURN_ANNOUNCE_ADDR:-0.0.0.0:0}"
     cluster_secret = "${TURNA_CLUSTER_SECRET:-}"
     drain_grace_secs = {{ .Values.cluster.drainGraceSecs }}
     {{- end }}

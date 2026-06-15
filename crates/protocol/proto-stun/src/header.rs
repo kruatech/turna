@@ -93,7 +93,7 @@ impl MessageHeader {
             return Err(StunError::InvalidMagicCookie);
         }
 
-        if length % 4 != 0 {
+        if !length.is_multiple_of(4) {
             return Err(StunError::InvalidLength);
         }
 

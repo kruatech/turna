@@ -209,7 +209,7 @@ services:
       TURNA_SHARED_SECRET: "${TURNA_SHARED_SECRET}"   # from .env or secrets mgr
     volumes:
       - ./turn.toml:/etc/turna/turn.toml:ro
-    command: ["/usr/local/bin/turna-node", "/etc/turna/turn.toml"]
+    command: ["/etc/turna/turn.toml"]
 ```
 
 Notes:

@@ -226,6 +226,10 @@ async fn dispatch(
             ManagementResponse::ok(serde_json::from_str(&status_json(metrics)).unwrap())
         }
 
+        "failover.status" => {
+            ManagementResponse::ok(serde_json::from_str(&failover_json(metrics)).unwrap())
+        }
+
         "node.drain" => {
             metrics.set_draining(true);
             info!("drain ENABLED via turnactl");
@@ -310,7 +314,20 @@ fn status_json(m: &Metrics) -> String {
     .to_string()
 }
 
-// ── Prometheus helper ─────────────────────────────────────────────────────────
+/// Failover counters for this node, surfaced to `turnactl failover status`.
+/// All four counters live in the shared [`Metrics`] and are updated by the
+/// failover sweep task (`failover::run_failover`), so this reflects live
+/// takeover activity for the node serving the request.
+fn failover_json(m: &Metrics) -> String {
+    serde_json::json!({
+        "claimed_total":   m.failover_claimed_total.load(Ordering::Relaxed),
+        "lost_race_total": m.failover_lost_race_total.load(Ordering::Relaxed),
+        "errors_total":    m.failover_errors_total.load(Ordering::Relaxed),
+        "last_sweep_us":   m.failover_sweep_duration_us.load(Ordering::Relaxed),
+        "draining":        m.is_draining(),
+    })
+    .to_string()
+}
 
 pub fn parse_prom_gauge(text: &str, name: &str) -> Option<u64> {
     text.lines()

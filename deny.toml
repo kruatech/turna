@@ -9,14 +9,7 @@ targets = [
 
 [advisories]
 # Блокируем уязвимые зависимости
-ignore = [
-    # rustls-pemfile unmaintained — transitive via tonic 0.12.3, no fix available yet
-    { id = "RUSTSEC-2025-0134", reason = "transitive via tonic 0.12.3, update tonic when available" },
-    # webpki name constraints — transitive via tonic 0.12.3
-    { id = "RUSTSEC-2026-0098", reason = "transitive via tonic 0.12.3, update tonic when available" },
-    { id = "RUSTSEC-2026-0099", reason = "transitive via tonic 0.12.3, update tonic when available" },
-    { id = "RUSTSEC-2026-0104", reason = "transitive via tonic 0.12.3, update tonic when available" },
-]
+ignore = []
 
 [licenses]
 # Разрешённые лицензии — только permissive и weak-copyleft
@@ -27,12 +20,8 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
-    "OpenSSL",
     "Zlib",
-    "MPL-2.0",
     "Unicode-3.0",
-    "CC0-1.0",
     "Unlicense",
     "BSL-1.0",
 ]
@@ -63,9 +52,14 @@ deny = [
 ]
 
 skip = [
-    { crate = "generic-array", reason = "transitive dependency version conflict" },
     { crate = "thiserror", reason = "transitive dependency version conflict v1/v2" },
     { crate = "thiserror-impl", reason = "transitive dependency version conflict v1/v2" },
+    { crate = "getrandom", reason = "ubiquitous 0.2/0.3 split across transitive deps" },
+    { crate = "hashbrown", reason = "multiple versions across transitive deps" },
+]
+
+skip-tree = [
+    { crate = "opentelemetry-otlp", reason = "0.16 brings an older tonic 0.11 / http 0.2 stack; bump planned separately" },
 ]
 
 [sources]

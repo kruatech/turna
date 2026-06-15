@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 pub struct WorkerPoolConfig {
     pub listen_addr: SocketAddr,
     pub num_workers: usize,
+    /// IOU-2: max relay sockets per io_uring worker (from `[turn.io_uring]`).
+    pub relay_capacity_per_worker: usize,
     pub buffers_per_worker: u16,
     pub external_ip: std::net::IpAddr,
     /// RFC 8016 sharded ownership: shared relay route table (port → owner).
@@ -61,6 +63,7 @@ impl Default for WorkerPoolConfig {
         Self {
             listen_addr: "0.0.0.0:3478".parse().unwrap(),
             num_workers: num_cpus(),
+            relay_capacity_per_worker: 256,
             buffers_per_worker: 2048,
             external_ip: "127.0.0.1".parse().unwrap(),
             relay_routes: RelayRoutes::new(),
@@ -151,6 +154,7 @@ where
         let shutdown = config.shutdown.clone();
         let drain_grace = config.drain_grace;
         let ring_stats = config.ring_stats.clone();
+        let relay_cap = config.relay_capacity_per_worker;
         // Per-worker inbound command channel (cross-worker relay-send forwards).
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WorkerCommand>();
 
@@ -162,7 +166,7 @@ where
                 let handler = factory(worker_id);
                 run_worker(
                     worker_id, addr, bufs, handler, routes, cmd_tx, cmd_rx, poll, shutdown,
-                    drain_grace, ring_stats,
+                    drain_grace, ring_stats, relay_cap,
                 );
             })
             .expect("failed to spawn worker thread");
@@ -176,6 +180,7 @@ where
 
 // ── Inner worker loop ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker<H: PacketHandler>(
     worker_id: usize,
     addr: SocketAddr,
@@ -188,8 +193,9 @@ fn run_worker<H: PacketHandler>(
     shutdown: Arc<AtomicBool>,
     drain_grace: Duration,
     ring_stats: Option<Arc<crate::uring::RingStatsAggregate>>,
+    relay_capacity_per_worker: usize,
 ) {
-    let mut engine = match UringEngine::new(addr, true, buf_count) {
+    let mut engine = match UringEngine::new(addr, true, buf_count, relay_capacity_per_worker) {
         Ok(e) => e,
         Err(e) => {
             error!(worker_id, %e, "failed to create engine");
@@ -230,6 +236,7 @@ fn run_worker<H: PacketHandler>(
             if let Some(agg) = &ring_stats {
                 agg.publish(worker_id, &rs, engine.buffers_available() as u32);
             }
+#[allow(clippy::manual_checked_ops)]
             let avg = if rs.cqe_batches > 0 {
                 rs.cqe_drained / rs.cqe_batches
             } else {
@@ -282,26 +289,46 @@ fn run_worker<H: PacketHandler>(
                     }
                     engine.remove_relay(port);
                 }
-                // Best-effort, bounded wait-until-reclaimed (#2b): drive the ring
-                // so the cancellations complete and the registered buffer/msghdr
-                // blocks return to their pools before we drop the engine, rather
-                // than relying on the kernel closing fds at process exit.
-                let reclaim_cap = Instant::now() + Duration::from_millis(250);
-                while !closing.iter().all(|p| !engine.has_relay(*p))
-                    && Instant::now() < reclaim_cap
-                {
+                // 2.6: bounded final drain. Drive the ring until BOTH every
+                // closing relay block is reclaimed AND all in-flight sends
+                // (main + relay) have completed, so queued responses are
+                // actually transmitted and no registered buffer is freed while
+                // the kernel still owns it. Bounded by `drain_grace` to keep
+                // shutdown finite. (Inbound recvs still in flight are abandoned
+                // to ring teardown — dropping ingress during shutdown is fine.)
+                let drain_cap = Instant::now() + drain_grace;
+                loop {
+                    let relays_reclaimed =
+                        closing.iter().all(|p| !engine.has_relay(*p));
+                    let sends_drained = engine.send_slots_inflight() == 0;
+                    if relays_reclaimed && sends_drained {
+                        break;
+                    }
+                    if Instant::now() >= drain_cap {
+                        break;
+                    }
                     if engine.submit_and_wait_timeout(cmd_poll_timeout).is_err() {
                         break;
                     }
-                    let _ = engine.collect_completions(); // drives reclaim
+                    let _ = engine.collect_completions(); // reclaim + send drain
                 }
                 let _ = engine.flush();
+                let sends_left = engine.send_slots_inflight();
                 info!(
                     worker_id,
                     relays = closing.len(),
                     fully_reclaimed = closing.iter().all(|p| !engine.has_relay(*p)),
+                    sends_inflight_remaining = sends_left,
                     "worker drain complete; exiting loop"
                 );
+                if sends_left > 0 {
+                    warn!(
+                        worker_id,
+                        sends_left,
+                        "shutdown drain window elapsed with sends still in \
+                         flight; they may be lost on ring teardown"
+                    );
+                }
                 break;
             }
         }
@@ -427,7 +454,7 @@ fn run_worker<H: PacketHandler>(
         // is dropped (acceptable for UDP) and counted; the next
         // submit_and_wait frees slots as completions arrive.
         for (data, target) in &main_sends {
-            if engine.submit_main_send(&data, *target).is_err() {
+            if engine.submit_main_send(data, *target).is_err() {
                 stats.errors += 1;
             }
         }
@@ -546,6 +573,7 @@ fn run_worker<H: PacketHandler>(
 
 // ── Action dispatch ───────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn process_action(
     action: ForwardAction,
     buf_idx: u16,
@@ -589,7 +617,12 @@ fn process_action(
         } => {
             stats.zc += 1;
             zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
-            // Don't resubmit — buffer is held until the send completes.
+            // F1 (intentional, NOT a bug): do not resubmit the main recv slot
+            // here. The recv buffer is handed to the zero-copy relay send and
+            // released only after that send completes (release_buffer in the
+            // zc_relay_sends loop); re-arming/freeing it now would be a
+            // use-after-free. STUN-response paths (ForwardAction::Send) free the
+            // buffer immediately and DO re-arm the recv slot.
         }
         ForwardAction::CreateRelay { port, allocation_id } => {
             new_relays.push((port, allocation_id));
@@ -676,10 +709,24 @@ struct Stats {
 
 #[cfg(target_os = "linux")]
 fn pin_to_core(core_id: usize) {
+    // `cpu_set_t` is a fixed-size bitmask; calling CPU_SET with an index
+    // beyond its capacity is out-of-bounds (UB) and historically truncated
+    // silently. Derive the capacity from the type's own size and guard: a
+    // core id past the mask means we skip pinning (run unpinned) rather than
+    // risk UB. Worker ids are 0..num_workers <= num_cpus, so this only trips
+    // when pinning a very high core on a >1024-CPU host.
+    let capacity_bits = std::mem::size_of::<libc::cpu_set_t>() * 8;
+    if core_id >= capacity_bits {
+        warn!(
+            core_id,
+            capacity_bits, "core id exceeds cpu_set_t capacity; running unpinned"
+        );
+        return;
+    }
+    // SAFETY: cpu_set_t is a C POD (all-zeroes valid). `core_id` is proven
+    // < capacity_bits, so CPU_SET writes within the mask. sched_setaffinity
+    // targets this thread (pid 0) with the cpuset's own byte length.
     unsafe {
-        // NEEDS-REVIEW: cpu_set_t fixed size (1024 CPUs on glibc). If the
-        // host has more CPUs and core_id is high, CPU_SET silently bit-
-        // truncates. Modern kernels support CPU_ALLOC for dynamic sizing.
         let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(core_id, &mut cpuset);
         let ret = libc::sched_setaffinity(0, std::mem::size_of_val(&cpuset), &cpuset);

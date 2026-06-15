@@ -243,14 +243,14 @@ mod tests {
     fn register_lookup_and_generation_bump() {
         let r = RelayRoutes::new();
         let (tx, _rx) = mpsc::channel();
-        let g1 = r.register(40000, 1, tx.clone(), -1, "A".into());
+        let g1 = r.register(40000, 1, tx.clone(), "A".into());
         assert_eq!(g1, 1);
         let o = r.lookup(40000).unwrap();
         assert_eq!(o.worker_id, 1);
         assert_eq!(o.allocation_id, "A");
         assert_eq!(o.generation, 1);
         // Re-register (port reuse) bumps generation.
-        let g2 = r.register(40000, 3, tx, -1, "B".into());
+        let g2 = r.register(40000, 3, tx, "B".into());
         assert_eq!(g2, 2);
         assert_eq!(r.lookup(40000).unwrap().generation, 2);
         assert_eq!(r.lookup(40000).unwrap().worker_id, 3);
@@ -260,7 +260,7 @@ mod tests {
     fn conditional_unregister_matches() {
         let r = RelayRoutes::new();
         let (tx, _rx) = mpsc::channel();
-        let g = r.register(40001, 1, tx, -1, "A".into());
+        let g = r.register(40001, 1, tx, "A".into());
         assert!(r.unregister_if(40001, "A", g));
         assert!(r.lookup(40001).is_none());
     }
@@ -270,9 +270,9 @@ mod tests {
         let r = RelayRoutes::new();
         let (tx, _rx) = mpsc::channel();
         // Allocation A on W1, gen 1.
-        let g_a = r.register(40002, 1, tx.clone(), -1, "A".into());
+        let g_a = r.register(40002, 1, tx.clone(), "A".into());
         // Port reused by allocation B on W3, gen 2.
-        let _g_b = r.register(40002, 3, tx, -1, "B".into());
+        let _g_b = r.register(40002, 3, tx, "B".into());
         // Late cleanup of A must NOT remove B's route.
         assert!(!r.unregister_if(40002, "A", g_a));
         let still = r.lookup(40002).unwrap();
@@ -295,7 +295,7 @@ mod tests {
     fn route_send_self_owned_is_flagged() {
         let r = RelayRoutes::new();
         let (tx, _rx) = mpsc::channel();
-        r.register(40003, 2, tx, -1, "A".into());
+        r.register(40003, 2, tx, "A".into());
         match r.route_send(2, 40003, sa("1.2.3.4:5"), Bytes::from_static(b"x")) {
             RouteDecision::SelfOwned => {}
             _ => panic!("expected self-owned desync flag"),
@@ -306,7 +306,7 @@ mod tests {
     fn route_send_forwards_with_owner_identity() {
         let r = RelayRoutes::new();
         let (tx, rx) = mpsc::channel();
-        let g = r.register(40004, 1, tx, -1, "A".into());
+        let g = r.register(40004, 1, tx, "A".into());
         match r.route_send(2, 40004, sa("9.9.9.9:7"), Bytes::from_static(b"hi")) {
             RouteDecision::Forward { tx, cmd, .. } => {
                 tx.send(cmd).unwrap();
@@ -346,7 +346,7 @@ mod tests {
         let w1_sends = Arc::new(AtomicU64::new(0));
         let w1_reforwards = Arc::new(AtomicU64::new(0));
         let port = 40010u16;
-        let g = routes.register(port, 1, w1_tx, -1, "A".into());
+        let g = routes.register(port, 1, w1_tx, "A".into());
 
         let w1_sends_c = w1_sends.clone();
         let w1_reforwards_c = w1_reforwards.clone();

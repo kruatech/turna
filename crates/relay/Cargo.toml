@@ -28,3 +28,13 @@ turna-qos.workspace = true
 turna-crypto.workspace = true
 turna-health.workspace = true
 turna-rtp-analyzer.workspace = true
+
+# Concurrency model checking for the nonce-rotation invariant (audit §3).
+# Only compiled under `--cfg loom`; never part of a normal build.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+# `loom` is set via RUSTFLAGS (--cfg loom), not a Cargo feature, so teach the
+# unexpected_cfgs lint about it (CI builds with -D warnings).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

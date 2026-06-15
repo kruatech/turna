@@ -7,3 +7,6 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 turna-proto-stun.workspace = true
+
+[dev-dependencies]
+proptest = "1"

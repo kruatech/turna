@@ -87,6 +87,9 @@ pub struct PoolStats {
 // - `allocated` / `stats` are AtomicU*/AtomicBool (inherently Sync).
 // ABA concern that invalidated this claim previously has been removed.
 unsafe impl Send for HugePagePool {}
+// SAFETY: see the Send rationale above — disjoint slot offsets (no aliasing),
+// free-list serialized by a Mutex, counters are atomics; sharing &HugePagePool
+// across threads is sound.
 unsafe impl Sync for HugePagePool {}
 
 impl HugePagePool {
@@ -156,9 +159,8 @@ impl HugePagePool {
     /// Return a slot to the pool. O(1) amortised.
     pub fn free(&self, buf: PoolBuffer) {
         let slot_index = buf.slot_index;
-        // Forget buf so its (trivial) Drop doesn't run — the slot is returned
-        // to the pool, not freed.
-        std::mem::forget(buf);
+        // `buf` is a plain handle with no Drop; it is consumed here and its slot
+        // returned to the pool below (the backing mmap region stays mapped).
         self.free_slots.lock().unwrap().push(slot_index);
         self.allocated.fetch_sub(1, Ordering::Relaxed);
         self.stats.total_frees.fetch_add(1, Ordering::Relaxed);
@@ -167,6 +169,8 @@ impl HugePagePool {
     fn prefault_pages(&self) {
         let ptr = self.base.as_ptr();
         for i in (0..self.total_size).step_by(4096) {
+            // SAFETY: `i` steps within `0..total_size`, so `ptr.add(i)` stays inside
+            // the mapped region; volatile write of a single byte to owned memory.
             unsafe { std::ptr::write_volatile(ptr.add(i), 0u8) };
         }
         debug!(pages = self.total_size / 4096, "prefaulted pages");
@@ -301,6 +305,8 @@ fn alloc_memory(size: usize, config: &HugePagesConfig) -> io::Result<(NonNull<u8
             | libc::MAP_HUGETLB
             | (21 << libc::MAP_HUGE_SHIFT);
 
+        // SAFETY: null addr lets the kernel choose; size/prot/huge_flags form a valid
+        // hugetlb mmap request; the result is checked vs MAP_FAILED below.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -327,6 +333,8 @@ fn alloc_memory(size: usize, config: &HugePagesConfig) -> io::Result<(NonNull<u8
         }
     }
 
+    // SAFETY: null addr lets the kernel choose; size/prot/flags form a valid anonymous
+    // mmap request; the result is checked vs MAP_FAILED by the caller.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -346,6 +354,8 @@ fn alloc_memory(size: usize, config: &HugePagesConfig) -> io::Result<(NonNull<u8
 
 #[cfg(not(target_os = "linux"))]
 fn alloc_memory(size: usize, _config: &HugePagesConfig) -> io::Result<(NonNull<u8>, bool)> {
+    // SAFETY: null addr lets the kernel choose; size/prot/flags form a valid anonymous
+    // mmap request; the result is checked vs MAP_FAILED below.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -367,6 +377,8 @@ fn alloc_memory(size: usize, _config: &HugePagesConfig) -> io::Result<(NonNull<u
 }
 
 fn free_memory(base: NonNull<u8>, size: usize) {
+    // SAFETY: `base`/`size` are exactly the region mmap returned for this pool,
+    // unmapped exactly once here.
     unsafe { libc::munmap(base.as_ptr() as *mut libc::c_void, size) };
 }
 

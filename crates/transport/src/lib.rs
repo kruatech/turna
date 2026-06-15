@@ -25,6 +25,8 @@ pub mod relay_route;
 
 #[cfg(all(target_os = "linux", feature = "af-xdp"))]
 pub mod af_xdp;
+#[cfg(all(target_os = "linux", feature = "af-xdp"))]
+pub mod neighbor;
 
 #[cfg(feature = "tls")]
 pub mod tcp_tls;

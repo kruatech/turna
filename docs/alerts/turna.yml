@@ -1,207 +1,229 @@
+# Prometheus alerting rules for turna (TURN/STUN server).
+#
+# Every expression references a metric actually exported on the /metrics
+# endpoint (crates/health). Thresholds are deliberate starting points — tune
+# `expr` constants and `for` windows to your traffic profile before relying on
+# them for paging. Counters use rate()/increase() over [5m]; gauges are read
+# directly.
+#
+# Failover counters (failover_claimed_total, …) are intentionally NOT here:
+# they are exposed via `turnactl failover status` (JSON), not Prometheus.
+#
+# Wire into Prometheus, e.g.:
+#   rule_files:
+#     - /etc/prometheus/rules/turna.yml
+
 groups:
-  - name: turna_turn
+  # ── Availability & correctness ──────────────────────────────────────────────
+  - name: turna.availability
     rules:
-      # ── Availability ───────────────────────────────────────────────────────
-
-      - alert: TurnaNodeDown
-        expr: up{job="turna"} == 0
-        for: 1m
+      - alert: TurnaProcessorPanics
+        expr: increase(turna_processor_panics_total[5m]) > 0
+        for: 0m
         labels:
           severity: critical
         annotations:
-          summary: "turna-node {{ $labels.instance }} is down"
-          description: >
-            The turna-node health endpoint has been unreachable for over 1 minute.
-            TURN allocations on this node are orphaned until failover completes.
+          summary: "turna packet-processing panic on {{ $labels.instance }}"
+          description: >-
+            The worker's panic guard (A3-O1) caught at least one panic in
+            process(). The packet was dropped and the worker survived, but a
+            non-zero rate means a packet is tripping a bug in PacketProcessor.
+            Capture a sample and investigate; this should normally be flat at 0.
 
-      - alert: TurnaNodeDraining
+      - alert: TurnaNodeStuckDraining
         expr: turna_draining == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna node draining for 30m+ on {{ $labels.instance }}"
+          description: >-
+            The node has reported draining=1 for over 30 minutes. Either a
+            graceful shutdown is wedged or draining was left on. New Allocate
+            requests are being rejected with 508.
+
+      - alert: TurnaNodeRestarted
+        expr: turna_uptime_seconds < 120
         for: 0m
         labels:
-          severity: warning
+          severity: info
         annotations:
-          summary: "turna-node {{ $labels.instance }} is draining"
-          description: >
-            Node is in draining state (SIGTERM received or set by operator).
-            Expect reduced capacity until the node exits or drain completes.
+          summary: "turna recently (re)started on {{ $labels.instance }}"
+          description: >-
+            Uptime is under 2 minutes. Expected during deploys; unexpected
+            otherwise (crash loop). Correlate with TurnaProcessorPanics and
+            container restart counts.
 
-      # ── Allocations ────────────────────────────────────────────────────────
-
-      - alert: TurnaAllocationsHigh
-        expr: turna_active_allocations > 5000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High allocation count on {{ $labels.instance }}"
-          description: >
-            Active TURN allocations ({{ $value }}) exceed 5000 for 5 minutes.
-            Review max_allocations config and consider adding nodes.
-
-      - alert: TurnaAllocationRateSpike
-        expr: rate(turna_total_allocations[5m]) > 100
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Allocation rate spike on {{ $labels.instance }}"
-          description: >
-            New allocations are being created at {{ $value | humanize }}/s.
-            May indicate a client bug or a SFU configuration issue.
-
-      # ── Auth ───────────────────────────────────────────────────────────────
-
-      - alert: TurnaAuthFailuresHigh
-        expr: rate(turna_auth_failures[5m]) > 10
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High TURN auth failure rate on {{ $labels.instance }}"
-          description: >
-            Auth failures at {{ $value | humanize }}/s over 5 minutes.
-            Could indicate credential rotation mismatch or a brute-force attempt.
-
-      # ── Bandwidth ──────────────────────────────────────────────────────────
-
-      - alert: TurnaHighBandwidth
-        expr: |
-          rate(turna_bytes_received[5m]) + rate(turna_bytes_sent[5m]) > 800e6
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High bandwidth on {{ $labels.instance }}"
-          description: >
-            Combined inbound+outbound traffic exceeds 800 MB/s for 5 minutes.
-            Verify NIC capacity and consider load-balancing to another node.
-
-      # ── Tarantool backend ──────────────────────────────────────────────────
-
-      - alert: TurnaTarantoolConnectionFailed
-        expr: tarantool_connection_state > 0
-        for: 30s
-        labels:
-          severity: critical
-        annotations:
-          summary: "Tarantool connection degraded on {{ $labels.instance }}"
-          description: >
-            tarantool_connection_state = {{ $value }}
-            (0 = connected, 1 = reconnecting, 2 = failed).
-            Allocations will not be persisted until the connection recovers.
-
-      - alert: TurnaTarantoolPoolBroken
-        expr: tarantool_pool_slots{state="broken"} > 0
-        for: 1m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Broken Tarantool pool slots on {{ $labels.instance }}"
-          description: >
-            {{ $value }} pool slot(s) are in broken state for over 1 minute.
-            Reconnect is attempted automatically; check Tarantool connectivity
-            if this persists.
-
-      - alert: TurnaTarantoolWriteErrors
-        expr: rate(tarantool_writer_errors_total[5m]) > 1
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Tarantool write errors on {{ $labels.instance }}"
-          description: >
-            Write-behind writer is failing at {{ $value | humanize }} errors/s.
-            Allocations may not be persisted correctly.
-
-      - alert: TurnaTarantoolWritesDropped
-        expr: rate(tarantool_writes_dropped_total[5m]) > 5
-        for: 1m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Tarantool write queue full on {{ $labels.instance }}"
-          description: >
-            Writer channel is dropping {{ $value | humanize }} events/s.
-            Tarantool may be too slow or the write rate is unusually high.
-
-      # ── Failover ───────────────────────────────────────────────────────────
-
-      - alert: TurnaFailoverActive
-        expr: rate(failover_claimed_total[10m]) > 0
-        for: 0m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Failover claims detected from {{ $labels.instance }}"
-          description: >
-            Node is claiming allocations from dead peers at
-            {{ $value | humanize }} claims/s. Verify cluster health.
-
-      - alert: TurnaFailoverErrors
-        expr: rate(failover_errors_total[5m]) > 1
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Failover backend errors on {{ $labels.instance }}"
-          description: >
-            Failover sweep is hitting backend errors at
-            {{ $value | humanize }}/s. Orphaned allocations may not be reclaimed.
-
-      - alert: TurnaFailoverSweepSlow
-        expr: failover_sweep_duration_us > 5_000_000
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Slow failover sweep on {{ $labels.instance }}"
-          description: >
-            Last failover sweep took {{ $value | humanizeDuration }} (> 5s).
-            Check Tarantool latency and the number of dead-node allocations.
-
-  # ── Node exporter baseline ────────────────────────────────────────────────
-
-  - name: node_baseline
+  # ── Security / abuse signals ────────────────────────────────────────────────
+  - name: turna.security
     rules:
-      - alert: NodeHighCPU
-        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High CPU on {{ $labels.instance }}"
-          description: "CPU usage is {{ $value | humanize }}% for 5+ minutes."
-
-      - alert: NodeLowDisk
-        expr: |
-          (node_filesystem_avail_bytes{mountpoint="/"} /
-           node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+      - alert: TurnaForbiddenPeerSpike
+        expr: rate(turna_peer_rejected_total[5m]) > 5
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Low disk on {{ $labels.instance }}"
-          description: >
-            Only {{ $value | humanize }}% disk space remaining on /.
-            Clean up logs or expand the volume.
+          summary: "turna rejecting many forbidden-peer attempts on {{ $labels.instance }}"
+          description: >-
+            Permission/ChannelBind/Send to special-use (RFC1918/loopback/etc.)
+            peers are being denied at a high rate. Sustained traffic here can
+            indicate SSRF/relay-abuse probing. Check source clients.
 
-      - alert: NodeCriticalDisk
-        expr: |
-          (node_filesystem_avail_bytes{mountpoint="/"} /
-           node_filesystem_size_bytes{mountpoint="/"}) * 100 < 5
-        for: 5m
+      - alert: TurnaAuthFailureSpike
+        expr: sum(rate(turna_auth_failures_by_reason_total[5m])) by (instance) > 10
+        for: 10m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: "Critical disk on {{ $labels.instance }}"
-          description: "Less than 5% disk remaining — node may stop writing logs and crash."
+          summary: "turna high auth-failure rate on {{ $labels.instance }}"
+          description: >-
+            Sustained authentication failures may indicate a credential
+            brute-force or a misconfigured client. Break down by the `reason`
+            label to distinguish bad credentials from stale nonces.
 
-      - alert: NodeHighMemory
-        expr: |
-          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+      - alert: TurnaMalformedPacketFlood
+        expr: rate(turna_malformed_packets_total[5m]) + rate(turna_parser_rejections_total[5m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna high malformed/parser-reject rate on {{ $labels.instance }}"
+          description: >-
+            A flood of unparseable STUN traffic. Could be a scanner, a broken
+            client, or a crafted-input probe. Sustained high volume is a DoS
+            signal.
+
+      - alert: TurnaQuotaExceededSpike
+        expr: rate(turna_quota_exceeded_total[5m]) > 5
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "turna bandwidth quota rejections elevated on {{ $labels.instance }}"
+          description: >-
+            Clients are repeatedly hitting bandwidth quotas. May be normal under
+            load, or a sign quotas are too tight for legitimate usage.
+
+  # ── Relay routing health (io_uring sharded ownership) ───────────────────────
+  - name: turna.relay_routing
+    rules:
+      - alert: TurnaRelayRouteMisses
+        expr: rate(turna_relay_route_miss_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna relay sends with no owning route on {{ $labels.instance }}"
+          description: >-
+            Relay sends are landing on a port not owned by any worker. A low
+            rate during migrations/resharding is expected; a sustained rate
+            points to a routing/ownership bug or lost RegisterRelay.
+
+      - alert: TurnaRelayStaleForwards
+        expr: rate(turna_relay_route_send_stale_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna stale relay forwards on {{ $labels.instance }}"
+          description: >-
+            Forwarded sends dropped because the owner's (allocation, generation)
+            no longer matched — the port was reused after a migration. Expected
+            briefly around migrations; sustained means epochs are not advancing
+            correctly.
+
+      - alert: TurnaRelayForwardFailures
+        expr: rate(turna_relay_route_send_forward_failed_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna relay cross-worker forwards failing on {{ $labels.instance }}"
+          description: >-
+            Cross-worker relay forwards are failing to send. Investigate the
+            inter-worker channel and target worker health.
+
+  # ── Transport / I/O saturation ──────────────────────────────────────────────
+  - name: turna.transport
+    rules:
+      - alert: TurnaSendQueueDrops
+        expr: rate(turna_send_queue_dropped_total[5m]) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High memory on {{ $labels.instance }}"
-          description: "Memory usage is {{ $value | humanize }}%. Risk of OOM kill."
+          summary: "turna dropping outbound packets (send queue full) on {{ $labels.instance }}"
+          description: >-
+            The send path is shedding packets because the queue is saturated.
+            The node cannot keep up with outbound load — check CPU, NIC, and
+            per-worker balance.
+
+      - alert: TurnaUringSubmissionQueueFull
+        expr: rate(turna_uring_sq_push_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna io_uring submission queue full on {{ $labels.instance }}"
+          description: >-
+            SQE pushes are failing because the submission queue is full. The
+            ring is saturated; consider a larger ring or more workers.
+
+      - alert: TurnaUringBuffersExhausted
+        expr: turna_uring_buffers_available == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna io_uring receive buffers exhausted on {{ $labels.instance }}"
+          description: >-
+            No receive buffers are available; inbound packets are being dropped
+            at the ring. This is a hard backpressure / capacity event.
+
+      - alert: TurnaQuicSendErrors
+        expr: rate(turna_quic_send_errors_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna QUIC send errors on {{ $labels.instance }}"
+          description: >-
+            The QUIC transport is reporting datagram send errors. Check the QUIC
+            listener and underlying socket health.
+
+      - alert: TurnaDtlsOverCapacityRejections
+        expr: rate(turna_dtls_rejected_over_cap_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna rejecting DTLS sessions over capacity on {{ $labels.instance }}"
+          description: >-
+            New DTLS sessions are being refused because the session cap is hit.
+            Either legitimate demand exceeds capacity or sessions are not being
+            reaped.
+
+  # ── Media quality (RTP observability) ───────────────────────────────────────
+  - name: turna.media_quality
+    rules:
+      - alert: TurnaHighRtpLoss
+        expr: turna_rtp_avg_loss_percent > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna elevated RTP packet loss on {{ $labels.instance }}"
+          description: >-
+            Average relayed RTP loss is above 5% for 10m. Likely a network/path
+            problem affecting media quality for relayed sessions.
+
+      - alert: TurnaHighRtpJitter
+        expr: turna_rtp_avg_jitter_ms > 50
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "turna elevated RTP jitter on {{ $labels.instance }}"
+          description: >-
+            Average relayed RTP jitter is above 50ms for 10m. Watch alongside
+            loss; sustained high jitter degrades real-time media.

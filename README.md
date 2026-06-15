@@ -26,7 +26,7 @@ High-performance TURN/STUN server written in Rust (RFC 5766, RFC 8656, RFC 5389)
 
 ```bash
 cargo build --release
-./target/release/turna-node --config deploy/turn.toml
+./target/release/turna-node deploy/turn.toml
 ```
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a complete walkthrough,

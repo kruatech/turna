@@ -86,8 +86,11 @@
 ### INV-RELAY-02: Replay transaction ID отклоняется
 > Nonce с истёкшим или неверным значением возвращает 438 Stale Nonce.
 
-**Реализация:** `NonceManager::validate()` с rotation interval 10 мин и grace period 30 сек.  
-**Нарушение:** принятие старого nonce.
+**Реализация:** `NonceManager::validate(client, nonce)` — nonce stateless и
+привязан к адресу клиента (IP:port): `HMAC(server_key, ts || client)`,
+`server_key` эфемерный на процесс. Валиден ≤ 630 с (600 с lifetime + 30 с
+grace); неверный MAC, чужой клиент или истёкший nonce → 438 Stale Nonce.
+**Нарушение:** принятие старого nonce или nonce, выданного другому клиенту.
 
 ### INV-RELAY-03: Channel number валиден
 > ChannelBind принимается только для channel 0x4000–0x7FFE.

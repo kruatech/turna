@@ -18,4 +18,16 @@ sha1.workspace        = true
 md5.workspace         = true
 turna-proto-stun.workspace = true
 base64 = "0.22"
+# F-5 #2 hermetic harness: PR_SET_PDEATHSIG so a spawned node never orphans.
+libc = "0.2"
 turna-common = { path = "../../crates/common" }
+# DTL-5: optional DTLS client for the TURN-over-DTLS e2e test (feature `dtls`).
+# Pinned to the same versions the transport crate uses for the server side.
+webrtc-dtls = { version = "0.10", optional = true }
+webrtc-util = { version = "0.9", optional = true }
+
+[features]
+# Enables `stun_binding_over_dtls` (also #[ignore]d). Needs a server built and
+# configured with the `dtls` feature. Run explicitly:
+#   cargo test -p turna-integration-tests --features dtls -- --ignored dtls
+dtls = ["dep:webrtc-dtls", "dep:webrtc-util"]

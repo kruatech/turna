@@ -18,7 +18,7 @@ use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -32,7 +32,7 @@ use turna_proto_stun::method::Method;
 use turna_proto_turn as turn;
 use turna_qos::{TieredLimits, TieredRateLimiter};
 use turna_rtp_analyzer::RtpAnalyzer;
-use turna_session::AllocationStore;
+use turna_session::{AllocationStore, SessionError};
 use turna_transport::migration::MigrationManager;
 
 use crate::peer_filter::{is_forbidden_peer, normalize_addr, normalize_ip};
@@ -53,6 +53,23 @@ pub enum Action {
     /// literally just a pointer + length, no copy.
     Forward {
         data: Bytes,
+        target: SocketAddr,
+        relay_port: u16,
+    },
+
+    /// Forward a payload via a relay socket by `(offset, len)` into the original
+    /// recv buffer, instead of an owned `Bytes` (P1).
+    ///
+    /// Emitted only on the borrowed-slice ingress paths (io_uring / AF_XDP) via
+    /// `process_slice`, where the payload still lives in the kernel-registered
+    /// recv buffer. The worker forwards straight from that buffer
+    /// (`ForwardAction::ZeroCopyViaRelay`), skipping the whole-packet
+    /// `Bytes::copy_from_slice`. The tokio path keeps using `Forward { data }`,
+    /// which is already zero-copy via `Bytes::slice`. `offset`/`len` are
+    /// relative to the slice handed to `process_slice` (== the buffer slot).
+    ForwardZeroCopy {
+        offset: usize,
+        len: usize,
         target: SocketAddr,
         relay_port: u16,
     },
@@ -84,31 +101,150 @@ pub enum Action {
     None,
 }
 
+// ── Encode-result handling (M2) ──────────────────────────────────────────────
+
+/// Resolve a STUN encode result, or drop the outbound packet on the
+/// (practically unreachable) buffer-overflow path instead of panicking.
+///
+/// Server responses are encoded into fixed stack buffers that are sized for
+/// the message, so `Err` should never occur for them; the one attacker-
+/// influenced caller is the Data-Indication fallback in `process_relay_recv`,
+/// where an oversized peer payload now drops the indication rather than
+/// panicking the worker. `$drop` is the value returned from the enclosing
+/// handler when encoding overflows.
+macro_rules! encode_or_drop {
+    ($expr:expr, $drop:expr) => {
+        match $expr {
+            Ok(written) => written,
+            Err(err) => {
+                warn!(error = %err, "STUN message did not fit its buffer; dropping response");
+                return $drop;
+            }
+        }
+    };
+}
+
+/// Sign `resp` with the same MESSAGE-INTEGRITY variant the request used: if the
+/// request carried MESSAGE-INTEGRITY-SHA256 (RFC 8489), respond with HMAC-SHA-256,
+/// otherwise the RFC 5389 HMAC-SHA-1. `key` is the long-term key derived during
+/// auth — already the matching digest (see `turna_auth::AuthMode::validate`).
+fn encode_with_integrity_auto(
+    resp: &StunMessage,
+    buf: &mut [u8],
+    key: &[u8],
+    req: &StunMessage,
+) -> Result<usize, turna_proto_stun::StunError> {
+    if req.get_message_integrity_sha256().is_some() {
+        resp.encode_with_integrity_sha256(buf, key)
+    } else {
+        resp.encode_with_integrity(buf, key)
+    }
+}
+
+// ── Latency-histogram sampling (P2) ──────────────────────────────────────────
+//
+// Two `Instant::now()` reads plus an atomic histogram update on every packet
+// cost measurable cycles at hundreds of thousands of pps. Sample 1-in-N
+// instead. Default N = 1 (sample everything — identical to the previous
+// behaviour); operators under load set `TURNA_LATENCY_SAMPLE_N` to trade
+// histogram fidelity for fewer clock reads on the hot path.
+fn latency_sample_n() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TURNA_LATENCY_SAMPLE_N")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1)
+    })
+}
+
+#[inline]
+fn should_sample() -> bool {
+    let n = latency_sample_n();
+    if n <= 1 {
+        return true;
+    }
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    CTR.fetch_add(1, Ordering::Relaxed).is_multiple_of(n)
+}
+
+/// P1 kill switch. The zero-copy ChannelData forward path (offset/len straight
+/// from the kernel-registered recv buffer) is on by default; set
+/// `TURNA_URING_ZEROCOPY_FORWARD` to `0`/`false`/`no` to fall back to the
+/// previous copy-then-`process()` path without a rebuild — e.g. if a buffer
+/// lifecycle regression shows up under a soak/bench run.
+fn zerocopy_forward_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("TURNA_URING_ZEROCOPY_FORWARD")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false") | Some("no")
+        )
+    })
+}
+
+/// A3-F4: set the IPv4 "Don't Fragment" bit on a relay socket so the kernel
+/// stamps DF on every datagram relayed for this allocation (and refuses to
+/// fragment — oversized sends fail with EMSGSIZE, and the path MTU drops surface
+/// as ICMP "fragmentation needed", which the Data-error path can relay back).
+///
+/// Applied per allocation when the client set DONT-FRAGMENT on Allocate
+/// (RFC 8656 §16.4). The relay socket binds IPv4 (`0.0.0.0`), so only the IPv4
+/// knob is needed today; an IPv6 relay would also want `IPV6_MTU_DISCOVER`.
+#[cfg(target_os = "linux")]
+fn set_dont_fragment(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // IP_MTU_DISCOVER = IP_PMTUDISC_DO → kernel sets DF and never fragments.
+    let val: libc::c_int = libc::IP_PMTUDISC_DO;
+    // SAFETY: `fd` is the caller's open socket; `val` is a c_int living for the call,
+    // optlen = size_of::<c_int>().
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-Linux builds (e.g. macOS dev hosts) are a no-op: production runs on
+/// Linux, and the dev build only needs the control-plane logic to compile.
+#[cfg(not(target_os = "linux"))]
+fn set_dont_fragment(_fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    Ok(())
+}
+
 // ── Nonce manager ────────────────────────────────────────────────────────────
 
+/// Stateless, per-client nonce issuer (F-7). The nonce is an HMAC over the
+/// client address and an issue timestamp, keyed by a random per-process key, so
+/// it carries no server-side state and is bound to the client it was issued to:
+/// a nonce handed to one peer cannot be replayed by another. The key is
+/// ephemeral — after a restart, outstanding nonces simply trigger a fresh 401
+/// challenge.
 struct NonceManager {
-    current: RwLock<String>,
-    previous: RwLock<Option<String>>,
+    server_key: [u8; 32],
     start: Instant,
-    /// Elapsed-ms (from `start`) at the last rotation. Atomic so the common
-    /// "not due yet" path takes no lock at all.
-    last_rotation_ms: AtomicU64,
-    /// Elapsed-ms when `previous` was last set — bounds the grace window.
-    rotation_time_ms: AtomicU64,
-    rotation_interval: Duration,
-    grace_period: Duration,
+    /// How long an issued nonce stays valid, including a grace window for the
+    /// client's in-flight retry.
+    max_age: Duration,
 }
 
 impl NonceManager {
     fn new() -> Self {
         Self {
-            current: RwLock::new(turna_crypto::generate_nonce()),
-            previous: RwLock::new(None),
+            server_key: turna_crypto::random_key_32(),
             start: Instant::now(),
-            last_rotation_ms: AtomicU64::new(0),
-            rotation_time_ms: AtomicU64::new(0),
-            rotation_interval: Duration::from_secs(600),
-            grace_period: Duration::from_secs(30),
+            // 600s lifetime + 30s grace, matching the previous rotation policy.
+            max_age: Duration::from_secs(630),
         }
     }
 
@@ -117,47 +253,20 @@ impl NonceManager {
         self.start.elapsed().as_millis() as u64
     }
 
-    fn current(&self) -> String {
-        self.maybe_rotate();
-        self.current.read().clone()
+    /// Issue a fresh nonce bound to `client`.
+    fn issue(&self, client: SocketAddr) -> String {
+        turna_crypto::issue_client_nonce(&self.server_key, &client.to_string(), self.now_ms())
     }
 
-    fn validate(&self, nonce: &str) -> NonceStatus {
-        self.maybe_rotate();
-        if nonce == self.current.read().as_str() {
-            return NonceStatus::Valid;
-        }
-        if let Some(prev) = self.previous.read().as_ref() {
-            if nonce == prev.as_str() {
-                let rot = self.rotation_time_ms.load(Ordering::Acquire);
-                if self.now_ms().saturating_sub(rot) < self.grace_period.as_millis() as u64 {
-                    return NonceStatus::Valid;
-                }
+    /// Validate `nonce` for `client`: the MAC must match (same client + key) and
+    /// the nonce must not be older than `max_age`.
+    fn validate(&self, client: SocketAddr, nonce: &str) -> NonceStatus {
+        let max_age_ms = self.max_age.as_millis() as u64;
+        match turna_crypto::verify_client_nonce(&self.server_key, &client.to_string(), nonce) {
+            Some(issued_ms) if self.now_ms().saturating_sub(issued_ms) <= max_age_ms => {
+                NonceStatus::Valid
             }
-        }
-        NonceStatus::Stale
-    }
-
-    fn maybe_rotate(&self) {
-        let now = self.now_ms();
-        let last = self.last_rotation_ms.load(Ordering::Acquire);
-        // Common path: not due — no lock, no write.
-        if now.saturating_sub(last) < self.rotation_interval.as_millis() as u64 {
-            return;
-        }
-        // Exactly one caller wins the CAS and performs the rotation; the rest
-        // see the updated timestamp and skip. Exclusive locks are taken only
-        // here (≈ once per rotation_interval), not per request.
-        if self
-            .last_rotation_ms
-            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let old = self.current.read().clone();
-            *self.previous.write() = Some(old);
-            *self.current.write() = turna_crypto::generate_nonce();
-            self.rotation_time_ms.store(now, Ordering::Release);
-            debug!("nonce rotated");
+            _ => NonceStatus::Stale,
         }
     }
 }
@@ -368,35 +477,96 @@ impl PacketProcessor {
             return vec![Action::None];
         }
 
+        if is_channel {
+            // P5: ChannelData on an established session is legitimately
+            // high-rate media (the ~95% path). The per-prefix tier of the
+            // ingress limiter exists mainly to catch pre-auth STUN floods;
+            // running both per-IP and per-prefix sharded-lock checks on every
+            // media packet is a redundant second lock. Unknown-source
+            // ChannelData is dropped at the allocation lookup in
+            // `process_channel_data`, and established sessions are bounded by
+            // the per-allocation bandwidth quota — so a cheaper per-IP-only
+            // gate (single shard lock) is sufficient here.
+            if !self.rate_limiter.check_ingress_ip(src.ip()) {
+                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                return vec![Action::None];
+            }
+            // P2: only read the clock / update the histogram on sampled packets.
+            if should_sample() {
+                let t0 = std::time::Instant::now();
+                let actions = self.process_channel_data(raw, src);
+                self.metrics
+                    .histograms
+                    .observe("turna_relay_forward_duration_seconds", t0.elapsed());
+                return actions;
+            }
+            return self.process_channel_data(raw, src);
+        }
+
+        // STUN is pre-auth: keep the full per-IP + per-prefix ingress gate.
         if !self.rate_limiter.check_ingress(src.ip()) {
             self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
-
-        if is_channel {
+        if should_sample() {
             let t0 = std::time::Instant::now();
-            let actions = self.process_channel_data(raw, src);
+            let actions = self.process_stun(raw, src);
             self.metrics
                 .histograms
-                .observe("turna_relay_forward_duration_seconds", t0.elapsed());
+                .observe("turna_stun_request_duration_seconds", t0.elapsed());
             return actions;
         }
-        let t0 = std::time::Instant::now();
-        let actions = self.process_stun(raw, src);
-        self.metrics
-            .histograms
-            .observe("turna_stun_request_duration_seconds", t0.elapsed());
-        actions
+        self.process_stun(raw, src)
     }
 
-    /// Compatibility shim for the io_uring handler which provides `&[u8]`.
+    /// Entry point for the borrowed-slice ingress paths (io_uring / AF_XDP),
+    /// where `raw` points into a kernel-registered recv buffer.
     ///
-    /// Copies once into `Bytes` then delegates to `process()`.
-    /// The io_uring path achieves true zero-copy at a lower level
-    /// (kernel-registered buffers + `ZeroCopyViaRelay`), so this
-    /// extra copy does not appear on the hot path there.
+    /// ChannelData forwards (the hot path) are resolved directly on the slice
+    /// and returned as `Action::ForwardZeroCopy { offset, len, .. }` — the
+    /// payload is never copied into an owned `Bytes`; the worker sends straight
+    /// from the recv buffer. Everything else (STUN, Send Indication, malformed,
+    /// or the kill switch disabled) takes one copy and goes through the full
+    /// `process()` pipeline, which is rare relative to media.
     #[inline]
     pub fn process_slice(&self, raw: &[u8], src: SocketAddr) -> Vec<Action> {
+        if zerocopy_forward_enabled() && message::is_channel_data(raw) {
+            self.metrics
+                .packets_received
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .bytes_received
+                .fetch_add(raw.len() as u64, Ordering::Relaxed);
+
+            // ChannelData uses the per-IP-only ingress gate (see P5 in process()).
+            if !self.rate_limiter.check_ingress_ip(src.ip()) {
+                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                return vec![Action::None];
+            }
+
+            let decision = if should_sample() {
+                let t0 = std::time::Instant::now();
+                let d = self.channel_data_decision(raw, src);
+                self.metrics
+                    .histograms
+                    .observe("turna_relay_forward_duration_seconds", t0.elapsed());
+                d
+            } else {
+                self.channel_data_decision(raw, src)
+            };
+
+            return match decision {
+                Some((offset, len, target, relay_port)) => vec![Action::ForwardZeroCopy {
+                    offset,
+                    len,
+                    target,
+                    relay_port,
+                }],
+                None => vec![Action::None],
+            };
+        }
+
+        // Non-hot path (or kill switch off): one copy, then the full pipeline.
         self.process(Bytes::copy_from_slice(raw), src)
     }
 
@@ -430,7 +600,16 @@ impl PacketProcessor {
             return vec![Action::None];
         }
 
+        // P3: pull everything we need out of the allocation, then release the
+        // DashMap shard `Ref` BEFORE the (relatively expensive) RTP analysis and
+        // metric updates. Holding it across `analyze()` serializes refresh /
+        // re_key / add_permission on the same shard for no reason — the
+        // ChannelData hot path already drops early; bring this path in line.
         alloc.add_bytes(data.len() as u64);
+        let ca = alloc.client_addr;
+        let channel = alloc.get_peer_channel(&peer_addr);
+        drop(alloc);
+
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -438,16 +617,12 @@ impl PacketProcessor {
         self.rtp_analyzer.analyze(data, peer_addr);
 
         // Prefer ChannelData if a channel is bound.
-        if let Some(channel) = alloc.get_peer_channel(&peer_addr) {
-            let ch = channel;
-            let ca = alloc.client_addr;
-            drop(alloc);
-
+        if let Some(ch) = channel {
             // Build ChannelData frame: 4-byte header + payload (one copy).
             let frame_len = (4 + data.len() + 3) & !3; // include 4-byte padding
             let mut buf = BytesMut::with_capacity(frame_len);
             buf.resize(frame_len, 0);
-            let written = message::encode_channel_data(&mut buf, ch, data);
+            let written = encode_or_drop!(message::encode_channel_data(&mut buf, ch, data), vec![Action::None]);
             buf.truncate(written);
 
             return vec![Action::Send {
@@ -457,16 +632,13 @@ impl PacketProcessor {
         }
 
         // Fallback: Data Indication.
-        let ca = alloc.client_addr;
-        drop(alloc);
-
         let mut ind =
             StunMessage::with_transaction_id(Method::Data, MessageClass::Indication, [0; 12]);
         ind.add(Attribute::XorPeerAddress(peer_addr));
         ind.add(Attribute::Data(data.to_vec()));
 
         let mut buf = [0u8; 4096];
-        let len = ind.encode(&mut buf);
+        let len = encode_or_drop!(ind.encode(&mut buf), vec![Action::None]);
         vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: ca,
@@ -475,27 +647,29 @@ impl PacketProcessor {
 
     // ── ChannelData (hot path) ────────────────────────────────────────────────
 
-    fn process_channel_data(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
-        let Ok((channel, data_slice)) = message::decode_channel_data(&raw) else {
-            return vec![Action::None];
+    /// Core ChannelData forward decision over a borrowed slice. Returns the
+    /// payload's `(offset, len)` within `raw` plus the peer target and relay
+    /// port — or `None` to drop. Shared by the owned path (`process_channel_data`,
+    /// tokio) and the borrowed paths (`process_slice`, io_uring / AF_XDP) so the
+    /// two can't drift. All accounting — bandwidth quota, byte/packet counters,
+    /// RTP analysis — happens here exactly once.
+    fn channel_data_decision(
+        &self,
+        raw: &[u8],
+        src: SocketAddr,
+    ) -> Option<(usize, usize, SocketAddr, u16)> {
+        let Ok((channel, data_slice)) = message::decode_channel_data(raw) else {
+            return None;
         };
 
-        let alloc = match self.store.get(&src) {
-            Some(a) => a,
-            None => return vec![Action::None],
-        };
-
-        let Some(peer_addr) = alloc.get_channel_peer(channel).copied() else {
-            return vec![Action::None];
-        };
+        let alloc = self.store.get(&src)?;
+        let peer_addr = alloc.get_channel_peer(channel).copied()?;
 
         let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
-        if bw_limit > 0 {
-            if alloc.check_bandwidth(bw_limit).is_err() {
-                debug!(%src, "bandwidth quota exceeded, dropping packet");
-                self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
-                return vec![Action::None];
-            }
+        if bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err() {
+            debug!(%src, "bandwidth quota exceeded, dropping packet");
+            self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
 
         alloc.add_bytes(data_slice.len() as u64);
@@ -511,19 +685,22 @@ impl PacketProcessor {
 
         self.rtp_analyzer.analyze(data_slice, src);
 
-        // Zero-copy slice: pointer arithmetic + AtomicAdd, no memcpy.
-        //
-        // data_slice is &[u8] pointing into `raw` (guaranteed by decode_channel_data).
-        // We compute the byte offset and use Bytes::slice() which only adjusts
-        // the start pointer and length — no allocation, no copy.
+        // data_slice points into `raw` (guaranteed by decode_channel_data), so
+        // this offset is valid against the very buffer the caller still holds.
         let offset = data_slice.as_ptr() as usize - raw.as_ptr() as usize;
-        let data = raw.slice(offset..offset + data_slice.len());
+        Some((offset, data_slice.len(), peer_addr, relay_port))
+    }
 
-        vec![Action::Forward {
-            data,
-            target: peer_addr,
-            relay_port,
-        }]
+    fn process_channel_data(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
+        match self.channel_data_decision(&raw, src) {
+            // Zero-copy slice of the owned recv buffer: pointer + length, no copy.
+            Some((offset, len, target, relay_port)) => vec![Action::Forward {
+                data: raw.slice(offset..offset + len),
+                target,
+                relay_port,
+            }],
+            None => vec![Action::None],
+        }
     }
 
     // ── STUN dispatch ─────────────────────────────────────────────────────────
@@ -539,11 +716,16 @@ impl PacketProcessor {
         msg: &StunMessage,
         raw: &[u8],
     ) -> Result<turna_auth::AuthResolution, turna_auth::AuthError> {
-        let started = std::time::Instant::now();
-        let r = self.auth.validate(msg, raw);
-        self.metrics
-            .histograms
-            .observe("turna_auth_duration_seconds", started.elapsed());
+        let r = if should_sample() {
+            let started = std::time::Instant::now();
+            let r = self.auth.validate(msg, raw);
+            self.metrics
+                .histograms
+                .observe("turna_auth_duration_seconds", started.elapsed());
+            r
+        } else {
+            self.auth.validate(msg, raw)
+        };
         if let Err(e) = &r {
             let counter = match e {
                 turna_auth::AuthError::MissingCredentials => {
@@ -554,6 +736,7 @@ impl PacketProcessor {
                 }
                 turna_auth::AuthError::Expired => &self.metrics.auth_fail_expired,
                 turna_auth::AuthError::IntegrityFailed => &self.metrics.auth_fail_integrity,
+                turna_auth::AuthError::BadRequest => &self.metrics.auth_fail_bad_request,
             };
             counter.fetch_add(1, Ordering::Relaxed);
         }
@@ -657,7 +840,7 @@ impl PacketProcessor {
         let resp =
             turn::build_redirect_response(msg.method, msg.transaction_id, alternate_addr, src);
         let mut buf = [0u8; 512];
-        let len = resp.encode(&mut buf);
+        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         self.metrics.cluster_redirects.fetch_add(1, Ordering::Relaxed);
@@ -678,14 +861,13 @@ impl PacketProcessor {
                 turna_proto_stun::attribute::Attribute::MessageIntegrity(_)
             )
         });
-        if has_integrity {
-            if self.auth_validate(msg, raw).is_err() {
+        if has_integrity
+            && self.auth_validate(msg, raw).is_err() {
                 self.metrics
                     .auth_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return self.encode_auth_challenge(msg, src);
             }
-        }
 
         let mut resp = StunMessage::with_transaction_id(
             Method::Binding,
@@ -696,7 +878,7 @@ impl PacketProcessor {
         resp.add(Attribute::Software("turna 0.1".into()));
 
         let mut buf = [0u8; 256];
-        let len = resp.encode(&mut buf);
+        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
@@ -709,12 +891,11 @@ impl PacketProcessor {
         if self.metrics.is_draining() {
             return self.encode_error(msg, src, 508, "Server Draining");
         }
-        if self.store.get(&src).is_some() {
-            return self.encode_error(msg, src, 437, "Allocation Mismatch");
-        }
-        if msg.get_requested_transport() != Some(turn::TRANSPORT_UDP) {
-            return self.encode_error(msg, src, 442, "Unsupported Transport Protocol");
-        }
+
+        // A3-L1: authenticate first (RFC 5766 §6.2). Running the 437/442 checks
+        // before auth let an unauthenticated client probe whether an allocation
+        // already exists on this 5-tuple (437 vs 401 disclosure). Challenge and
+        // validate first, then do the allocation-mismatch / transport checks.
         if msg.get_username().is_none() {
             return self.encode_auth_challenge(msg, src);
         }
@@ -727,6 +908,9 @@ impl PacketProcessor {
             Err(e) => {
                 warn!(%src, %e, "auth failed");
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, turna_auth::AuthError::BadRequest) {
+                    return self.encode_error(msg, src, 400, "Bad Request");
+                }
                 return self.encode_auth_challenge(msg, src);
             }
         };
@@ -736,15 +920,55 @@ impl PacketProcessor {
         let key = resolution.key;
         let tenant_id = resolution.tenant_id;
 
+        // Post-auth checks (A3-L1): only an authenticated client reaches here.
+        if self.store.get(&src).is_some() {
+            return self.encode_error(msg, src, 437, "Allocation Mismatch");
+        }
+        if msg.get_requested_transport() != Some(turn::TRANSPORT_UDP) {
+            return self.encode_error(msg, src, 442, "Unsupported Transport Protocol");
+        }
+
         // Allocate the relay port from the *resolved tenant's* isolated pool.
-        let (relay_port, relay_sock) = match self
-            .store
-            .pool(tenant_id.as_deref())
-            .allocate_and_bind()
-        {
-            Some(x) => x,
-            None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
+        // RFC 8656 §7.2: EVEN-PORT and RESERVATION-TOKEN are mutually exclusive.
+        let even_port = msg.get_even_port();
+        let reservation_token = msg.get_reservation_token();
+        if even_port.is_some() && reservation_token.is_some() {
+            return self.encode_error(msg, src, 400, "Bad Request");
+        }
+        let pool = self.store.pool(tenant_id.as_deref());
+        let (relay_port, relay_sock, issued_token) = if let Some(token) = reservation_token {
+            // Follow-up Allocate: bind the port reserved by an earlier EVEN-PORT
+            // (R=1) request. An unknown/expired token yields 508.
+            match pool.claim_and_bind(&token) {
+                Some((p, s)) => (p, s, None),
+                None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
+            }
+        } else if let Some(reserve_next) = even_port {
+            match pool.allocate_even_and_bind(reserve_next) {
+                Some(x) => x,
+                None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
+            }
+        } else {
+            match pool.allocate_and_bind() {
+                Some((p, s)) => (p, s, None),
+                None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
+            }
         };
+
+        // A3-F4: honour an allocation-scoped DONT-FRAGMENT (RFC 8656 §16.4) by
+        // setting the real IP DF bit on this allocation's relay socket. io_uring
+        // sends go out on this same fd, so the option applies to all relayed
+        // traffic. Set before the socket is handed to RegisterRelay.
+        let dont_fragment = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, turna_proto_stun::attribute::Attribute::DontFragment));
+        if dont_fragment {
+            use std::os::fd::AsRawFd;
+            if let Err(e) = set_dont_fragment(relay_sock.as_raw_fd()) {
+                warn!(%src, %e, "DONT-FRAGMENT: failed to set DF on relay socket");
+            }
+        }
 
         let relay_addr = SocketAddr::new(self.external_ip, relay_port);
         let lifetime = msg
@@ -753,14 +977,18 @@ impl PacketProcessor {
             .min(turn::MAX_LIFETIME);
         let username = msg.get_username().unwrap_or("").to_string();
 
-        if let Err(_) = self.store.create_for_tenant(
-            src,
-            relay_addr,
-            username,
-            key.clone(),
-            lifetime,
-            tenant_id.clone(),
-        ) {
+        if self
+            .store
+            .create_for_tenant(
+                src,
+                relay_addr,
+                username,
+                key.clone(),
+                lifetime,
+                tenant_id.clone(),
+            )
+            .is_err()
+        {
             self.store.pool_for_port(relay_port).release(relay_port);
             // relay_sock dropped here → socket closed, port freed.
             return self.encode_error(msg, src, 508, "Insufficient Capacity");
@@ -778,6 +1006,14 @@ impl PacketProcessor {
             self.metrics.record_tenant_allocation(t);
         }
 
+        // A3-Q2: a single lookup of the freshly-created allocation, reused for
+        // the MOBILITY-TICKET below and the relay-route stamp further down (this
+        // path previously did two get(&src) calls = two shard-lock acquisitions).
+        let (allocation_id, migration_epoch) = match self.store.get(&src) {
+            Some(a) => (a.allocation_id.clone(), a.migration_epoch),
+            None => (String::new(), 0),
+        };
+
         let mut resp = turn::build_allocate_response(msg.transaction_id, relay_addr, src, lifetime);
         // RFC 8016: if migration is enabled and the client opted in by sending a
         // MOBILITY-TICKET (typically zero-length) in the request, issue one bound
@@ -785,28 +1021,24 @@ impl PacketProcessor {
         // MESSAGE-INTEGRITY covers the ticket.
         if let Some(mgr) = &self.migration {
             if msg.has_mobility_ticket() {
-                if let Some(a) = self.store.get(&src) {
-                    let token = mgr.issue_token(&a.allocation_id, a.migration_epoch);
-                    drop(a);
-                    resp.add(Attribute::MobilityTicket(token.token));
-                }
+                let token = mgr.issue_token(&allocation_id, migration_epoch);
+                resp.add(Attribute::MobilityTicket(token.token));
             }
         }
+        // RFC 8656 §7.3: echo a RESERVATION-TOKEN when EVEN-PORT (R=1) reserved
+        // the next-higher port. Added before encode so MESSAGE-INTEGRITY covers it.
+        if let Some(tok) = issued_token {
+            resp.add(Attribute::ReservationToken(tok));
+        }
         let mut buf = [0u8; 1024];
-        let len = resp.encode_with_integrity(&mut buf, &key);
+        let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
         info!(%src, %relay_addr, lifetime, "allocation created");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
 
-        // RFC 8016: stamp the relay route with the owning allocation id so the
-        // io_uring worker pool can forward relay sends to this owner after a
-        // client migration reshards onto another worker.
-        let allocation_id = self
-            .store
-            .get(&src)
-            .map(|a| a.allocation_id.clone())
-            .unwrap_or_default();
-
+        // RFC 8016: stamp the relay route with the owning allocation id (looked
+        // up once above) so the io_uring worker pool can forward relay sends to
+        // this owner after a client migration reshards onto another worker.
         vec![
             Action::RegisterRelay {
                 port: relay_port,
@@ -830,8 +1062,11 @@ impl PacketProcessor {
         }
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
-            Err(_) => {
+            Err(e) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, turna_auth::AuthError::BadRequest) {
+                    return self.encode_error(msg, src, 400, "Bad Request");
+                }
                 return self.encode_auth_challenge(msg, src);
             }
         };
@@ -863,7 +1098,7 @@ impl PacketProcessor {
                 let mut resp = turn::build_success_response(Method::Refresh, msg.transaction_id);
                 resp.add(Attribute::Lifetime(lifetime));
                 let mut buf = [0u8; 1024];
-                let len = resp.encode_with_integrity(&mut buf, &key);
+                let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
                 self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                 let mut actions = vec![Action::Send {
@@ -946,7 +1181,7 @@ impl PacketProcessor {
         resp.add(Attribute::MobilityTicket(new_token.token));
 
         let mut buf = [0u8; 1024];
-        let len = resp.encode_with_integrity(&mut buf, key);
+        let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, key, msg), Some(vec![Action::None]));
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         info!(%src, %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
@@ -971,39 +1206,61 @@ impl PacketProcessor {
         }
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
-            Err(_) => {
+            Err(e) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, turna_auth::AuthError::BadRequest) {
+                    return self.encode_error(msg, src, 400, "Bad Request");
+                }
                 return self.encode_auth_challenge(msg, src);
             }
         };
 
-        let Some(peer_addr) = msg.get_xor_peer_address() else {
+        // RFC 5766 §9.2 / RFC 8656 §9.2: a CreatePermission may carry multiple
+        // XOR-PEER-ADDRESS attributes (clients batch all ICE candidates in one
+        // request). Collect them all — handling only the first silently drops
+        // permissions for the rest.
+        let peers: Vec<std::net::IpAddr> = msg
+            .attributes
+            .iter()
+            .filter_map(|a| match a {
+                turna_proto_stun::attribute::Attribute::XorPeerAddress(p) => {
+                    Some(normalize_ip(p.ip()))
+                }
+                _ => None,
+            })
+            .collect();
+        if peers.is_empty() {
             return self.encode_error(msg, src, 400, "Bad Request");
-        };
-
-        // Normalize ::ffff: → v4 and reject special-use peers (C2/C3).
-        let peer_ip = normalize_ip(peer_addr.ip());
-        if is_forbidden_peer(peer_ip) {
-            warn!(%src, %peer_ip, "CreatePermission to forbidden peer denied");
-            self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
-            return self.encode_error(msg, src, 403, "Forbidden");
         }
 
-        match self.store.add_permission(&src, peer_ip) {
-            Ok(_) => {
-                let resp =
-                    turn::build_success_response(Method::CreatePermission, msg.transaction_id);
-                let mut buf = [0u8; 1024];
-                let len = resp.encode_with_integrity(&mut buf, &key);
-                self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-                self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
-                vec![Action::Send {
-                    data: Bytes::copy_from_slice(&buf[..len]),
-                    target: src,
-                }]
+        // Atomic policy: validate every peer first. If any is forbidden, reject
+        // the whole request (403) and create no permissions.
+        for peer_ip in &peers {
+            if is_forbidden_peer(*peer_ip) {
+                warn!(%src, %peer_ip, "CreatePermission to forbidden peer denied");
+                self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
+                return self.encode_error(msg, src, 403, "Forbidden");
             }
-            Err(_) => self.encode_error(msg, src, 437, "Allocation Mismatch"),
         }
+
+        // Then install all permissions. add_permission only fails if the
+        // allocation is gone (437); the first call establishes existence, so in
+        // practice this is all-or-nothing.
+        for peer_ip in &peers {
+            if self.store.add_permission(&src, *peer_ip).is_err() {
+                return self.encode_error(msg, src, 437, "Allocation Mismatch");
+            }
+        }
+
+        let resp = turn::build_success_response(Method::CreatePermission, msg.transaction_id);
+        let mut buf = [0u8; 1024];
+        let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: src,
+        }]
     }
 
     fn handle_channel_bind(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
@@ -1015,8 +1272,11 @@ impl PacketProcessor {
         }
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
-            Err(_) => {
+            Err(e) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, turna_auth::AuthError::BadRequest) {
+                    return self.encode_error(msg, src, 400, "Bad Request");
+                }
                 return self.encode_auth_challenge(msg, src);
             }
         };
@@ -1044,13 +1304,17 @@ impl PacketProcessor {
             Ok(_) => {
                 let resp = turn::build_success_response(Method::ChannelBind, msg.transaction_id);
                 let mut buf = [0u8; 1024];
-                let len = resp.encode_with_integrity(&mut buf, &key);
+                let len = encode_or_drop!(encode_with_integrity_auto(&resp, &mut buf, &key, msg), vec![Action::None]);
                 self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
                 self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
                 vec![Action::Send {
                     data: Bytes::copy_from_slice(&buf[..len]),
                     target: src,
                 }]
+            }
+            // A3-H1: a channel/peer uniqueness violation is a client error → 400.
+            Err(SessionError::ChannelConflict) => {
+                self.encode_error(msg, src, 400, "Bad Request")
             }
             Err(_) => self.encode_error(msg, src, 437, "Allocation Mismatch"),
         }
@@ -1059,7 +1323,7 @@ impl PacketProcessor {
     fn handle_send_indication(
         &self,
         msg: &StunMessage,
-        raw: &[u8],
+        _raw: &[u8],
         src: SocketAddr,
     ) -> Vec<Action> {
         let Some(peer_addr) = msg.get_xor_peer_address() else {
@@ -1103,12 +1367,18 @@ impl PacketProcessor {
         let relay_port = alloc.relay_addr.port();
         drop(alloc);
 
-        // `raw` here is a &[u8] (not the owned Bytes), so one copy into an
-        // owned Bytes is required. This is the Send-indication path, not the
-        // hot path — bidirectional media uses ChannelData (process_channel_data),
-        // which is genuinely zero-copy via Bytes::slice().
-        let offset = data.as_ptr() as usize - raw.as_ptr() as usize;
-        let data_bytes = Bytes::copy_from_slice(&raw[offset..offset + data.len()]);
+        // The Send-indication path copies the DATA payload into an owned
+        // `Bytes`. This is not the hot path — bidirectional media uses
+        // ChannelData (process_channel_data), which is genuinely zero-copy via
+        // Bytes::slice().
+        //
+        // A3-C1: `data` comes from `msg.get_data()`, which is a slice into the
+        // *owned* `Attribute::Data(Vec<u8>)` produced by the parser — a separate
+        // allocation from the receive buffer. The previous code computed an
+        // offset by subtracting the receive-buffer pointer from `data`'s pointer
+        // (pointer arithmetic across two allocations), producing a bogus offset
+        // that panicked on the slice index. Copy the slice directly.
+        let data_bytes = Bytes::copy_from_slice(data);
 
         vec![Action::SendViaRelay {
             data: data_bytes,
@@ -1128,7 +1398,7 @@ impl PacketProcessor {
     ) -> Vec<Action> {
         let resp = turn::build_error_response(msg.method, msg.transaction_id, code, reason);
         let mut buf = [0u8; 512];
-        let len = resp.encode(&mut buf);
+        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
@@ -1142,10 +1412,10 @@ impl PacketProcessor {
             msg.method,
             msg.transaction_id,
             self.auth.default_realm(),
-            &self.nonce_mgr.current(),
+            &self.nonce_mgr.issue(dst),
         );
         let mut buf = [0u8; 512];
-        let len = resp.encode(&mut buf);
+        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
@@ -1158,9 +1428,9 @@ impl PacketProcessor {
         let mut resp =
             turn::build_error_response(msg.method, msg.transaction_id, 438, "Stale Nonce");
         resp.add(Attribute::Realm(self.auth.default_realm().to_string()));
-        resp.add(Attribute::Nonce(self.nonce_mgr.current()));
+        resp.add(Attribute::Nonce(self.nonce_mgr.issue(dst)));
         let mut buf = [0u8; 512];
-        let len = resp.encode(&mut buf);
+        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
         vec![Action::Send {
@@ -1171,7 +1441,7 @@ impl PacketProcessor {
 
     fn validate_nonce(&self, msg: &StunMessage, dst: SocketAddr) -> Option<Vec<Action>> {
         if let Some(nonce) = msg.get_nonce() {
-            match self.nonce_mgr.validate(nonce) {
+            match self.nonce_mgr.validate(dst, nonce) {
                 NonceStatus::Valid => None,
                 NonceStatus::Stale => Some(self.encode_stale_nonce(msg, dst)),
             }
@@ -1181,5 +1451,130 @@ impl PacketProcessor {
             // rather than being allowed through on MESSAGE-INTEGRITY alone.
             Some(self.encode_auth_challenge(msg, dst))
         }
+    }
+}
+
+#[cfg(test)]
+mod a3_send_indication_tests {
+    use super::*;
+    use turna_auth::AuthMode;
+
+    #[test]
+    fn nonce_is_client_bound_and_validates() {
+        let mgr = NonceManager::new();
+        let a: SocketAddr = "203.0.113.7:51000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.8:51000".parse().unwrap();
+        let n = mgr.issue(a);
+        assert!(matches!(mgr.validate(a, &n), NonceStatus::Valid));
+        // A nonce issued to `a` must not validate for a different client.
+        assert!(matches!(mgr.validate(b, &n), NonceStatus::Stale));
+        // Garbage input is Stale, never a panic.
+        assert!(matches!(mgr.validate(a, "garbage"), NonceStatus::Stale));
+    }
+
+    fn test_processor() -> PacketProcessor {
+        let store = Arc::new(AllocationStore::new(49152, 65535, 1000));
+        let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
+            realm: "turna".into(),
+            secret: b"test-secret".to_vec(),
+        }));
+        PacketProcessor::new(store, auth, "127.0.0.1".parse().unwrap(), Arc::new(Metrics::new()))
+    }
+
+    /// A3-C1 regression: a Send Indication on an allocation with a matching
+    /// permission used to panic — `handle_send_indication` subtracted
+    /// `raw.as_ptr()` from `data.as_ptr()`, but `data` is a slice into the
+    /// owned `Attribute::Data(Vec<u8>)`, a different allocation, so the offset
+    /// was bogus and the subsequent slice index panicked. This is the normal
+    /// relay path for clients that use Send/Data Indications instead of
+    /// ChannelData, so it broke real interop, not just an edge case.
+    #[test]
+    fn send_indication_relays_payload_without_panic() {
+        let p = test_processor();
+        let client: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let relay: SocketAddr = "127.0.0.1:49152".parse().unwrap();
+        let peer: SocketAddr = "8.8.8.8:7000".parse().unwrap(); // global unicast — passes the peer filter
+
+        // Seed an allocation + a permission for the peer's IP.
+        p.store()
+            .create(client, relay, "u".into(), vec![1, 2, 3], 600)
+            .unwrap();
+        p.store().add_permission(&client, peer.ip()).unwrap();
+
+        // Build a Send Indication carrying XOR-PEER-ADDRESS + DATA, encode to
+        // the wire, and feed it through the real `process` path.
+        let mut msg = StunMessage::new(Method::Send, MessageClass::Indication);
+        msg.attributes.push(Attribute::XorPeerAddress(peer));
+        msg.attributes.push(Attribute::Data(b"hello-peer".to_vec()));
+        let mut buf = [0u8; 1500];
+        let n = msg.encode(&mut buf).expect("encode test message");
+
+        let actions = p.process(Bytes::copy_from_slice(&buf[..n]), client);
+
+        // Exactly the relayed payload, addressed to the peer — no panic.
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendViaRelay { data, target, .. }
+                    if *target == peer && data.as_ref() == b"hello-peer"
+            )),
+            "expected a SendViaRelay carrying the payload to the peer"
+        );
+    }
+
+    /// Send Indication without a permission must be silently dropped (no relay,
+    /// no panic) — guards the early-return paths around the A3-C1 fix.
+    #[test]
+    fn send_indication_without_permission_is_dropped() {
+        let p = test_processor();
+        let client: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let relay: SocketAddr = "127.0.0.1:49153".parse().unwrap();
+        let peer: SocketAddr = "8.8.8.8:7001".parse().unwrap();
+
+        p.store()
+            .create(client, relay, "u".into(), vec![1, 2, 3], 600)
+            .unwrap();
+        // no add_permission
+
+        let mut msg = StunMessage::new(Method::Send, MessageClass::Indication);
+        msg.attributes.push(Attribute::XorPeerAddress(peer));
+        msg.attributes.push(Attribute::Data(b"hello-peer".to_vec()));
+        let mut buf = [0u8; 1500];
+        let n = msg.encode(&mut buf).expect("encode test message");
+
+        let actions = p.process(Bytes::copy_from_slice(&buf[..n]), client);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SendViaRelay { .. })),
+            "a Send Indication without a permission must not relay"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod a3_f4_dont_fragment_tests {
+    use super::set_dont_fragment;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn set_dont_fragment_sets_pmtudisc_do() {
+        let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        set_dont_fragment(sock.as_raw_fd()).expect("setsockopt IP_MTU_DISCOVER should succeed");
+
+        // Read the option back to confirm DF/PMTUD is enabled.
+        let mut val: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed");
+        assert_eq!(val, libc::IP_PMTUDISC_DO);
     }
 }

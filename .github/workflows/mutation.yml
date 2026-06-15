@@ -1,0 +1,34 @@
+name: mutation tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeout_seconds:
+        description: "Per-mutant timeout in seconds"
+        required: false
+        default: "60"
+      jobs:
+        description: "cargo-mutants parallel jobs"
+        required: false
+        default: "2"
+  schedule:
+    # Weekly signal without turning every PR into a long mutation run.
+    - cron: "41 2 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  proto-stun-mutants:
+    name: cargo-mutants proto-stun parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MUTANTS_TIMEOUT_SECONDS: ${{ github.event.inputs.timeout_seconds || '60' }}
+      MUTANTS_JOBS: ${{ github.event.inputs.jobs || '2' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run proto-stun mutation tests
+        run: scripts/ci/mutants_proto_stun.sh

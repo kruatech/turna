@@ -1,0 +1,56 @@
+# Prometheus alert rules for the io_uring / DTLS / AF_XDP transport backends
+# (roadmap §9.1). Load alongside the base turna alert file.
+#
+# NOTE: some referenced metrics are wired up in later steps — these rules go
+# live as the metrics land:
+#   * turna_uring_relay_capacity_exhausted_total  -> IOU-2b (metric plumbing)
+#   * turna_dtls_*                                 -> DTLS observability step
+#   * turna_afxdp_*                                -> AF_XDP metrics step
+groups:
+  - name: turna-io-uring
+    rules:
+      - alert: TurnaIoUringSqPushFailures
+        expr: rate(turna_uring_sq_push_failed_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "io_uring SQ push failures detected"
+          description: "Submission-queue pushes are failing; the ring may be saturated."
+      - alert: TurnaIoUringRelayCapacityExhausted
+        expr: rate(turna_uring_relay_capacity_exhausted_total[5m]) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "io_uring relay socket capacity exhausted"
+          description: "Allocations are being rejected (508). Raise [turn.io_uring].relay_socket_capacity_per_worker or add workers."
+
+  - name: turna-dtls
+    rules:
+      - alert: TurnaDtlsHandshakeFailuresHigh
+        expr: rate(turna_dtls_handshake_failures_total[5m]) > 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Elevated DTLS handshake failures"
+      - alert: TurnaDtlsOutboundDrops
+        expr: rate(turna_dtls_outbound_dropped_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "DTLS outbound queue dropping datagrams (slow client / backpressure)"
+
+  - name: turna-af-xdp
+    rules:
+      - alert: TurnaAfXdpRingPressure
+        expr: turna_afxdp_umem_free_frames < 128
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "AF_XDP UMEM nearly exhausted"
+          description: "Free frames are critically low; RX/TX will start dropping."
+      - alert: TurnaAfXdpParseDrops
+        expr: rate(turna_afxdp_parse_drops_total[5m]) > 100
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "AF_XDP parser dropping frames"

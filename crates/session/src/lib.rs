@@ -28,6 +28,16 @@ const PERMISSION_LIFETIME: Duration = Duration::from_secs(300); // 5 minutes
 /// Channel binding lifetime per RFC 8656 section 12.
 const CHANNEL_LIFETIME: Duration = Duration::from_secs(600); // 10 minutes
 
+/// How long a port reserved via EVEN-PORT (R=1) is held for the follow-up
+/// Allocate that presents the RESERVATION-TOKEN (RFC 8656 §7.2 suggests ~30s).
+const RESERVATION_LIFETIME: Duration = Duration::from_secs(30);
+
+/// A port reserved under a RESERVATION-TOKEN, pending a follow-up Allocate.
+struct Reservation {
+    port: u16,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("max allocations reached")]
@@ -48,6 +58,11 @@ pub enum SessionError {
     /// Re-keying onto it would clobber that allocation, so we refuse.
     #[error("migration target address already in use")]
     MigrationTargetInUse,
+    /// ChannelBind violates RFC 8656 §12.2 uniqueness: the channel is already
+    /// bound to a different peer, or the peer to a different channel. Maps to
+    /// a 400 (Bad Request) response.
+    #[error("channel/peer binding conflict")]
+    ChannelConflict,
 }
 
 /// Permission with expiry.
@@ -175,17 +190,24 @@ impl Allocation {
     }
 
     /// Check if bandwidth quota is exceeded. Returns current bps.
+#[allow(clippy::result_unit_err)]
     pub fn check_bandwidth(&self, max_bytes_per_sec: u64) -> Result<u64, ()> {
         let mut start = self.bandwidth_window_start.lock();
         let now = Instant::now();
-        let elapsed = now.duration_since(*start).as_secs_f64();
+        let elapsed = now.duration_since(*start);
 
-        if elapsed >= 1.0 {
-            // Reset window
+        if elapsed >= Duration::from_secs(1) {
+            // Roll the window under the lock: capture-and-zero the counter and
+            // advance `start` together. `swap` is an atomic RMW, so every byte
+            // from a concurrent (lock-free) `add_bytes` lands in exactly one
+            // window — none are lost across the boundary.
             let bytes = self.bandwidth_window_bytes.swap(0, Ordering::Relaxed);
             *start = now;
-            let bps = (bytes as f64 / elapsed) as u64;
-            return Ok(bps);
+            let bps = (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            // Enforce the completed window too (L6): previously a window
+            // boundary always returned Ok, letting one packet per second slip
+            // past the quota.
+            return if bps > max_bytes_per_sec { Err(()) } else { Ok(bps) };
         }
 
         let current = self.bandwidth_window_bytes.load(Ordering::Relaxed);
@@ -220,6 +242,15 @@ impl Allocation {
         (perms_removed, chans_removed)
     }
 
+    /// Cheap read-only check: does this allocation have any expired permission
+    /// or channel binding to prune? Lets the store classify under a short read
+    /// lock and skip taking a write lock (`get_mut`) on allocations that have
+    /// nothing stale — the common case between sweeps.
+    pub fn has_stale_entries(&self) -> bool {
+        self.permissions.values().any(|p| p.is_expired())
+            || self.channel_bindings.values().any(|b| b.is_expired())
+    }
+
     /// Time remaining before expiry.
     pub fn time_remaining(&self) -> Duration {
         self.expires_at.saturating_duration_since(Instant::now())
@@ -251,6 +282,11 @@ pub struct PortAllocator {
     max_port: u16,
     next_port: Mutex<u16>,
     used: Mutex<HashSet<u16>>,
+    /// Ports reserved via EVEN-PORT (R=1), keyed by RESERVATION-TOKEN. The port
+    /// is also held in `used`; an expired-but-unclaimed reservation is swept
+    /// (and its port released) on the next claim attempt. Lock order is always
+    /// `used` then `reservations`.
+    reservations: Mutex<HashMap<[u8; 8], Reservation>>,
 }
 
 impl PortAllocator {
@@ -260,6 +296,7 @@ impl PortAllocator {
             max_port,
             next_port: Mutex::new(min_port),
             used: Mutex::new(HashSet::new()),
+            reservations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -330,6 +367,128 @@ impl PortAllocator {
         None
     }
 
+    /// Lowest free *even* port in range, marked used. RFC 8656 §18.7 EVEN-PORT.
+    fn allocate_even(&self) -> Option<u16> {
+        let mut used = self.used.lock();
+        let mut p = if self.min_port.is_multiple_of(2) {
+            self.min_port
+        } else {
+            self.min_port.saturating_add(1)
+        };
+        while p <= self.max_port {
+            if !used.contains(&p) {
+                used.insert(p);
+                return Some(p);
+            }
+            p = match p.checked_add(2) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+        None
+    }
+
+    /// Allocate an even port AND reserve the next-higher (odd) port under a
+    /// fresh token (EVEN-PORT R=1). Both ports are marked used; the odd one is
+    /// held only by the reservation until claimed. Returns `(even, token)`.
+    fn allocate_even_with_reservation(&self) -> Option<(u16, [u8; 8])> {
+        let mut used = self.used.lock();
+        let mut p = if self.min_port.is_multiple_of(2) {
+            self.min_port
+        } else {
+            self.min_port.saturating_add(1)
+        };
+        // Need p+1 within range for the odd reservation, so stop at max_port-1.
+        while p < self.max_port {
+            let odd = p + 1;
+            if !used.contains(&p) && !used.contains(&odd) {
+                used.insert(p);
+                used.insert(odd);
+                let token: [u8; 8] = rand::random();
+                self.reservations.lock().insert(
+                    token,
+                    Reservation {
+                        port: odd,
+                        expires_at: Instant::now() + RESERVATION_LIFETIME,
+                    },
+                );
+                return Some((p, token));
+            }
+            p = match p.checked_add(2) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+        None
+    }
+
+    /// Resolve a RESERVATION-TOKEN to its reserved port (still marked used).
+    /// Expired reservations are swept and their ports released first. Returns
+    /// `None` if the token is unknown or expired.
+    fn claim_reservation(&self, token: &[u8; 8]) -> Option<u16> {
+        let now = Instant::now();
+        let mut used = self.used.lock();
+        let mut res = self.reservations.lock();
+        res.retain(|_, r| {
+            if r.expires_at <= now {
+                used.remove(&r.port); // release the leaked reserved port
+                false
+            } else {
+                true
+            }
+        });
+        res.remove(token).map(|r| r.port)
+    }
+
+    /// EVEN-PORT allocate + bind. `reserve_next` mirrors the EVEN-PORT R bit;
+    /// when set, the next-higher port is reserved and the token is returned for
+    /// the caller to echo as a RESERVATION-TOKEN. Releases everything on bind
+    /// failure and retries another even pair.
+    pub fn allocate_even_and_bind(
+        &self,
+        reserve_next: bool,
+    ) -> Option<(u16, std::net::UdpSocket, Option<[u8; 8]>)> {
+        for _ in 0..64 {
+            let (even, token) = if reserve_next {
+                let (e, t) = self.allocate_even_with_reservation()?;
+                (e, Some(t))
+            } else {
+                (self.allocate_even()?, None)
+            };
+            match std::net::UdpSocket::bind(("0.0.0.0", even)) {
+                Ok(sock) => {
+                    let _ = sock.set_nonblocking(true);
+                    return Some((even, sock, token));
+                }
+                Err(_) => {
+                    self.release(even);
+                    if let Some(t) = token {
+                        if let Some(r) = self.reservations.lock().remove(&t) {
+                            self.release(r.port);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Claim a RESERVATION-TOKEN and bind its reserved port. Releases the port
+    /// on bind failure. Returns `None` if the token is invalid/expired.
+    pub fn claim_and_bind(&self, token: &[u8; 8]) -> Option<(u16, std::net::UdpSocket)> {
+        let port = self.claim_reservation(token)?;
+        match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+            Ok(sock) => {
+                let _ = sock.set_nonblocking(true);
+                Some((port, sock))
+            }
+            Err(_) => {
+                self.release(port);
+                None
+            }
+        }
+    }
+
     /// Mark a specific port as used without going through the rotating
     /// allocator. Used by [`AllocationStore::rehydrate`] to re-claim ports
     /// of allocations that already existed before this process started.
@@ -380,6 +539,18 @@ pub struct TenantPool {
     pub quota: BandwidthQuota,
 }
 
+/// Cumulative relayed traffic for one tenant. Accrued when an allocation is
+/// removed (design (a): the per-allocation `bytes_relayed`/`packets_relayed`
+/// are folded into the tenant total at teardown, so there is no per-packet
+/// hot-path cost). Exposed for billing/observability via
+/// [`AllocationStore::tenant_traffic_snapshot`].
+#[derive(Default, Clone, Copy)]
+pub struct TenantTraffic {
+    pub bytes: u64,
+    pub packets: u64,
+    pub closed_allocations: u64,
+}
+
 /// Main allocation store — thread-safe via DashMap.
 pub struct AllocationStore {
     allocations: DashMap<SocketAddr, Allocation>,
@@ -418,6 +589,11 @@ pub struct AllocationStore {
     /// through every call site — keeps the crate dependency-free of
     /// `turna-health`.
     dropped_writes: AtomicU64,
+    /// Cumulative per-tenant relayed traffic, accrued at allocation removal
+    /// (see [`TenantTraffic`]). Kept on the store — not threaded through
+    /// `Arc<Metrics>` — so the crate stays free of a `turna-health` dependency
+    /// (same rationale as `dropped_writes`).
+    tenant_traffic: std::sync::Mutex<std::collections::HashMap<String, TenantTraffic>>,
 }
 
 impl AllocationStore {
@@ -435,6 +611,7 @@ impl AllocationStore {
             quota: BandwidthQuota::default(),
             write_tx: OnceLock::new(),
             dropped_writes: AtomicU64::new(0),
+            tenant_traffic: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -726,6 +903,7 @@ impl AllocationStore {
     ///   skipped, port not reserved. Not an error.
     /// - `Err(_)`    — record was malformed, port unavailable, or quota
     ///   exceeded. Caller logs and continues with next record.
+#[allow(clippy::too_many_arguments)]
     pub fn rehydrate(
         &self,
         client_addr: SocketAddr,
@@ -1032,6 +1210,23 @@ impl AllocationStore {
             .get_mut(client_addr)
             .ok_or(SessionError::NotFound)?;
 
+        // RFC 8656 §12.2 / RFC 5766 §11.2 uniqueness invariants. Reject with a
+        // conflict (→ 400) and make NO state change if either:
+        //   (a) the requested channel is already bound to a *different* peer, or
+        //   (b) the requested peer is already bound to a *different* channel.
+        // The only mutating cases left after this are the same (channel, peer)
+        // pair (refresh) or a brand-new pair (insert).
+        if let Some(existing) = alloc.channel_bindings.get(&channel) {
+            if existing.peer_addr != peer_addr {
+                return Err(SessionError::ChannelConflict);
+            }
+        }
+        if let Some(&bound_ch) = alloc.channels_reverse.get(&peer_addr) {
+            if bound_ch != channel {
+                return Err(SessionError::ChannelConflict);
+            }
+        }
+
         // Also add/refresh permission for this peer
         if let Some(perm) = alloc.permissions.get_mut(&peer_addr.ip()) {
             perm.refresh();
@@ -1127,7 +1322,8 @@ impl AllocationStore {
         relay_addr: SocketAddr,
     ) -> Result<(), SessionError> {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
-            for (&ch, _) in &alloc.channel_bindings {
+            self.accrue_tenant_traffic(&alloc);
+            for &ch in alloc.channel_bindings.keys() {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
             }
             self.relay_to_client.remove(&relay_addr);
@@ -1151,29 +1347,103 @@ impl AllocationStore {
         Ok(())
     }
 
+    /// Fold a removed allocation's relayed totals into its tenant's cumulative
+    /// counters. Called from every whole-allocation removal path (`remove`,
+    /// `force_remove`, and therefore `cleanup_expired_budget` which removes via
+    /// `remove`). No-op for untenanted (base) allocations. Cheap: one mutex
+    /// acquisition per allocation teardown, never on the packet path.
+    fn accrue_tenant_traffic(&self, alloc: &Allocation) {
+        let Some(tenant) = alloc.tenant_id.as_ref() else {
+            return;
+        };
+        let bytes = alloc.bytes_relayed.load(Ordering::Relaxed);
+        let packets = alloc.packets_relayed.load(Ordering::Relaxed);
+        if let Ok(mut map) = self.tenant_traffic.lock() {
+            let e = map.entry(tenant.clone()).or_default();
+            e.bytes = e.bytes.saturating_add(bytes);
+            e.packets = e.packets.saturating_add(packets);
+            e.closed_allocations = e.closed_allocations.saturating_add(1);
+        }
+    }
+
+    /// Snapshot of cumulative per-tenant relayed traffic for the `/metrics`
+    /// exporter: `(tenant, bytes, packets, closed_allocations)`. Reflects all
+    /// allocations torn down so far; bytes of currently-live allocations are
+    /// counted when those allocations are removed.
+    pub fn tenant_traffic_snapshot(&self) -> Vec<(String, u64, u64, u64)> {
+        match self.tenant_traffic.lock() {
+            Ok(map) => map
+                .iter()
+                .map(|(t, v)| (t.clone(), v.bytes, v.packets, v.closed_allocations))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Cleanup expired allocations, permissions, and channel bindings.
     pub fn cleanup_expired(&self) -> usize {
-        // Clean expired permissions/channels inside live allocations
-        for mut entry in self.allocations.iter_mut() {
-            entry.value_mut().cleanup_expired_entries();
+        self.cleanup_expired_budget(usize::MAX)
+    }
+
+    /// Sweep expired allocations and stale per-allocation entries.
+    ///
+    /// Returns the number of fully-expired allocations removed.
+    ///
+    /// Lock discipline (the fix for the all-shards stall): instead of holding
+    /// each shard's write lock across a whole `iter_mut()` pass over the live
+    /// datapath map, we take one read-only pass to classify, then act on each
+    /// key with a brief, independent `get_mut` / `remove`. Allocations with
+    /// nothing stale are skipped without ever taking a write lock. That turns a
+    /// single long per-shard write-lock hold into a few short ones, so
+    /// `store.get` on the hot path interleaves instead of stalling for the whole
+    /// sweep.
+    ///
+    /// `max_ops` bounds the allocations classified this call, so a maintenance
+    /// loop can cap its worst-case work under very large stores (100k+) and let
+    /// the remainder roll to the next tick — the work is idempotent and
+    /// order-independent, so no cursor is needed.
+    pub fn cleanup_expired_budget(&self, max_ops: usize) -> usize {
+        // 1. Read-only classification pass (short read locks, no write lock held
+        //    across the map).
+        let mut expired: Vec<(SocketAddr, SocketAddr)> = Vec::new();
+        let mut to_clean: Vec<SocketAddr> = Vec::new();
+        for r in self.allocations.iter() {
+            if expired.len() + to_clean.len() >= max_ops {
+                break;
+            }
+            if r.value().is_expired() {
+                expired.push((*r.key(), r.value().relay_addr));
+            } else if r.value().has_stale_entries() {
+                to_clean.push(*r.key());
+            }
         }
 
-        // Remove fully expired allocations
-        let expired: Vec<(SocketAddr, SocketAddr)> = self
-            .allocations
-            .iter()
-            .filter(|r| r.value().is_expired())
-            .map(|r| (*r.key(), r.value().relay_addr))
-            .collect();
+        // 2. Prune stale sub-entries on still-live allocations — one short
+        //    write lock per allocation, released between each.
+        for client in to_clean {
+            if let Some(mut alloc) = self.allocations.get_mut(&client) {
+                alloc.cleanup_expired_entries();
+            }
+        }
 
-        let count = expired.len();
+        // 3. Remove fully-expired allocations. Re-check expiry under a fresh
+        //    lock first: a concurrent Refresh may have extended the lifetime
+        //    since the classification pass (this also tightens the pre-existing
+        //    scan-then-remove race down to a single get→remove gap).
+        let mut count = 0;
         for (client, relay) in expired {
-            let _ = self.remove(&client, relay);
+            let still_expired = self
+                .allocations
+                .get(&client)
+                .map(|a| a.is_expired())
+                .unwrap_or(false);
+            if still_expired {
+                let _ = self.remove(&client, relay);
+                count += 1;
+            }
         }
 
-        // Clean empty user entries
         self.user_allocations.retain(|_, v| !v.is_empty());
-
         count
     }
 
@@ -1195,9 +1465,10 @@ impl AllocationStore {
 
     pub fn force_remove(&self, client_addr: &std::net::SocketAddr) {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
+            self.accrue_tenant_traffic(&alloc);
             self.relay_to_client.remove(&alloc.relay_addr);
             self.id_to_client.remove(&alloc.allocation_id);
-            for (&ch, _) in &alloc.channel_bindings {
+            for &ch in alloc.channel_bindings.keys() {
                 self.channel_to_client
                     .remove(&(alloc.relay_addr.port(), ch));
             }
@@ -1875,5 +2146,99 @@ mod tenant_quota_tests {
             store.create_for_tenant(addr(2000 + i), addr(40000 + i),
                 "baseuser".into(), vec![], 600, None).unwrap();
         }
+    }
+
+    #[test]
+    fn tenant_traffic_accrues_on_removal() {
+        let store = AllocationStore::new(40000, 40099, 10_000);
+        let client = addr(5000);
+        let relay = addr(40000);
+        store
+            .create_for_tenant(client, relay, "u".into(), vec![1, 2, 3], 600, Some("acme".into()))
+            .unwrap();
+
+        // Relay some traffic; each add_bytes also bumps the packet counter.
+        {
+            let a = store.allocations.get(&client).unwrap();
+            a.add_bytes(1000);
+            a.add_bytes(500);
+        } // drop the DashMap ref before remove()
+
+        // Design (a): nothing is accrued until the allocation is torn down.
+        assert!(store.tenant_traffic_snapshot().is_empty());
+
+        store.remove(&client, relay).unwrap();
+
+        let mut snap = store.tenant_traffic_snapshot();
+        assert_eq!(snap.len(), 1);
+        let (tenant, bytes, packets, closed) = snap.pop().unwrap();
+        assert_eq!(tenant, "acme");
+        assert_eq!(bytes, 1500);
+        assert_eq!(packets, 2);
+        assert_eq!(closed, 1);
+    }
+
+    #[test]
+    fn base_tenant_traffic_not_tracked() {
+        let store = AllocationStore::new(40000, 40099, 10_000);
+        let client = addr(5001);
+        let relay = addr(40001);
+        store.create(client, relay, "u".into(), vec![1], 600).unwrap(); // tenant_id = None
+        {
+            let a = store.allocations.get(&client).unwrap();
+            a.add_bytes(999);
+        }
+        store.remove(&client, relay).unwrap();
+        assert!(
+            store.tenant_traffic_snapshot().is_empty(),
+            "untenanted (base) traffic is not attributed to any tenant"
+        );
+    }
+
+    #[test]
+    fn channel_bind_uniqueness_conflicts() {
+        let store = AllocationStore::new(40000, 40099, 10_000);
+        let client = addr(6000);
+        let relay = addr(40000);
+        store.create(client, relay, "u".into(), vec![1], 600).unwrap();
+        let peer_a = addr(7000);
+        let peer_b = addr(7001);
+
+        // First bind succeeds.
+        store.add_channel(&client, 0x4000, peer_a).unwrap();
+        // Same channel, different peer → conflict (RFC 8656 §12.2), no state change.
+        assert!(matches!(
+            store.add_channel(&client, 0x4000, peer_b),
+            Err(SessionError::ChannelConflict)
+        ));
+        // Different channel, peer already bound elsewhere → conflict.
+        assert!(matches!(
+            store.add_channel(&client, 0x4001, peer_a),
+            Err(SessionError::ChannelConflict)
+        ));
+        // Re-binding the same (channel, peer) pair is a refresh → ok.
+        store.add_channel(&client, 0x4000, peer_a).unwrap();
+    }
+
+    #[test]
+    fn even_port_and_reservation_token() {
+        let pool = PortAllocator::new(40000, 40010);
+
+        // EVEN-PORT (R=0): an even port.
+        let e = pool.allocate_even().expect("an even port");
+        assert_eq!(e % 2, 0, "EVEN-PORT must yield an even port");
+
+        // EVEN-PORT (R=1): even port + reserved next-higher odd port under a token.
+        let (e2, tok) = pool
+            .allocate_even_with_reservation()
+            .expect("even + reservation");
+        assert_eq!(e2 % 2, 0);
+
+        // The token resolves to e2+1 exactly once (single-use).
+        assert_eq!(pool.claim_reservation(&tok), Some(e2 + 1));
+        assert_eq!(pool.claim_reservation(&tok), None, "token is single-use");
+
+        // An unknown token resolves to nothing.
+        assert_eq!(pool.claim_reservation(&[0u8; 8]), None);
     }
 }

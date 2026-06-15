@@ -1,64 +1,44 @@
-# Turna TURN — Docker Compose
+# Turna TURN/STUN — Docker Compose
 #
-# Usage:
-#   docker compose up -d
-#   docker compose logs -f turna
+# Usage from repository root:
+#   docker compose -f deploy/docker-compose.yml up --build
+#   docker compose -f deploy/docker-compose.yml logs -f turna
 #
 # Services:
-#   turna     — TURN/STUN server (UDP:3478, health:9090)
-#   turna-signal   — WebSocket signaling (TCP:8080)
-#   prometheus   — Metrics collection (TCP:9091)
+#   turna      — TURN/STUN server (UDP/TCP:3478, health/metrics:9090)
+#   prometheus — optional metrics collection (host TCP:9091)
 
 services:
   turna:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
+    image: turna:local
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
       - "5349:5349/tcp"
       - "9090:9090/tcp"
-      - "49152-50152:49152-50152/udp"  # Relay ports (subset)
+      # Relay ports for local/dev tests. Keep this range in sync with
+      # deploy/turn.toml [turn.relay] when you narrow it for testing.
+      - "49152-50152:49152-50152/udp"
     environment:
       RUST_LOG: "info,turna=debug"
-      TURNA_WORKERS: "0"  # 0 = auto-detect
+      TURNA_WORKERS: "0" # 0 = auto-detect
     volumes:
       - ./turn.toml:/etc/turna/turn.toml:ro
-      # TLS certs (optional)
+      # TLS certs (optional, only when [tls].enabled = true)
       # - ./tls:/etc/turna/tls:ro
     restart: unless-stopped
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
-    sysctls:
-      - net.core.rmem_max=8388608
-      - net.core.wmem_max=8388608
-      - net.core.rmem_default=2097152
-      - net.core.wmem_default=2097152
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/health"]
       interval: 10s
       timeout: 3s
       retries: 3
-    networks:
-      - turna
-
-  turna-signal:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    entrypoint: ["turna-signaling"]
-    command: []
-    ports:
-      - "8080:8080/tcp"
-    environment:
-      RUST_LOG: "info"
-    restart: unless-stopped
-    depends_on:
-      turna:
-        condition: service_healthy
     networks:
       - turna
 
@@ -70,6 +50,9 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     restart: unless-stopped
+    depends_on:
+      turna:
+        condition: service_healthy
     networks:
       - turna
 

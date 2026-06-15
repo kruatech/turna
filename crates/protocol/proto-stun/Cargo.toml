@@ -9,9 +9,14 @@ bytes.workspace = true
 thiserror.workspace = true
 hmac.workspace = true
 sha1.workspace = true
+sha2.workspace = true
 crc.workspace = true
 rand.workspace = true
-md5.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "parser_bench"
+harness = false

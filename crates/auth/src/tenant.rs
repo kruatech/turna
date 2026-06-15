@@ -83,7 +83,7 @@ impl AuthRegistry {
     pub fn validate(&self, msg: &StunMessage, raw: &[u8]) -> Result<AuthResolution, AuthError> {
         let realm = msg.get_realm().ok_or(AuthError::MissingCredentials)?;
         // Normalise to &str regardless of whether get_realm yields &str/String.
-        let realm_ref: &str = &realm;
+        let realm_ref: &str = realm;
 
         if let Some((tenant_id, auth)) = self.tenants.get(realm_ref) {
             // Tenant realm: validate against the tenant's backend.
