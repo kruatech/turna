@@ -18,6 +18,31 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: deps
+    ignore:
+      # API-завязанные крейты: код таргетит конкретный major. У pre-1.0 крейтов
+      # ломающие изменения приходят в minor-позиции (0.x -> 0.(x+1)), поэтому
+      # глушим и semver-minor — иначе ignore не срабатывает. Patch разрешён.
+      - dependency-name: "xsk-rs"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "wtransport"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "webrtc-util"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "webrtc-dtls"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "rtnetlink"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "netlink-packet-route"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # RustCrypto движется в лок-степе — бампить вместе, не поштучно.
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "sha1"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "digest"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   # The fuzz crate is an isolated workspace (excluded from the root one),
   # so Dependabot needs a separate entry to see it.
@@ -27,6 +52,13 @@ updates:
       interval: weekly
     commit-message:
       prefix: deps(fuzz)
+    ignore:
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "sha1"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   # Base image referenced by deploy/Dockerfile.
   - package-ecosystem: docker
