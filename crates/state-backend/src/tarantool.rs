@@ -368,6 +368,28 @@ impl TarantoolBackend {
             .collect())
     }
 
+    pub async fn store_user(&self, user: &StoredUser) -> Result<()> {
+        let json = ser(user)?;
+        self.call("turna_store_user", &[&user.username, &user.realm, &json])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_user(&self, username: &str, realm: &str) -> Result<Option<StoredUser>> {
+        let resp = self.call("turna_get_user", &[username, realm]).await?;
+        call_optional(&resp)
+    }
+
+    pub async fn remove_user(&self, username: &str, realm: &str) -> Result<bool> {
+        let resp = self.call("turna_remove_user", &[username, realm]).await?;
+        call_bool(&resp)
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<StoredUser>> {
+        let resp = self.call("turna_list_users", &[]).await?;
+        call_list(&resp)
+    }
+
     pub async fn ping(&self) -> Result<()> {
         self.call("turna_ping", &[]).await?;
         Ok(())

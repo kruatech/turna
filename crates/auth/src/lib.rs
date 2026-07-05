@@ -17,6 +17,9 @@ pub mod user;
 
 pub use tenant::{AuthRegistry, AuthResolution};
 
+use std::sync::Arc;
+
+use dashmap::DashMap;
 use thiserror::Error;
 use turna_proto_stun::message::StunMessage;
 
@@ -40,12 +43,36 @@ pub enum AuthError {
 
 // ── TURN auth mode ────────────────────────────────────────────────────────────
 
+/// Pre-derived long-term keys for one LongTerm user (Variant B: the plaintext
+/// password is never stored). Both digests are kept so the server can answer
+/// whichever MESSAGE-INTEGRITY variant the client uses (RFC 5389 vs RFC 8489).
+#[derive(Debug, Clone)]
+pub struct UserKeys {
+    /// RFC 5389 key: HMAC-SHA-1 key = MD5(username:realm:password).
+    pub key_md5: Vec<u8>,
+    /// RFC 8489 key: SHA-256 variant of the long-term key.
+    pub key_sha256: Vec<u8>,
+}
+
+impl UserKeys {
+    /// Derive both keys from a plaintext password. The password is consumed
+    /// here and never retained.
+    pub fn derive(username: &str, realm: &str, password: &str) -> Self {
+        Self {
+            key_md5: turna_crypto::long_term_key(username, realm, password),
+            key_sha256: turna_crypto::long_term_key_sha256(username, realm, password),
+        }
+    }
+}
+
 /// TURN authentication mode.
 pub enum AuthMode {
-    /// Long-term credentials with static users.
+    /// Long-term credentials. Users are stored as pre-derived keys (Variant B:
+    /// no plaintext password retained). Interior-mutable (`Arc<DashMap>`) so the
+    /// management API can add/remove users at runtime without `&mut self`.
     LongTerm {
         realm: String,
-        users: Vec<(String, String)>,
+        users: Arc<DashMap<String, UserKeys>>,
     },
     /// Time-limited credentials with shared secret.
     SharedSecret { realm: String, secret: Vec<u8> },
@@ -63,16 +90,43 @@ impl AuthMode {
             return Err(AuthError::InvalidCredentials);
         }
 
-        // Resolve the user's password (cleartext for LongTerm; REST-derived for
-        // SharedSecret). The long-term *key* is derived from it below, with the
-        // digest chosen by the integrity attribute the client actually used.
-        let password: String = match self {
+        let server_realm = self.realm();
+        let has_sha256 = msg.get_message_integrity_sha256().is_some();
+
+        // Resolve the verification key for the digest the client actually used.
+        //
+        // LongTerm (Variant B): both long-term keys are pre-derived at user
+        // creation and stored; no plaintext password is kept. Select the one
+        // matching the integrity attribute present.
+        // SharedSecret (REST, coturn-compatible): derive the ephemeral key from
+        // the time-limited credential at request time.
+        let key: Vec<u8> = match self {
             AuthMode::LongTerm { users, .. } => {
-                let (_, password) = users
-                    .iter()
-                    .find(|(u, _)| u == username)
-                    .ok_or(AuthError::InvalidCredentials)?;
-                password.clone()
+                match users.get(username) {
+                    Some(entry) => {
+                        if has_sha256 {
+                            entry.key_sha256.clone()
+                        } else {
+                            entry.key_md5.clone()
+                        }
+                    }
+                    None => {
+                        // M3: equalize response latency between known and unknown
+                        // users so timing doesn't leak whether `username` exists
+                        // (enumeration). Run one integrity verify against a fixed
+                        // dummy key — the same dominant HMAC cost as the real
+                        // path — then reject. The result is discarded; an unknown
+                        // user is always InvalidCredentials. Not a constant-time
+                        // guarantee, but it closes the obvious early-return gap.
+                        const DUMMY_KEY: [u8; 32] = [0x2b; 32];
+                        if has_sha256 {
+                            let _ = msg.verify_integrity_sha256(raw, &DUMMY_KEY);
+                        } else {
+                            let _ = msg.verify_integrity(raw, &DUMMY_KEY);
+                        }
+                        return Err(AuthError::InvalidCredentials);
+                    }
+                }
             }
             AuthMode::SharedSecret { secret, .. } => {
                 // TURN REST API (coturn-compatible): username is
@@ -95,27 +149,26 @@ impl AuthMode {
                 use sha1::Sha1;
                 let mut mac = Hmac::<Sha1>::new_from_slice(secret).unwrap();
                 mac.update(username.as_bytes());
-                base64::Engine::encode(
+                let password = base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
                     mac.finalize().into_bytes(),
-                )
+                );
+                if has_sha256 {
+                    turna_crypto::long_term_key_sha256(username, server_realm, &password)
+                } else {
+                    turna_crypto::long_term_key(username, server_realm, &password)
+                }
             }
         };
-
-        let server_realm = self.realm();
-        let has_sha256 = msg.get_message_integrity_sha256().is_some();
 
         // RFC 8489: if the client declared a PASSWORD-ALGORITHM (0x001D), it must
         // be consistent with the integrity attribute actually present. We do NOT
         // require 0x001D to be present — legacy (RFC 5389) clients omit it.
         //
-        // NOTE (Stage 3 follow-up): the precise error code for an *unknown*
-        // algorithm should be 400 Bad Request per RFC 8489, but the current
-        // `AuthError` model maps every auth failure to a 401 challenge. Until the
-        // error model gains a Bad-Request path, any mismatch or unknown algorithm
-        // is rejected here as `InvalidCredentials`. This is why we advertise +
-        // accept MESSAGE-INTEGRITY-SHA256 but do not claim full RFC 8489
-        // compliance yet.
+        // RFC 8489: an inconsistent or unknown PASSWORD-ALGORITHM is a 400 Bad
+        // Request. `AuthError::BadRequest` carries that through — the processor
+        // maps it to a 400 response (see `handle_allocate`/`handle_refresh`),
+        // distinct from the 401 challenge used for other auth failures.
         if let Some(algo) = msg.get_password_algorithm() {
             use turna_proto_stun::attribute::{PASSWORD_ALGORITHM_MD5, PASSWORD_ALGORITHM_SHA256};
             let consistent = match algo {
@@ -128,28 +181,87 @@ impl AuthMode {
             }
         }
 
-        // Prefer MESSAGE-INTEGRITY-SHA256 when present (RFC 8489); otherwise fall
-        // back to the RFC 5389 MESSAGE-INTEGRITY (HMAC-SHA-1 + MD5 key). When no
-        // SHA-256 attribute is present, behaviour is byte-for-byte unchanged.
+        // Verify MESSAGE-INTEGRITY with the resolved key: SHA-256 (RFC 8489)
+        // when present, otherwise RFC 5389 HMAC-SHA-1 (+ MD5 key).
         if has_sha256 {
-            let key = turna_crypto::long_term_key_sha256(username, server_realm, &password);
             if !msg.verify_integrity_sha256(raw, &key) {
                 return Err(AuthError::IntegrityFailed);
             }
-            Ok(key)
-        } else {
-            let key = turna_crypto::long_term_key(username, server_realm, &password);
-            if !msg.verify_integrity(raw, &key) {
-                return Err(AuthError::IntegrityFailed);
-            }
-            Ok(key)
+        } else if !msg.verify_integrity(raw, &key) {
+            return Err(AuthError::IntegrityFailed);
         }
+        Ok(key)
     }
 
     pub fn realm(&self) -> &str {
         match self {
             AuthMode::LongTerm { realm, .. } => realm,
             AuthMode::SharedSecret { realm, .. } => realm,
+        }
+    }
+
+    /// Build a LongTerm backend from `(username, password)` pairs, pre-deriving
+    /// both long-term keys so the plaintext password is never retained.
+    pub fn long_term<I, U, P>(realm: impl Into<String>, users: I) -> Self
+    where
+        I: IntoIterator<Item = (U, P)>,
+        U: AsRef<str>,
+        P: AsRef<str>,
+    {
+        let realm = realm.into();
+        let map: DashMap<String, UserKeys> = DashMap::new();
+        for (u, p) in users {
+            let (u, p) = (u.as_ref(), p.as_ref());
+            map.insert(u.to_string(), UserKeys::derive(u, &realm, p));
+        }
+        AuthMode::LongTerm {
+            realm,
+            users: Arc::new(map),
+        }
+    }
+
+    /// Add (or replace) a LongTerm user at runtime. No-op on SharedSecret.
+    /// Returns `true` if applied (i.e. this is a LongTerm backend).
+    pub fn add_user(&self, username: &str, password: &str) -> bool {
+        match self {
+            AuthMode::LongTerm { realm, users } => {
+                users.insert(
+                    username.to_string(),
+                    UserKeys::derive(username, realm, password),
+                );
+                true
+            }
+            AuthMode::SharedSecret { .. } => false,
+        }
+    }
+
+    /// Remove a LongTerm user at runtime. No-op on SharedSecret. Returns `true`
+    /// if a user was present and removed.
+    pub fn remove_user(&self, username: &str) -> bool {
+        match self {
+            AuthMode::LongTerm { users, .. } => users.remove(username).is_some(),
+            AuthMode::SharedSecret { .. } => false,
+        }
+    }
+
+    /// Whether a LongTerm user exists. Always `false` for SharedSecret.
+    pub fn has_user(&self, username: &str) -> bool {
+        match self {
+            AuthMode::LongTerm { users, .. } => users.contains_key(username),
+            AuthMode::SharedSecret { .. } => false,
+        }
+    }
+
+    /// Insert a user from pre-derived keys (Variant B rehydration: no password
+    /// is available — e.g. loading from the state backend at startup). No-op on
+    /// SharedSecret. Returns `true` if applied.
+    pub fn add_user_keys(&self, username: &str, keys: UserKeys) -> bool {
+        match self {
+            AuthMode::LongTerm { users, .. } => {
+                users.insert(username.to_string(), keys);
+                true
+            }
+            AuthMode::SharedSecret { .. } => false,
         }
     }
 }
@@ -204,10 +316,7 @@ mod f10_tests {
     }
 
     fn long_term() -> AuthMode {
-        AuthMode::LongTerm {
-            realm: "r".into(),
-            users: vec![("u".into(), "p".into())],
-        }
+        AuthMode::long_term("r", [("u", "p")])
     }
 
     #[test]

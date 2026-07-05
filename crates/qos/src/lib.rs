@@ -1,6 +1,4 @@
-//! Quality of Service — rate limiting, backpressure
-
-pub mod backpressure;
+//! Quality of Service — rate limiting
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

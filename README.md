@@ -4,14 +4,14 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 
 [![CI](https://github.com/kruatech/turna/actions/workflows/ci.yml/badge.svg)](https://github.com/kruatech/turna/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-alpha-orange.svg)
+![Status](https://img.shields.io/badge/status-beta-yellow.svg)
 
 > Turna is the Turkish name of the crane — a migratory bird that relays itself
 > across continents. This server does the same for your packets.
 
 ## Status
 
-**Pre-release (`0.2.0-alpha.1`).** The default **tokio UDP datapath** is the
+**Beta (`0.3.0-beta.1`).** The default **tokio UDP datapath** is the
 primary supported path: STUN binding, the full TURN allocation lifecycle,
 long-term-credential and JWT auth, Prometheus/OpenTelemetry, config validation,
 and graceful drain / RFC 8016 migration are exercised here.
@@ -167,7 +167,7 @@ Workspace crates can be consumed via a git dependency:
 
 ```toml
 [dependencies]
-turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.2.0-alpha.1" }
+turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.0-beta.1" }
 ```
 
 ## Development

@@ -19,11 +19,25 @@
 use std::net::SocketAddr;
 use turna_management::ManagementClient;
 
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+
+mod proto {
+    tonic::include_proto!("turna.management.v1");
+}
+use proto::turna_management_client::TurnaManagementClient;
+use proto::{AddUserRequest, RemoveUserRequest};
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     let mut addr: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+    let mut grpc_addr: String = "http://127.0.0.1:5350".to_string();
+    let mut tls_ca: Option<String> = None;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
+    let mut org: Option<String> = None;
+    let mut force = false;
     let mut json_output = false;
     let mut cmd_args: Vec<String> = Vec::new();
 
@@ -36,6 +50,29 @@ async fn main() {
             }
             "--json" => {
                 json_output = true;
+            }
+            "--grpc-addr" => {
+                i += 1;
+                grpc_addr = args[i].clone();
+            }
+            "--tls-ca" => {
+                i += 1;
+                tls_ca = Some(args[i].clone());
+            }
+            "--tls-cert" => {
+                i += 1;
+                tls_cert = Some(args[i].clone());
+            }
+            "--tls-key" => {
+                i += 1;
+                tls_key = Some(args[i].clone());
+            }
+            "--org" => {
+                i += 1;
+                org = Some(args[i].clone());
+            }
+            "--force" => {
+                force = true;
             }
             "--help" | "-h" => {
                 print_help();
@@ -50,6 +87,25 @@ async fn main() {
 
     if cmd_args.is_empty() {
         print_help();
+        return;
+    }
+
+    // User management is served over gRPC by the control-plane (not the node's
+    // HTTP management API), so it uses a separate transport and address.
+    if cmd_args.first().map(|s| s.as_str()) == Some("user") {
+        handle_user_command(
+            &grpc_addr,
+            TlsArgs {
+                ca: tls_ca,
+                cert: tls_cert,
+                key: tls_key,
+            },
+            &cmd_args,
+            org,
+            force,
+            json_output,
+        )
+        .await;
         return;
     }
 
@@ -70,6 +126,136 @@ async fn main() {
         Err(e) => {
             eprintln!("Connection failed: {e}");
             eprintln!("Is turna-node running with management API on {addr}?");
+            std::process::exit(1);
+        }
+    }
+}
+
+struct TlsArgs {
+    ca: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+}
+
+impl TlsArgs {
+    fn enabled(&self) -> bool {
+        self.ca.is_some() || self.cert.is_some() || self.key.is_some()
+    }
+}
+
+async fn connect_grpc(
+    addr: &str,
+    tls: &TlsArgs,
+) -> Result<TurnaManagementClient<Channel>, Box<dyn std::error::Error>> {
+    let mut endpoint = Channel::from_shared(addr.to_string())?;
+    if tls.enabled() {
+        let mut cfg = ClientTlsConfig::new();
+        if let Some(ca) = &tls.ca {
+            cfg = cfg.ca_certificate(Certificate::from_pem(std::fs::read(ca)?));
+        }
+        match (&tls.cert, &tls.key) {
+            (Some(cert), Some(key)) => {
+                cfg = cfg.identity(Identity::from_pem(
+                    std::fs::read(cert)?,
+                    std::fs::read(key)?,
+                ));
+            }
+            (None, None) => {}
+            _ => return Err("both --tls-cert and --tls-key are required for mTLS".into()),
+        }
+        endpoint = endpoint.tls_config(cfg)?;
+    }
+    let channel = endpoint.connect().await?;
+    Ok(TurnaManagementClient::new(channel))
+}
+
+async fn handle_user_command(
+    grpc_addr: &str,
+    tls: TlsArgs,
+    args: &[String],
+    org: Option<String>,
+    force: bool,
+    json_output: bool,
+) {
+    let mut client = match connect_grpc(grpc_addr, &tls).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gRPC connect failed: {e}");
+            eprintln!("Is turna-control-plane running with management gRPC on {grpc_addr}?");
+            std::process::exit(1);
+        }
+    };
+
+    match args.get(1).map(|s| s.as_str()) {
+        Some("add") => {
+            let (Some(username), Some(password)) = (args.get(2).cloned(), args.get(3).cloned())
+            else {
+                eprintln!("usage: turnactl user add <username> <password> [--org ORG]");
+                std::process::exit(1);
+            };
+            let req = AddUserRequest {
+                username: username.clone(),
+                password,
+                organization: org.unwrap_or_default(),
+            };
+            match client.add_user(req).await {
+                Ok(resp) => {
+                    let ok = resp.into_inner().success;
+                    if json_output {
+                        println!("{}", serde_json::json!({ "success": ok }));
+                    } else if ok {
+                        println!("User '{username}' added");
+                    } else {
+                        eprintln!("Server reported failure adding user '{username}'");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("AddUser failed: {}", e.message());
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("remove") => {
+            let Some(username) = args.get(2).cloned() else {
+                eprintln!("usage: turnactl user remove <username> [--force]");
+                std::process::exit(1);
+            };
+            let req = RemoveUserRequest {
+                username: username.clone(),
+                force_delete_allocations: force,
+            };
+            match client.remove_user(req).await {
+                Ok(resp) => {
+                    let r = resp.into_inner();
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "success": r.success,
+                                "allocations_deleted": r.allocations_deleted,
+                            })
+                        );
+                    } else if r.success {
+                        println!(
+                            "User '{username}' removed ({} allocation(s) dropped)",
+                            r.allocations_deleted
+                        );
+                    } else {
+                        eprintln!("Server reported failure removing user '{username}'");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("RemoveUser failed: {}", e.message());
+                    std::process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("Unknown: user {}", other.unwrap_or(""));
+            eprintln!("usage: turnactl user add <username> <password> [--org ORG]");
+            eprintln!("       turnactl user remove <username> [--force]");
             std::process::exit(1);
         }
     }
@@ -229,4 +415,12 @@ fn print_help() {
     println!("  allocations kill <port>  Force-remove allocation");
     println!("  rooms list               List active rooms");
     println!("  cluster nodes            List live cluster nodes (gossip ring)");
+    println!("  user add <u> <p> [--org O]  Add a long-term user (gRPC → control-plane)");
+    println!("  user remove <u> [--force]   Remove a long-term user (gRPC → control-plane)");
+    println!();
+    println!("gRPC options (user commands):");
+    println!("  --grpc-addr URL          control-plane gRPC (default: http://127.0.0.1:5350)");
+    println!("  --tls-ca FILE            CA cert (PEM) to verify the server");
+    println!("  --tls-cert FILE          client cert (PEM) for mTLS");
+    println!("  --tls-key FILE           client key (PEM) for mTLS");
 }

@@ -43,6 +43,7 @@ use tracing::{info, warn};
 
 use turna_config::TurnaConfig;
 use turna_control::{start_grpc_server, GrpcConfig, GrpcTlsConfig, TurnCoreImpl};
+use turna_state_backend::{create_backend, Backend, BackendConfig};
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -90,22 +91,28 @@ async fn main() -> Result<(), AnyError> {
     let metrics = Arc::new(turna_health::Metrics::new());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let core = Arc::new(
-        TurnCoreImpl::new(
-            Arc::clone(&store),
-            Arc::clone(&metrics),
-            shutdown_tx.clone(),
-        )
-        .with_config(
-            "turna",
-            external_ip,
-            vec!["0.0.0.0:3478".into()],
-            49152,
-            65535,
-            600,
-            3600,
-        ),
+    let realm = resolve_realm(&file_cfg);
+    let user_backend = build_user_backend(&file_cfg).await?;
+
+    let mut core_impl = TurnCoreImpl::new(
+        Arc::clone(&store),
+        Arc::clone(&metrics),
+        shutdown_tx.clone(),
+    )
+    .with_config(
+        realm.clone(),
+        external_ip,
+        vec!["0.0.0.0:3478".into()],
+        49152,
+        65535,
+        600,
+        3600,
     );
+    if let Some(backend) = user_backend {
+        info!(%realm, "runtime user management enabled (state backend attached)");
+        core_impl = core_impl.with_user_backend(backend);
+    }
+    let core = Arc::new(core_impl);
 
     // ── Signal handler ────────────────────────────────────────────────────────
     let signal_tx = shutdown_tx.clone();
@@ -146,6 +153,65 @@ async fn main() -> Result<(), AnyError> {
 
     info!("control plane stopped");
     Ok(())
+}
+
+/// Resolve the realm advertised to TURN clients. MUST match the nodes' realm,
+/// or the long-term keys this control-plane derives will not verify on a node.
+fn resolve_realm(file_cfg: &Option<TurnaConfig>) -> String {
+    file_cfg
+        .as_ref()
+        .map(|c| c.turn.realm.clone())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "turna".into())
+}
+
+/// Build the shared state backend used for runtime user CRUD (R8). Only a
+/// Tarantool backend is useful here: the control-plane is a separate process,
+/// so an in-memory store would never reach the nodes. Returns `None` (user
+/// management stays Unimplemented) when no usable backend is configured.
+async fn build_user_backend(
+    file_cfg: &Option<TurnaConfig>,
+) -> Result<Option<Arc<Backend>>, AnyError> {
+    let Some(cfg) = file_cfg else {
+        warn!("no config file — runtime user management (AddUser) disabled (no state backend)");
+        return Ok(None);
+    };
+    let b = &cfg.cluster.backend;
+    let backend_cfg = match b.r#type.as_str() {
+        "tarantool" => BackendConfig::Tarantool {
+            uri: b.uri.clone(),
+            user: if b.user.is_empty() {
+                None
+            } else {
+                Some(b.user.clone())
+            },
+            password: if b.password.is_empty() {
+                None
+            } else {
+                Some(b.password.clone())
+            },
+            pool_size: if b.pool_size == 0 {
+                None
+            } else {
+                Some(b.pool_size)
+            },
+        },
+        "memory" | "" => {
+            warn!(
+                "[cluster.backend].type is memory/empty — a control-plane user store would be                  process-local and NOT reach nodes; set type = \"tarantool\" for a cluster.                  Runtime user management disabled."
+            );
+            return Ok(None);
+        }
+        other => {
+            warn!(backend = %other,
+                  "unknown [cluster.backend].type; runtime user management disabled");
+            return Ok(None);
+        }
+    };
+    let backend = create_backend(&backend_cfg)
+        .await
+        .map_err(|e| -> AnyError { format!("state backend init failed: {e}").into() })?;
+    Ok(Some(Arc::new(backend)))
 }
 
 /// Resolve the gRPC bind address from (in priority order):

@@ -49,6 +49,16 @@ pub enum StunError {
     /// of kilobytes per request.
     #[error("message length too large: declared={len} max={max}")]
     MessageTooLong { len: u16, max: u16 },
+
+    /// The two most-significant bits of the STUN message type are not zero
+    /// (RFC 5389 §6): not a STUN message type we accept.
+    #[error("invalid message type: top two bits must be zero (0x{0:04x})")]
+    InvalidMessageType(u16),
+
+    /// The message type encodes a method we don't implement. Distinct from
+    /// `UnknownAttribute` — a method is not an attribute (I4).
+    #[error("unknown method: 0x{0:04x}")]
+    UnknownMethod(u16),
 }
 
 pub type Result<T> = std::result::Result<T, StunError>;

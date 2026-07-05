@@ -93,6 +93,11 @@ impl MessageHeader {
             return Err(StunError::InvalidMagicCookie);
         }
 
+        // RFC 5389 §6: the two most-significant bits of every STUN message are 0.
+        if msg_type & 0xC000 != 0 {
+            return Err(StunError::InvalidMessageType(msg_type));
+        }
+
         if !length.is_multiple_of(4) {
             return Err(StunError::InvalidLength);
         }
@@ -108,7 +113,7 @@ impl MessageHeader {
         }
 
         let raw_method = extract_method(msg_type);
-        let method = Method::from_raw(raw_method).ok_or(StunError::UnknownAttribute(raw_method))?;
+        let method = Method::from_raw(raw_method).ok_or(StunError::UnknownMethod(raw_method))?;
         let class = MessageClass::from_raw(msg_type);
 
         let mut transaction_id = [0u8; 12];
@@ -184,5 +189,26 @@ mod tests {
         buf[4..8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
         let err = MessageHeader::decode(&buf).unwrap_err();
         assert!(matches!(err, StunError::InvalidMagicCookie));
+    }
+
+    #[test]
+    fn rejects_top_bits_set() {
+        for bad in [0x8001u16, 0xC001] {
+            let buf = header_bytes(bad, 0);
+            match MessageHeader::decode(&buf) {
+                Err(StunError::InvalidMessageType(t)) => assert_eq!(t, bad),
+                other => panic!("expected InvalidMessageType for {bad:#06x}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_method_is_reported_as_unknown_method() {
+        // msg_type 0x0002 → method 0x0002 (unassigned), class Request, top bits 0.
+        let buf = header_bytes(0x0002, 0);
+        assert!(matches!(
+            MessageHeader::decode(&buf),
+            Err(StunError::UnknownMethod(2))
+        ));
     }
 }

@@ -1308,7 +1308,7 @@ pub mod xsk {
         /// Optional Phase-2 neighbor resolution: (cache, resolve-request sender, TTL).
         neighbor: Option<(
             crate::neighbor::NeighborCache,
-            tokio::sync::mpsc::UnboundedSender<std::net::IpAddr>,
+            tokio::sync::mpsc::Sender<std::net::IpAddr>,
             std::time::Duration,
         )>,
         /// 1.1: the selective XDP program attached to the NIC for this datapath.
@@ -1591,7 +1591,7 @@ pub mod xsk {
         pub fn attach_neighbor(
             &mut self,
             cache: crate::neighbor::NeighborCache,
-            req_tx: tokio::sync::mpsc::UnboundedSender<std::net::IpAddr>,
+            req_tx: tokio::sync::mpsc::Sender<std::net::IpAddr>,
             ttl: std::time::Duration,
         ) {
             self.neighbor = Some((cache, req_tx, ttl));
@@ -1607,7 +1607,10 @@ pub mod xsk {
                 // Stale or missing: trigger async (re)resolution. Prefer a
                 // last-known (stale) MAC over the static fallback so a TTL
                 // refresh doesn't drop packets; the resolver updates it soon.
-                let _ = req_tx.send(dst);
+                // B6: bounded queue — drop the resolve hint if it's full. A miss
+                // just falls back to the static dst_mac this time; the resolver
+                // catches up on the next packet, so dropping here is harmless.
+                let _ = req_tx.try_send(dst);
                 if let Some(stale) = cache.get_stale(dst) {
                     return stale;
                 }

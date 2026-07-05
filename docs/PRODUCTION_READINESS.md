@@ -33,8 +33,7 @@ Production checklist:
 
 - Generate `turn.auth.shared_secret` with `openssl rand -hex 32`.
 - Set `turn.external_ip` to a concrete IPv4/IPv6 address. Empty values are
-  refused in production; invalid strings are refused once validation includes
-  the P0 external-IP patch.
+  refused in production, and invalid strings are rejected at config validation.
 - Prefer `transport = "tokio"` for the public production path.
 - Keep `/health`, `/status`, `/metrics`, and the gRPC management port off the
   public Internet.
@@ -59,7 +58,7 @@ Production checklist:
 | AF_XDP | Explicit opt-in backend | Experimental Linux/NIC-specific path; never auto-selected. |
 | Cluster redirect/gossip | Implemented path | Useful for new-client distribution; secure gossip with `cluster_secret`. |
 | Tarantool allocation persistence/failover | Implemented path | Monitor writer drops/errors; validate failover in your environment. |
-| Runtime user CRUD over gRPC | Not implemented | Static users in config or shared-secret credentials only. |
+| Runtime user CRUD over gRPC | Implemented (requires Tarantool backend) | `AddUser`/`RemoveUser` via the control-plane gRPC; users persist in the shared backend and nodes pick them up at startup and via periodic refresh. Needs `[cluster.backend] type = "tarantool"`. |
 
 ## Risk register
 
@@ -139,15 +138,27 @@ another's tickets.
   node. Empty is a hard validation error when migration and cluster mode are
   both enabled.
 
-### R8 — gRPC user management is not runtime CRUD
+### R8 — runtime user management requires the Tarantool backend
 
-`TurnCore::add_user` currently returns an explicit unimplemented error.
-Long-term users are configured in `turn.toml`; shared-secret credentials are
-validated statelessly.
+`AddUser`/`RemoveUser` on the control-plane gRPC persist long-term users to the
+shared state backend. No plaintext password is stored — only the two
+pre-derived long-term keys (RFC 5389 MD5 key and RFC 8489 SHA-256 key). Nodes
+load users from the backend at startup and re-read them every
+`cluster.persistence.user_refresh_secs` seconds, so additions apply without a
+restart. Because the control-plane is a separate process, this only works with
+`[cluster.backend] type = "tarantool"`; an in-memory backend is process-local
+and never reaches the nodes.
 
-- **Severity:** Low operationally if documented.
-- **Mitigation:** manage users through config/static users or issue
-  coturn-compatible time-limited credentials from your own credential service.
+- **Severity:** Low–Medium. Without a Tarantool backend, runtime user
+  management is unavailable (the RPC returns an explicit unimplemented error)
+  and you fall back to config/static users or shared-secret credentials.
+- **Mitigation:** for runtime management, run the Tarantool backend with the
+  **same `[turn] realm` on the control-plane and every node** (long-term keys
+  are realm-bound, so a realm mismatch makes them fail to verify). Add users
+  with `turnactl user add <u> <p>` or grpcurl. Note: user *deletion* reaches a
+  running node on its next restart (or use `remove --force` to drop the user's
+  active allocations on the serving node); periodic refresh propagates
+  additions/updates, not deletions.
 
 ## Metrics to watch first
 

@@ -128,6 +128,25 @@ pub struct StoredParticipant {
     pub joined_at_ms: u64,
 }
 
+/// A long-term TURN user persisted in the state backend (R8).
+///
+/// Variant B: the plaintext password is never stored. Both pre-derived
+/// long-term keys are kept as lowercase hex, so a node can rehydrate its
+/// `AuthRegistry` directly and answer either MESSAGE-INTEGRITY variant
+/// (RFC 5389 / RFC 8489).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredUser {
+    pub username: String,
+    pub realm: String,
+    /// hex(HMAC-SHA-1 key = MD5(username:realm:password)) — RFC 5389.
+    pub key_md5_hex: String,
+    /// hex(SHA-256 long-term key) — RFC 8489.
+    pub key_sha256_hex: String,
+    #[serde(default)]
+    pub organization: Option<String>,
+    pub created_at_ms: u64,
+}
+
 // ── Backend enum dispatch ─────────────────────────────────────────────────────
 
 pub enum Backend {
@@ -209,6 +228,7 @@ impl Backend {
         dispatch!(self, remove_room, room_id)
     }
 
+    #[cfg_attr(not(feature = "tarantool"), allow(unused_variables))]
     pub async fn revoke_token(
         &self,
         jti: &str,
@@ -217,27 +237,34 @@ impl Backend {
         expires_at_ms: u64,
     ) -> Result<()> {
         match self {
+            #[cfg(feature = "tarantool")]
             Backend::Tarantool(b) => b.revoke_token(jti, sub, revoked_at_ms, expires_at_ms).await,
             Backend::Memory(_) => Ok(()),
         }
     }
 
+    #[cfg_attr(not(feature = "tarantool"), allow(unused_variables))]
     pub async fn is_token_revoked(&self, jti: &str) -> Result<bool> {
         match self {
+            #[cfg(feature = "tarantool")]
             Backend::Tarantool(b) => b.is_token_revoked(jti).await,
             Backend::Memory(_) => Ok(false),
         }
     }
 
+    #[cfg_attr(not(feature = "tarantool"), allow(unused_variables))]
     pub async fn cleanup_revoked_tokens(&self, before_ms: u64) -> Result<u64> {
         match self {
+            #[cfg(feature = "tarantool")]
             Backend::Tarantool(b) => b.cleanup_revoked_tokens(before_ms).await,
             Backend::Memory(_) => Ok(0),
         }
     }
 
+    #[cfg_attr(not(feature = "tarantool"), allow(unused_variables))]
     pub async fn load_active_revocations(&self, after_ms: u64) -> Result<Vec<(String, u64)>> {
         match self {
+            #[cfg(feature = "tarantool")]
             Backend::Tarantool(b) => b.load_active_revocations(after_ms).await,
             Backend::Memory(_) => Ok(vec![]),
         }
@@ -245,6 +272,45 @@ impl Backend {
 
     pub async fn ping(&self) -> Result<()> {
         dispatch!(self, ping)
+    }
+
+    // ── User store (R8: runtime long-term users) ──────────────────────────────
+    //
+    // Cluster-shared auth state, like the token blacklist: the source of truth
+    // is Tarantool. On the in-memory backend this is process-local (single-node
+    // / dev convenience) — it cannot synchronise users across separate
+    // processes, so a multi-process cluster MUST use the Tarantool backend.
+
+    pub async fn store_user(&self, user: &StoredUser) -> Result<()> {
+        match self {
+            #[cfg(feature = "tarantool")]
+            Backend::Tarantool(b) => b.store_user(user).await,
+            Backend::Memory(b) => b.store_user(user).await,
+        }
+    }
+
+    pub async fn get_user(&self, username: &str, realm: &str) -> Result<Option<StoredUser>> {
+        match self {
+            #[cfg(feature = "tarantool")]
+            Backend::Tarantool(b) => b.get_user(username, realm).await,
+            Backend::Memory(b) => b.get_user(username, realm).await,
+        }
+    }
+
+    pub async fn remove_user(&self, username: &str, realm: &str) -> Result<bool> {
+        match self {
+            #[cfg(feature = "tarantool")]
+            Backend::Tarantool(b) => b.remove_user(username, realm).await,
+            Backend::Memory(b) => b.remove_user(username, realm).await,
+        }
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<StoredUser>> {
+        match self {
+            #[cfg(feature = "tarantool")]
+            Backend::Tarantool(b) => b.list_users().await,
+            Backend::Memory(b) => b.list_users().await,
+        }
     }
 
     // ── Failover (PR 5, task #3) ──────────────────────────────────────────────

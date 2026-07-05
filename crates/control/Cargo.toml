@@ -22,6 +22,8 @@ futures              = "0.3"
 turna-session.workspace  = true
 turna-health.workspace   = true
 turna-auth.workspace     = true
+turna-state-backend.workspace = true
+turna-crypto.workspace   = true
 
 [build-dependencies]
 tonic-prost-build = "0.14"

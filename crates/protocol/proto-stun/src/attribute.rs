@@ -110,6 +110,9 @@ pub enum Attribute {
     ReservationToken([u8; 8]),
     /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
     MobilityTicket(Vec<u8>),
+    /// RFC 5389 §15.9 UNKNOWN-ATTRIBUTES: list of attribute types the server did
+    /// not comprehend. Response-only (built for 420 replies).
+    UnknownAttributes(Vec<u16>),
     Unknown {
         attr_type: u16,
         value: Vec<u8>,
@@ -139,6 +142,7 @@ impl Attribute {
             Self::EvenPort(_) => ATTR_EVEN_PORT,
             Self::ReservationToken(_) => ATTR_RESERVATION_TOKEN,
             Self::MobilityTicket(_) => ATTR_MOBILITY_TICKET,
+            Self::UnknownAttributes(_) => ATTR_UNKNOWN_ATTRIBUTES,
             Self::Unknown { attr_type, .. } => *attr_type,
         }
     }
@@ -223,6 +227,14 @@ impl Attribute {
                 ensure(buf.len(), t.len())?;
                 buf[..t.len()].copy_from_slice(t);
                 Ok(t.len())
+            }
+            Self::UnknownAttributes(types) => {
+                let n = types.len() * 2;
+                ensure(buf.len(), n)?;
+                for (i, t) in types.iter().enumerate() {
+                    buf[i * 2..i * 2 + 2].copy_from_slice(&t.to_be_bytes());
+                }
+                Ok(n)
             }
             Self::Unknown { value, .. } => {
                 ensure(buf.len(), value.len())?;
@@ -459,10 +471,12 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 Attribute::Lifetime(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
             ATTR_REQUESTED_TRANSPORT => {
-                if value.is_empty() {
-                    return Err(StunError::AttributeParse(
-                        "REQUESTED-TRANSPORT empty".into(),
-                    ));
+                // RFC 8656 §18.8: exactly 4 bytes (1 protocol + 3 reserved).
+                if value.len() != 4 {
+                    return Err(StunError::AttributeParse(format!(
+                        "REQUESTED-TRANSPORT must be 4 bytes, got {}",
+                        value.len()
+                    )));
                 }
                 Attribute::RequestedTransport(value[0])
             }
@@ -473,27 +487,64 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 Attribute::XorRelayedAddress(decode_xor_address(value, transaction_id)?)
             }
             ATTR_CHANNEL_NUMBER => {
-                if value.len() < 2 {
+                // RFC 5766/8656 §18.1: exactly 4 bytes (2 channel + 2 reserved).
+                if value.len() != 4 {
                     return Err(StunError::AttributeParse(format!(
-                        "CHANNEL-NUMBER too short: {}",
+                        "CHANNEL-NUMBER must be 4 bytes, got {}",
                         value.len()
                     )));
                 }
                 Attribute::ChannelNumber(u16::from_be_bytes([value[0], value[1]]))
             }
             ATTR_DATA => Attribute::Data(value.to_vec()),
-            ATTR_DONT_FRAGMENT => Attribute::DontFragment,
+            ATTR_DONT_FRAGMENT => {
+                // RFC 8656 §18.9: zero-length flag.
+                if !value.is_empty() {
+                    return Err(StunError::AttributeParse(format!(
+                        "DONT-FRAGMENT must be empty, got {}",
+                        value.len()
+                    )));
+                }
+                Attribute::DontFragment
+            }
             ATTR_EVEN_PORT => {
-                ensure(value.len(), 1)?;
+                // RFC 8656 §18.6: exactly 1 byte; only the high (R) bit is
+                // defined, the low 7 bits are reserved and must be zero.
+                if value.len() != 1 {
+                    return Err(StunError::AttributeParse(format!(
+                        "EVEN-PORT must be 1 byte, got {}",
+                        value.len()
+                    )));
+                }
+                if value[0] & 0x7F != 0 {
+                    return Err(StunError::AttributeParse(
+                        "EVEN-PORT reserved bits must be zero".into(),
+                    ));
+                }
                 Attribute::EvenPort(value[0] & 0x80 != 0)
             }
             ATTR_RESERVATION_TOKEN => {
-                ensure(value.len(), 8)?;
+                // RFC 8656 §18.5: exactly 8 bytes.
+                if value.len() != 8 {
+                    return Err(StunError::AttributeParse(format!(
+                        "RESERVATION-TOKEN must be 8 bytes, got {}",
+                        value.len()
+                    )));
+                }
                 let mut t = [0u8; 8];
                 t.copy_from_slice(&value[..8]);
                 Attribute::ReservationToken(t)
             }
             ATTR_MOBILITY_TICKET => Attribute::MobilityTicket(value.to_vec()),
+            // I3: symmetric with the encoder — decode the 420 list of 16-bit
+            // attribute types back into `UnknownAttributes` rather than a generic
+            // `Unknown`, so callers (and tests) can introspect the reported list.
+            ATTR_UNKNOWN_ATTRIBUTES => Attribute::UnknownAttributes(
+                value
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect(),
+            ),
             _ => Attribute::Unknown {
                 attr_type,
                 value: value.to_vec(),
@@ -724,10 +775,57 @@ mod tests {
     }
 
     #[test]
+    fn strict_lengths_reject_non_exact() {
+        // I2: exact-length TURN attributes reject off-by-one.
+        assert!(parse_attributes(&build_attr(ATTR_REQUESTED_TRANSPORT, &[17]), &TID).is_err());
+        assert!(
+            parse_attributes(&build_attr(ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]), &TID).is_ok()
+        );
+        assert!(parse_attributes(&build_attr(ATTR_CHANNEL_NUMBER, &[0x40, 0x01]), &TID).is_err());
+        assert!(
+            parse_attributes(&build_attr(ATTR_CHANNEL_NUMBER, &[0x40, 0x01, 0, 0]), &TID).is_ok()
+        );
+        assert!(parse_attributes(&build_attr(ATTR_DONT_FRAGMENT, &[0]), &TID).is_err());
+        assert!(parse_attributes(&build_attr(ATTR_DONT_FRAGMENT, &[]), &TID).is_ok());
+        assert!(parse_attributes(&build_attr(ATTR_EVEN_PORT, &[0x80, 0x00]), &TID).is_err());
+        assert!(parse_attributes(&build_attr(ATTR_EVEN_PORT, &[0x01]), &TID).is_err());
+        assert!(parse_attributes(&build_attr(ATTR_EVEN_PORT, &[0x80]), &TID).is_ok());
+        assert!(parse_attributes(&build_attr(ATTR_RESERVATION_TOKEN, &[0u8; 7]), &TID).is_err());
+        assert!(parse_attributes(&build_attr(ATTR_RESERVATION_TOKEN, &[0u8; 8]), &TID).is_ok());
+    }
+
+    #[test]
     fn mobility_ticket_empty_is_valid() {
         // A zero-length ticket must parse as an empty MobilityTicket, not panic.
         let buf = build_attr(ATTR_MOBILITY_TICKET, &[]);
         let attrs = parse_attributes(&buf, &TID).unwrap();
         assert!(matches!(attrs.as_slice(), [Attribute::MobilityTicket(t)] if t.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod i3_unknown_attributes_roundtrip {
+    use super::*;
+
+    #[test]
+    fn unknown_attributes_encode_then_parse_symmetric() {
+        // I3: a UNKNOWN-ATTRIBUTES value must round-trip to `UnknownAttributes`,
+        // not a generic `Unknown` (which is what a missing parse arm produced).
+        let tid = [0u8; 12];
+        let attr = Attribute::UnknownAttributes(vec![0x0021, 0x4000]);
+        let mut buf = [0u8; 64];
+        let vlen = attr.encode_value(&mut buf[4..], &tid).unwrap();
+        buf[0..2].copy_from_slice(&ATTR_UNKNOWN_ATTRIBUTES.to_be_bytes());
+        buf[2..4].copy_from_slice(&(vlen as u16).to_be_bytes());
+        let padded = (4 + vlen + 3) & !3;
+        let parsed = parse_attributes(&buf[..padded], &tid).unwrap();
+        assert!(
+            matches!(
+                parsed.first(),
+                Some(Attribute::UnknownAttributes(v)) if v == &vec![0x0021, 0x4000]
+            ),
+            "expected UnknownAttributes([0x0021, 0x4000]), got {:?}",
+            parsed.first()
+        );
     }
 }

@@ -765,6 +765,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "curve25519-dalek-derive",
+ "digest",
  "fiat-crypto",
  "rustc_version",
  "subtle",
@@ -904,6 +905,30 @@ dependencies = [
  "rfc6979",
  "signature",
  "spki",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1675,11 +1700,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
  "base64",
+ "ed25519-dalek",
  "getrandom 0.2.17",
+ "hmac",
  "js-sys",
+ "p256",
+ "p384",
  "pem",
+ "rand 0.8.6",
+ "rsa",
  "serde",
  "serde_json",
+ "sha2",
  "signature",
  "simple_asn1",
  "zeroize",
@@ -1690,6 +1722,9 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+dependencies = [
+ "spin",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -1970,6 +2005,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint-dig"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
+dependencies = [
+ "lazy_static",
+ "libm",
+ "num-integer",
+ "num-iter",
+ "num-traits",
+ "rand 0.8.6",
+ "smallvec",
+ "zeroize",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1985,12 +2036,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-iter"
+version = "0.1.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
+dependencies = [
+ "autocfg",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -2253,6 +2316,17 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pkcs1"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
+dependencies = [
+ "der",
+ "pkcs8",
+ "spki",
+]
 
 [[package]]
 name = "pkcs8"
@@ -2757,6 +2831,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsa"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
+dependencies = [
+ "const-oid",
+ "digest",
+ "num-bigint-dig",
+ "num-integer",
+ "num-traits",
+ "pkcs1",
+ "pkcs8",
+ "rand_core 0.6.4",
+ "signature",
+ "spki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "rtnetlink"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3152,6 +3246,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "spki"
@@ -3710,7 +3810,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turna-auth"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "argon2",
  "base64",
@@ -3730,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "turna-benchmark"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "rand 0.8.6",
  "tokio",
@@ -3740,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "turna-cluster"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "hmac",
  "serde",
@@ -3753,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "turna-common"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3763,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "turna-config"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3774,7 +3874,7 @@ dependencies = [
 
 [[package]]
 name = "turna-control"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3790,13 +3890,15 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "turna-auth",
+ "turna-crypto",
  "turna-health",
  "turna-session",
+ "turna-state-backend",
 ]
 
 [[package]]
 name = "turna-control-plane"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "tokio",
  "tracing",
@@ -3805,11 +3907,12 @@ dependencies = [
  "turna-health",
  "turna-observability",
  "turna-session",
+ "turna-state-backend",
 ]
 
 [[package]]
 name = "turna-crypto"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "base64",
  "hmac",
@@ -3822,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "turna-diff-test"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "clap",
  "serde",
@@ -3836,14 +3939,14 @@ dependencies = [
 
 [[package]]
 name = "turna-garbage-gen"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "turna-health"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3854,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "turna-integration-tests"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "base64",
  "hmac",
@@ -3872,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "turna-load-test"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "clap",
  "hmac",
@@ -3887,7 +3990,7 @@ dependencies = [
 
 [[package]]
 name = "turna-management"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -3899,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "turna-node"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "hostname",
  "parking_lot",
@@ -3919,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "turna-observability"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "hostname",
  "opentelemetry",
@@ -3933,21 +4036,21 @@ dependencies = [
 
 [[package]]
 name = "turna-packet"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "turna-proto-rtp"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "turna-proto-stun"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "bytes",
  "crc",
@@ -3962,7 +4065,7 @@ dependencies = [
 
 [[package]]
 name = "turna-proto-turn"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "proptest",
  "thiserror 2.0.18",
@@ -3971,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "turna-qos"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "dashmap",
  "loom",
@@ -3982,7 +4085,7 @@ dependencies = [
 
 [[package]]
 name = "turna-relay"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -4007,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "turna-rtp-analyzer"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "dashmap",
  "tracing",
@@ -4016,7 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "turna-session"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "dashmap",
  "parking_lot",
@@ -4028,7 +4131,7 @@ dependencies = [
 
 [[package]]
 name = "turna-soak"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "bytes",
  "tokio",
@@ -4041,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "turna-state-backend"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "base64",
  "dashmap",
@@ -4056,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "turna-transport"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4086,11 +4189,15 @@ dependencies = [
 
 [[package]]
 name = "turnactl"
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 dependencies = [
+ "prost",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
  "turna-management",
 ]

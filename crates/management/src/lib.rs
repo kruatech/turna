@@ -139,6 +139,19 @@ pub async fn serve_management(
     metrics: Arc<Metrics>,
     store_handler: Option<Arc<dyn StoreHandler>>,
 ) -> std::io::Result<()> {
+    // I10: this management listener is plaintext and unauthenticated. Refuse to
+    // expose it beyond loopback unless the operator explicitly opts in — prod
+    // management is the mTLS gRPC control-plane, not this interface.
+    if !addr.ip().is_loopback()
+        && std::env::var("TURNA_ALLOW_PLAINTEXT_MANAGEMENT").as_deref() != Ok("1")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to bind plaintext management to a non-loopback address; use the \
+             mTLS gRPC control-plane, or set TURNA_ALLOW_PLAINTEXT_MANAGEMENT=1 for a \
+             trusted-network dev/test setup",
+        ));
+    }
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "management server started");
     loop {

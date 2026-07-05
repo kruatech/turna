@@ -110,6 +110,7 @@ pub fn spawn_quic(
 
     // -- consumer task: bridge events into the processor, route responses back --
     let mut bridge = QuicBridge::new(processor);
+    let stats_out = stats.clone();
     tokio::spawn(async move {
         // session_id -> client addr, so SessionClosed (which carries no addr)
         // can drop the right client_sink. Egress mirrors the DTLS path.
@@ -129,6 +130,7 @@ pub fn spawn_quic(
                     client_sinks.insert(addr, sink_tx);
 
                     let reg = outbound.clone();
+                    let st_pump = stats_out.clone();
                     tokio::spawn(async move {
                         while let Some(bytes) = sink_rx.recv().await {
                             // ChannelData (0x40..=0x7f) -> unreliable datagram;
@@ -141,11 +143,20 @@ pub fn spawn_quic(
                             // the registry entry landing just after NewSession).
                             let sender = reg.lock().ok().and_then(|g| g.get(&session_id).cloned());
                             if let Some(tx) = sender {
-                                let _ = tx.send(QuicOutbound {
-                                    session_id: session_id.clone(),
-                                    data: bytes,
-                                    via_datagram,
-                                });
+                                // B6: non-blocking enqueue; a full per-session queue
+                                // sheds this outbound instead of stalling the pump.
+                                if tx
+                                    .try_send(QuicOutbound {
+                                        session_id: session_id.clone(),
+                                        data: bytes,
+                                        via_datagram,
+                                    })
+                                    .is_err()
+                                {
+                                    st_pump
+                                        .send_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                     });
@@ -192,11 +203,19 @@ pub fn spawn_quic(
                     .ok()
                     .and_then(|g| g.get(&session_id).cloned());
                 if let Some(tx) = sender {
-                    let _ = tx.send(QuicOutbound {
-                        session_id,
-                        data: data.to_vec(),
-                        via_datagram,
-                    });
+                    // B6: non-blocking enqueue; drop + count on a full queue.
+                    if tx
+                        .try_send(QuicOutbound {
+                            session_id,
+                            data: data.to_vec(),
+                            via_datagram,
+                        })
+                        .is_err()
+                    {
+                        stats_out
+                            .send_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
         }

@@ -329,6 +329,10 @@ impl StunMessage {
             let attr_type = u16::from_be_bytes([raw[pos], raw[pos + 1]]);
             let attr_len = u16::from_be_bytes([raw[pos + 2], raw[pos + 3]]) as usize;
             if attr_type == attribute::ATTR_MESSAGE_INTEGRITY {
+                // I1: nothing but FINGERPRINT may follow MESSAGE-INTEGRITY.
+                if !only_fingerprint_after(raw, pos + 4 + 20) {
+                    return false;
+                }
                 // Build temp buffer with adjusted length
                 let mut tmp = raw[..pos].to_vec();
                 let adjusted_len = (pos - HEADER_SIZE + 24) as u16;
@@ -354,6 +358,10 @@ impl StunMessage {
             let attr_type = u16::from_be_bytes([raw[pos], raw[pos + 1]]);
             let attr_len = u16::from_be_bytes([raw[pos + 2], raw[pos + 3]]) as usize;
             if attr_type == attribute::ATTR_MESSAGE_INTEGRITY_SHA256 {
+                // I1: nothing but FINGERPRINT may follow MESSAGE-INTEGRITY-SHA256.
+                if !only_fingerprint_after(raw, pos + 4 + ((attr_len + 3) & !3)) {
+                    return false;
+                }
                 let mut tmp = raw[..pos].to_vec();
                 let adjusted_len = (pos - HEADER_SIZE + 4 + attr_len) as u16;
                 tmp[2..4].copy_from_slice(&adjusted_len.to_be_bytes());
@@ -363,6 +371,22 @@ impl StunMessage {
         }
         false
     }
+}
+
+/// I1: after MESSAGE-INTEGRITY[-SHA256] only FINGERPRINT may appear (RFC 5389
+/// §15.4 / RFC 8489 §14.6). True iff every attribute from `pos` onward is
+/// FINGERPRINT (or none). Stops a signed prefix from being extended with an
+/// unauthenticated trailing attribute that `get_*()` would still honour.
+fn only_fingerprint_after(raw: &[u8], mut pos: usize) -> bool {
+    while pos + 4 <= raw.len() {
+        let attr_type = u16::from_be_bytes([raw[pos], raw[pos + 1]]);
+        let attr_len = u16::from_be_bytes([raw[pos + 2], raw[pos + 3]]) as usize;
+        if attr_type != attribute::ATTR_FINGERPRINT {
+            return false;
+        }
+        pos += 4 + ((attr_len + 3) & !3);
+    }
+    true
 }
 
 /// Check if a buffer looks like a STUN message (first two bits are 0, magic cookie present).
@@ -468,6 +492,33 @@ mod tests {
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
         assert!(decoded.verify_integrity(&buf[..len], key));
         assert!(!decoded.verify_integrity(&buf[..len], b"wrongkey"));
+    }
+
+    #[test]
+    fn integrity_rejects_attribute_after_message_integrity() {
+        // I1: a validly-signed message must not verify if a non-FINGERPRINT
+        // attribute is appended after MESSAGE-INTEGRITY.
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::Username("alice".into()));
+        let key = b"secret-key-1234";
+        let mut buf = [0u8; 512];
+        let len = m.encode_with_integrity(&mut buf, key).unwrap();
+
+        assert!(StunMessage::decode(&buf[..len])
+            .unwrap()
+            .verify_integrity(&buf[..len], key));
+
+        let mut tampered = buf[..len].to_vec();
+        tampered.extend_from_slice(&0x0006u16.to_be_bytes());
+        tampered.extend_from_slice(&0u16.to_be_bytes());
+        let new_body = (len - HEADER_SIZE + 4) as u16;
+        tampered[2..4].copy_from_slice(&new_body.to_be_bytes());
+
+        let decoded = StunMessage::decode(&tampered).unwrap();
+        assert!(
+            !decoded.verify_integrity(&tampered, key),
+            "an attribute after MESSAGE-INTEGRITY must invalidate the signature (I1)"
+        );
     }
 
     #[test]

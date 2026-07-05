@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-beta.1]
+
+Production-hardening of the core UDP/IPv4 TURN path. No new features; this
+release closes the concurrency, resource-bound, protocol-strictness and
+fail-closed-config gaps that kept `0.2.0-alpha.1` at alpha. See
+[docs/COMPLIANCE.md](docs/COMPLIANCE.md) for the supported/not-supported scope.
+
+### Fixed
+- Atomic allocation create: a lost create race now returns `437 Allocation
+  Mismatch` instead of silently overwriting an existing allocation.
+- Global and per-tenant allocation quotas enforced with atomic reserve/rollback
+  accounting (no quota race); per-user tracking is tenant-scoped.
+- EVEN-PORT reservations released immediately on create failure instead of
+  leaking until the sweep.
+
+### Security
+- Bounded per-allocation resources: 256 permissions, 256 channels, 32 peers per
+  CreatePermission.
+- Bandwidth quota enforced on all relay paths (channel data, Send-indication
+  egress, peer -> client), not only ChannelData.
+- Bounded internal QUIC/AF_XDP outbound and neighbour queues (experimental).
+- Fail-closed production config: placeholder/empty shared or cluster secrets,
+  unlimited bandwidth without explicit opt-in, and non-loopback plaintext
+  management binds are refused at startup.
+
+### Changed
+- Strict STUN/TURN parsing: exact attribute lengths; MESSAGE-INTEGRITY /
+  MESSAGE-INTEGRITY-SHA256 strictness; `420 UNKNOWN-ATTRIBUTES` for unknown
+  comprehension-required attributes (symmetric encode/parse); reserved/unknown
+  message types rejected.
+- Runtime user revocation now propagates to live nodes via the backend refresh
+  loop (config static users are never affected).
+- Readiness degrades to `503` when backend writes are dropped, and recovers.
+
+### CI
+- New `msrv` job builds + tests on the pinned 1.95.0 toolchain (`--locked`) on
+  every PR/push.
+- The remaining tag-pinned action (`ossf/scorecard-action`) pinned by commit SHA.
+
 ## [0.2.0-alpha.1] - 2026-06-15
 
 First public pre-release. Builds on the internal `v0.1.0` tag with multi-node
@@ -108,5 +147,6 @@ are experimental — see [README](README.md#status) and
   transitives remain. The full picture is tracked in
   `docs/security/dependency-dedup.md`.
 
-[Unreleased]: https://github.com/kruatech/turna/compare/v0.2.0-alpha.1...HEAD
+[Unreleased]: https://github.com/kruatech/turna/compare/v0.3.0-beta.1...HEAD
+[0.3.0-beta.1]: https://github.com/kruatech/turna/compare/v0.2.0-alpha.1...v0.3.0-beta.1
 [0.2.0-alpha.1]: https://github.com/kruatech/turna/compare/v0.1.0...v0.2.0-alpha.1

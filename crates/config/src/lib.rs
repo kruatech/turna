@@ -163,6 +163,20 @@ impl TurnaConfig {
                 self.turn.relay.min_port, self.turn.relay.max_port
             ));
         }
+        // B2: an unlimited per-allocation bandwidth cap in production is a DoS
+        // amplifier — a single authenticated client can relay without bound.
+        // Require an explicit opt-in to run that way.
+        if prod
+            && self.turn.relay.quota.max_bytes_per_sec == 0
+            && !self.turn.relay.quota.allow_unlimited_bandwidth
+        {
+            errors.push(
+                "turn.relay.quota.max_bytes_per_sec is 0 (unlimited) in production; \
+                 set a per-allocation byte/sec cap, or explicitly set \
+                 turn.relay.quota.allow_unlimited_bandwidth = true to accept the risk"
+                    .into(),
+            );
+        }
         if self.turn.external_ip.is_empty() {
             if prod {
                 errors.push(
@@ -279,6 +293,16 @@ impl TurnaConfig {
                     errors.push(format!(
                         "tenant '{}' has neither shared_secret nor static_users — \
                          no client could authenticate",
+                        t.id
+                    ));
+                }
+                // I1: a tenant must not ship the public placeholder secret in
+                // production. The base shared_secret is already rejected; tenants
+                // were not. Mirrors the base-secret placeholder check.
+                if !t.shared_secret.is_empty() && t.shared_secret == DEFAULT_SHARED_SECRET && prod {
+                    errors.push(format!(
+                        "tenant '{}' shared_secret is the public placeholder default; \
+                         generate one with `openssl rand -hex 32`",
                         t.id
                     ));
                 }
@@ -615,6 +639,10 @@ pub struct QuotaConfig {
     pub max_bytes_per_sec: u64,
     /// Max simultaneous allocations per username. 0 = unlimited.
     pub max_per_user: usize,
+    /// B2: acknowledge running with NO per-allocation bandwidth cap in
+    /// production. `max_bytes_per_sec = 0` (unlimited) is refused in production
+    /// unless this is explicitly set — an unbounded relay is a DoS amplifier.
+    pub allow_unlimited_bandwidth: bool,
 }
 
 impl Default for QuotaConfig {
@@ -622,6 +650,7 @@ impl Default for QuotaConfig {
         Self {
             max_bytes_per_sec: 0, // unlimited — matches session default
             max_per_user: 100,
+            allow_unlimited_bandwidth: false,
         }
     }
 }
@@ -836,6 +865,17 @@ impl ClusterConfig {
                         .into(),
                 );
             }
+            // B3 / R5: an empty cluster_secret leaves gossip unauthenticated on
+            // any shared network. Mirror the ticket_secret rule — hard error when
+            // cluster_mode is on (PRODUCTION_READINESS R5, Severity High).
+            if self.cluster_secret.trim().is_empty() {
+                errors.push(
+                    "cluster.cluster_secret must be non-empty when cluster_mode = true \
+                     (an empty secret leaves gossip unauthenticated — R5); generate one \
+                     with `openssl rand -hex 32` and set the SAME value on every node"
+                        .into(),
+                );
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -894,6 +934,10 @@ pub struct PersistenceConfig {
     /// …or when this many milliseconds have elapsed since the first
     /// event in the current batch, whichever comes first.
     pub batch_max_delay_ms: u64,
+    /// R8 live propagation: how often (seconds) a node re-reads runtime users
+    /// from the state backend so AddUser/RemoveUser reach it without a restart.
+    /// `0` disables periodic refresh (users are loaded only at startup).
+    pub user_refresh_secs: u64,
 }
 
 impl Default for PersistenceConfig {
@@ -903,6 +947,7 @@ impl Default for PersistenceConfig {
             channel_capacity: 65_536,
             batch_max_size: 256,
             batch_max_delay_ms: 100,
+            user_refresh_secs: 30,
         }
     }
 }
@@ -1697,6 +1742,57 @@ mod tests {
     }
 
     #[test]
+    fn cluster_mode_empty_cluster_secret_is_hard_error() {
+        // B3 / R5: unauthenticated gossip must not pass validation.
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.external_ip = "203.0.113.1".into();
+        cfg.cluster.cluster_mode = true;
+        cfg.cluster.node_id = "node-a".into();
+        cfg.cluster.cluster_name = "turna".into();
+        cfg.cluster.cluster_secret.clear();
+
+        let msg = cfg
+            .validate()
+            .expect_err("empty cluster_secret + cluster_mode must fail validation")
+            .to_string();
+        assert!(
+            msg.contains("cluster_secret"),
+            "validation error should call out cluster_secret, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tenant_placeholder_secret_in_production_is_error() {
+        // I1: a tenant using the public placeholder secret must fail in prod.
+        let mut cfg = TurnaConfig {
+            production: true,
+            ..Default::default()
+        };
+        cfg.turn.external_ip = "203.0.113.1".into();
+        cfg.turn.auth.shared_secret = "a-real-non-placeholder-secret".into();
+        cfg.signaling.turn_shared_secret = "a-real-non-placeholder-secret".into();
+        cfg.tenants = vec![TenantConfig {
+            id: "t1".into(),
+            realm: "t1realm".into(),
+            relay_port_range: [50000, 50100],
+            shared_secret: DEFAULT_SHARED_SECRET.into(),
+            static_users: Vec::new(),
+            max_allocations: 0,
+            quota: QuotaConfig::default(),
+            listen: None,
+        }];
+
+        let msg = cfg
+            .validate()
+            .expect_err("tenant placeholder secret in production must fail")
+            .to_string();
+        assert!(
+            msg.contains("placeholder"),
+            "validation error should call out the placeholder secret, got: {msg}"
+        );
+    }
+
+    #[test]
     fn migration_section_parses() {
         let toml = r#"
 [turn]
@@ -1850,11 +1946,19 @@ turn_shared_secret = "s"
 
     #[test]
     fn example_config_parseable() {
+        // The example is a dev template; whether it validates now depends on
+        // production mode (B2's unlimited-bandwidth gate). TURNA_PRODUCTION is
+        // process-global and flipped by other tests, so serialise on the shared
+        // lock and pin dev mode for the duration.
+        let _guard = production_env_lock();
+        let saved_turna_production = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
         // Set env var that example config references
         std::env::set_var("TURNA_SHARED_SECRET", "test");
         let config = TurnaConfig::from_str(&example_config()).unwrap();
         assert_eq!(config.turn.listen.port(), 3478);
         std::env::remove_var("TURNA_SHARED_SECRET");
+        restore_turna_production(saved_turna_production);
     }
 
     #[test]
@@ -2015,6 +2119,9 @@ external_ip = "1.2.3.4"
 [turn.auth]
 shared_secret = "deadbeef-this-is-a-real-secret-honest"
 
+[turn.relay.quota]
+allow_unlimited_bandwidth = true
+
 [signaling]
 turn_shared_secret = "another-not-placeholder"
 "#
@@ -2087,5 +2194,46 @@ turn_shared_secret = "another-not-placeholder"
 
         // Restore the caller's environment instead of leaking test state.
         restore_turna_production(saved_turna_production);
+    }
+}
+
+#[cfg(test)]
+mod b2_bandwidth_optin_tests {
+    use super::*;
+
+    fn prod_base(quota_section: &str) -> String {
+        format!(
+            "production = true\n\n\
+             [turn]\nexternal_ip = \"1.2.3.4\"\n\n\
+             [turn.auth]\nshared_secret = \"deadbeef-this-is-a-real-secret-honest\"\n\n\
+             {quota_section}\
+             [signaling]\nturn_shared_secret = \"another-not-placeholder\"\n"
+        )
+    }
+
+    #[test]
+    fn b2_prod_unlimited_bandwidth_requires_optin() {
+        // production=true in the file, so is_production() is true regardless of
+        // the process-global TURNA_PRODUCTION env — no env lock needed.
+
+        // Default quota (max_bytes_per_sec = 0) in prod, no opt-in → rejected.
+        let err = TurnaConfig::from_str(&prod_base("")).expect_err("unlimited bw must fail");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("bandwidth") || msg.contains("max_bytes_per_sec"),
+            "expected a bandwidth error, got: {err}"
+        );
+
+        // Explicit opt-in → accepted.
+        TurnaConfig::from_str(&prod_base(
+            "[turn.relay.quota]\nallow_unlimited_bandwidth = true\n\n",
+        ))
+        .expect("explicit opt-in must validate");
+
+        // A real cap → accepted.
+        TurnaConfig::from_str(&prod_base(
+            "[turn.relay.quota]\nmax_bytes_per_sec = 1000000\n\n",
+        ))
+        .expect("a concrete cap must validate");
     }
 }

@@ -201,15 +201,20 @@ pub struct QuicOutbound {
     pub via_datagram: bool,
 }
 
+/// B6: per-session outbound queue depth. A bounded channel means a slow or
+/// stalled session sheds excess outbound (media/control) instead of growing
+/// memory without limit; the producer drops on full (try_send) and counts it.
+#[cfg(any(feature = "quic", feature = "web-transport"))]
+pub const QUIC_OUTBOUND_CAP: usize = 1024;
+
 /// `session_id` → sender into that session's writer task. The relay-bridge
 /// consumer pushes `QuicOutbound`s here; each session task drains its own
 /// receiver and writes to the wtransport connection. A cheap `std::Mutex` is
-/// fine — no `.await` is held across the lock and unbounded sends don't block.
+/// fine — no `.await` is held across the lock and the non-blocking `try_send`
+/// never awaits.
 #[cfg(any(feature = "quic", feature = "web-transport"))]
 pub type OutboundRegistry = std::sync::Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<QuicOutbound>>,
-    >,
+    std::sync::Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<QuicOutbound>>>,
 >;
 
 /// Process-wide counters for the WebTransport/QUIC path (parity with the DTLS
@@ -500,7 +505,7 @@ async fn handle_quic_connection(
 
     // Register the outbound channel before announcing the session, so the
     // bridge can route responses as soon as it processes NewSession.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<QuicOutbound>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<QuicOutbound>(QUIC_OUTBOUND_CAP);
     if let Ok(mut g) = outbound.lock() {
         g.insert(session_id.clone(), out_tx);
     }
@@ -644,7 +649,7 @@ async fn handle_wt_session(
 
     // Register the outbound channel *before* announcing the session, so the
     // bridge can route responses as soon as it processes NewSession.
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<QuicOutbound>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<QuicOutbound>(QUIC_OUTBOUND_CAP);
     if let Ok(mut g) = outbound.lock() {
         g.insert(session_id.clone(), out_tx);
     }

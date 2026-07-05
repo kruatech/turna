@@ -107,4 +107,58 @@ impl AuthRegistry {
             Err(AuthError::InvalidCredentials)
         }
     }
+
+    // ── Runtime user management (R8) ──────────────────────────────────────────
+    //
+    // Mutates the in-memory LongTerm store through the shared `Arc<DashMap>`
+    // inside `AuthMode`, so `&self` suffices (the registry is held as an
+    // `Arc<AuthRegistry>` shared across workers + the gRPC core).
+
+    /// Add (or replace) a user in the base (`[turn]`) realm. Returns `true` if
+    /// applied (base backend is LongTerm).
+    pub fn add_user(&self, username: &str, password: &str) -> bool {
+        self.base.add_user(username, password)
+    }
+
+    /// Remove a user from the base realm. Returns `true` if removed.
+    pub fn remove_user(&self, username: &str) -> bool {
+        self.base.remove_user(username)
+    }
+
+    /// Add a user to a specific realm (base or a tenant's). Returns `false` if
+    /// the realm is unknown or its backend is SharedSecret.
+    pub fn add_user_for_realm(&self, realm: &str, username: &str, password: &str) -> bool {
+        if realm == self.base.realm() {
+            self.base.add_user(username, password)
+        } else if let Some((_, auth)) = self.tenants.get(realm) {
+            auth.add_user(username, password)
+        } else {
+            false
+        }
+    }
+
+    /// Remove a user from a specific realm. Returns `false` if the realm is
+    /// unknown or no such user existed.
+    pub fn remove_user_for_realm(&self, realm: &str, username: &str) -> bool {
+        if realm == self.base.realm() {
+            self.base.remove_user(username)
+        } else if let Some((_, auth)) = self.tenants.get(realm) {
+            auth.remove_user(username)
+        } else {
+            false
+        }
+    }
+
+    /// Insert a user from pre-derived keys into a specific realm (base or a
+    /// tenant's). Used to rehydrate the registry from the state backend on
+    /// startup. Returns `false` if the realm is unknown or SharedSecret.
+    pub fn add_user_with_keys(&self, realm: &str, username: &str, keys: crate::UserKeys) -> bool {
+        if realm == self.base.realm() {
+            self.base.add_user_keys(username, keys)
+        } else if let Some((_, auth)) = self.tenants.get(realm) {
+            auth.add_user_keys(username, keys)
+        } else {
+            false
+        }
+    }
 }

@@ -20,7 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      # тулчейн берётся из rust-toolchain.toml автоматически
+      # CI runs on stable. NOTE: `toolchain: stable` overrides rust-toolchain.toml
+      # (pinned 1.95.0), so the pinned channel is the local/reproducible-build
+      # toolchain and is NOT what CI uses. MSRV against 1.95.0 is not enforced
+      # here — add a dedicated job if that guarantee is required.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
@@ -28,6 +31,28 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
+
+  msrv:
+    name: msrv (pinned 1.95.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Enforce the pinned/reproducible-build toolchain on every PR/push, not
+      # only at release-tag time. The release `binaries` job builds on 1.95.0,
+      # but it runs only on `v*` tags, so without this nothing proves a PR still
+      # compiles + tests under the pinned channel. --locked also proves the
+      # committed Cargo.lock is consistent.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libclang-dev pkg-config protobuf-compiler
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
 
   test:
     name: test (${{ matrix.os }})

@@ -117,7 +117,7 @@ datapath validated live (IPv4+IPv6):
 
 ## Stage 6 - security / reliability
 - **shipped+verified** unsafe audit: every `unsafe` block carries a `// SAFETY:` rationale; `clippy::undocumented_unsafe_blocks` at zero under `-D warnings`.
-- **shipped** fuzz targets (`fuzz/`: stun, stun-semantic, turn, turn-lifecycle, encode); smoke-run clean (fuzz_stun 4M+ exec, no crash). Extended/CI fuzz pending.
+- **shipped+verified** fuzz targets (`fuzz/`: stun, stun-semantic, turn, turn-lifecycle, encode); smoke-run clean (fuzz_stun 4M+ exec, no crash). CI builds all targets and runs a 30s smoke per target (`.github/workflows/ci.yml`, `fuzz-build` job, nightly toolchain); longer/extended fuzzing campaigns remain pending.
 - **shipped+verified** property tests: `proto-stun/tests/property.rs` proptest
   roundtrips for STUN attributes and the raw ChannelData frame codec
   (`encode/decode/is_channel_data`: roundtrip, 4-byte padding, channel-range

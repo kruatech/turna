@@ -48,7 +48,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0-alpha.1"
+version = "0.3.0-beta.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kruatech/turna"
@@ -80,7 +80,7 @@ rand = "0.8"
 base64 = "0.22"
 
 # auth
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 uuid = { version = "1", features = ["v4"] }
 

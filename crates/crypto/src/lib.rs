@@ -79,12 +79,12 @@ pub fn generate_turn_credentials(
 ) -> (String, String) {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is before the UNIX epoch")
         .as_secs()
         + ttl_secs;
 
     let username = format!("{timestamp}:{user_id}");
-    let mut mac = HmacSha1::new_from_slice(shared_secret).unwrap();
+    let mut mac = HmacSha1::new_from_slice(shared_secret).expect("HMAC accepts any key size");
     mac.update(username.as_bytes());
     let result = mac.finalize();
     let password = base64::Engine::encode(

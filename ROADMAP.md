@@ -1,6 +1,6 @@
 # Roadmap
 
-`turna` is alpha (`0.2.0-alpha.x`). This roadmap is intentionally
+`turna` is beta (`0.3.0-beta.x`). This roadmap is intentionally
 direction-only — no committed dates — and points to the living documents that
 track detail.
 
@@ -24,11 +24,14 @@ These are the areas we want to harden, in rough priority order:
    `quic`, and `web-transport` are behind Cargo features and not yet
    runtime-verified for production. Move them toward "supported" one at a time,
    with soak and integration coverage.
-3. **Control plane completeness.** Round out the gRPC management surface
-   (including runtime user management) and document what is and is not
-   implemented.
-4. **Supply-chain hardening for releases.** SBOM, artifact checksums, signed
-   images/provenance, and pinned CI actions.
+3. **Control plane completeness.** Runtime user management (AddUser/RemoveUser
+   over the control-plane gRPC, backed by Tarantool) is implemented; the
+   remaining work is rounding out the rest of the gRPC management surface and
+   keeping the implemented-vs-not documentation current.
+4. **Supply-chain hardening for releases.** The release workflow already
+   produces SBOMs, artifact checksums, cosign-signed images and SLSA
+   provenance, with its actions pinned by commit SHA. Remaining: extend the
+   same SHA-pinning and hardening discipline to the rest of the CI workflows.
 5. **Operability.** Clustering ergonomics, runbooks, and dashboards.
 
 ## Contributing to the roadmap

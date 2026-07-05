@@ -1383,6 +1383,67 @@ mod tests {
             "expected 28-char base64 password, got {pass:?}"
         );
     }
+
+    /// #7 interop: an authenticated Allocate carrying a NONCE the server never
+    /// issued must be answered with `438 Stale Nonce` (not 401) plus a fresh
+    /// NONCE; retrying with that NONCE then succeeds. Exercises the nonce path
+    /// distinctly from the wrong-password path.
+    #[tokio::test]
+    async fn turn_stale_nonce_challenge() {
+        let socket = bind_socket().await;
+        let target = target_addr();
+
+        // Get a real realm (nonce value is deliberately ignored below).
+        let (realm, _nonce) = skip_if_no_server!(get_realm_nonce(&socket, target).await, target);
+
+        let (username, password) = effective_credentials();
+        let key = long_term_key(&username, &realm, &password);
+
+        // Authenticated Allocate with a bogus NONCE the server never minted.
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username(&username);
+        alloc.add_realm(&realm);
+        alloc.add_nonce("stale-nonce-000000");
+        let (resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to stale-nonce Allocate");
+
+        assert!(is_error(&resp), "stale nonce must yield an error response");
+        let (code, _) = extract_error_code(&resp).expect("missing ERROR-CODE");
+        assert_eq!(code, 438, "expected 438 Stale Nonce, got {code}");
+
+        // The 438 must carry a fresh NONCE to retry with.
+        let fresh = extract_nonce(&resp).expect("438 must carry a fresh NONCE");
+        assert_ne!(fresh, "stale-nonce-000000", "server must issue a new NONCE");
+
+        // Retry with the fresh NONCE → success.
+        let mut alloc2 = TurnMsg::request(0x0003);
+        alloc2.add_requested_transport();
+        alloc2.add_lifetime(600);
+        alloc2.add_username(&username);
+        alloc2.add_realm(&realm);
+        alloc2.add_nonce(&fresh);
+        let (resp2, _) = send_recv(&socket, target, &alloc2.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to retried Allocate");
+        assert!(
+            is_success(&resp2),
+            "retry with the fresh NONCE should succeed; err={:?}",
+            extract_error_code(&resp2)
+        );
+        eprintln!("\u{2713} Stale nonce challenged (438) then accepted with fresh nonce");
+
+        // Cleanup.
+        let nonce_del = extract_nonce(&resp2).unwrap_or(fresh);
+        let mut del = TurnMsg::request(0x0004);
+        del.add_lifetime(0);
+        del.add_username(&username);
+        del.add_realm(&realm);
+        del.add_nonce(&nonce_del);
+        let _ = send_recv(&socket, target, &del.encode_with_integrity(&key), 1000).await;
+    }
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────────────

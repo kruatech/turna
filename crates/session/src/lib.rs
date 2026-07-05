@@ -32,6 +32,17 @@ const CHANNEL_LIFETIME: Duration = Duration::from_secs(600); // 10 minutes
 /// Allocate that presents the RESERVATION-TOKEN (RFC 8656 §7.2 suggests ~30s).
 const RESERVATION_LIFETIME: Duration = Duration::from_secs(30);
 
+/// B5: hard caps on per-allocation resources. Bounds memory on an authenticated
+/// session — a client can otherwise send CreatePermission / ChannelBind without
+/// limit. Refreshing an existing entry never counts against the cap.
+const MAX_PERMISSIONS_PER_ALLOCATION: usize = 256;
+const MAX_CHANNELS_PER_ALLOCATION: usize = 256;
+
+/// B4: per-user allocation tracking is keyed by (tenant, username), not the bare
+/// username — otherwise `alice` under tenant A and `alice` under tenant B share
+/// one counter and one tenant can exhaust the other's per-user quota.
+type UserKey = (Option<String>, String);
+
 /// A port reserved under a RESERVATION-TOKEN, pending a follow-up Allocate.
 struct Reservation {
     port: u16,
@@ -63,6 +74,15 @@ pub enum SessionError {
     /// a 400 (Bad Request) response.
     #[error("channel/peer binding conflict")]
     ChannelConflict,
+    /// A concurrent Allocate on the same client 5-tuple already created an
+    /// allocation for this slot (B1). The loser must release any relay port it
+    /// bound; the processor's existing create-error path already does this.
+    #[error("allocation already exists for this client address")]
+    AllocationExists,
+    /// A per-allocation resource cap (permissions or channel bindings) was hit
+    /// (B5). Maps to 486 Allocation Quota Reached.
+    #[error("per-allocation resource limit exceeded")]
+    LimitExceeded,
 }
 
 /// Permission with expiry.
@@ -444,6 +464,16 @@ impl PortAllocator {
         res.remove(token).map(|r| r.port)
     }
 
+    /// I9: cancel a reservation created by an EVEN-PORT (R=1) allocate — drop the
+    /// token and release its reserved port. Used when post-reservation bookkeeping
+    /// (e.g. `create_for_tenant`) fails, so the reserved odd port is freed
+    /// immediately instead of lingering until the reservation-expiry sweep.
+    pub fn cancel_reservation(&self, token: &[u8; 8]) {
+        if let Some(r) = self.reservations.lock().remove(token) {
+            self.release(r.port);
+        }
+    }
+
     /// EVEN-PORT allocate + bind. `reserve_next` mirrors the EVEN-PORT R bit;
     /// when set, the next-higher port is reserved and the token is returned for
     /// the caller to echo as a RESERVATION-TOKEN. Releases everything on bind
@@ -570,7 +600,13 @@ pub struct AllocationStore {
     /// itself need not be unpredictable, only unique within this process.
     next_id: AtomicU64,
     /// Username -> list of client addresses (for multi-allocation tracking).
-    user_allocations: DashMap<String, Vec<SocketAddr>>,
+    user_allocations: DashMap<UserKey, Vec<SocketAddr>>,
+    /// B1: atomic allocation counters for O(1), race-free quota reservation.
+    /// `global_count` mirrors `allocations.len()`; `tenant_counts[tid]` mirrors
+    /// the count for tenant `tid`. Every add path reserves (fetch_add→check→
+    /// rollback); every remove path releases.
+    global_count: std::sync::atomic::AtomicUsize,
+    tenant_counts: DashMap<String, std::sync::atomic::AtomicUsize>,
     pub ports: PortAllocator,
     /// Per-tenant isolated port pools (multi-tenancy). Empty = single-tenant.
     /// Built once at startup via [`AllocationStore::with_tenant_pool`]; read-only
@@ -609,6 +645,8 @@ impl AllocationStore {
             id_to_client: DashMap::new(),
             next_id: AtomicU64::new(1),
             user_allocations: DashMap::new(),
+            global_count: std::sync::atomic::AtomicUsize::new(0),
+            tenant_counts: DashMap::new(),
             ports: PortAllocator::new(min_port, max_port),
             tenant_pools: Vec::new(),
             max_allocations,
@@ -780,6 +818,45 @@ impl AllocationStore {
         self.create_for_tenant(client_addr, relay_addr, username, key, lifetime, None)
     }
 
+    /// B1: atomically reserve one allocation slot against the global cap and,
+    /// for a tenanted allocation, the tenant cap. fetch_add→check→rollback so N
+    /// racing creates can never over-admit past a cap. On success the caller
+    /// MUST eventually `release_slot` (via `remove`/`force_remove`).
+    fn try_reserve_slot(&self, tenant_id: Option<&str>) -> Result<(), SessionError> {
+        if self.global_count.fetch_add(1, Ordering::AcqRel) >= self.max_allocations {
+            self.global_count.fetch_sub(1, Ordering::AcqRel);
+            return Err(SessionError::MaxAllocations);
+        }
+        if let Some(tid) = tenant_id {
+            let cap = self.tenant_max_allocations(tid);
+            if cap > 0 {
+                let entry = self
+                    .tenant_counts
+                    .entry(tid.to_string())
+                    .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
+                if entry.fetch_add(1, Ordering::AcqRel) >= cap {
+                    entry.fetch_sub(1, Ordering::AcqRel);
+                    drop(entry);
+                    self.global_count.fetch_sub(1, Ordering::AcqRel);
+                    return Err(SessionError::MaxAllocations);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// B1: release a slot reserved by `try_reserve_slot`. Called from every path
+    /// that drops an allocation (`remove`, `force_remove` — which cover Refresh
+    /// lifetime=0, the expiry sweep, and revocation). Moves (`re_key`) never call it.
+    fn release_slot(&self, tenant_id: Option<&str>) {
+        self.global_count.fetch_sub(1, Ordering::AcqRel);
+        if let Some(tid) = tenant_id {
+            if let Some(entry) = self.tenant_counts.get(tid) {
+                entry.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
     /// Like [`create`](Self::create) but records the owning tenant and enforces
     /// the tenant's allocation cap. `tenant_id = None` is the base tenant and is
     /// identical to `create`.
@@ -793,38 +870,24 @@ impl AllocationStore {
         lifetime: u32,
         tenant_id: Option<String>,
     ) -> Result<(), SessionError> {
-        if self.allocations.len() >= self.max_allocations {
-            return Err(SessionError::MaxAllocations);
-        }
-
-        // Per-tenant allocation cap (isolation): a tenant cannot exceed its own
-        // limit, independent of other tenants or the global cap.
-        if let Some(tid) = tenant_id.as_deref() {
-            let cap = self.tenant_max_allocations(tid);
-            if cap > 0 {
-                let count = self
-                    .allocations
-                    .iter()
-                    .filter(|e| e.value().tenant_id.as_deref() == Some(tid))
-                    .count();
-                if count >= cap {
-                    return Err(SessionError::MaxAllocations);
-                }
-            }
-        }
+        let user_key: UserKey = (tenant_id.clone(), username.clone());
 
         // Check per-user limit (per-tenant override when the tenant sets one).
         let max_per_user = self.effective_max_per_user(tenant_id.as_deref());
         if max_per_user > 0 {
             let count = self
                 .user_allocations
-                .get(&username)
+                .get(&user_key)
                 .map(|v| v.len())
                 .unwrap_or(0);
             if count >= max_per_user {
                 return Err(SessionError::MaxAllocationsPerUser);
             }
         }
+
+        // B1: atomic global + per-tenant reservation (replaces the old racy
+        // len()/scan checks). Released by remove()/force_remove().
+        self.try_reserve_slot(tenant_id.as_deref())?;
 
         let now = Instant::now();
         let allocation_id = self.mint_id();
@@ -847,15 +910,33 @@ impl AllocationStore {
             bandwidth_window_start: Mutex::new(now),
         };
 
-        self.relay_to_client.insert(relay_addr, client_addr);
-        self.id_to_client.insert(allocation_id.clone(), client_addr);
-        self.allocations.insert(client_addr, alloc);
-
-        // Track per-user
-        self.user_allocations
-            .entry(username.clone())
-            .or_default()
-            .push(client_addr);
+        // B1: atomic insert-if-vacant. With N SO_REUSEPORT recv workers, two
+        // Allocate retransmits on the same 5-tuple could both clear the
+        // check-then-insert in the processor and both reach this insert, the
+        // second silently clobbering the first and orphaning its relay port and
+        // socket until restart. Gate on the allocations slot so exactly one wins.
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.allocations.entry(client_addr) {
+                Entry::Occupied(_) => {
+                    // B1: reserved a slot but lost the insert race — give it back.
+                    self.release_slot(user_key.0.as_deref());
+                    return Err(SessionError::AllocationExists);
+                }
+                Entry::Vacant(slot) => {
+                    // Secondary indices are set while the slot is held, so the
+                    // allocation is visible in `allocations` only once its
+                    // relay/id/user indices already point at it.
+                    self.relay_to_client.insert(relay_addr, client_addr);
+                    self.id_to_client.insert(allocation_id.clone(), client_addr);
+                    self.user_allocations
+                        .entry(user_key)
+                        .or_default()
+                        .push(client_addr);
+                    slot.insert(alloc);
+                }
+            }
+        }
 
         // Emit write-behind event — only after the in-memory state is
         // fully consistent (design doc §9 question 5).
@@ -927,13 +1008,11 @@ impl AllocationStore {
             return Ok(false);
         }
 
-        if self.allocations.len() >= self.max_allocations {
-            return Err(SessionError::MaxAllocations);
-        }
+        let user_key: UserKey = (self.tenant_id_for_port(relay_addr.port()), username.clone());
         if self.quota.max_per_user > 0 {
             let count = self
                 .user_allocations
-                .get(&username)
+                .get(&user_key)
                 .map(|v| v.len())
                 .unwrap_or(0);
             if count >= self.quota.max_per_user {
@@ -941,12 +1020,19 @@ impl AllocationStore {
             }
         }
 
+        // B1: reserve the allocation slot (global + tenant) before the port so a
+        // cap rejection can't leak a port; release it if the port is taken.
+        self.try_reserve_slot(user_key.0.as_deref())?;
+
         // Reserve the port. If it's already taken, somebody else (live
         // create()? a duplicate record?) got there first. Route to the owning
         // pool by range so tenant-range ports are reserved in the tenant pool
         // (the base pool would reject an out-of-range port).
         self.pool_for_port(relay_addr.port())
-            .reserve(relay_addr.port())?;
+            .reserve(relay_addr.port())
+            .inspect_err(|_| {
+                self.release_slot(user_key.0.as_deref());
+            })?;
 
         // Convert wall-clock epoch_ms back into a monotonic `Instant` by
         // anchoring against `Instant::now()`. We lose accuracy of the
@@ -1038,7 +1124,7 @@ impl AllocationStore {
         }
         self.allocations.insert(client_addr, alloc);
         self.user_allocations
-            .entry(username.clone())
+            .entry(user_key)
             .or_default()
             .push(client_addr);
 
@@ -1134,6 +1220,7 @@ impl AllocationStore {
         let relay_port = relay_addr.port();
         let allocation_id = alloc.allocation_id.clone();
         let username = alloc.username.clone();
+        let tenant_id = alloc.tenant_id.clone();
 
         // Rewrite the owned copy, then re-insert under the new key.
         alloc.client_addr = new_addr;
@@ -1152,7 +1239,10 @@ impl AllocationStore {
             self.channel_to_client.insert((relay_port, ch), new_addr);
         }
         self.id_to_client.insert(allocation_id, new_addr);
-        if let Some(mut addrs) = self.user_allocations.get_mut(&username) {
+        if let Some(mut addrs) = self
+            .user_allocations
+            .get_mut(&(tenant_id.clone(), username.clone()))
+        {
             for a in addrs.iter_mut() {
                 if a == old_addr {
                     *a = new_addr;
@@ -1185,6 +1275,10 @@ impl AllocationStore {
                 perm.refresh();
                 tracing::debug!(%client_addr, %peer_ip, "permission refreshed");
             } else {
+                // B5: bound distinct permissions per allocation.
+                if alloc.permissions.len() >= MAX_PERMISSIONS_PER_ALLOCATION {
+                    return Err(SessionError::LimitExceeded);
+                }
                 alloc.permissions.insert(peer_ip, Permission::new(peer_ip));
                 tracing::debug!(%client_addr, %peer_ip, "permission added");
             }
@@ -1229,6 +1323,16 @@ impl AllocationStore {
             if bound_ch != channel {
                 return Err(SessionError::ChannelConflict);
             }
+        }
+
+        // B5: bound distinct channel bindings per allocation. A refresh of an
+        // existing (channel, peer) pair is always allowed; only a brand-new
+        // binding counts. Checked before any state change so an over-cap request
+        // leaves the allocation untouched.
+        if !alloc.channel_bindings.contains_key(&channel)
+            && alloc.channel_bindings.len() >= MAX_CHANNELS_PER_ALLOCATION
+        {
+            return Err(SessionError::LimitExceeded);
         }
 
         // Also add/refresh permission for this peer
@@ -1326,6 +1430,7 @@ impl AllocationStore {
         relay_addr: SocketAddr,
     ) -> Result<(), SessionError> {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
+            self.release_slot(alloc.tenant_id.as_deref());
             self.accrue_tenant_traffic(&alloc);
             for &ch in alloc.channel_bindings.keys() {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
@@ -1336,7 +1441,10 @@ impl AllocationStore {
                 .release(relay_addr.port());
 
             // Remove from user tracking
-            if let Some(mut addrs) = self.user_allocations.get_mut(&alloc.username) {
+            if let Some(mut addrs) = self
+                .user_allocations
+                .get_mut(&(alloc.tenant_id.clone(), alloc.username.clone()))
+            {
                 addrs.retain(|a| a != client_addr);
             }
 
@@ -1453,10 +1561,13 @@ impl AllocationStore {
 
     /// Get count of allocations for a username.
     pub fn user_allocation_count(&self, username: &str) -> usize {
+        // B4: tracking is keyed by (tenant, username); keep the bare-username
+        // contract by summing this user across all tenants.
         self.user_allocations
-            .get(username)
-            .map(|v| v.len())
-            .unwrap_or(0)
+            .iter()
+            .filter(|e| e.key().1 == username)
+            .map(|e| e.value().len())
+            .sum()
     }
 
     pub fn len(&self) -> usize {
@@ -1469,6 +1580,7 @@ impl AllocationStore {
 
     pub fn force_remove(&self, client_addr: &std::net::SocketAddr) {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
+            self.release_slot(alloc.tenant_id.as_deref());
             self.accrue_tenant_traffic(&alloc);
             self.relay_to_client.remove(&alloc.relay_addr);
             self.id_to_client.remove(&alloc.allocation_id);
@@ -1478,7 +1590,10 @@ impl AllocationStore {
             }
             let relay_port = alloc.relay_addr.port();
             self.pool_for_port(relay_port).release(relay_port);
-            if let Some(mut user_allocs) = self.user_allocations.get_mut(&alloc.username) {
+            if let Some(mut user_allocs) = self
+                .user_allocations
+                .get_mut(&(alloc.tenant_id.clone(), alloc.username.clone()))
+            {
                 user_allocs.retain(|a| a != client_addr);
             }
             self.emit_write(WriteOp::Remove { relay_port });
@@ -2343,5 +2458,254 @@ mod tenant_quota_tests {
 
         // An unknown token resolves to nothing.
         assert_eq!(pool.claim_reservation(&[0u8; 8]), None);
+    }
+}
+
+#[cfg(test)]
+mod b1_concurrent_create_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, Barrier};
+
+    // B1 DoD: two concurrent create_for_tenant on the same client_addr from
+    // different threads — exactly one wins, the other gets AllocationExists,
+    // and only one allocation lands in the store. Looped to shake out the race.
+    #[test]
+    fn concurrent_create_same_client_only_one_wins() {
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50000);
+        for _ in 0..10_000 {
+            let store = Arc::new(AllocationStore::new(40000, 40100, 1000));
+            let barrier = Arc::new(Barrier::new(2));
+
+            let mk = |relay_port: u16, user: &'static str| {
+                let s = store.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    let relay =
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), relay_port);
+                    b.wait();
+                    s.create_for_tenant(client, relay, user.into(), vec![1], 600, None)
+                })
+            };
+
+            let h1 = mk(40001, "u1");
+            let h2 = mk(40002, "u2");
+            let o1 = h1.join().unwrap();
+            let o2 = h2.join().unwrap();
+
+            let wins = [o1.is_ok(), o2.is_ok()].iter().filter(|w| **w).count();
+            assert_eq!(wins, 1, "exactly one concurrent create must win");
+            let losers = [&o1, &o2]
+                .iter()
+                .filter(|r| matches!(r, Err(SessionError::AllocationExists)))
+                .count();
+            assert_eq!(losers, 1, "the loser must get AllocationExists");
+            assert!(
+                store.get(&client).is_some(),
+                "winner's allocation must exist"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod b5_resource_caps_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn store_with_alloc() -> (AllocationStore, SocketAddr) {
+        let store = AllocationStore::new(40000, 40100, 1000);
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50000);
+        let relay = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 40001);
+        store
+            .create(client, relay, "u".into(), vec![1], 600)
+            .unwrap();
+        (store, client)
+    }
+
+    #[test]
+    fn permission_cap_enforced_refresh_exempt() {
+        let (store, client) = store_with_alloc();
+        for i in 0..MAX_PERMISSIONS_PER_ALLOCATION {
+            let ip = IpAddr::V4(Ipv4Addr::from(0x0b00_0000u32 + i as u32));
+            store.add_permission(&client, ip).expect("under cap");
+        }
+        let over = IpAddr::V4(Ipv4Addr::from(0x0c00_0000u32));
+        assert!(matches!(
+            store.add_permission(&client, over),
+            Err(SessionError::LimitExceeded)
+        ));
+        let first = IpAddr::V4(Ipv4Addr::from(0x0b00_0000u32));
+        assert!(store.add_permission(&client, first).is_ok());
+    }
+
+    #[test]
+    fn channel_cap_enforced_refresh_exempt() {
+        let (store, client) = store_with_alloc();
+        for i in 0..MAX_CHANNELS_PER_ALLOCATION {
+            let ch = 0x4000u16 + i as u16;
+            let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000u32 + i as u32)), 9000);
+            store.add_channel(&client, ch, peer).expect("under cap");
+        }
+        let over_ch = 0x4000u16 + MAX_CHANNELS_PER_ALLOCATION as u16;
+        let over_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0c00_0000u32)), 9000);
+        assert!(matches!(
+            store.add_channel(&client, over_ch, over_peer),
+            Err(SessionError::LimitExceeded)
+        ));
+        let peer0 = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(0x0b00_0000u32)), 9000);
+        assert!(store.add_channel(&client, 0x4000, peer0).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod b4_tenant_scoped_user_key_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn c(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    #[test]
+    fn per_user_tracking_is_tenant_scoped() {
+        // B4: alice@A and alice@B must not share a per-user bucket.
+        let store = AllocationStore::new(40000, 40100, 1000);
+        store
+            .create_for_tenant(
+                c(50000),
+                c(40001),
+                "alice".into(),
+                vec![1],
+                600,
+                Some("A".into()),
+            )
+            .unwrap();
+        store
+            .create_for_tenant(
+                c(50001),
+                c(40002),
+                "alice".into(),
+                vec![1],
+                600,
+                Some("B".into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .user_allocations
+                .get(&(Some("A".to_string()), "alice".to_string()))
+                .map(|v| v.len())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            store
+                .user_allocations
+                .get(&(Some("B".to_string()), "alice".to_string()))
+                .map(|v| v.len())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(store.user_allocation_count("alice"), 2);
+    }
+}
+
+#[cfg(test)]
+mod b1_atomic_quota_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::{Arc, Barrier};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    #[test]
+    fn concurrent_creates_never_exceed_global_cap() {
+        // B1 DoD: 100 racing Allocate at max=10 → stored count never exceeds 10.
+        for _ in 0..100 {
+            let store = Arc::new(AllocationStore::new(40000, 41000, 10));
+            let barrier = Arc::new(Barrier::new(100));
+            let mut hs = Vec::new();
+            for i in 0..100u16 {
+                let s = store.clone();
+                let b = barrier.clone();
+                hs.push(std::thread::spawn(move || {
+                    b.wait();
+                    s.create_for_tenant(
+                        addr(50000 + i),
+                        addr(40000 + i),
+                        "u".into(),
+                        vec![1],
+                        600,
+                        None,
+                    )
+                }));
+            }
+            let ok = hs
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|r| r.is_ok())
+                .count();
+            assert!(
+                store.len() <= 10,
+                "global cap exceeded: len={}",
+                store.len()
+            );
+            assert_eq!(ok, store.len(), "Ok count must equal stored count");
+        }
+    }
+
+    #[test]
+    fn release_on_remove_frees_capacity() {
+        let store = AllocationStore::new(40000, 41000, 1);
+        store
+            .create_for_tenant(addr(50000), addr(40000), "u".into(), vec![1], 600, None)
+            .unwrap();
+        assert!(matches!(
+            store.create_for_tenant(addr(50001), addr(40001), "u".into(), vec![1], 600, None),
+            Err(SessionError::MaxAllocations)
+        ));
+        store.remove(&addr(50000), addr(40000)).unwrap();
+        assert!(store
+            .create_for_tenant(addr(50001), addr(40001), "u".into(), vec![1], 600, None)
+            .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod i9_reservation_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_reservation_frees_reserved_port() {
+        let pool = PortAllocator::new(40000, 40010);
+        // EVEN-PORT (R=1): reserves even `p` and odd `p+1`, issues a token.
+        let (even, sock, token) = pool
+            .allocate_even_and_bind(true)
+            .expect("allocate even+reservation");
+        let token = token.expect("R=1 must issue a reservation token");
+        let odd = even + 1;
+        assert!(
+            pool.used.lock().contains(&even) && pool.used.lock().contains(&odd),
+            "both even and reserved-odd start out used"
+        );
+
+        // Simulate a create-error path: release the relay port, cancel the token.
+        pool.release(even);
+        pool.cancel_reservation(&token);
+
+        assert!(!pool.used.lock().contains(&even), "relay port freed");
+        assert!(
+            !pool.used.lock().contains(&odd),
+            "reserved odd port freed (I9)"
+        );
+        assert!(
+            !pool.reservations.lock().contains_key(&token),
+            "reservation entry dropped"
+        );
+        drop(sock);
     }
 }

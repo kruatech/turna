@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
-use turna_auth::{AuthMode, AuthRegistry};
+use turna_auth::{AuthMode, AuthRegistry, UserKeys};
 use turna_cluster::gossip::{run_gossip, GossipConfig};
 use turna_cluster::{ClusterNode, HashRing};
 use turna_config::{ClusterConfig, TurnConfig, TurnaConfig};
@@ -148,15 +148,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             secret: config.auth.shared_secret.as_bytes().to_vec(),
         }
     } else {
-        AuthMode::LongTerm {
-            realm: config.realm.clone(),
-            users: config
+        AuthMode::long_term(
+            config.realm.clone(),
+            config
                 .auth
                 .static_users
                 .iter()
-                .map(|u| (u.username.clone(), u.password.clone()))
-                .collect(),
-        }
+                .map(|u| (&u.username, &u.password)),
+        )
     };
     // Multi-tenancy: register each [[tenants]] entry under its own realm. Tenant
     // identity is resolved from the authenticated realm at request time (see
@@ -170,14 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     secret: t.shared_secret.as_bytes().to_vec(),
                 }
             } else {
-                AuthMode::LongTerm {
-                    realm: t.realm.clone(),
-                    users: t
-                        .static_users
-                        .iter()
-                        .map(|u| (u.username.clone(), u.password.clone()))
-                        .collect(),
-                }
+                AuthMode::long_term(
+                    t.realm.clone(),
+                    t.static_users.iter().map(|u| (&u.username, &u.password)),
+                )
             };
             info!(tenant = %t.id, realm = %t.realm, ports = ?t.relay_port_range,
                   "tenant registered");
@@ -462,6 +457,116 @@ fn run_tokio(
                 std::sync::atomic::Ordering::Relaxed,
             );
 
+            // R8: rehydrate runtime long-term users from the shared backend into
+            // the in-memory AuthRegistry. Variant B — the backend holds two
+            // pre-derived keys (hex); the password is never persisted.
+            fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+                if !s.len().is_multiple_of(2) {
+                    return None;
+                }
+                (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+                    .collect()
+            }
+            // I5: track (realm, username) pairs we sync from the backend so the
+            // refresh loop can propagate *deletions* too — without ever touching
+            // config static_users (which this task never adds here).
+            let mut synced_users: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            match backend.list_users().await {
+                Ok(users) => {
+                    let mut loaded = 0usize;
+                    for u in users {
+                        match (hex_to_bytes(&u.key_md5_hex), hex_to_bytes(&u.key_sha256_hex)) {
+                            (Some(key_md5), Some(key_sha256)) => {
+                                if auth.add_user_with_keys(
+                                    &u.realm,
+                                    &u.username,
+                                    UserKeys { key_md5, key_sha256 },
+                                ) {
+                                    loaded += 1;
+                                    synced_users.insert((u.realm.clone(), u.username.clone()));
+                                }
+                            }
+                            _ => warn!(username = %u.username, realm = %u.realm,
+                                       "skipping backend user with malformed key hex"),
+                        }
+                    }
+                    info!(loaded, "rehydrated runtime users from state backend");
+                }
+                Err(e) => warn!(%e, "failed to load users from state backend (continuing)"),
+            }
+
+            // R8 live propagation: periodically re-read users from the backend so
+            // AddUser on the control-plane reaches a running node without a
+            // restart. Insert/overwrite is idempotent. (Deletion is not
+            // propagated here — see remove_user with force, or a node restart.)
+            let refresh_secs = cluster.persistence.user_refresh_secs;
+            if refresh_secs > 0 {
+                let refresh_backend = backend.clone();
+                let refresh_auth = auth.clone();
+                let mut refresh_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+                        if !s.len().is_multiple_of(2) {
+                            return None;
+                        }
+                        (0..s.len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+                            .collect()
+                    }
+                    let mut synced_users = synced_users;
+                    let mut tick = tokio::time::interval(Duration::from_secs(refresh_secs));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // First tick fires immediately; skip it (startup already loaded).
+                    tick.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = tick.tick() => {
+                                match refresh_backend.list_users().await {
+                                    Ok(users) => {
+                                        let mut current: std::collections::HashSet<(String, String)> =
+                                            std::collections::HashSet::new();
+                                        let mut n = 0usize;
+                                        for u in users {
+                                            if let (Some(key_md5), Some(key_sha256)) = (
+                                                hex_to_bytes(&u.key_md5_hex),
+                                                hex_to_bytes(&u.key_sha256_hex),
+                                            ) {
+                                                current.insert((u.realm.clone(), u.username.clone()));
+                                                if refresh_auth.add_user_with_keys(
+                                                    &u.realm,
+                                                    &u.username,
+                                                    UserKeys { key_md5, key_sha256 },
+                                                ) {
+                                                    n += 1;
+                                                }
+                                            }
+                                        }
+                                        // I5: propagate revocation without a restart. Remove only
+                                        // users THIS task previously synced from the backend that the
+                                        // backend no longer lists; config static_users are never in
+                                        // `synced_users`, so they are never touched.
+                                        let mut removed = 0usize;
+                                        for (realm, username) in synced_users.difference(&current) {
+                                            if refresh_auth.remove_user_for_realm(realm, username) {
+                                                removed += 1;
+                                            }
+                                        }
+                                        synced_users = current;
+                                        tracing::debug!(refreshed = n, removed, "user refresh from backend");
+                                    }
+                                    Err(e) => tracing::warn!(%e, "user refresh from backend failed"),
+                                }
+                            }
+                            _ = refresh_shutdown.changed() => break,
+                        }
+                    }
+                });
+            }
+
             let (tx, rx) = tokio::sync::mpsc::channel::<turna_session::WriteOp>(
                 cluster.persistence.channel_capacity,
             );
@@ -592,6 +697,45 @@ fn run_tokio(
         // 2.4: startup validation passed and listeners are coming up -> mark
         // the node ready so `/ready` returns 200 (flips to 503 on drain).
         metrics.set_readiness(turna_health::Readiness::Ready);
+
+        // I6: in cluster mode, persistence write-drops mean in-memory state has
+        // diverged from the backend. Surface that as `Degraded` (/ready → 503) so
+        // a load balancer / failover controller stops trusting this node instead
+        // of leaving it Ready; recover to Ready when drops stop. Drain always wins
+        // (once Draining, stop touching readiness). Single-node stays Ready — the
+        // drop counter + alert are enough there (R6).
+        if cluster.cluster_mode {
+            let mon_metrics = metrics.clone();
+            let mut mon_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut last = mon_metrics
+                    .tarantool_writes_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = mon_shutdown.changed() => break,
+                    }
+                    if *mon_shutdown.borrow() {
+                        break;
+                    }
+                    // Drain is terminal — never override it.
+                    if mon_metrics.readiness() == turna_health::Readiness::Draining {
+                        break;
+                    }
+                    let now = mon_metrics
+                        .tarantool_writes_dropped
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if now > last {
+                        mon_metrics.set_readiness(turna_health::Readiness::Degraded);
+                    } else if mon_metrics.readiness() == turna_health::Readiness::Degraded {
+                        mon_metrics.set_readiness(turna_health::Readiness::Ready);
+                    }
+                    last = now;
+                }
+            });
+        }
 
         // Signal handler → shutdown (shared by both backends).
         let drain_routing = cluster_routing.clone();
@@ -1176,6 +1320,7 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("channel_capacity   = {}", c.persistence.channel_capacity);
     println!("batch_max_size     = {}", c.persistence.batch_max_size);
     println!("batch_max_delay_ms = {}", c.persistence.batch_max_delay_ms);
+    println!("user_refresh_secs  = {}", c.persistence.user_refresh_secs);
     println!();
     println!("[management]");
     println!("listen = \"{}\"", cfg.management.listen);

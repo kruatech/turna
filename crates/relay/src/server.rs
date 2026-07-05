@@ -386,12 +386,16 @@ impl RelayServer {
             let store = self.processor.store().clone();
             let metrics = self.processor.metrics().clone();
             let rtp = self.processor.rtp_analyzer().clone();
+            let processor_cl = self.processor.clone();
             let relay_sockets_cl = self.relay_sockets.clone();
             let relay_tasks_cl = relay_tasks.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     ticker.tick().await;
+                    // I2: reclaim rate-limiter buckets idle > 10 min (bounded by
+                    // max_entries anyway, but don't let them linger until restart).
+                    processor_cl.cleanup_rate_limiter(600.0);
                     let removed = store.cleanup_expired();
                     if removed > 0 {
                         metrics

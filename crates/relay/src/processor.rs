@@ -436,6 +436,13 @@ impl PacketProcessor {
         &self.rtp_analyzer
     }
 
+    /// I2: drop rate-limiter buckets idle longer than `max_age_secs`. Memory is
+    /// bounded by `max_entries` per tier already, but without periodic cleanup
+    /// idle buckets linger until restart; the maintenance loop calls this.
+    pub fn cleanup_rate_limiter(&self, max_age_secs: f64) {
+        self.rate_limiter.cleanup(max_age_secs);
+    }
+
     // ── Main entry point ─────────────────────────────────────────────────────
 
     /// Process a raw incoming packet.
@@ -594,6 +601,11 @@ impl PacketProcessor {
             Some(a) => a,
             None => return vec![Action::None],
         };
+        // I3: don't relay peer->client on an expired allocation.
+        if alloc.is_expired() {
+            drop(alloc);
+            return vec![Action::None];
+        }
 
         if !alloc.has_permission(&peer_addr) {
             drop(alloc);
@@ -605,6 +617,16 @@ impl PacketProcessor {
         // metric updates. Holding it across `analyze()` serializes refresh /
         // re_key / add_permission on the same shard for no reason — the
         // ChannelData hot path already drops early; bring this path in line.
+        // B2: enforce the per-allocation bandwidth quota on the peer->client
+        // direction too. Note `add_bytes`/`check_bandwidth` share one per-alloc
+        // window, so `max_bytes_per_sec` now bounds both directions combined.
+        let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
+        if bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err() {
+            drop(alloc);
+            debug!(%peer_addr, "bandwidth quota exceeded, dropping relay->client packet");
+            self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
+            return vec![Action::None];
+        }
         alloc.add_bytes(data.len() as u64);
         let ca = alloc.client_addr;
         let channel = alloc.get_peer_channel(&peer_addr);
@@ -666,6 +688,11 @@ impl PacketProcessor {
         };
 
         let alloc = self.store.get(&src)?;
+        // I3: the allocation's own expiry is swept only every ~5s; drop on an
+        // expired allocation now rather than relaying through that window.
+        if alloc.is_expired() {
+            return None;
+        }
         let peer_addr = alloc.get_channel_peer(channel).copied()?;
 
         let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
@@ -759,6 +786,11 @@ impl PacketProcessor {
         };
 
         if matches!(msg.class, MessageClass::Request) {
+            // I3: reject unknown comprehension-required attributes with 420 before
+            // routing/auth — a request we can't parse must not be redirected.
+            if let Some(actions) = self.reject_unknown_comprehension_required(&msg, src) {
+                return actions;
+            }
             if let Some(actions) = self.maybe_redirect_new_client(&msg, src) {
                 return actions;
             }
@@ -793,6 +825,48 @@ impl PacketProcessor {
             }
             _ => vec![Action::None],
         }
+    }
+
+    /// I3 (RFC 5389 §7.3.1): answer 420 UNKNOWN-ATTRIBUTES for comprehension-
+    /// required (type < 0x8000) attributes we didn't understand. 0x001C
+    /// (MESSAGE-INTEGRITY-SHA256) and 0x001D (PASSWORD-ALGORITHM) are understood
+    /// despite being parsed generically, so they never trigger 420.
+    fn reject_unknown_comprehension_required(
+        &self,
+        msg: &StunMessage,
+        src: SocketAddr,
+    ) -> Option<Vec<Action>> {
+        let unknown: Vec<u16> = msg
+            .attributes
+            .iter()
+            .filter_map(|a| match a {
+                Attribute::Unknown { attr_type, .. }
+                    if *attr_type < 0x8000
+                        && *attr_type
+                            != turna_proto_stun::attribute::ATTR_MESSAGE_INTEGRITY_SHA256
+                        && *attr_type != turna_proto_stun::attribute::ATTR_PASSWORD_ALGORITHM =>
+                {
+                    Some(*attr_type)
+                }
+                _ => None,
+            })
+            .collect();
+        if unknown.is_empty() {
+            return None;
+        }
+        let mut resp =
+            turn::build_error_response(msg.method, msg.transaction_id, 420, "Unknown Attribute");
+        resp.add(Attribute::UnknownAttributes(unknown));
+        let mut buf = [0u8; 512];
+        let len = encode_or_drop!(resp.encode(&mut buf), Some(vec![Action::None]));
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+        Some(vec![Action::Send {
+            data: Bytes::copy_from_slice(&buf[..len]),
+            target: src,
+        }])
     }
 
     fn maybe_redirect_new_client(&self, msg: &StunMessage, src: SocketAddr) -> Option<Vec<Action>> {
@@ -863,12 +937,11 @@ impl PacketProcessor {
     fn handle_binding(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
         // RFC 5389 §10.1.2: if MESSAGE-INTEGRITY present, validate it over the
         // actual message bytes (not an empty buffer).
-        let has_integrity = msg.attributes.iter().any(|a| {
-            matches!(
-                a,
-                turna_proto_stun::attribute::Attribute::MessageIntegrity(_)
-            )
-        });
+        // A client may authenticate a Binding with RFC 5389 MESSAGE-INTEGRITY
+        // (HMAC-SHA-1) or RFC 8489 MESSAGE-INTEGRITY-SHA256. Checking only the
+        // SHA-1 variant let a SHA256-only Binding through unauthenticated (I6).
+        let has_integrity =
+            msg.get_message_integrity().is_some() || msg.get_message_integrity_sha256().is_some();
         if has_integrity && self.auth_validate(msg, raw).is_err() {
             self.metrics
                 .auth_failures
@@ -882,7 +955,9 @@ impl PacketProcessor {
             msg.transaction_id,
         );
         resp.add(Attribute::XorMappedAddress(src));
-        resp.add(Attribute::Software("turna 0.1".into()));
+        resp.add(Attribute::Software(
+            concat!("turna ", env!("CARGO_PKG_VERSION")).into(),
+        ));
 
         let mut buf = [0u8; 256];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
@@ -986,21 +1061,31 @@ impl PacketProcessor {
             .min(turn::MAX_LIFETIME);
         let username = msg.get_username().unwrap_or("").to_string();
 
-        if self
-            .store
-            .create_for_tenant(
-                src,
-                relay_addr,
-                username,
-                key.clone(),
-                lifetime,
-                tenant_id.clone(),
-            )
-            .is_err()
-        {
+        if let Err(e) = self.store.create_for_tenant(
+            src,
+            relay_addr,
+            username,
+            key.clone(),
+            lifetime,
+            tenant_id.clone(),
+        ) {
             self.store.pool_for_port(relay_port).release(relay_port);
+            // I9: an EVEN-PORT (R=1) allocate reserved the next-higher port and
+            // issued a token; if create bookkeeping failed, cancel it too so the
+            // reserved odd port isn't held until the reservation-expiry sweep.
+            if let Some(t) = issued_token {
+                self.store.pool_for_port(relay_port).cancel_reservation(&t);
+            }
             // relay_sock dropped here → socket closed, port freed.
-            return self.encode_error(msg, src, 508, "Insufficient Capacity");
+            // B1: a lost create race (a concurrent Allocate on the same 5-tuple
+            // already won the slot) is an Allocation Mismatch (437), not a
+            // capacity failure (508).
+            return match e {
+                SessionError::AllocationExists => {
+                    self.encode_error(msg, src, 437, "Allocation Mismatch")
+                }
+                _ => self.encode_error(msg, src, 508, "Insufficient Capacity"),
+            };
         }
 
         self.metrics
@@ -1183,7 +1268,11 @@ impl PacketProcessor {
             Ok(r) => r,
             Err(_) => return Some(self.encode_error(msg, src, 437, "Allocation Mismatch")),
         };
-        // Apply the requested lifetime to the migrated allocation.
+        // Apply the requested lifetime to the migrated allocation. Capture the
+        // relay port first: a release (lifetime 0) removes the re-keyed
+        // allocation here, so keep the gauge honest and close the relay
+        // deterministically instead of leaving it for the sweep (I4).
+        let migrated_relay_port = relay_addr.port();
         let _ = self.store.refresh(&src, lifetime);
 
         // Success response: LIFETIME + XOR-MAPPED-ADDRESS(new addr) + a fresh
@@ -1210,10 +1299,19 @@ impl PacketProcessor {
             .fetch_add(len as u64, Ordering::Relaxed);
         info!(%src, %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
 
-        Some(vec![Action::Send {
+        let mut actions = vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: src,
-        }])
+        }];
+        if lifetime == 0 {
+            self.metrics
+                .active_allocations
+                .fetch_sub(1, Ordering::Relaxed);
+            actions.push(Action::CloseRelay {
+                port: migrated_relay_port,
+            });
+        }
+        Some(actions)
     }
 
     fn handle_create_permission(
@@ -1256,6 +1354,12 @@ impl PacketProcessor {
         if peers.is_empty() {
             return self.encode_error(msg, src, 400, "Bad Request");
         }
+        // B5: bound peers in a single CreatePermission (batched ICE candidates)
+        // so one request can't inflate the permission table.
+        const MAX_PEERS: usize = 32;
+        if peers.len() > MAX_PEERS {
+            return self.encode_error(msg, src, 400, "Bad Request: too many peers");
+        }
 
         // Atomic policy: validate every peer first. If any is forbidden, reject
         // the whole request (403) and create no permissions.
@@ -1271,8 +1375,13 @@ impl PacketProcessor {
         // allocation is gone (437); the first call establishes existence, so in
         // practice this is all-or-nothing.
         for peer_ip in &peers {
-            if self.store.add_permission(&src, *peer_ip).is_err() {
-                return self.encode_error(msg, src, 437, "Allocation Mismatch");
+            if let Err(e) = self.store.add_permission(&src, *peer_ip) {
+                return match e {
+                    SessionError::LimitExceeded => {
+                        self.encode_error(msg, src, 486, "Allocation Quota Reached")
+                    }
+                    _ => self.encode_error(msg, src, 437, "Allocation Mismatch"),
+                };
             }
         }
 
@@ -1348,6 +1457,9 @@ impl PacketProcessor {
             }
             // A3-H1: a channel/peer uniqueness violation is a client error → 400.
             Err(SessionError::ChannelConflict) => self.encode_error(msg, src, 400, "Bad Request"),
+            Err(SessionError::LimitExceeded) => {
+                self.encode_error(msg, src, 486, "Allocation Quota Reached")
+            }
             Err(_) => self.encode_error(msg, src, 437, "Allocation Mismatch"),
         }
     }
@@ -1386,8 +1498,22 @@ impl PacketProcessor {
             Some(a) => a,
             None => return vec![Action::None],
         };
+        // I3: drop a Send-indication relay on an expired allocation.
+        if alloc.is_expired() {
+            return vec![Action::None];
+        }
 
         if !alloc.has_permission(&peer_addr) {
+            return vec![Action::None];
+        }
+
+        // B2: enforce the per-allocation bandwidth quota on the Send-indication
+        // egress path too, not only ChannelData — otherwise a client bypasses
+        // `max_bytes_per_sec` entirely by relaying via Send/Data Indications.
+        let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
+        if bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err() {
+            debug!(%src, "bandwidth quota exceeded, dropping Send indication");
+            self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
 
@@ -1496,6 +1622,56 @@ impl PacketProcessor {
 mod a3_send_indication_tests {
     use super::*;
     use turna_auth::AuthMode;
+
+    #[test]
+    fn unknown_comprehension_required_yields_420() {
+        let p = test_processor();
+        let client: SocketAddr = "127.0.0.1:50100".parse().unwrap();
+
+        // Required unknown (0x0021) → 420 + UNKNOWN-ATTRIBUTES.
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.attributes.push(Attribute::Unknown {
+            attr_type: 0x0021,
+            value: vec![],
+        });
+        let mut buf = [0u8; 512];
+        let n = msg.encode(&mut buf).unwrap();
+        let actions = p.process(Bytes::copy_from_slice(&buf[..n]), client);
+        let sent = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("expected a Send response");
+        let resp = StunMessage::decode(&sent).unwrap();
+        assert!(matches!(resp.class, MessageClass::ErrorResponse));
+        assert!(
+            resp.attributes.iter().any(|a| matches!(
+                a, Attribute::UnknownAttributes(v) if v.contains(&0x0021)
+            )),
+            "response must list the unknown required attribute"
+        );
+
+        // Optional unknown (0x8021) → NOT 420.
+        let mut msg2 = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg2.attributes.push(Attribute::Unknown {
+            attr_type: 0x8021,
+            value: vec![],
+        });
+        let n2 = msg2.encode(&mut buf).unwrap();
+        let actions2 = p.process(Bytes::copy_from_slice(&buf[..n2]), client);
+        let has_420 = actions2.iter().any(|a| {
+            matches!(a, Action::Send { data, .. }
+            if StunMessage::decode(data)
+                .map(|m| m.attributes.iter().any(|x| matches!(x, Attribute::UnknownAttributes(_))))
+                .unwrap_or(false))
+        });
+        assert!(
+            !has_420,
+            "comprehension-optional unknown must not trigger 420"
+        );
+    }
 
     #[test]
     fn nonce_is_client_bound_and_validates() {

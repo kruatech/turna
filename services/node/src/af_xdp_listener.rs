@@ -97,7 +97,8 @@ pub fn run_af_xdp(
     {
         use turna_transport::neighbor::{run_resolver, NeighborCache};
         let cache = NeighborCache::new();
-        let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+        // B6: bounded neighbor-resolve queue (drop-on-full in the datapath).
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(1024);
         let resolver_cache = cache.clone();
         tokio::runtime::Handle::current().spawn(async move {
             if let Err(e) = run_resolver(resolver_cache, req_rx).await {

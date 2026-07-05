@@ -8,6 +8,8 @@ pub struct InMemoryBackend {
     allocations: DashMap<u16, StoredAllocation>,
     nodes: DashMap<String, NodeHeartbeat>,
     rooms: DashMap<String, StoredRoom>,
+    /// (username, realm) -> user. Process-local; see `Backend::store_user`.
+    users: DashMap<(String, String), StoredUser>,
 }
 
 impl InMemoryBackend {
@@ -16,6 +18,7 @@ impl InMemoryBackend {
             allocations: DashMap::new(),
             nodes: DashMap::new(),
             rooms: DashMap::new(),
+            users: DashMap::new(),
         }
     }
 
@@ -155,6 +158,30 @@ impl InMemoryBackend {
 
     pub async fn ping(&self) -> Result<()> {
         Ok(())
+    }
+
+    pub async fn store_user(&self, user: &StoredUser) -> Result<()> {
+        self.users
+            .insert((user.username.clone(), user.realm.clone()), user.clone());
+        Ok(())
+    }
+
+    pub async fn get_user(&self, username: &str, realm: &str) -> Result<Option<StoredUser>> {
+        Ok(self
+            .users
+            .get(&(username.to_string(), realm.to_string()))
+            .map(|v| v.clone()))
+    }
+
+    pub async fn remove_user(&self, username: &str, realm: &str) -> Result<bool> {
+        Ok(self
+            .users
+            .remove(&(username.to_string(), realm.to_string()))
+            .is_some())
+    }
+
+    pub async fn list_users(&self) -> Result<Vec<StoredUser>> {
+        Ok(self.users.iter().map(|e| e.value().clone()).collect())
     }
 }
 

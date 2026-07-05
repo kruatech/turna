@@ -10,3 +10,9 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 turna-management = { path = "../../crates/management" }
+tonic = { version = "0.14", features = ["tls-ring"] }
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

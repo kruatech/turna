@@ -162,6 +162,16 @@ box.space.turna_token_blacklist:create_index("primary",
 box.space.turna_token_blacklist:create_index("by_expiry",
     { parts = { "expires_at_ms" }, unique = false, if_not_exists = true })
 
+-- R8: runtime long-term users (Variant B — two pre-derived keys, no password).
+box.schema.space.create("turna_users", { if_not_exists = true })
+box.space.turna_users:format({
+    { name = "username", type = "string" },
+    { name = "realm",    type = "string" },
+    { name = "data",     type = "string" },
+})
+box.space.turna_users:create_index("primary",
+    { parts = { "username", "realm" }, if_not_exists = true })
+
 -- ── 3. Stored functions ──────────────────────────────────────────────────────
 -- All data operations go through stored functions called via iproto CALL.
 -- This means turna_app needs `execute on function <name>` only — NOT
@@ -183,6 +193,7 @@ local TURNA_FUNCS_ALL = {
     "turna_ping",             "turna_claim_allocation",
     "turna_revoke_token", "turna_is_token_revoked",
     "turna_cleanup_revoked_tokens", "turna_load_active_revocations",
+    "turna_store_user", "turna_get_user", "turna_remove_user", "turna_list_users",
 }
 for _, fn_name in ipairs(TURNA_FUNCS_ALL) do
     box.schema.func.drop(fn_name, { if_exists = true })
@@ -226,6 +237,14 @@ box.schema.func.create("turna_init_schema", {
         })
         box.space.turna_rooms:create_index("primary",
             { parts = { "room_id" }, if_not_exists = true })
+        box.schema.space.create("turna_users", { if_not_exists = true })
+        box.space.turna_users:format({
+            { name = "username", type = "string" },
+            { name = "realm",    type = "string" },
+            { name = "data",     type = "string" },
+        })
+        box.space.turna_users:create_index("primary",
+            { parts = { "username", "realm" }, if_not_exists = true })
     end]],
 })
 
@@ -431,6 +450,41 @@ box.schema.func.create("turna_claim_allocation", {
     end]],
 })
 
+box.schema.func.create("turna_store_user", {
+    language = "LUA", is_sandboxed = false, setuid = true,
+    body = [[function(username, realm, data)
+        box.space.turna_users:replace({ username, realm, data })
+    end]],
+})
+
+box.schema.func.create("turna_get_user", {
+    language = "LUA", is_sandboxed = false, setuid = true,
+    body = [[function(username, realm)
+        local t = box.space.turna_users:get({ username, realm })
+        if t then return t[3] end
+    end]],
+})
+
+box.schema.func.create("turna_remove_user", {
+    language = "LUA", is_sandboxed = false, setuid = true,
+    body = [[function(username, realm)
+        local existed = box.space.turna_users:get({ username, realm }) ~= nil
+        box.space.turna_users:delete({ username, realm })
+        return existed
+    end]],
+})
+
+box.schema.func.create("turna_list_users", {
+    language = "LUA", is_sandboxed = false, setuid = true,
+    body = [[function()
+        local res = {}
+        for _, t in box.space.turna_users:pairs() do
+            table.insert(res, t[3])
+        end
+        return unpack(res)
+    end]],
+})
+
 -- ── 4. Role with minimum required privileges ─────────────────────────────────
 -- Only execute on the specific functions above. No universe-wide execute.
 -- A compromised turna-node can ONLY call these 17 functions — nothing else.
@@ -447,6 +501,7 @@ local TURNA_FUNCS = {
     "turna_ping",              "turna_claim_allocation",
     "turna_revoke_token", "turna_is_token_revoked",
     "turna_cleanup_revoked_tokens", "turna_load_active_revocations",
+    "turna_store_user", "turna_get_user", "turna_remove_user", "turna_list_users",
 }
 for _, fn_name in ipairs(TURNA_FUNCS) do
     box.schema.role.grant("turna_app", "execute", "function", fn_name,

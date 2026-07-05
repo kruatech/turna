@@ -46,9 +46,19 @@ pub fn compute_message_integrity_sha256(message_bytes: &[u8], key: &[u8]) -> [u8
 /// Verify MESSAGE-INTEGRITY-SHA256 in constant time. `expected` may be a
 /// left-truncated tag (16..=32 bytes, a multiple of 4) or the full 32 bytes.
 pub fn verify_message_integrity_sha256(message_bytes: &[u8], key: &[u8], expected: &[u8]) -> bool {
+    // RFC 8489 §14.6: the tag is the full 32-byte HMAC-SHA-256 or a left
+    // truncation to a multiple of 4 bytes, no shorter than 16. Reject anything
+    // outside {16,20,24,28,32} before comparing. Without this an attacker can
+    // present a short (e.g. 4-byte) or empty tag and `verify_truncated_left`
+    // would only match that many leading bytes of the real HMAC, collapsing the
+    // forgery search space (an empty tag would compare nothing at all).
+    let len = expected.len();
+    if !(16..=32).contains(&len) || !len.is_multiple_of(4) {
+        return false;
+    }
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
     mac.update(message_bytes);
-    if expected.len() == 32 {
+    if len == 32 {
         mac.verify_slice(expected).is_ok()
     } else {
         mac.verify_truncated_left(expected).is_ok()

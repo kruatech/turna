@@ -238,7 +238,7 @@ async fn resolve_one(handle: &Handle, cache: &NeighborCache, target: IpAddr) {
 /// cache entries. Returns when the request channel closes.
 pub async fn run_resolver(
     cache: NeighborCache,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<IpAddr>,
+    mut rx: tokio::sync::mpsc::Receiver<IpAddr>,
 ) -> std::io::Result<()> {
     let handle = connect()?;
     let mut last_attempt: HashMap<IpAddr, Instant> = HashMap::new();

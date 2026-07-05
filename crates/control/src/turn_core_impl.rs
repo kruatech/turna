@@ -20,6 +20,7 @@ use tracing::{info, warn};
 
 use turna_health::Metrics;
 use turna_session::AllocationStore;
+use turna_state_backend::{now_ms, Backend, StoredUser};
 
 use crate::grpc::{
     AllocationEvent, AllocationInfo, ChannelInfo, ConfigUpdate, CoreError, CurrentConfig,
@@ -39,6 +40,9 @@ pub struct TurnCoreImpl {
     started_at: Instant,
     /// Runtime-mutable config fields.
     config: Arc<std::sync::RwLock<RuntimeConfig>>,
+    /// Shared state backend for runtime user CRUD (R8). `None` → user
+    /// management returns Unimplemented (no backend configured).
+    user_backend: Option<Arc<Backend>>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +90,16 @@ impl TurnCoreImpl {
             shutdown_tx,
             started_at: Instant::now(),
             config: Arc::new(std::sync::RwLock::new(RuntimeConfig::default())),
+            user_backend: None,
         }
+    }
+
+    /// Attach a shared state backend so runtime user CRUD (AddUser/RemoveUser)
+    /// persists to the cluster store. Without it, user management is
+    /// Unimplemented.
+    pub fn with_user_backend(mut self, backend: Arc<Backend>) -> Self {
+        self.user_backend = Some(backend);
+        self
     }
 
     /// Configure initial values from node config.
@@ -171,6 +184,24 @@ impl TurnCoreImpl {
             })
             .collect()
     }
+
+    /// Allocation list with a cluster-wide view: when a shared state backend is
+    /// attached (control-plane), read from it; otherwise fall back to the local
+    /// in-process store (embedded/node mode). This is what makes the
+    /// control-plane's read RPCs reflect the real cluster instead of its own
+    /// empty store.
+    async fn cluster_allocations(&self) -> Vec<AllocationInfo> {
+        if let Some(backend) = self.user_backend.clone() {
+            // Cap the pull; gRPC pagination/aggregation happens on top of this.
+            match backend.list_allocations(0, 100_000).await {
+                Ok(list) => return list.into_iter().map(stored_to_info).collect(),
+                Err(e) => {
+                    warn!(%e, "list_allocations from backend failed; using local store");
+                }
+            }
+        }
+        self.all_allocations()
+    }
 }
 
 // ── TurnCore implementation ───────────────────────────────────────────────────
@@ -186,7 +217,7 @@ impl TurnCore for TurnCoreImpl {
     ) -> Result<(Vec<AllocationInfo>, Option<String>, usize), CoreError> {
         let offset: usize = token.and_then(|t| t.parse().ok()).unwrap_or(0);
 
-        let mut all = self.all_allocations();
+        let mut all = self.cluster_allocations().await;
 
         // Filter
         if let Some(u) = user {
@@ -210,7 +241,8 @@ impl TurnCore for TurnCoreImpl {
 
     async fn get_allocation(&self, id: &str) -> Result<AllocationInfo, CoreError> {
         // `id` = relay_addr string, e.g. "5.6.7.8:12345"
-        self.all_allocations()
+        self.cluster_allocations()
+            .await
             .into_iter()
             .find(|a| a.id == id)
             .ok_or_else(|| CoreError::NotFound(format!("allocation {id}")))
@@ -230,16 +262,34 @@ impl TurnCore for TurnCoreImpl {
 
     async fn server_stats(&self) -> ServerStatsInfo {
         let m = &self.metrics;
-        let active = m.active_allocations.load(Ordering::Relaxed);
         let total = m.total_allocations.load(Ordering::Relaxed);
-        let bytes_in = m.bytes_received.load(Ordering::Relaxed);
-        let bytes_out = m.bytes_sent.load(Ordering::Relaxed);
         let pps = m.packets_received.load(Ordering::Relaxed); // approximate
 
-        // Count unique users
+        // Allocation-derived figures come from the shared backend when one is
+        // attached (cluster-wide view); otherwise from the local store. The
+        // runtime gauges below (ports, latency, pps) stay node-local — the
+        // backend does not persist them, so on a standalone control-plane they
+        // read as zero/local rather than cluster-aggregated.
+        let cluster = self.cluster_allocations().await;
+        let backend_mode = self.user_backend.is_some();
+        let active = if backend_mode {
+            cluster.len() as u64
+        } else {
+            m.active_allocations.load(Ordering::Relaxed)
+        };
+        let (bytes_in, bytes_out) = if backend_mode {
+            cluster
+                .iter()
+                .fold((0u64, 0u64), |(i, o), a| (i + a.bytes_in, o + a.bytes_out))
+        } else {
+            (
+                m.bytes_received.load(Ordering::Relaxed),
+                m.bytes_sent.load(Ordering::Relaxed),
+            )
+        };
         let mut users = std::collections::HashSet::new();
-        for a in self.all_allocations() {
-            users.insert(a.username);
+        for a in &cluster {
+            users.insert(a.username.clone());
         }
 
         ServerStatsInfo {
@@ -272,7 +322,7 @@ impl TurnCore for TurnCoreImpl {
         let mut by_user: std::collections::HashMap<String, TopTalkerInfo> =
             std::collections::HashMap::new();
 
-        for a in self.all_allocations() {
+        for a in self.cluster_allocations().await {
             let entry = by_user.entry(a.username.clone()).or_insert(TopTalkerInfo {
                 username: a.username,
                 organization: a.organization,
@@ -319,54 +369,90 @@ impl TurnCore for TurnCoreImpl {
         Ok(())
     }
 
-    async fn add_user(&self, user: &str, _pass: &str, _org: Option<&str>) -> Result<(), CoreError> {
-        // Runtime user management is not supported by the current auth modes:
-        // LongTerm users are defined in config and SharedSecret/REST mode has
-        // no per-user records. Returning Unimplemented (not Ok) so operators
-        // get an honest failure instead of believing a user was created.
-        // TODO: wire to turna-auth UserStore once it supports runtime CRUD.
-        warn!(
-            username = user,
-            "add_user via gRPC rejected: runtime user management not supported"
-        );
-        Err(CoreError::Unimplemented(
-            "runtime user management is not supported; configure LongTerm users in \
-             turn.toml or use SharedSecret/REST credentials"
-                .into(),
-        ))
+    async fn add_user(&self, user: &str, pass: &str, org: Option<&str>) -> Result<(), CoreError> {
+        // R8: persist the long-term user to the shared backend (source of
+        // truth). Variant B — store the two pre-derived keys, never the
+        // password. Nodes rehydrate their AuthRegistry from this on startup.
+        let Some(backend) = self.user_backend.clone() else {
+            warn!(
+                username = user,
+                "add_user via gRPC rejected: no state backend configured"
+            );
+            return Err(CoreError::Unimplemented(
+                "runtime user management requires a state backend; set [cluster.backend] \
+                 (type = \"tarantool\") so users are shared across the cluster"
+                    .into(),
+            ));
+        };
+        let realm = self
+            .config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .realm
+            .clone();
+        let su = StoredUser {
+            username: user.to_string(),
+            realm: realm.clone(),
+            key_md5_hex: bytes_to_hex(&turna_crypto::long_term_key(user, &realm, pass)),
+            key_sha256_hex: bytes_to_hex(&turna_crypto::long_term_key_sha256(user, &realm, pass)),
+            organization: org.map(|s| s.to_string()),
+            created_at_ms: now_ms(),
+        };
+        backend
+            .store_user(&su)
+            .await
+            .map_err(|e| CoreError::Internal(e.to_string()))?;
+        info!(username = user, realm = %realm, "user added via gRPC");
+        Ok(())
     }
 
     async fn remove_user(&self, user: &str, force: bool) -> Result<u32, CoreError> {
-        // There is no runtime user store to delete a user record from (see
-        // add_user), so without `force` this RPC has nothing to do. Report that
-        // honestly as Unimplemented instead of returning a misleading success.
-        // With `force` we drop the user's *active allocations* (not a user
-        // record); the response's allocations_deleted conveys what happened.
-        if !force {
-            return Err(CoreError::Unimplemented(
-                "runtime user removal is not supported; pass force to drop the user's \
-                 active allocations, or manage LongTerm users in turn.toml"
-                    .into(),
-            ));
+        // R8: remove the persisted user record (source of truth) when a backend
+        // is configured. With `force` we additionally drop the user's active
+        // allocations on this node; allocations_deleted conveys how many.
+        let realm = self
+            .config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .realm
+            .clone();
+        match self.user_backend.clone() {
+            Some(backend) => {
+                backend
+                    .remove_user(user, &realm)
+                    .await
+                    .map_err(|e| CoreError::Internal(e.to_string()))?;
+            }
+            None => {
+                if !force {
+                    return Err(CoreError::Unimplemented(
+                        "runtime user removal requires a state backend; pass force to drop \
+                         the user's active allocations, or set [cluster.backend]"
+                            .into(),
+                    ));
+                }
+            }
         }
 
-        let allocs: Vec<_> = self
-            .all_allocations()
-            .into_iter()
-            .filter(|a| a.username == user)
-            .collect();
-        let mut deleted = 0u32;
-        for a in allocs {
-            self.store.force_remove(&a.client_address);
-            self.metrics
-                .active_allocations
-                .fetch_sub(1, Ordering::Relaxed);
-            deleted += 1;
-        }
-        info!(
-            username = user,
-            deleted, "user allocations force-dropped via gRPC"
-        );
+        let deleted = if force {
+            let allocs: Vec<_> = self
+                .all_allocations()
+                .into_iter()
+                .filter(|a| a.username == user)
+                .collect();
+            let mut deleted = 0u32;
+            for a in allocs {
+                self.store.force_remove(&a.client_address);
+                self.metrics
+                    .active_allocations
+                    .fetch_sub(1, Ordering::Relaxed);
+                deleted += 1;
+            }
+            deleted
+        } else {
+            0
+        };
+        info!(username = user, deleted, force, "user removed via gRPC");
         Ok(deleted)
     }
 
@@ -420,6 +506,60 @@ impl TurnCore for TurnCoreImpl {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
+/// Map a backend `StoredAllocation` to the gRPC `AllocationInfo`. Mirrors the
+/// local-store mapping in `all_allocations`. Fields the backend does not
+/// persist on an allocation (transport, organization) use the same defaults as
+/// the local path; `address_family` is derived from the client address.
+fn stored_to_info(a: turna_state_backend::StoredAllocation) -> AllocationInfo {
+    let client_address = a
+        .client_addr
+        .parse()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+    let relay_address = a
+        .relay_addr
+        .parse()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+    AllocationInfo {
+        id: a.relay_addr.clone(),
+        username: a.user_id,
+        realm: a.realm,
+        client_address,
+        relay_address,
+        created_at_ms: a.created_at_ms,
+        expires_at_ms: a.expires_at_ms,
+        transport: "UDP".into(),
+        address_family: if client_address.is_ipv6() {
+            "IPv6"
+        } else {
+            "IPv4"
+        }
+        .into(),
+        organization: None,
+        bytes_in: a.bytes_in,
+        bytes_out: a.bytes_out,
+        packets_in: a.packets_in,
+        packets_out: a.packets_out,
+        permissions: a.permissions,
+        channels: a
+            .channels
+            .into_iter()
+            .map(|c| ChannelInfo {
+                number: c.number,
+                peer_addr: c.peer_addr,
+                expires_at_ms: c.expires_at_ms,
+            })
+            .collect(),
+    }
+}
 
 fn instant_to_ms(instant: Instant) -> u64 {
     let now_instant = Instant::now();

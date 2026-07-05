@@ -11,4 +11,5 @@ turna-config.workspace   = true
 turna-observability.workspace = true
 turna-session.workspace  = true
 turna-health.workspace   = true
+turna-state-backend.workspace = true
 turna-control            = { path = "../../crates/control" }
