@@ -1474,4 +1474,50 @@ mod tests {
 
         backend.remove_allocation(port).await.unwrap();
     }
+
+    /// Regression (P1, failover): a list-returning stored function with N rows
+    /// must yield all N through the Rust CALL parser, not just the first.
+    ///
+    /// The bug: init.lua list functions used `return unpack(res)`, a flat
+    /// multiple-return that iproto CALL serialised so `parse_call_data` saw the
+    /// first element only and truncated the result to one row. This silently
+    /// broke `find_by_node` / `get_live_nodes` / `list_allocations`, which in
+    /// turn broke the failover sweep (it saw <=1 orphan / <=1 dead node and
+    /// never completed a claim in a real Tarantool cluster). The fix is
+    /// `return res` (a single array value) so `parse_call_data` unwraps the
+    /// outer CALL array and yields every row. This guards that contract: run
+    /// against a Tarantool loaded with the FIXED init.lua.
+    #[tokio::test]
+    async fn integration_list_functions_return_all_rows_not_truncated() {
+        let Some(backend) = connect_test_backend().await else {
+            return;
+        };
+        let node = "regr-multi-row";
+        let ports = [19980u16, 19981, 19982, 19983, 19984];
+        // Clean slate.
+        for p in ports {
+            backend.remove_allocation(p).await.ok();
+        }
+        // Five allocations owned by one node.
+        for p in ports {
+            backend
+                .store_allocation(&owned_alloc(p, node, now_ms() + 600_000))
+                .await
+                .unwrap();
+        }
+
+        // find_by_node MUST return all five. Pre-fix this returned 1 (the
+        // multiple-return was truncated by parse_call_data).
+        let found = backend.find_by_node(node).await.unwrap();
+        assert_eq!(
+            found.len(),
+            5,
+            "find_by_node must return all rows, not a truncated multiple-return"
+        );
+
+        // Cleanup.
+        for p in ports {
+            backend.remove_allocation(p).await.unwrap();
+        }
+    }
 }

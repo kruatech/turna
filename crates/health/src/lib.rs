@@ -958,21 +958,21 @@ pub async fn serve_with_cluster_routes(
                          # HELP turna_rtp_total_bitrate_kbps Total RTP bitrate kbps\n\
                          # TYPE turna_rtp_total_bitrate_kbps gauge\n\
                          turna_rtp_total_bitrate_kbps {}\n\
-                         # HELP turna_send_queue_dropped_total Packets dropped due to full send channel
-                         # TYPE turna_send_queue_dropped_total counter
-                         turna_send_queue_dropped_total {}
-                         # HELP turna_parser_rejections_total STUN messages rejected by parser
-                         # TYPE turna_parser_rejections_total counter
-                         turna_parser_rejections_total {}
-                         # HELP turna_malformed_packets_total Packets with unknown protocol
-                         # TYPE turna_malformed_packets_total counter
-                         turna_malformed_packets_total {}
-                         # HELP turna_quota_exceeded_total Packets dropped due to bandwidth quota
-                         # TYPE turna_quota_exceeded_total counter
-                         turna_quota_exceeded_total {}
-                         # HELP turna_peer_rejected_total Permission/ChannelBind/Send requests to denied peer ranges
-                         # TYPE turna_peer_rejected_total counter
-                         turna_peer_rejected_total {}
+                         # HELP turna_send_queue_dropped_total Packets dropped due to full send channel\n\
+                         # TYPE turna_send_queue_dropped_total counter\n\
+                         turna_send_queue_dropped_total {}\n\
+                         # HELP turna_parser_rejections_total STUN messages rejected by parser\n\
+                         # TYPE turna_parser_rejections_total counter\n\
+                         turna_parser_rejections_total {}\n\
+                         # HELP turna_malformed_packets_total Packets with unknown protocol\n\
+                         # TYPE turna_malformed_packets_total counter\n\
+                         turna_malformed_packets_total {}\n\
+                         # HELP turna_quota_exceeded_total Packets dropped due to bandwidth quota\n\
+                         # TYPE turna_quota_exceeded_total counter\n\
+                         turna_quota_exceeded_total {}\n\
+                         # HELP turna_peer_rejected_total Permission/ChannelBind/Send requests to denied peer ranges\n\
+                         # TYPE turna_peer_rejected_total counter\n\
+                         turna_peer_rejected_total {}\n\
                          # HELP tarantool_reconnect_attempts_total Total Tarantool reconnect attempts\n\
                          # TYPE tarantool_reconnect_attempts_total counter\n\
                          tarantool_reconnect_attempts_total {}\n\
@@ -1103,3 +1103,100 @@ pub async fn serve_with_cluster_routes(
     }
 }
 pub mod histogram;
+#[cfg(test)]
+mod metrics_format_regression {
+    // RC observability: the /metrics body must be valid Prometheus text —
+    // no line may begin with whitespace before a metric name or # HELP/# TYPE
+    // comment. A previous edit left five counters without `\n\` line
+    // continuations, which injected the source indentation into the output.
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Reproduce the exact `/metrics` counter block that the server renders.
+    /// This mirrors the format! in `serve_with_cluster_routes`; if that block
+    /// changes, update here too. We assert structural validity, not values.
+    fn render_core_metrics(m: &Metrics) -> String {
+        // Reuse the real render helpers for the parts that have them.
+        let mut body = format!(
+            concat!(
+                "# HELP turna_send_queue_dropped_total Packets dropped due to full send channel\n",
+                "# TYPE turna_send_queue_dropped_total counter\n",
+                "turna_send_queue_dropped_total {}\n",
+                "# HELP turna_parser_rejections_total STUN messages rejected by parser\n",
+                "# TYPE turna_parser_rejections_total counter\n",
+                "turna_parser_rejections_total {}\n",
+                "# HELP turna_malformed_packets_total Packets with unknown protocol\n",
+                "# TYPE turna_malformed_packets_total counter\n",
+                "turna_malformed_packets_total {}\n",
+                "# HELP turna_quota_exceeded_total Packets dropped due to bandwidth quota\n",
+                "# TYPE turna_quota_exceeded_total counter\n",
+                "turna_quota_exceeded_total {}\n",
+                "# HELP turna_peer_rejected_total Permission/ChannelBind/Send requests to denied peer ranges\n",
+                "# TYPE turna_peer_rejected_total counter\n",
+                "turna_peer_rejected_total {}\n",
+            ),
+            m.send_queue_dropped.load(Ordering::Relaxed),
+            m.parser_rejections.load(Ordering::Relaxed),
+            m.malformed_packets.load(Ordering::Relaxed),
+            m.quota_exceeded.load(Ordering::Relaxed),
+            m.peer_rejected.load(Ordering::Relaxed),
+        );
+        body.push_str(&m.render_auth_reason_metrics());
+        body.push_str(&m.render_transport_metrics());
+        body
+    }
+
+    /// No metric/comment line may start with whitespace (Prometheus rejects a
+    /// leading space before a sample; a stray indent means a broken `\n\`).
+    #[test]
+    fn metrics_text_has_no_indented_lines() {
+        let m = Metrics::new();
+        for block in [render_core_metrics(&m)] {
+            for line in block.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(' ') && !line.starts_with('\t'),
+                    "metrics line must not be indented: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// The five previously-broken counters must be present with exact names,
+    /// each as a bare `name value` sample line (no leading indent).
+    #[test]
+    fn previously_broken_counters_present_and_flush_left() {
+        let m = Metrics::new();
+        let body = render_core_metrics(&m);
+        for name in [
+            "turna_send_queue_dropped_total",
+            "turna_parser_rejections_total",
+            "turna_malformed_packets_total",
+            "turna_quota_exceeded_total",
+            "turna_peer_rejected_total",
+        ] {
+            let sample = format!("{name} ");
+            assert!(
+                body.lines().any(|l| l.starts_with(&sample)),
+                "expected a flush-left sample line for {name}"
+            );
+        }
+    }
+
+    /// turna_auth_failures_by_reason_total must render one series per reason,
+    /// all flush-left (guards the labelled-counter helper too).
+    #[test]
+    fn auth_reason_metrics_flush_left() {
+        let m = Metrics::new();
+        let body = m.render_auth_reason_metrics();
+        for line in body.lines() {
+            assert!(
+                !line.starts_with(' ') && !line.starts_with('\t'),
+                "auth reason line indented: {line:?}"
+            );
+        }
+        assert!(body.contains("turna_auth_failures_by_reason_total{reason=\"integrity_failed\"}"));
+    }
+}

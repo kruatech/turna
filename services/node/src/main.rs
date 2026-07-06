@@ -266,7 +266,11 @@ fn run_tokio(
     let _ = &tls_cfg;
     let num_threads = std::env::var("TURNA_WORKERS")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        // TURNA_WORKERS=0 means "auto" (the Helm chart's default). tokio's
+        // worker_threads(0) panics, so treat 0 (and unset/unparseable) as a
+        // request to size the pool from available parallelism.
+        .filter(|&n| n != 0)
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())

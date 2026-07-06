@@ -295,7 +295,7 @@ box.schema.func.create("turna_find_by_user", {
         for _,t in box.space.turna_allocations.index.by_user:pairs({user_id}) do
             table.insert(res, t[5])
         end
-        return unpack(res)
+        return res
     end]],
 })
 
@@ -306,7 +306,7 @@ box.schema.func.create("turna_find_by_node", {
         for _,t in box.space.turna_allocations.index.by_node:pairs({node_id}) do
             table.insert(res, t[5])
         end
-        return unpack(res)
+        return res
     end]],
 })
 
@@ -319,7 +319,7 @@ box.schema.func.create("turna_find_expired", {
             if t[4] >= cutoff then break end
             table.insert(res, t[5])
         end
-        return unpack(res)
+        return res
     end]],
 })
 
@@ -340,7 +340,7 @@ box.schema.func.create("turna_list_allocations", {
             if i > off then table.insert(res, t[5]) end
             if #res >= lim then break end
         end
-        return unpack(res)
+        return res
     end]],
 })
 
@@ -360,7 +360,7 @@ box.schema.func.create("turna_get_live_nodes", {
             local d = require('json').decode(t[2])
             if d.last_seen_ms >= cutoff then table.insert(res, t[2]) end
         end
-        return unpack(res)
+        return res
     end]],
 })
 
@@ -430,7 +430,7 @@ box.schema.func.create("turna_load_active_revocations", {
         for _, t in box.space.turna_token_blacklist.index.by_expiry:pairs() do
             if t[4] >= cutoff then table.insert(res, t[1] .. ":" .. tostring(t[4])) end
         end
-        return unpack(res)
+        return res
     end]],
 })
 
@@ -481,7 +481,7 @@ box.schema.func.create("turna_list_users", {
         for _, t in box.space.turna_users:pairs() do
             table.insert(res, t[3])
         end
-        return unpack(res)
+        return res
     end]],
 })
 

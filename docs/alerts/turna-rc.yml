@@ -1,0 +1,296 @@
+# turna — Prometheus alerting rules (v0.3.0-rc.1)
+#
+# Every metric name below is taken verbatim from crates/health/src/lib.rs and
+# confirmed present in a live /metrics scrape. Notes on conventions:
+#
+#   * Counters (name ends _total) use rate()/increase() over a window.
+#   * Gauges are compared by value.
+#   * THRESHOLDS ARE STARTING VALUES. Calibrate them against the §2 soak run
+#     before trusting them in production — a turna server's normal reject/drop
+#     baseline depends entirely on your traffic mix and abuse level.
+#   * Some metrics are transport-conditional: the QUIC/DTLS/AF_XDP/io_uring
+#     families are all-zero unless that datapath is built and enabled, so their
+#     alerts simply never fire on a plain UDP/tokio build.
+#   * Metrics WITHOUT the turna_ prefix (failover_*, grpc_*, tarantool_*) are
+#     named that way in the code — not a typo here.
+#
+# Validate before committing:  promtool check rules docs/alerts/turna-rc.yml
+
+groups:
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_readiness
+    rules:
+      - alert: TurnaBackendDegraded
+        # 2 = Degraded. Do NOT alert on 3 (Draining) — that is an operator
+        # action (turnactl node.drain), not a fault. 0 = Starting is only
+        # briefly seen at boot; a long Starting is caught by the boot alert.
+        expr: turna_backend_readiness == 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna backend readiness is Degraded on {{ $labels.instance }}"
+          description: "turna_backend_readiness=2 (Degraded) for >2m. Draining (3) is excluded intentionally."
+
+      - alert: TurnaStuckStarting
+        expr: turna_backend_readiness == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna stuck in Starting on {{ $labels.instance }}"
+          description: "turna_backend_readiness=0 (Starting) for >5m — listeners never reached Ready."
+
+      - alert: TurnaTransportDegraded
+        expr: turna_transport_readiness == 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna primary UDP transport Degraded on {{ $labels.instance }}"
+          description: "turna_transport_readiness=2 for >2m."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_panics
+    rules:
+      - alert: TurnaProcessorPanics
+        # A3-O1: the worker panic guard survives the packet but increments this.
+        # Any sustained rate means a packet is tripping a bug in PacketProcessor.
+        expr: increase(turna_processor_panics_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna caught packet-processing panic(s) on {{ $labels.instance }}"
+          description: "turna_processor_panics_total increased in the last 5m. A packet is hitting a processor bug; capture inputs and investigate."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_persistence
+    rules:
+      # These are the real "dropped persistence writes" metrics (the RC plan's
+      # placeholder name does not exist in code):
+      - alert: TarantoolWritesDropped
+        expr: increase(tarantool_writes_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna dropped state writes on {{ $labels.instance }}"
+          description: "tarantool_writes_dropped_total increased — the write-behind channel was full, so allocation state was NOT persisted. Backend is not keeping up or is unavailable."
+
+      - alert: TarantoolWriterErrors
+        expr: increase(tarantool_writer_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna backend flush errors on {{ $labels.instance }}"
+          description: "tarantool_writer_errors_total increasing — per-port flushes to the backend are failing."
+
+      - alert: TarantoolConnectionNotConnected
+        # gauge: 0 = connected, 1 = reconnecting, 2 = failed.
+        expr: tarantool_connection_state != 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna Tarantool connection not healthy on {{ $labels.instance }}"
+          description: "tarantool_connection_state={{ $value }} (1=reconnecting, 2=failed) for >1m."
+
+      - alert: TarantoolPoolBroken
+        expr: tarantool_pool_slots{state="broken"} > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna Tarantool pool has broken slots on {{ $labels.instance }}"
+          description: "{{ $value }} pool slot(s) in broken state for >2m."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_failover
+    rules:
+      - alert: TurnaFailoverErrors
+        expr: increase(failover_errors_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna failover sweep errors on {{ $labels.instance }}"
+          description: "failover_errors_total increased — backend errors during failover sweeps. Adoption of dead-node allocations may be impaired."
+
+      - alert: TurnaFailoverLostRaceSpike
+        # Some lost races are normal in a multi-node cluster; a sustained spike
+        # suggests two nodes fighting over the same allocations. STARTING value.
+        expr: increase(failover_lost_race_total[10m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna failover lost-race spike on {{ $labels.instance }}"
+          description: "failover_lost_race_total rose by >50 in 10m (starting threshold; calibrate via soak/failover drill)."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_shutdown
+    rules:
+      - alert: TurnaForcedStreamKills
+        expr: increase(grpc_forced_kills_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna forced gRPC stream kills on {{ $labels.instance }}"
+          description: "grpc_forced_kills_total increased — a graceful drain timed out before streaming RPCs closed."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_backpressure
+    rules:
+      - alert: TurnaSendQueueDrops
+        # Backpressure: packets dropped because the send channel was full.
+        # STARTING threshold — calibrate to your peak throughput in §2 soak.
+        expr: rate(turna_send_queue_dropped_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna dropping packets under send backpressure on {{ $labels.instance }}"
+          description: "turna_send_queue_dropped_total rate >1/s for 5m (starting threshold; calibrate via soak)."
+
+      - alert: TurnaUringRelayCapacityExhausted
+        # io_uring build only; zero otherwise.
+        expr: increase(turna_uring_relay_capacity_exhausted_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna io_uring relay pool exhausted on {{ $labels.instance }}"
+          description: "turna_uring_relay_capacity_exhausted_total increasing — per-worker relay msghdr pool full; relay allocations are being rejected."
+
+      - alert: TurnaUringSendSlotStalled
+        expr: increase(turna_uring_send_slot_stalled_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna io_uring send slots stalled on {{ $labels.instance }}"
+          description: "turna_uring_send_slot_stalled_total increased — send slots stalled >5s without completion and were not reused."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_abuse
+    rules:
+      - alert: TurnaParserRejectionSpike
+        # STARTING threshold. Some malformed traffic is normal on the open
+        # internet; a spike may indicate a scanner or a broken client.
+        expr: rate(turna_parser_rejections_total[5m]) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna STUN parser rejection spike on {{ $labels.instance }}"
+          description: "turna_parser_rejections_total rate >20/s for 10m (starting threshold; calibrate via soak)."
+
+      - alert: TurnaMalformedPacketSpike
+        expr: rate(turna_malformed_packets_total[5m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna unknown-protocol packet spike on {{ $labels.instance }}"
+          description: "turna_malformed_packets_total rate >50/s for 10m (starting threshold; calibrate via soak)."
+
+      - alert: TurnaPeerRejectedSpike
+        # Permission/ChannelBind/Send to denied (special-use) peer ranges.
+        expr: rate(turna_peer_rejected_total[5m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna denied-peer request spike on {{ $labels.instance }}"
+          description: "turna_peer_rejected_total rate >5/s for 10m — clients repeatedly targeting denied peer ranges (starting threshold; calibrate)."
+
+      - alert: TurnaQuotaExceededSpike
+        expr: rate(turna_quota_exceeded_total[5m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna bandwidth quota drops on {{ $labels.instance }}"
+          description: "turna_quota_exceeded_total rate >5/s for 10m — allocations repeatedly hitting the per-allocation byte/sec cap (starting threshold; calibrate)."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_auth
+    rules:
+      - alert: TurnaAuthFailureSpike
+        # Labelled counter: reason ∈ {missing_credentials, invalid_credentials,
+        # expired, integrity_failed, bad_request}. Alert per reason so a
+        # credential-stuffing spike (invalid_credentials) is visible distinctly
+        # from clock-skew (expired). STARTING threshold.
+        expr: sum by (instance, reason) (rate(turna_auth_failures_by_reason_total[5m])) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna auth-failure spike ({{ $labels.reason }}) on {{ $labels.instance }}"
+          description: "turna_auth_failures_by_reason_total[reason={{ $labels.reason }}] rate >10/s for 10m (starting threshold; calibrate via soak)."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_saturation
+    rules:
+      - alert: TurnaAllocationsNearMax
+        # Compare against your configured max_alloc (log line showed 50000).
+        # Adjust the constant to your deployment's turn max_allocations.
+        expr: turna_active_allocations > 45000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna active allocations near capacity on {{ $labels.instance }}"
+          description: "turna_active_allocations={{ $value }} (>90% of the example 50000 cap). Set this threshold to 0.9 × your configured max_allocations."
+
+      - alert: TurnaAfxdpNeighborUnresolved
+        # AF_XDP build only. 1 = next-hop MAC unresolved → TX will not deliver.
+        expr: turna_afxdp_neighbor_unresolved == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna AF_XDP next-hop unresolved on {{ $labels.instance }}"
+          description: "turna_afxdp_neighbor_unresolved=1 for >1m — AF_XDP TX cannot deliver (zero placeholder MAC)."
+
+      - alert: TurnaAfxdpUmemLow
+        # AF_XDP build only. Free UMEM frames near zero = RX/TX starvation.
+        # STARTING threshold; set relative to your configured UMEM frame count.
+        expr: turna_afxdp_umem_free_frames < 64
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna AF_XDP UMEM nearly exhausted on {{ $labels.instance }}"
+          description: "turna_afxdp_umem_free_frames={{ $value }} (<64) for >2m (starting threshold; set to a fraction of your UMEM size)."
+
+  # ────────────────────────────────────────────────────────────────────────
+  - name: turna_liveness
+    rules:
+      - alert: TurnaInstanceDown
+        expr: up{job="turna"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna instance down ({{ $labels.instance }})"
+          description: "Prometheus cannot scrape turna /metrics for >1m. Adjust job= to match your scrape_config."
+
+# ─────────────────────────────────────────────────────────────────────────
+# GAPS / NOT ALERTED (intentional — no false alerts on non-existent metrics):
+#
+#   * There is no dedicated "permission cap" / "channel cap" reject counter in
+#     health/lib.rs. Over-limit CreatePermission/ChannelBind return 486/400 to
+#     the client but are not individually counted as a metric. If you want an
+#     alert here, that path needs instrumentation first — flag, don't fake.
+#   * rate_limited is exposed on /status JSON but NOT as a /metrics counter in
+#     the code shown, so there is no rate-limit alert here. If you add a
+#     turna_rate_limited_total counter, add a spike alert mirroring the abuse
+#     group above.
+#   * turna_backend_readiness Degraded (2) may rarely be set today: the code
+#     comment says it is reserved for future non-fatal backend failures under
+#     fail-fast startup. The alert is correct but may stay silent until that
+#     path sets Degraded.

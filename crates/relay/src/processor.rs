@@ -777,6 +777,14 @@ impl PacketProcessor {
         let msg = match StunMessage::decode(&raw) {
             Ok(m) => m,
             Err(e) => {
+                // Anti-amplification: a packet that fails to decode (truncated,
+                // garbage, or a malformed attribute such as a bad-length /
+                // unknown-family REQUESTED-ADDRESS-FAMILY) is dropped SILENTLY —
+                // no STUN/TURN error is returned. Answering generic decode
+                // failures would let a spoofed source IP turn this UDP port into
+                // a reflection/amplification vector. Semantic errors (420/440/
+                // 442/…) are only produced once a message parses cleanly, so the
+                // syntax layer rejects quietly while the protocol layer answers.
                 warn!(%src, %e, "STUN decode error");
                 self.metrics
                     .parser_rejections
@@ -1010,6 +1018,22 @@ impl PacketProcessor {
         }
         if msg.get_requested_transport() != Some(turn::TRANSPORT_UDP) {
             return self.encode_error(msg, src, 442, "Unsupported Transport Protocol");
+        }
+
+        // RFC 8656 §14.1 / §7.2: REQUESTED-ADDRESS-FAMILY. This build is
+        // IPv4-only (see RC scope): an explicit IPv4 request is accepted, an
+        // IPv6 request is refused with 440 Address Family not Supported, and a
+        // malformed attribute was already rejected at parse time (the packet
+        // fails to decode → handled as a bad request upstream). §7.2 also makes
+        // REQUESTED-ADDRESS-FAMILY and RESERVATION-TOKEN mutually exclusive.
+        match msg.get_requested_address_family() {
+            None | Some(turna_proto_stun::attribute::AddressFamily::Ipv4) => {}
+            Some(turna_proto_stun::attribute::AddressFamily::Ipv6) => {
+                return self.encode_error(msg, src, 440, "Address Family not Supported");
+            }
+        }
+        if msg.get_requested_address_family().is_some() && msg.get_reservation_token().is_some() {
+            return self.encode_error(msg, src, 400, "Bad Request");
         }
 
         // Allocate the relay port from the *resolved tenant's* isolated pool.
@@ -1622,6 +1646,37 @@ impl PacketProcessor {
 mod a3_send_indication_tests {
     use super::*;
     use turna_auth::AuthMode;
+
+    #[test]
+    fn requested_address_family_ipv4_not_reported_as_unknown() {
+        // Regression (interop): turnutils_uclient -X sends REQUESTED-ADDRESS-FAMILY
+        // (0x0017). It is now a typed attribute, so it must NOT be reported as an
+        // unknown comprehension-required attribute — i.e. no 420 listing 0x0017.
+        // (This is the exact case that made coturn's `-X` client fail before.)
+        let p = test_processor();
+        let client: SocketAddr = "127.0.0.1:50123".parse().unwrap();
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.attributes.push(Attribute::RequestedAddressFamily(
+            turna_proto_stun::attribute::AddressFamily::Ipv4,
+        ));
+        let mut buf = [0u8; 512];
+        let n = msg.encode(&mut buf).unwrap();
+        let actions = p.process(Bytes::copy_from_slice(&buf[..n]), client);
+        // The request is unauthenticated, so the response is an auth challenge —
+        // but whatever it is, it must never be a 420 that lists 0x0017.
+        for a in &actions {
+            if let Action::Send { data, .. } = a {
+                if let Ok(resp) = StunMessage::decode(data) {
+                    assert!(
+                        !resp.attributes.iter().any(|x| matches!(
+                            x, Attribute::UnknownAttributes(v) if v.contains(&0x0017)
+                        )),
+                        "REQUESTED-ADDRESS-FAMILY (0x0017) must not appear in UNKNOWN-ATTRIBUTES"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn unknown_comprehension_required_yields_420() {

@@ -1869,6 +1869,14 @@ enbaled = true
 
     #[test]
     fn parse_minimal_toml() {
+        // Isolate from the process-global TURNA_PRODUCTION env: a concurrent
+        // test (production_mode_validation_scenarios) sets it, and this minimal
+        // dev config has no [turn.relay.quota], so a leaked prod flag would trip
+        // B2's unlimited-bandwidth gate. Same pattern as example_config_parseable.
+        let _guard = production_env_lock();
+        let saved_turna_production = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
         let toml = r#"
 [turn]
 listen = "0.0.0.0:3478"
@@ -1884,6 +1892,11 @@ turn_shared_secret = "test-secret"
         let config = TurnaConfig::from_str(toml).unwrap();
         assert_eq!(config.turn.listen.port(), 3478);
         assert_eq!(config.turn.auth.shared_secret, "test-secret");
+
+        match saved_turna_production {
+            Some(v) => std::env::set_var("TURNA_PRODUCTION", v),
+            None => std::env::remove_var("TURNA_PRODUCTION"),
+        }
     }
 
     #[test]

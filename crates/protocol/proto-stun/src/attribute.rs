@@ -50,6 +50,9 @@ pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
 pub const ATTR_DATA: u16 = 0x0013;
 pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+/// RFC 8656 §14.1 REQUESTED-ADDRESS-FAMILY (Allocate). 4 bytes: 1 family +
+/// 3 reserved. Family 0x01=IPv4, 0x02=IPv6.
+pub const ATTR_REQUESTED_ADDRESS_FAMILY: u16 = 0x0017;
 pub const ATTR_EVEN_PORT: u16 = 0x0018;
 pub const ATTR_DONT_FRAGMENT: u16 = 0x001A;
 pub const ATTR_RESERVATION_TOKEN: u16 = 0x0022;
@@ -81,6 +84,13 @@ pub const MAX_ATTRIBUTE_VALUE_LEN: usize = 1500;
 /// messages have 3–8 attributes; 32 is a comfortable ceiling.
 pub const MAX_ATTRIBUTES_PER_MESSAGE: usize = 32;
 
+/// RFC 8656 §14.1 address family for REQUESTED-ADDRESS-FAMILY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Ipv4 = 0x01,
+    Ipv6 = 0x02,
+}
+
 #[derive(Debug, Clone)]
 pub enum Attribute {
     MappedAddress(SocketAddr),
@@ -108,6 +118,8 @@ pub enum Attribute {
     EvenPort(bool),
     /// RFC 8656 §18.10 RESERVATION-TOKEN (8 opaque bytes).
     ReservationToken([u8; 8]),
+    /// RFC 8656 §14.1 REQUESTED-ADDRESS-FAMILY (Allocate request only).
+    RequestedAddressFamily(AddressFamily),
     /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
     MobilityTicket(Vec<u8>),
     /// RFC 5389 §15.9 UNKNOWN-ATTRIBUTES: list of attribute types the server did
@@ -141,6 +153,7 @@ impl Attribute {
             Self::DontFragment => ATTR_DONT_FRAGMENT,
             Self::EvenPort(_) => ATTR_EVEN_PORT,
             Self::ReservationToken(_) => ATTR_RESERVATION_TOKEN,
+            Self::RequestedAddressFamily(_) => ATTR_REQUESTED_ADDRESS_FAMILY,
             Self::MobilityTicket(_) => ATTR_MOBILITY_TICKET,
             Self::UnknownAttributes(_) => ATTR_UNKNOWN_ATTRIBUTES,
             Self::Unknown { attr_type, .. } => *attr_type,
@@ -222,6 +235,15 @@ impl Attribute {
                 ensure(buf.len(), 8)?;
                 buf[..8].copy_from_slice(tok);
                 Ok(8)
+            }
+            Self::RequestedAddressFamily(fam) => {
+                // RFC 8656 §14.1: 4 bytes — 1 family + 3 reserved (zero).
+                ensure(buf.len(), 4)?;
+                buf[0] = *fam as u8;
+                buf[1] = 0;
+                buf[2] = 0;
+                buf[3] = 0;
+                Ok(4)
             }
             Self::MobilityTicket(t) => {
                 ensure(buf.len(), t.len())?;
@@ -365,6 +387,14 @@ pub fn decode_address(buf: &[u8]) -> Result<SocketAddr> {
 }
 
 pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Attribute>> {
+    // Strict-parser invariant: the attribute body is always a multiple of 4
+    // (STUN pads every attribute to a 4-byte boundary, so the message length is
+    // too). MessageHeader::decode already enforces this on the top-level path;
+    // enforcing it here makes the helper correct for direct callers (fuzz,
+    // tests) instead of relying on the caller's invariant.
+    if !buf.len().is_multiple_of(4) {
+        return Err(StunError::InvalidLength);
+    }
     let mut attrs = Vec::new();
     let mut pos = 0;
 
@@ -535,6 +565,28 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 t.copy_from_slice(&value[..8]);
                 Attribute::ReservationToken(t)
             }
+            ATTR_REQUESTED_ADDRESS_FAMILY => {
+                // RFC 8656 §14.1: exactly 4 bytes (1 family + 3 reserved). A
+                // malformed length or unknown family is a parse error, which the
+                // Allocate handler maps to 400 Bad Request. Reserved bytes are
+                // not checked (consistent with REQUESTED-TRANSPORT).
+                if value.len() != 4 {
+                    return Err(StunError::AttributeParse(format!(
+                        "REQUESTED-ADDRESS-FAMILY must be 4 bytes, got {}",
+                        value.len()
+                    )));
+                }
+                let fam = match value[0] {
+                    0x01 => AddressFamily::Ipv4,
+                    0x02 => AddressFamily::Ipv6,
+                    other => {
+                        return Err(StunError::AttributeParse(format!(
+                            "REQUESTED-ADDRESS-FAMILY unknown family 0x{other:02x}"
+                        )))
+                    }
+                };
+                Attribute::RequestedAddressFamily(fam)
+            }
             ATTR_MOBILITY_TICKET => Attribute::MobilityTicket(value.to_vec()),
             // I3: symmetric with the encoder — decode the 420 list of 16-bit
             // attribute types back into `UnknownAttributes` rather than a generic
@@ -553,8 +605,20 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
 
         attrs.push(attr);
 
-        // Padding to 4-byte boundary
+        // Padding to a 4-byte boundary. The body length is already validated
+        // as a multiple of 4 at function entry, so for a well-formed walk the
+        // padding is always in-bounds; this check is secondary defense-in-depth
+        // against an internal desync. We deliberately do NOT check the padding
+        // *value*: RFC 5389 §15 says the padding bits are ignored and may be any
+        // value, and RFC 8489 §14 says the receiver MUST ignore them — rejecting
+        // non-zero padding would break spec-compliant clients (coturn, pion).
         let padded = (attr_len + 3) & !3;
+        if pos + padded > buf.len() {
+            return Err(StunError::BufferTooShort {
+                need: pos + padded,
+                have: buf.len(),
+            });
+        }
         pos += padded;
     }
 
@@ -639,12 +703,17 @@ mod tests {
 
     #[test]
     fn accepts_attribute_one_over_max_rejected() {
-        // Confirm the boundary is exact: MAX+1 fails.
+        // Confirm the boundary is exact: MAX+1 fails on the value-length cap.
+        // Pad the frame to a 4-byte boundary so the body-alignment guard does
+        // not fire first — we want to exercise AttributeValueTooLong.
         let mut buf = Vec::new();
         let bad_len = (MAX_ATTRIBUTE_VALUE_LEN + 1) as u16;
         buf.extend_from_slice(&ATTR_SOFTWARE.to_be_bytes());
         buf.extend_from_slice(&bad_len.to_be_bytes());
         buf.extend_from_slice(&vec![0u8; bad_len as usize]);
+        while !buf.len().is_multiple_of(4) {
+            buf.push(0);
+        }
 
         let err = parse_attributes(&buf, &TID).unwrap_err();
         assert!(matches!(err, StunError::AttributeValueTooLong { .. }));
@@ -801,6 +870,69 @@ mod tests {
         let attrs = parse_attributes(&buf, &TID).unwrap();
         assert!(matches!(attrs.as_slice(), [Attribute::MobilityTicket(t)] if t.is_empty()));
     }
+
+    #[test]
+    fn requested_address_family_ipv4_parses() {
+        // RFC 8656 §14.1: 4 bytes, family 0x01 = IPv4.
+        let buf = build_attr(ATTR_REQUESTED_ADDRESS_FAMILY, &[0x01, 0, 0, 0]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(
+            attrs.as_slice(),
+            [Attribute::RequestedAddressFamily(AddressFamily::Ipv4)]
+        ));
+    }
+
+    #[test]
+    fn requested_address_family_ipv6_parses() {
+        let buf = build_attr(ATTR_REQUESTED_ADDRESS_FAMILY, &[0x02, 0, 0, 0]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(
+            attrs.as_slice(),
+            [Attribute::RequestedAddressFamily(AddressFamily::Ipv6)]
+        ));
+    }
+
+    #[test]
+    fn requested_address_family_wrong_length_rejected() {
+        for bad in [&[][..], &[0x01][..], &[0x01, 0x00][..]] {
+            assert!(
+                parse_attributes(&build_attr(ATTR_REQUESTED_ADDRESS_FAMILY, bad), &TID).is_err(),
+                "RAF len {} must be rejected",
+                bad.len()
+            );
+        }
+    }
+
+    #[test]
+    fn requested_address_family_unknown_value_rejected() {
+        let buf = build_attr(ATTR_REQUESTED_ADDRESS_FAMILY, &[0x03, 0, 0, 0]);
+        assert!(matches!(
+            parse_attributes(&buf, &TID).unwrap_err(),
+            StunError::AttributeParse(_)
+        ));
+    }
+
+    #[test]
+    fn requested_address_family_roundtrip_and_not_unknown() {
+        // encode → frame → parse; and confirm 0x0017 is a typed variant, NOT
+        // Attribute::Unknown (which is what triggers a 420 in the relay layer).
+        let attr = Attribute::RequestedAddressFamily(AddressFamily::Ipv4);
+        assert_eq!(attr.attr_type(), ATTR_REQUESTED_ADDRESS_FAMILY);
+        let mut value = [0u8; 8];
+        let len = attr.encode_value(&mut value, &TID).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(value[0], 0x01);
+        let buf = build_attr(ATTR_REQUESTED_ADDRESS_FAMILY, &value[..len]);
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(
+            attrs.as_slice(),
+            [Attribute::RequestedAddressFamily(AddressFamily::Ipv4)]
+        ));
+        assert!(
+            !matches!(attrs.as_slice(), [Attribute::Unknown { .. }]),
+            "0x0017 must not decode as Unknown (would trigger 420)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -827,5 +959,79 @@ mod i3_unknown_attributes_roundtrip {
             "expected UnknownAttributes([0x0021, 0x4000]), got {:?}",
             parsed.first()
         );
+    }
+}
+
+#[cfg(test)]
+mod rc_parser_regression {
+    // RC #4: targeted regression tests for strict-parser edge cases not already
+    // covered elsewhere in this file. Byte frames are built by hand because
+    // several cases are intentionally malformed (build_attr would pad them).
+    use super::*;
+
+    const TID: [u8; 12] = [0u8; 12];
+
+    /// A non-multiple-of-4 value that IS correctly padded to the 4-byte
+    /// boundary parses, and the padding is consumed (the value length is
+    /// reported without the padding). Rejection of *missing* padding is covered
+    /// by `truncated_trailing_header_rejected` via the body-alignment guard.
+    #[test]
+    fn padded_odd_length_value_parses_and_consumes_padding() {
+        // SOFTWARE, declared len 1, one value byte + 3 padding bytes = 8 total.
+        let buf = [0x80u8, 0x22, 0x00, 0x01, b'x', 0x00, 0x00, 0x00];
+        let attrs = parse_attributes(&buf, &TID).expect("padded odd-length value must parse");
+        assert!(matches!(attrs.as_slice(), [Attribute::Software(s)] if s == "x"));
+    }
+
+    /// RFC 5389 §15 / RFC 8489 §14: padding bits are ignored and may be any
+    /// value. Non-zero padding must NOT be rejected (would break coturn/pion).
+    #[test]
+    fn non_zero_padding_is_ignored_not_rejected() {
+        let buf = [0x80u8, 0x22, 0x00, 0x01, b'x', 0xFF, 0xFF, 0xFF];
+        let attrs = parse_attributes(&buf, &TID).expect("non-zero padding must be tolerated");
+        assert!(matches!(attrs.as_slice(), [Attribute::Software(s)] if s == "x"));
+    }
+
+    /// A declared length running past the packet must be BufferTooShort, not an
+    /// out-of-bounds read. SOFTWARE claims 100 bytes; only 4 present.
+    #[test]
+    fn declared_length_exceeds_packet_rejected() {
+        let buf = [0x80u8, 0x22, 0x00, 0x64, 1, 2, 3, 4];
+        let err = parse_attributes(&buf, &TID).unwrap_err();
+        assert!(
+            matches!(err, StunError::BufferTooShort { .. }),
+            "over-declared length must be BufferTooShort, got: {err:?}"
+        );
+    }
+
+    /// A dangling partial header (1..=3 trailing bytes) makes the body length
+    /// non-multiple-of-4, which the strict parser rejects up front rather than
+    /// tolerating a misaligned tail.
+    #[test]
+    fn truncated_trailing_header_rejected() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x80, 0x22, 0x00, 0x02, b'x', b'y', 0x00, 0x00]); // SOFTWARE "xy"
+        buf.extend_from_slice(&[0xDE, 0xAD]); // two stray bytes -> len 10, not % 4
+        let err = parse_attributes(&buf, &TID).unwrap_err();
+        assert!(
+            matches!(err, StunError::InvalidLength),
+            "a non-4-aligned body must be InvalidLength, got: {err:?}"
+        );
+    }
+
+    /// UNKNOWN-ATTRIBUTES with an odd byte count: the decoder uses
+    /// chunks_exact(2), so a trailing odd byte is dropped and parsing does not
+    /// panic (the value is response-only; this guards the parse path).
+    #[test]
+    fn unknown_attributes_odd_length_does_not_panic() {
+        // declared len 3: [0x00,0x21, 0x40], padded to 4.
+        let buf = [0x00u8, 0x0A, 0x00, 0x03, 0x00, 0x21, 0x40, 0x00];
+        let attrs = parse_attributes(&buf, &TID).expect("odd-length list must not panic");
+        match attrs.as_slice() {
+            [Attribute::UnknownAttributes(v)] => {
+                assert_eq!(v, &vec![0x0021u16], "trailing odd byte is dropped");
+            }
+            other => panic!("expected UnknownAttributes, got: {other:?}"),
+        }
     }
 }

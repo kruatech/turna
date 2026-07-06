@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.1] - 2026-07-06
+
+Release-candidate hardening on top of `0.3.0-beta.1`: interop, cluster
+failover, and deploy-artifact fixes surfaced by live verification on Linux
+(fuzz, coturn interop, soak, multi-node failover drill, Helm/Docker).
+
+### Fixed
+- REQUESTED-ADDRESS-FAMILY (0x0017): the Allocate flow now parses this base
+  RFC 8656 attribute. An explicit IPv4 request is honoured; an IPv6 request is
+  refused with `440 Address Family not Supported`. Previously the strict
+  unknown-attribute handling answered `420` to any client sending it
+  (e.g. `turnutils_uclient -X`, dual-stack browsers), breaking allocation.
+- Cluster failover on the Tarantool backend: list-returning stored functions
+  used `return unpack(res)`, a flat multiple-return that the iproto CALL parser
+  truncated to a single row. This silently broke `find_by_node`,
+  `get_live_nodes`, `list_allocations`, and the other list reads, so the
+  failover sweep saw at most one node/orphan and adoption never completed in a
+  real cluster. Fixed to `return res`; a live drill now shows a killed owner's
+  allocations claimed by the survivor (`failover_claimed_total` increments,
+  owner reassigned in the backend, no split-brain).
+- `TURNA_WORKERS=0` no longer panics on startup. Zero (the Helm chart's default
+  meaning "auto") now maps to CPU-count autodetection, matching unset/invalid.
+- Config parse tests isolate the `TURNA_PRODUCTION` env var so a concurrent
+  production-validation test can't leak into an unrelated parse test.
+- `/metrics` output: several counters were emitted with leading indentation
+  that broke Prometheus parsing; all counter lines are now flush-left.
+- Strict STUN parser: enforce 4-byte body alignment up front and treat a
+  declared length past the packet as `BufferTooShort`; padding value is ignored
+  per RFC (non-zero padding tolerated).
+
+### Changed
+- Malformed REQUESTED-ADDRESS-FAMILY (bad length or unknown family) is dropped
+  silently with `parser_rejections` incremented, like any malformed STUN
+  attribute — intentional anti-amplification, not a `400` response.
+
+### Migration
+- The Tarantool stored-function fix changes `deploy/tarantool/init.lua`. Because
+  functions are created with `if_not_exists = true`, an existing Tarantool
+  instance will NOT pick up the new bodies on restart: drop and recreate the
+  affected functions (or reload the schema) when upgrading a live cluster.
+  Fresh installs are unaffected.
+
 ## [0.3.0-beta.1]
 
 Production-hardening of the core UDP/IPv4 TURN path. No new features; this
@@ -147,6 +189,7 @@ are experimental — see [README](README.md#status) and
   transitives remain. The full picture is tracked in
   `docs/security/dependency-dedup.md`.
 
-[Unreleased]: https://github.com/kruatech/turna/compare/v0.3.0-beta.1...HEAD
+[Unreleased]: https://github.com/kruatech/turna/compare/v0.3.0-rc.1...HEAD
+[0.3.0-rc.1]: https://github.com/kruatech/turna/compare/v0.3.0-beta.1...v0.3.0-rc.1
 [0.3.0-beta.1]: https://github.com/kruatech/turna/compare/v0.2.0-alpha.1...v0.3.0-beta.1
 [0.2.0-alpha.1]: https://github.com/kruatech/turna/compare/v0.1.0...v0.2.0-alpha.1

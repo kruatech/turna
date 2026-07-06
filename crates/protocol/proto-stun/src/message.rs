@@ -138,6 +138,16 @@ impl StunMessage {
         })
     }
 
+    /// RFC 8656 §14.1: REQUESTED-ADDRESS-FAMILY, if present. A malformed value
+    /// or length is rejected at parse time, so a present attribute is always a
+    /// valid `AddressFamily`.
+    pub fn get_requested_address_family(&self) -> Option<attribute::AddressFamily> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::RequestedAddressFamily(f) => Some(*f),
+            _ => None,
+        })
+    }
+
     pub fn get_message_integrity(&self) -> Option<&[u8; 20]> {
         self.attributes.iter().find_map(|a| match a {
             Attribute::MessageIntegrity(h) => Some(h),

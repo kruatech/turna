@@ -11,7 +11,7 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 
 ## Status
 
-**Beta (`0.3.0-beta.1`).** The default **tokio UDP datapath** is the
+**Release candidate (`0.3.0-rc.1`).** The default **tokio UDP datapath** is the
 primary supported path: STUN binding, the full TURN allocation lifecycle,
 long-term-credential and JWT auth, Prometheus/OpenTelemetry, config validation,
 and graceful drain / RFC 8016 migration are exercised here.
@@ -167,7 +167,7 @@ Workspace crates can be consumed via a git dependency:
 
 ```toml
 [dependencies]
-turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.0-beta.1" }
+turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.0-rc.1" }
 ```
 
 ## Development
