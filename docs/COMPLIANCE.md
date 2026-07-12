@@ -50,13 +50,15 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
 
 ## 3. Deliberate constraints (Verified — by design, not bugs)
 
-- **UDP relay transport only.** `REQUESTED-TRANSPORT` must be UDP or the Allocate is rejected with 442. TCP-allocation (RFC 6062) and TLS/DTLS relay transports are not offered by this path (`processor::handle_allocate`).
+- **UDP relay transport only.** `REQUESTED-TRANSPORT` must be UDP or the Allocate is rejected with 442. TCP-allocation (RFC 6062) and TLS/DTLS *relay-leg* transports are not offered (`processor::handle_allocate`). This concerns the turna↔peer leg only. The *client↔turna* leg does support TURNS (TURN-over-TLS-over-TCP) via the `tls` feature — verified end-to-end with Chrome, Firefox and Safari (see `docs/interop/`).
 - **IPv4 relay sockets.** Relay sockets bind `0.0.0.0` (`session::PortAllocator::allocate_and_bind` / `allocate_even_and_bind`), i.e. IPv4 only. Peer addresses are normalized `::ffff:` → v4 (`peer_filter::normalize_addr`). An IPv6 relay would additionally need `IPV6_MTU_DISCOVER` (noted in `set_dont_fragment`). **If IPv6 relay is a requirement, it is not implemented today.**
 - **Default MTU 1280.** `PacketProcessor` defaults to `mtu = 1280`; DONT-FRAGMENT drops oversized Send-indication payloads against this value. Operators set the real path MTU at construction (`with_mtu`).
 - **Experimental transports are feature-gated and off by default.** `quic` / `web-transport` (raw-QUIC / WebTransport ingress) and `af-xdp` (kernel-bypass datapath) compile only under their features. The B6 bounded-queue work applies to those paths; the default production profile does not include them. `af-xdp` is Linux-only (its `build.rs` refuses to build elsewhere by design).
 - **Nonce lifetime 630s, client-bound.** Nonces are an HMAC over client address + issue time under an ephemeral per-process key (`processor::NonceManager`): no server-side nonce table, and a restart forces a fresh 401 for outstanding nonces.
 - **Per-allocation resource caps.** 256 permissions and 256 channel bindings per allocation; 32 peers per CreatePermission (B5). Compile-time constants, not config.
 - **Credentials are not SASLprep/OpaqueString-normalized.** Long-term keys hash the raw `username:realm:password` UTF-8 bytes (`crypto/lib.rs`). ASCII credentials (the common case) interoperate fine; a client that normalizes non-ASCII credentials per RFC 8489 OpaqueString / RFC 5389 SASLprep before hashing would derive a different key and fail integrity. If non-ASCII credentials must interoperate, add normalization at both key-derivation sites (kept in parity today).
+- **Cluster failover assumes roughly-synchronized clocks (NTP).** Node liveness is `last_seen_ms` compared against the sweeper's local wall-clock; a dead node is confirmed after ~5s (`live_window` 3s + `suspicion_ticks` 2 × `sweep_interval` 1s). NTP-class skew (<1s) is well within this margin. If a node's clock runs minutes ahead it may mis-classify live peers as dead — but `claim_allocation` CAS preserves correctness: the mis-claim spins against the live node's re-asserted heartbeats rather than producing split-brain or data loss (`services/node/src/failover.rs`). Deploy nodes with NTP and keep inter-node skew below `live_window`. Confirmed by the failover-integration tests against a live Tarantool (`integration_failover_claim_is_atomic`, `_stale_claim_rejected`, `_sweep_reassigns_dead_node`).
+- **Failover time scales linearly with allocations-per-node.** A dead node's orphans are enumerated once (`find_by_node` — ~84 ms for 50k rows, 23.7 MB), then reassigned one `claim_allocation` CAS at a time over iproto. At 50k allocations this is on the order of tens of seconds in production (sequential claim loop + parsing a ~24 MB response); see `docs/scale/`. It is correct (all rows reassigned, exactly-one-winner) but not instant. Keep per-node allocation counts within a few thousand for fast failover. `find_by_node` has no limit, so 100k+ per node would warrant pagination on that path.
 
 ---
 
@@ -70,12 +72,26 @@ and shared-secret auth (realm-scoped); strict STUN/TURN parsing; bounded
 allocations, permissions (256), channels (256), peers-per-request (32) with
 atomic global/tenant quotas; fail-closed production config.
 
+**Verified since the beta cut (rc.1, see `docs/`):** multi-node failover
+adoption end-to-end — a killed owner's allocations claimed by the survivor via
+backend CAS, no split-brain (`docs/failover/`); external-client interop with
+coturn and all three major browser engines — Chrome 150, Firefox 152, Safari
+26.5, each 5/5 over TURNS with a trusted cert (allocate, auth-negative 401,
+end-to-end relay data, TLS transport, RAF) (`docs/interop/`); a 12-hour relay
+soak with no memory/fd leak (`docs/soak/`).
+
 **Not supported as stable (experimental / out of scope / unverified):** IPv6
 relay (IPv4-only today); QUIC / WebTransport ingress (feature-gated); AF_XDP and
-io_uring datapaths (feature-gated, not runtime-verified); full multi-node
-failover (backend CAS is tested, node-process-level adoption is not); full
-browser WebRTC compatibility matrix (no external-client interop yet); SASLprep /
-non-ASCII credentials (absent by design, §3).
+io_uring datapaths (feature-gated, not runtime-verified); TURN-over-DTLS
+(transport verified — DTLS 1.2 handshake + operator cert, `openssl s_client
+-dtls`, verify code 0 — but the full allocate-over-DTLS cycle is not exercised
+by a live TURN client; no common DTLS-TURN client exists and browsers use
+TURNS/TCP. The STUN/TURN layer is transport-independent and is verified over
+UDP/TURNS. DTLS requires a PKCS#8 ECDSA-P-256 key and fails closed if a
+configured cert cannot load; see `docs/dtls/`); an exhaustive
+browser matrix (three engines verified on macOS; mobile browsers, other OSes
+and older versions not yet); large-scale (10k–50k allocations) and real-network
+(non-loopback) load; SASLprep / non-ASCII credentials (absent by design, §3).
 
 ## 5. Not covered here / owed verification
 

@@ -7,11 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-rc.2] - 2026-07-12
+Second release candidate on top of `0.3.0-rc.1`. Lands the admin control-plane
+stage 2 (gRPC mutations) and DTLS fail-closed hardening, and records the
+verification finished since rc.1 (multi-day endurance, mobile/multi-OS interop).
+NOT GA: an external code audit flagged production blockers that are still open —
+notably the control-plane's management model (mutations must be proven to reach
+a live node, not a control-plane-local store), the gRPC TLS env-override /
+`tls` vs `mtls` gap, Helm/K8s production topology, unknown-backend fallback,
+task supervision, and Tarantool operation timeouts. See docs/verification/
+pre-GA-status.md and the audit follow-up before promoting to a stable release.
+
+Verification completed (see `docs/`):
+- Endurance: a continuous relay run of more than 5 full days (uptime 434,908 s,
+  ~130M packets, 21.4 GB) with flat memory (RSS below start), stable fds, and
+  zero error counters across the soak window — no leak at a multi-day horizon
+  (`docs/soak/endurance-v0.3.0-rc.1.md`), extending the 12-hour soak.
+- Browser interop broadened to mobile and multi-OS: iPhone (Safari/Chrome),
+  Android (Chrome/Firefox), iPad, Windows, Linux, macOS — each 5/5 over TURNS
+  (TCP/TLS) from the external network, including mobile 4G/5G
+  (`docs/interop/v0.3.0-rc.1.md`).
+- DTLS: transport + DTLS 1.2 handshake + allocate confirmed against a live node
+  with `turnutils_uclient` and `openssl s_client -dtls` (`docs/dtls/`).
+- A consolidated pre-GA verification map, honest about what is and is not
+  covered (`docs/verification/pre-GA-status.md`).
+
+### Added
+- Admin console stage 2: mutating operations via a gRPC bridge to the
+  control-plane (`SetDraining`, `DeleteAllocation`, `AddUser`/`RemoveUser`/
+  `SetUserLimits`, `UpdateConfig`, plus reads). Operator mutations are gated by
+  an `X-Admin-Token`; the HTTP-to-node mutation path was removed in favour of
+  gRPC only. Verified live end-to-end (drain/undrain/stats/auth)
+  (`docs/admin/`).
+
+### Security
+- Admin fail-closed hardening: a plaintext (`http://`) non-loopback gRPC address
+  is refused, and — symmetrically — a non-loopback `--listen` with no
+  `--auth-token` is refused, so an exposed console cannot serve unauthenticated
+  mutations. The config checks run before any network dial.
+- DTLS transport now fails closed when a configured operator certificate cannot
+  be loaded, instead of silently falling back to an ephemeral self-signed cert
+  (`crates/transport/src/dtls.rs`).
+
+## [0.3.0-rc.1] - 2026-07-06
+
 ## [0.3.0-rc.1] - 2026-07-06
 
 Release-candidate hardening on top of `0.3.0-beta.1`: interop, cluster
 failover, and deploy-artifact fixes surfaced by live verification on Linux
 (fuzz, coturn interop, soak, multi-node failover drill, Helm/Docker).
+
+Verification highlights (see `docs/`): a 12-hour relay soak with no memory/fd
+leak (518M packets, 0 panics, 0 drops, P99 500 us — `docs/soak/`); a live
+multi-node failover drill that found and fixed the list-truncation P1
+(`docs/failover/`); and real-browser WebRTC interop over TURNS with a trusted
+Let's Encrypt cert — allocate, auth-negative (401), end-to-end relay data
+transfer, and the RAF fix all confirmed with Chrome (`docs/interop/`).
 
 ### Fixed
 - REQUESTED-ADDRESS-FAMILY (0x0017): the Allocate flow now parses this base

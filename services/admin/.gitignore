@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+
+# Frontend dependencies and build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Served static bundle (built from frontend/, not source)
+dist/
+
+# Logs / env
+*.log
+.env
+.env.local

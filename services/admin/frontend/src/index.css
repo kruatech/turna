@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ── theme variables ───────────────────────────────────────── */
+:root {
+  --bg:       #f4f6fb;
+  --card:     #ffffff;
+  --raised:   #eef1f8;
+  --border:   #e2e6f0;
+  --border2:  #d0d5e8;
+  --ink:      #111827;
+  --muted:    #6b7280;
+  --faint:    #9ca3af;
+  --sidebar:  #ffffff;
+  --sidebar-border: #e2e6f0;
+  --sidebar-active-bg: #eff6ff;
+  --sidebar-active-ink: #2563eb;
+  color-scheme: light;
+}
+.dark {
+  --bg:       #0d0f17;
+  --card:     #131620;
+  --raised:   #1a1e2e;
+  --border:   #ffffff0d;
+  --border2:  #ffffff18;
+  --ink:      #e8eaf2;
+  --muted:    #6b7394;
+  --faint:    #353a52;
+  --sidebar:  #0d0f17;
+  --sidebar-border: #ffffff0d;
+  --sidebar-active-bg: #2dd4bf14;
+  --sidebar-active-ink: #2dd4bf;
+  color-scheme: dark;
+}
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: 'DM Sans', ui-sans-serif, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 99px; }
+
+/* card base */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 8px 24px -12px rgba(0,0,0,.12);
+}
+.dark .card {
+  box-shadow: 0 0 0 1px rgba(255,255,255,.04), 0 8px 32px -8px rgba(0,0,0,.6);
+}
+
+/* value transitions */
+.vf { transition: color .2s ease, opacity .2s ease; }
+@keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+.fade-up { animation: fadeUp .35s ease both; }
+
+/* progress bars */
+.progress-track { background: var(--raised); border-radius: 99px; height: 4px; overflow: hidden; }
+.progress-fill  { height: 100%; border-radius: 99px; transition: width .4s ease; }
+
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+.pulse { animation: pulse 1.4s ease-in-out infinite; }

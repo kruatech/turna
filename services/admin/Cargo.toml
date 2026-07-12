@@ -1,0 +1,35 @@
+[package]
+name = "turna-admin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Admin panel bridge for turna — read-only monitoring (stage 1) + gRPC mutate (stage 2)."
+
+[[bin]]
+name = "turna-admin"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server + static files
+axum        = "0.7"
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"] }
+tower       = "0.5"
+tower-http  = { version = "0.6", features = ["fs", "trace"] }
+
+# HTTP upstream client (read-only: /status /metrics /health /ready /cluster)
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# gRPC client to control-plane (stage 2)
+tonic       = { version = "0.11", features = ["tls", "tls-roots"] }
+prost       = "0.12"
+
+# Serialisation / CLI / logging
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+clap        = { version = "4", features = ["derive", "env"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow      = "1"
+
+[build-dependencies]
+tonic-build = "0.11"

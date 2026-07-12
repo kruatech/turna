@@ -43,12 +43,12 @@ members = [
     # tests
     "tests/integration",
     "tests/soak",
-]
+    "services/admin",]
 # fuzz — изолированный workspace для cargo-fuzz (как и было)
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.3.0-rc.1"
+version = "0.3.0-rc.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kruatech/turna"

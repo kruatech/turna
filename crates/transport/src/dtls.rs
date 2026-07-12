@@ -429,20 +429,33 @@ async fn handle_dtls_session(
 /// `openssl pkcs8 -topk8 -nocrypt` if needed.
 #[cfg(feature = "dtls")]
 fn load_certificate(cert_path: &str, key_path: &str) -> Result<webrtc_dtls::crypto::Certificate> {
+    // If the operator did not configure a cert/key, use an ephemeral
+    // self-signed cert (dev/test convenience — DTLS-TURN has no CA trust needs
+    // for a throwaway handshake). But if a cert/key WAS configured and fails to
+    // load, fail closed: do NOT silently downgrade to self-signed, or the
+    // operator would believe DTLS is serving their cert when it is not.
+    if cert_path.is_empty() || key_path.is_empty() {
+        tracing::info!("DTLS: no operator cert configured; using ephemeral self-signed cert");
+        return webrtc_dtls::crypto::Certificate::generate_self_signed(vec![
+            "turn.local".to_owned()
+        ])
+        .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")));
+    }
     match load_operator_certificate(cert_path, key_path) {
         Ok(cert) => {
             tracing::info!(cert = %cert_path, key = %key_path, "DTLS using operator certificate");
             Ok(cert)
         }
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 error = %e,
                 cert = %cert_path,
                 key = %key_path,
-                "DTLS operator certificate unavailable; using ephemeral self-signed cert"
+                "DTLS operator certificate configured but failed to load; refusing to start. \
+                 The key must be PKCS#8 ECDSA P-256 (`PRIVATE KEY`, not `EC PRIVATE KEY`); \
+                 convert with `openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pk8.pem`."
             );
-            webrtc_dtls::crypto::Certificate::generate_self_signed(vec!["turn.local".to_owned()])
-                .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")))
+            Err(e)
         }
     }
 }

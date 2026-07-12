@@ -5,6 +5,12 @@ Encrypted UDP transport for TURN, implemented with the pure-Rust `webrtc-dtls`
 `[turn.dtls] enabled = true`. Implementation: `crates/transport/src/dtls.rs` +
 `services/node/src/dtls_listener.rs`.
 
+Operational notes (cert format, fail-closed behaviour, live handshake
+verification) are in `docs/dtls/v0.3.0-rc.1.md`. In short: the operator key must
+be PKCS#8 ECDSA-P-256, and a configured-but-unloadable cert now fails closed
+(the node refuses to start) rather than silently falling back to an ephemeral
+self-signed cert.
+
 ## Shape
 
 The shape mirrors the QUIC listener: a listener task emits `DtlsEvent`s
