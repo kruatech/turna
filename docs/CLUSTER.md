@@ -8,8 +8,9 @@ cluster mode when **any** of these is true:
   allocations after the configured failure-detection window, roughly 5 seconds
   with current defaults (`live_window_secs=3`, `suspicion_ticks=2`,
   `sweep_interval_secs=1`).
-- You want **rolling upgrades** without dropping calls: drain one node,
-  re-deploy, repeat.
+- You want **rolling upgrades** that keep *new* calls flowing: drain one node
+  (existing sessions get `drain_grace_secs` to finish — see the drain caveat
+  under "Architecture decisions"), re-deploy, repeat.
 - You're scaling beyond what one box can carry (~100k concurrent
   allocations on commodity hardware).
 
@@ -97,9 +98,11 @@ can inject a node and redirect clients to it.
 On the second node, use a different `node_id`, swap the seed, and set
 `turn_announce_addr` to that node's externally reachable TURN address.
 
-This mode is independent of allocation persistence: you can use redirects for
-load distribution with the in-memory backend, and enable Tarantool persistence
-separately when you also need failover/rehydration.
+Cluster mode requires a shared state backend. The config validator **rejects**
+`cluster_mode = true` with the in-memory backend (regardless of persistence
+mode) — redirect routing and failover both need shared membership/state. Set
+`[cluster.backend] type = "tarantool"`; enable write-behind persistence
+additionally when you also need failover/rehydration.
 
 ## Architecture decisions worth knowing
 
@@ -340,9 +343,12 @@ new clients elsewhere during the grace window.
   coarser for those clients.
 
 - **Lame-duck drain.** On SIGTERM/SIGINT a node sets a draining flag, keeps
-  redirecting *new* clients to other nodes for `drain_grace_secs`, broadcasts a
-  `leaving` message, then exits. Existing sessions are never interrupted — they
-  run until they expire. Good for rolling deploys.
+  redirecting *new* clients to other nodes, and waits up to `drain_grace_secs`
+  for active allocations to reach zero — then exits **even if some are still
+  active** (logged as "drain grace elapsed with allocations still active").
+  Existing sessions are therefore NOT guaranteed to survive: they finish only if
+  they complete within `drain_grace_secs` (default 5s — raise it to cover your
+  expected session length for graceful rolling deploys).
 
 - **Membership observability is wired on the server side only.** `HashRing`
   exposes a `snapshot()` and `ClusterRouting::members()` returns the current
@@ -403,3 +409,16 @@ yet — `batch_max_delay_ms = 100` means at most 100ms of writes are in
 flight. After a kill -9 you may lose up to that window. Tighter
 durability is a `mode = "write_through"` story — not implemented
 because it would block the data plane on Tarantool latency.
+
+## GA scope boundary (standalone-first)
+
+Cluster mode is an experimental new-allocation routing/failover surface, not the
+canonical GA deployment. The GA Helm example uses `cluster.enabled=false`, one
+TURN pod, one public IP, and one relay range. Tarantool may still be enabled in
+that topology for command-log and runtime desired/observed persistence.
+
+A leaving notification removes a draining node promptly and seq/incarnation
+tombstones prevent stale indirect advertisements from resurrecting it. This
+does not imply that active media survives owner death: relay sockets are not
+rehydrated on another node, the old relay IP is not preserved, relay-port
+conflicts are not automatically resolved, and rolling upgrades are not zero-gap.

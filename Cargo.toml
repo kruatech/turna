@@ -98,6 +98,10 @@ dashmap = "6"
 # Hot-path locks: parking_lot has no poison state, so a panic while holding a
 # lock can't cascade into worker-wide crashes via downstream .unwrap().
 parking_lot = "0.12"
+# Lock-free atomic Arc swap for the single published runtime-config snapshot
+# (S4-3): readers load without blocking; a config update swaps the whole
+# snapshot in one operation.
+arc-swap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # workspace-крейты

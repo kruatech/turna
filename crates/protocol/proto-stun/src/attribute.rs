@@ -56,12 +56,28 @@ pub const ATTR_REQUESTED_ADDRESS_FAMILY: u16 = 0x0017;
 pub const ATTR_EVEN_PORT: u16 = 0x0018;
 pub const ATTR_DONT_FRAGMENT: u16 = 0x001A;
 pub const ATTR_RESERVATION_TOKEN: u16 = 0x0022;
+/// RFC 6062 §6.2.1 CONNECTION-ID (0x002A): 32-bit id returned by a Connect
+/// success response and echoed by the client in its CONNECTION-BIND request.
+pub const ATTR_CONNECTION_ID: u16 = 0x002A;
+/// RFC 7635 §6.2 ACCESS-TOKEN (0x001B, comprehension-required): the opaque,
+/// AEAD-encrypted self-contained OAuth token. The codec keeps it as raw bytes;
+/// decryption/validation happens in the auth layer.
+pub const ATTR_ACCESS_TOKEN: u16 = 0x001B;
 
 // Comprehension-optional (>= 0x8000)
 // RFC 8016 "Mobility with TURN": opaque, server-issued ticket. Issued in an
 // Allocate success response; presented in a Refresh from a new address to
 // rebind the allocation to the new client 5-tuple without disturbing peers.
 pub const ATTR_MOBILITY_TICKET: u16 = 0x8030;
+/// draft-ietf-tram-stun-origin-06 ORIGIN (0x802F, comprehension-optional):
+/// client-supplied web origin (UTF-8). Forgeable — a hint for realm selection
+/// and logging/analytics only; MUST NOT be an authentication or tenant source
+/// of truth (see the draft's Security Considerations).
+pub const ATTR_ORIGIN: u16 = 0x802F;
+/// RFC 7635 §6.1 THIRD-PARTY-AUTHORIZATION (0x802E, comprehension-optional):
+/// server-advertised authorization-server identity (octet string). Sent by the
+/// server in a 401 challenge to signal OAuth support.
+pub const ATTR_THIRD_PARTY_AUTHORIZATION: u16 = 0x802E;
 
 // ── DoS / abuse caps ─────────────────────────────────────────────────────────
 //
@@ -108,6 +124,8 @@ pub enum Attribute {
     Software(String),
     // TURN
     Lifetime(u32),
+    /// RFC 6062 CONNECTION-ID — 32-bit TCP relay connection identifier.
+    ConnectionId(u32),
     RequestedTransport(u8),
     XorPeerAddress(SocketAddr),
     XorRelayedAddress(SocketAddr),
@@ -122,6 +140,13 @@ pub enum Attribute {
     RequestedAddressFamily(AddressFamily),
     /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
     MobilityTicket(Vec<u8>),
+    /// draft-ietf-tram-stun-origin ORIGIN — client-supplied web origin (UTF-8).
+    /// Forgeable; a policy/logging hint only. Multiple ORIGINs may appear.
+    Origin(String),
+    /// RFC 7635 ACCESS-TOKEN — opaque AEAD-encrypted OAuth token bytes.
+    AccessToken(Vec<u8>),
+    /// RFC 7635 THIRD-PARTY-AUTHORIZATION — authorization-server identity bytes.
+    ThirdPartyAuthorization(Vec<u8>),
     /// RFC 5389 §15.9 UNKNOWN-ATTRIBUTES: list of attribute types the server did
     /// not comprehend. Response-only (built for 420 replies).
     UnknownAttributes(Vec<u16>),
@@ -145,6 +170,7 @@ impl Attribute {
             Self::Nonce(_) => ATTR_NONCE,
             Self::Software(_) => ATTR_SOFTWARE,
             Self::Lifetime(_) => ATTR_LIFETIME,
+            Self::ConnectionId(_) => ATTR_CONNECTION_ID,
             Self::RequestedTransport(_) => ATTR_REQUESTED_TRANSPORT,
             Self::XorPeerAddress(_) => ATTR_XOR_PEER_ADDRESS,
             Self::XorRelayedAddress(_) => ATTR_XOR_RELAYED_ADDRESS,
@@ -155,6 +181,9 @@ impl Attribute {
             Self::ReservationToken(_) => ATTR_RESERVATION_TOKEN,
             Self::RequestedAddressFamily(_) => ATTR_REQUESTED_ADDRESS_FAMILY,
             Self::MobilityTicket(_) => ATTR_MOBILITY_TICKET,
+            Self::Origin(_) => ATTR_ORIGIN,
+            Self::AccessToken(_) => ATTR_ACCESS_TOKEN,
+            Self::ThirdPartyAuthorization(_) => ATTR_THIRD_PARTY_AUTHORIZATION,
             Self::UnknownAttributes(_) => ATTR_UNKNOWN_ATTRIBUTES,
             Self::Unknown { attr_type, .. } => *attr_type,
         }
@@ -205,6 +234,11 @@ impl Attribute {
                 buf[..4].copy_from_slice(&secs.to_be_bytes());
                 Ok(4)
             }
+            Self::ConnectionId(id) => {
+                ensure(buf.len(), 4)?;
+                buf[..4].copy_from_slice(&id.to_be_bytes());
+                Ok(4)
+            }
             Self::RequestedTransport(proto) => {
                 ensure(buf.len(), 4)?;
                 buf[0] = *proto;
@@ -246,6 +280,17 @@ impl Attribute {
                 Ok(4)
             }
             Self::MobilityTicket(t) => {
+                ensure(buf.len(), t.len())?;
+                buf[..t.len()].copy_from_slice(t);
+                Ok(t.len())
+            }
+            Self::Origin(s) => {
+                let b = s.as_bytes();
+                ensure(buf.len(), b.len())?;
+                buf[..b.len()].copy_from_slice(b);
+                Ok(b.len())
+            }
+            Self::AccessToken(t) | Self::ThirdPartyAuthorization(t) => {
                 ensure(buf.len(), t.len())?;
                 buf[..t.len()].copy_from_slice(t);
                 Ok(t.len())
@@ -500,6 +545,17 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 }
                 Attribute::Lifetime(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
             }
+            ATTR_CONNECTION_ID => {
+                if value.len() != 4 {
+                    return Err(StunError::AttributeParse(format!(
+                        "CONNECTION-ID must be 4 bytes, got {}",
+                        value.len()
+                    )));
+                }
+                Attribute::ConnectionId(u32::from_be_bytes([
+                    value[0], value[1], value[2], value[3],
+                ]))
+            }
             ATTR_REQUESTED_TRANSPORT => {
                 // RFC 8656 §18.8: exactly 4 bytes (1 protocol + 3 reserved).
                 if value.len() != 4 {
@@ -588,6 +644,12 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 Attribute::RequestedAddressFamily(fam)
             }
             ATTR_MOBILITY_TICKET => Attribute::MobilityTicket(value.to_vec()),
+            // ORIGIN: forgeable, comprehension-optional hint — decode lossily so
+            // a malformed origin never fails the whole message. Multiple ORIGIN
+            // attributes are preserved as separate entries.
+            ATTR_ORIGIN => Attribute::Origin(String::from_utf8_lossy(value).into_owned()),
+            ATTR_ACCESS_TOKEN => Attribute::AccessToken(value.to_vec()),
+            ATTR_THIRD_PARTY_AUTHORIZATION => Attribute::ThirdPartyAuthorization(value.to_vec()),
             // I3: symmetric with the encoder — decode the 420 list of 16-bit
             // attribute types back into `UnknownAttributes` rather than a generic
             // `Unknown`, so callers (and tests) can introspect the reported list.

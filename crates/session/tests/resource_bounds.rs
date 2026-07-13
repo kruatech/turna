@@ -78,7 +78,7 @@ fn allocations_freed_after_cleanup() {
 #[test]
 fn per_user_limit_enforced() {
     let store = AllocationStore::new(49300, 49400, 1000).with_quota(BandwidthQuota {
-        max_bytes_per_sec: 0,
+        max_bytes_per_sec_per_allocation: 0,
         max_per_user: 3,
     });
 
@@ -151,7 +151,7 @@ fn port_allocator_recycles_after_release() {
 #[test]
 fn bandwidth_quota_enforced() {
     let store = AllocationStore::new(52000, 52100, 100).with_quota(BandwidthQuota {
-        max_bytes_per_sec: 1000,
+        max_bytes_per_sec_per_allocation: 1000,
         max_per_user: 0,
     });
 

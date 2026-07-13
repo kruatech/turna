@@ -7,7 +7,7 @@ latest released version receives security fixes.
 
 | Version         | Supported                |
 |-----------------|--------------------------|
-| `0.2.0-alpha.x` | ✅ (current pre-release)  |
+| `0.3.0`         | ✅ (current, GA)          |
 | `< 0.2.0`       | ❌                       |
 
 Once a stable line is released, this table will track the supported minor

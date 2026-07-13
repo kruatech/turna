@@ -109,6 +109,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4395,6 +4404,7 @@ dependencies = [
 name = "turna-auth"
 version = "0.3.0-rc.2"
 dependencies = [
+ "aes-gcm",
  "argon2",
  "base64 0.22.1",
  "dashmap",
@@ -4589,6 +4599,8 @@ version = "0.3.0-rc.2"
 dependencies = [
  "hostname",
  "parking_lot",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
  "tracing",
@@ -4597,6 +4609,7 @@ dependencies = [
  "turna-config",
  "turna-health",
  "turna-observability",
+ "turna-proto-turn",
  "turna-relay",
  "turna-session",
  "turna-state-backend",
@@ -4704,6 +4717,7 @@ dependencies = [
 name = "turna-session"
 version = "0.3.0-rc.2"
 dependencies = [
+ "arc-swap",
  "dashmap",
  "parking_lot",
  "rand 0.8.6",

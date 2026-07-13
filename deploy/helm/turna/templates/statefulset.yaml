@@ -34,8 +34,10 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
-      # Allow time for lame-duck drain (drainGraceSecs) plus the gossip leave.
-      terminationGracePeriodSeconds: {{ add .Values.cluster.drainGraceSecs 10 }}
+      # Must cover the node's full shutdown budget (P0 #8): lame-duck drain
+      # (drainGraceSecs) + persistence flush (~10s) + background task joins
+      # (~10s) + safety margin. Too small and kubelet SIGKILLs mid-flush.
+      terminationGracePeriodSeconds: {{ add .Values.cluster.drainGraceSecs 25 }}
       securityContext:
         {{- with .Values.podSecurityContext }}
         {{- toYaml . | nindent 8 }}
@@ -96,6 +98,13 @@ spec:
                   fieldPath: status.hostIP
             - name: TURNA_TURN_ANNOUNCE_ADDR
               value: "$(HOST_IP):{{ .Values.turn.listenPort }}"
+            {{- end }}
+            {{- if and .Values.state.enabled .Values.state.existingSecret }}
+            - name: TURNA_BACKEND_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.state.existingSecret }}
+                  key: {{ .Values.state.existingSecretKey }}
             {{- end }}
             {{- if or .Values.turn.auth.existingSecret .Values.turn.auth.sharedSecret }}
             - name: TURNA_SHARED_SECRET

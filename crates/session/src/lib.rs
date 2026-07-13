@@ -16,8 +16,11 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
+
+use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -38,10 +41,122 @@ const RESERVATION_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_PERMISSIONS_PER_ALLOCATION: usize = 256;
 const MAX_CHANNELS_PER_ALLOCATION: usize = 256;
 
-/// B4: per-user allocation tracking is keyed by (tenant, username), not the bare
-/// username — otherwise `alice` under tenant A and `alice` under tenant B share
-/// one counter and one tenant can exhaust the other's per-user quota.
-type UserKey = (Option<String>, String);
+/// Per-user allocation tracking is keyed by (realm, tenant, username), not the
+/// bare username. Identical usernames in separate authentication namespaces
+/// must never share an admission counter or allocation index.
+type UserKey = (String, Option<String>, String);
+
+/// Canonical S5 identity. Realm and tenant are both carried so identical
+/// usernames in different authentication namespaces never share a limit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LimitSubject {
+    pub realm: String,
+    pub tenant_id: Option<String>,
+    pub username: String,
+}
+
+impl LimitSubject {
+    pub fn new(
+        realm: impl Into<String>,
+        tenant_id: Option<String>,
+        username: impl Into<String>,
+    ) -> Self {
+        Self {
+            realm: realm.into(),
+            tenant_id,
+            username: username.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LimitMode {
+    #[default]
+    Inherit,
+    Value,
+    Unlimited,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LimitU32 {
+    pub mode: LimitMode,
+    pub value: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LimitU64 {
+    pub mode: LimitMode,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserLimitsOverride {
+    pub max_allocations: Option<LimitU32>,
+    pub max_bytes_per_sec_per_allocation: Option<LimitU64>,
+    pub max_lifetime_secs: Option<LimitU32>,
+}
+
+impl UserLimitsOverride {
+    pub fn is_inherit_only(&self) -> bool {
+        fn inherit32(value: Option<LimitU32>) -> bool {
+            value
+                .map(|limit| limit.mode == LimitMode::Inherit)
+                .unwrap_or(true)
+        }
+        fn inherit64(value: Option<LimitU64>) -> bool {
+            value
+                .map(|limit| limit.mode == LimitMode::Inherit)
+                .unwrap_or(true)
+        }
+        inherit32(self.max_allocations)
+            && inherit64(self.max_bytes_per_sec_per_allocation)
+            && inherit32(self.max_lifetime_secs)
+    }
+}
+
+/// One immutable S5 cache. Management updates clone/modify/publish this value;
+/// Allocate, Refresh and packet paths only perform local reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserLimitsSnapshot {
+    /// §8: monotonic cache generation — a LOCAL counter bumped on each actual
+    /// publication of a changed snapshot (never on a no-op), independent of any
+    /// subject's version. NOT used for CAS/expected_version; per-subject
+    /// versions live in the durable UserLimitsState.
+    pub generation: u64,
+    pub bootstrap_max_lifetime_secs: u32,
+    pub global: UserLimitsOverride,
+    pub tenants: HashMap<(String, String), UserLimitsOverride>,
+    pub users: HashMap<(String, String, String), UserLimitsOverride>,
+}
+
+impl UserLimitsSnapshot {
+    fn empty() -> Self {
+        Self {
+            generation: 0,
+            bootstrap_max_lifetime_secs: 0,
+            global: UserLimitsOverride::default(),
+            tenants: HashMap::new(),
+            users: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveUserLimits {
+    /// 0 means unlimited when `allocations_disabled` is false.
+    pub max_allocations: usize,
+    pub allocations_disabled: bool,
+    /// 0 means unlimited when `bandwidth_disabled` is false.
+    pub max_bytes_per_sec_per_allocation: u64,
+    pub bandwidth_disabled: bool,
+    /// 0 means no additional dynamic ceiling when `lifetime_disabled` is false.
+    pub max_lifetime_secs: u32,
+    pub lifetime_disabled: bool,
+    pub inherited_fields: Vec<String>,
+    /// §7-B: fields clamped to a finite node ceiling.
+    pub capped_fields: Vec<String>,
+}
 
 /// A port reserved under a RESERVATION-TOKEN, pending a follow-up Allocate.
 struct Reservation {
@@ -83,6 +198,11 @@ pub enum SessionError {
     /// (B5). Maps to 486 Allocation Quota Reached.
     #[error("per-allocation resource limit exceeded")]
     LimitExceeded,
+    /// §8: the monotonic user-limits cache generation would overflow u64. Per the
+    /// GA contract this is surfaced as an error rather than panicking; the current
+    /// snapshot is left unpublished and unchanged.
+    #[error("user-limits cache generation overflow")]
+    CacheGenerationOverflow,
 }
 
 /// Permission with expiry.
@@ -135,6 +255,15 @@ impl ChannelBinding {
     }
 }
 
+/// Relayed transport protocol for an allocation. UDP is the RFC 8656 default;
+/// TCP is RFC 6062 (client uses CONNECT/CONNECTION-BIND, no relay UDP socket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportProto {
+    #[default]
+    Udp,
+    Tcp,
+}
+
 /// A single TURN allocation.
 #[derive(Debug)]
 pub struct Allocation {
@@ -154,8 +283,13 @@ pub struct Allocation {
     pub relay_addr: SocketAddr,
     pub username: String,
     pub key: Vec<u8>,
+    /// Authenticated REALM covered by MESSAGE-INTEGRITY.
+    pub realm: String,
     /// Owning tenant (multi-tenancy). `None` = base/default tenant.
     pub tenant_id: Option<String>,
+    /// Relayed transport (RFC 8656 UDP default; RFC 6062 TCP). TCP allocations
+    /// have no bound relay UDP socket — CONNECT/CONNECTION-BIND drive the datapath.
+    pub transport: TransportProto,
     /// Permissions with expiry.
     permissions: HashMap<std::net::IpAddr, Permission>,
     /// Channel bindings with expiry.
@@ -211,7 +345,7 @@ impl Allocation {
 
     /// Check if bandwidth quota is exceeded. Returns current bps.
     #[allow(clippy::result_unit_err)]
-    pub fn check_bandwidth(&self, max_bytes_per_sec: u64) -> Result<u64, ()> {
+    pub fn check_bandwidth(&self, max_bytes_per_sec_per_allocation: u64) -> Result<u64, ()> {
         let mut start = self.bandwidth_window_start.lock();
         let now = Instant::now();
         let elapsed = now.duration_since(*start);
@@ -227,7 +361,7 @@ impl Allocation {
             // Enforce the completed window too (L6): previously a window
             // boundary always returned Ok, letting one packet per second slip
             // past the quota.
-            return if bps > max_bytes_per_sec {
+            return if bps > max_bytes_per_sec_per_allocation {
                 Err(())
             } else {
                 Ok(bps)
@@ -235,7 +369,7 @@ impl Allocation {
         }
 
         let current = self.bandwidth_window_bytes.load(Ordering::Relaxed);
-        if current > max_bytes_per_sec {
+        if current > max_bytes_per_sec_per_allocation {
             Err(())
         } else {
             Ok(current)
@@ -547,7 +681,7 @@ impl PortAllocator {
 /// Bandwidth quota configuration.
 pub struct BandwidthQuota {
     /// Max bytes per second per allocation. 0 = unlimited.
-    pub max_bytes_per_sec: u64,
+    pub max_bytes_per_sec_per_allocation: u64,
     /// Max allocations per username. 0 = unlimited.
     pub max_per_user: usize,
 }
@@ -555,8 +689,8 @@ pub struct BandwidthQuota {
 impl Default for BandwidthQuota {
     fn default() -> Self {
         Self {
-            max_bytes_per_sec: 0, // unlimited
-            max_per_user: 100,    // 100 allocations per user
+            max_bytes_per_sec_per_allocation: 0, // unlimited
+            max_per_user: 100,                   // 100 allocations per user
         }
     }
 }
@@ -585,6 +719,31 @@ pub struct TenantTraffic {
     pub closed_allocations: u64,
 }
 
+/// Immutable, atomically-published view of the node-wide runtime limits.
+///
+/// S4-3: the store holds ONE `ArcSwap<RuntimeLimits>` rather than separate
+/// atomics for each field. A runtime `update_config` publishes a whole new
+/// snapshot in a single atomic swap, so every reader (allocation admission,
+/// per-user quota, bandwidth limiter, metrics, the management read API) always
+/// observes a self-consistent set of values plus the `version` they belong to —
+/// never a torn mix from a half-applied change. Usage/reservation counters stay
+/// as their own atomics; only configuration values live here.
+///
+/// This is the dataplane-side counterpart of `turna-config`'s `RuntimeSnapshot`;
+/// the node command handler translates a validated config snapshot into this
+/// type before publishing. `0` follows the existing store conventions:
+/// `max_bytes_per_sec_per_allocation == 0` = unlimited bandwidth, `max_per_user == 0` = no
+/// per-user cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLimits {
+    /// Observed config version this snapshot corresponds to. Boot = 0; each
+    /// successful runtime change increments it by 1 (set by the publisher).
+    pub version: u64,
+    pub max_bytes_per_sec_per_allocation: u64,
+    pub max_per_user: usize,
+    pub max_allocations: usize,
+}
+
 /// Main allocation store — thread-safe via DashMap.
 pub struct AllocationStore {
     allocations: DashMap<SocketAddr, Allocation>,
@@ -607,13 +766,24 @@ pub struct AllocationStore {
     /// rollback); every remove path releases.
     global_count: std::sync::atomic::AtomicUsize,
     tenant_counts: DashMap<String, std::sync::atomic::AtomicUsize>,
+    /// Race-free per-user reservations. The vector index remains for listing,
+    /// while this counter is the admission-control source of truth.
+    user_counts: DashMap<UserKey, std::sync::atomic::AtomicUsize>,
     pub ports: PortAllocator,
     /// Per-tenant isolated port pools (multi-tenancy). Empty = single-tenant.
     /// Built once at startup via [`AllocationStore::with_tenant_pool`]; read-only
     /// afterwards (small N → linear scan in `pool`/`pool_for_port` is fine).
     tenant_pools: Vec<TenantPool>,
-    max_allocations: usize,
-    pub quota: BandwidthQuota,
+    // S4/S5: node-local live limits, published as ONE immutable snapshot via a
+    // single atomic swap (S4-3). A runtime `update_config` replaces the whole
+    // `RuntimeLimits` at once, so readers never see a torn mix of fields or a
+    // value that disagrees with the reported `version`. Lowering a limit below
+    // current usage blocks NEW reservations (via the atomic counters) without
+    // tearing down active allocations. These are the global values; per-tenant
+    // overrides live in `tenant_pools` and are startup-only.
+    runtime: ArcSwap<RuntimeLimits>,
+    /// S5 immutable override cache. No backend access occurs on the dataplane.
+    user_limits: ArcSwap<UserLimitsSnapshot>,
     /// Optional sink for write-behind persistence events.
     ///
     /// `None` (the default) preserves the legacy single-node, no-persistence
@@ -636,6 +806,75 @@ pub struct AllocationStore {
     tenant_traffic: std::sync::Mutex<std::collections::HashMap<String, TenantTraffic>>,
 }
 
+struct CounterReservation<'a> {
+    store: &'a AllocationStore,
+    user_key: UserKey,
+    tenant_id: Option<String>,
+    user_reserved: bool,
+    tenant_reserved: bool,
+    global_reserved: bool,
+    committed: bool,
+}
+
+impl CounterReservation<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CounterReservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.global_reserved {
+            self.store.global_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        if self.tenant_reserved {
+            if let Some(tid) = self.tenant_id.as_deref() {
+                if let Some(entry) = self.store.tenant_counts.get(tid) {
+                    entry.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+        if self.user_reserved {
+            if let Some(entry) = self.store.user_counts.get(&self.user_key) {
+                entry.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+/// RAII ownership of a port already reserved in a pool. The processor commits
+/// it only after every allocation index and counter is installed.
+pub struct PortReservationGuard<'a> {
+    pool: &'a PortAllocator,
+    port: u16,
+    committed: bool,
+}
+
+impl<'a> PortReservationGuard<'a> {
+    pub fn new(pool: &'a PortAllocator, port: u16) -> Self {
+        Self {
+            pool,
+            port,
+            committed: false,
+        }
+    }
+
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PortReservationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.pool.release(self.port);
+        }
+    }
+}
+
 impl AllocationStore {
     pub fn new(min_port: u16, max_port: u16, max_allocations: usize) -> Self {
         Self {
@@ -647,19 +886,338 @@ impl AllocationStore {
             user_allocations: DashMap::new(),
             global_count: std::sync::atomic::AtomicUsize::new(0),
             tenant_counts: DashMap::new(),
+            user_counts: DashMap::new(),
             ports: PortAllocator::new(min_port, max_port),
             tenant_pools: Vec::new(),
-            max_allocations,
-            quota: BandwidthQuota::default(),
+            runtime: ArcSwap::from_pointee(RuntimeLimits {
+                version: 0,
+                max_bytes_per_sec_per_allocation: BandwidthQuota::default()
+                    .max_bytes_per_sec_per_allocation,
+                max_per_user: BandwidthQuota::default().max_per_user,
+                max_allocations,
+            }),
+            user_limits: ArcSwap::from_pointee(UserLimitsSnapshot::empty()),
             write_tx: OnceLock::new(),
             dropped_writes: AtomicU64::new(0),
             tenant_traffic: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    pub fn with_quota(mut self, quota: BandwidthQuota) -> Self {
-        self.quota = quota;
+    pub fn with_quota(self, quota: BandwidthQuota) -> Self {
+        self.set_user_quota(quota.max_bytes_per_sec_per_allocation, quota.max_per_user);
         self
+    }
+
+    /// S4-3 commit point: atomically publish a whole new runtime snapshot in a
+    /// single swap. The caller owns `version` (the node handler bumps it on a
+    /// real change; a no-op keeps it). This is the ONLY place a new logical
+    /// configuration becomes visible, so readers never observe a torn state.
+    pub fn publish_runtime(&self, next: RuntimeLimits) {
+        self.runtime.store(Arc::new(next));
+    }
+
+    /// Current published runtime snapshot (cheap, lock-free). Used by the node
+    /// to report observed config state and by all limit readers.
+    pub fn runtime_snapshot(&self) -> Arc<RuntimeLimits> {
+        self.runtime.load_full()
+    }
+
+    /// S5: publish new per-user limits (bytes/sec + allocations per user).
+    /// Compatibility wrapper: it does NOT write fields independently — it loads
+    /// the current snapshot, changes only these two values, and republishes the
+    /// whole snapshot in one atomic swap (version preserved). Read on the hot
+    /// path (`bandwidth_limit_for`) and at allocate (`effective_max_per_user`);
+    /// a lowered cap blocks new reservations while active allocations keep
+    /// running. Safe on a shared `&self` (behind `Arc`).
+    pub fn set_user_quota(&self, max_bytes_per_sec_per_allocation: u64, max_per_user: usize) {
+        let mut next = (*self.runtime.load_full()).clone();
+        next.max_bytes_per_sec_per_allocation = max_bytes_per_sec_per_allocation;
+        next.max_per_user = max_per_user;
+        self.runtime.store(Arc::new(next));
+    }
+
+    /// S4: publish a new global allocation cap. Compatibility wrapper over a
+    /// full-snapshot swap (version preserved). A lowered cap makes
+    /// `try_reserve_slot` reject new allocations once the live count is at/above
+    /// it; existing allocations are untouched.
+    pub fn set_max_allocations(&self, max_allocations: usize) {
+        let mut next = (*self.runtime.load_full()).clone();
+        next.max_allocations = max_allocations;
+        self.runtime.store(Arc::new(next));
+    }
+
+    /// Current live global limits `(max_bytes_per_sec_per_allocation, max_per_user,
+    /// max_allocations)` — read from the single published snapshot so the tuple
+    /// is always internally consistent. Used by the node to report observed
+    /// config state.
+    pub fn live_limits(&self) -> (u64, usize, usize) {
+        let rt = self.runtime.load();
+        (
+            rt.max_bytes_per_sec_per_allocation,
+            rt.max_per_user,
+            rt.max_allocations,
+        )
+    }
+
+    /// Seed the protocol/bootstrap lifetime ceiling used by S5 inheritance.
+    /// This updates the immutable limits cache, never a standalone atomic.
+    pub fn set_bootstrap_max_lifetime(&self, seconds: u32) {
+        let mut next = (*self.user_limits.load_full()).clone();
+        next.bootstrap_max_lifetime_secs = seconds;
+        // Bootstrap seed (generation 0 at startup); real limit publications advance
+        // the generation via publish_user_limits.
+        self.user_limits.store(Arc::new(next));
+    }
+
+    pub fn user_limits_snapshot(&self) -> Arc<UserLimitsSnapshot> {
+        self.user_limits.load_full()
+    }
+
+    pub fn publish_user_limits(&self, mut next: UserLimitsSnapshot) -> Result<(), SessionError> {
+        // §8: bump the LOCAL cache generation on an actual change only. Neutralise
+        // the incoming generation before comparing content so a no-op publish
+        // neither stores nor advances the counter.
+        let current = self.user_limits.load();
+        next.generation = current.generation;
+        if next == *current.as_ref() {
+            return Ok(());
+        }
+        // Overflow must NOT panic (GA contract): leave the current snapshot intact
+        // and surface the error to the apply/restore path.
+        let Some(generation) = current.generation.checked_add(1) else {
+            return Err(SessionError::CacheGenerationOverflow);
+        };
+        next.generation = generation;
+        self.user_limits.store(Arc::new(next));
+        Ok(())
+    }
+
+    /// Clone the current cache and apply one observed override. This is used by
+    /// the serialized node command handler; readers see either the old or the
+    /// complete new map.
+    pub fn limits_snapshot_with_override(
+        &self,
+        scope: &str,
+        realm: &str,
+        tenant: &str,
+        username: &str,
+        value: UserLimitsOverride,
+    ) -> Result<UserLimitsSnapshot, SessionError> {
+        let mut next = (*self.user_limits.load_full()).clone();
+        match scope {
+            "global" => next.global = value,
+            "tenant" => {
+                let key = (realm.to_string(), tenant.to_string());
+                if value.is_inherit_only() {
+                    next.tenants.remove(&key);
+                } else {
+                    next.tenants.insert(key, value);
+                }
+            }
+            "user" => {
+                let key = (realm.to_string(), tenant.to_string(), username.to_string());
+                if value.is_inherit_only() {
+                    next.users.remove(&key);
+                } else {
+                    next.users.insert(key, value);
+                }
+            }
+            _ => return Err(SessionError::LimitExceeded),
+        }
+        Ok(next)
+    }
+
+    fn resolve_u32(
+        candidates: impl IntoIterator<Item = Option<LimitU32>>,
+        fallback: usize,
+    ) -> (usize, bool, bool, bool) {
+        // Returns (effective, inherited, disabled, capped). §7-B: a finite node
+        // ceiling (fallback > 0) is a hard upper bound — a VALUE above it, or
+        // UNLIMITED, is capped to the ceiling and flagged. `fallback == 0` means
+        // the node itself permits unlimited, so the override applies as-is.
+        for candidate in candidates.into_iter().flatten() {
+            match candidate.mode {
+                LimitMode::Inherit => continue,
+                LimitMode::Disabled => return (0, false, true, false),
+                LimitMode::Value => {
+                    let requested = candidate.value as usize;
+                    if fallback > 0 && requested > fallback {
+                        return (fallback, false, false, true);
+                    }
+                    return (requested, false, false, false);
+                }
+                LimitMode::Unlimited => {
+                    if fallback > 0 {
+                        return (fallback, false, false, true);
+                    }
+                    return (0, false, false, false);
+                }
+            }
+        }
+        (fallback, true, false, false)
+    }
+
+    fn resolve_u64(
+        candidates: impl IntoIterator<Item = Option<LimitU64>>,
+        fallback: u64,
+    ) -> (u64, bool, bool, bool) {
+        // Returns (effective, inherited, disabled, capped). §7-B: see resolve_u32.
+        for candidate in candidates.into_iter().flatten() {
+            match candidate.mode {
+                LimitMode::Inherit => continue,
+                LimitMode::Disabled => return (0, false, true, false),
+                LimitMode::Value => {
+                    if fallback > 0 && candidate.value > fallback {
+                        return (fallback, false, false, true);
+                    }
+                    return (candidate.value, false, false, false);
+                }
+                LimitMode::Unlimited => {
+                    if fallback > 0 {
+                        return (fallback, false, false, true);
+                    }
+                    return (0, false, false, false);
+                }
+            }
+        }
+        (fallback, true, false, false)
+    }
+
+    /// Resolve one consistent S5 view from one runtime snapshot and one limits
+    /// snapshot. Each field inherits independently.
+    pub fn effective_user_limits(
+        &self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+    ) -> EffectiveUserLimits {
+        let runtime = self.runtime.load_full();
+        let limits = self.user_limits.load_full();
+        let tenant = tenant_id.unwrap_or("");
+        let user = limits
+            .users
+            .get(&(realm.to_string(), tenant.to_string(), username.to_string()));
+        let tenant_override = limits.tenants.get(&(realm.to_string(), tenant.to_string()));
+        let bootstrap_tenant = self.tenant_quota(tenant_id);
+
+        let (max_allocations, alloc_inherited, allocations_disabled, alloc_capped) =
+            Self::resolve_u32(
+                [
+                    user.and_then(|v| v.max_allocations),
+                    tenant_override.and_then(|v| v.max_allocations),
+                    limits.global.max_allocations,
+                ],
+                bootstrap_tenant
+                    .and_then(|q| (q.max_per_user > 0).then_some(q.max_per_user))
+                    .unwrap_or(runtime.max_per_user),
+            );
+        let (
+            max_bytes_per_sec_per_allocation,
+            bandwidth_inherited,
+            bandwidth_disabled,
+            bandwidth_capped,
+        ) = Self::resolve_u64(
+            [
+                user.and_then(|v| v.max_bytes_per_sec_per_allocation),
+                tenant_override.and_then(|v| v.max_bytes_per_sec_per_allocation),
+                limits.global.max_bytes_per_sec_per_allocation,
+            ],
+            bootstrap_tenant
+                .and_then(|q| {
+                    (q.max_bytes_per_sec_per_allocation > 0)
+                        .then_some(q.max_bytes_per_sec_per_allocation)
+                })
+                .unwrap_or(runtime.max_bytes_per_sec_per_allocation),
+        );
+        let (max_lifetime, lifetime_inherited, lifetime_disabled, lifetime_capped) =
+            Self::resolve_u32(
+                [
+                    user.and_then(|v| v.max_lifetime_secs),
+                    tenant_override.and_then(|v| v.max_lifetime_secs),
+                    limits.global.max_lifetime_secs,
+                ],
+                limits.bootstrap_max_lifetime_secs as usize,
+            );
+        let mut inherited_fields = Vec::new();
+        if alloc_inherited {
+            inherited_fields.push("max_allocations".to_string());
+        }
+        if bandwidth_inherited {
+            inherited_fields.push("max_bytes_per_sec_per_allocation".to_string());
+        }
+        if lifetime_inherited {
+            inherited_fields.push("max_lifetime_secs".to_string());
+        }
+        // §7-B: fields whose requested value exceeded a finite node ceiling and
+        // were clamped to it. Enforcement uses the (capped) effective value.
+        let mut capped_fields = Vec::new();
+        if alloc_capped {
+            capped_fields.push("max_allocations".to_string());
+        }
+        if bandwidth_capped {
+            capped_fields.push("max_bytes_per_sec_per_allocation".to_string());
+        }
+        if lifetime_capped {
+            capped_fields.push("max_lifetime_secs".to_string());
+        }
+        EffectiveUserLimits {
+            max_allocations,
+            allocations_disabled,
+            max_bytes_per_sec_per_allocation,
+            bandwidth_disabled,
+            max_lifetime_secs: max_lifetime as u32,
+            lifetime_disabled,
+            inherited_fields,
+            capped_fields,
+        }
+    }
+
+    pub fn current_user_usage(
+        &self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+    ) -> usize {
+        let key = (
+            realm.to_string(),
+            tenant_id.map(ToOwned::to_owned),
+            username.to_string(),
+        );
+        self.user_counts
+            .get(&key)
+            .map(|value| value.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    pub fn current_tenant_usage(&self, tenant_id: &str) -> usize {
+        self.tenant_counts
+            .get(tenant_id)
+            .map(|value| value.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Highest concurrent allocation usage of any user on this node. Global S5
+    /// defaults are per-user limits, so management must compare them to this
+    /// maximum rather than to the total number of allocations.
+    pub fn max_user_usage(&self) -> usize {
+        self.user_counts
+            .iter()
+            .map(|entry| entry.value().load(Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Highest concurrent allocation usage of any user in one realm/tenant.
+    /// Tenant-level S5 limits are inherited by each user independently, so
+    /// comparing an aggregate tenant allocation count to a per-user limit would
+    /// report false over-limit states.
+    pub fn max_user_usage_in_tenant(&self, realm: &str, tenant_id: &str) -> usize {
+        self.user_counts
+            .iter()
+            .filter(|entry| entry.key().0 == realm && entry.key().1.as_deref() == Some(tenant_id))
+            .map(|entry| entry.value().load(Ordering::Acquire))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Register an isolated relay-port pool for a tenant. Builder; call once per
@@ -690,22 +1248,57 @@ impl AllocationStore {
             .map(|p| &p.quota)
     }
 
-    /// Effective bandwidth limit (bytes/sec) for an allocation: the tenant's
-    /// value when set (> 0), otherwise the global quota. `0` = unlimited.
-    pub fn bandwidth_limit_for(&self, tenant_id: Option<&str>) -> u64 {
-        match self.tenant_quota(tenant_id) {
-            Some(q) if q.max_bytes_per_sec > 0 => q.max_bytes_per_sec,
-            _ => self.quota.max_bytes_per_sec,
-        }
+    /// Compatibility lookup for call sites that do not yet carry identity.
+    pub fn effective_max_per_user(&self, tenant_id: Option<&str>) -> usize {
+        self.effective_user_limits("", tenant_id, "")
+            .max_allocations
     }
 
-    /// Effective per-user allocation cap: the tenant's value when set (> 0),
-    /// otherwise the global quota. `0` = no per-user cap.
-    fn effective_max_per_user(&self, tenant_id: Option<&str>) -> usize {
-        match self.tenant_quota(tenant_id) {
-            Some(q) if q.max_per_user > 0 => q.max_per_user,
-            _ => self.quota.max_per_user,
-        }
+    /// Compatibility lookup for call sites that do not yet carry identity.
+    pub fn bandwidth_limit_for(&self, tenant_id: Option<&str>) -> u64 {
+        self.effective_user_limits("", tenant_id, "")
+            .max_bytes_per_sec_per_allocation
+    }
+
+    pub fn bandwidth_limit_for_user(
+        &self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+    ) -> u64 {
+        self.bandwidth_policy_for_user(realm, tenant_id, username).0
+    }
+
+    pub fn bandwidth_policy_for_user(
+        &self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+    ) -> (u64, bool) {
+        let effective = self.effective_user_limits(realm, tenant_id, username);
+        (
+            effective.max_bytes_per_sec_per_allocation,
+            effective.bandwidth_disabled,
+        )
+    }
+
+    pub fn max_lifetime_for_user(
+        &self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+    ) -> u32 {
+        self.lifetime_policy_for_user(realm, tenant_id, username).0
+    }
+
+    pub fn lifetime_policy_for_user(
+        &self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+    ) -> (u32, bool) {
+        let effective = self.effective_user_limits(realm, tenant_id, username);
+        (effective.max_lifetime_secs, effective.lifetime_disabled)
     }
 
     /// Select the port pool for a tenant at allocation time. `None` or an
@@ -766,6 +1359,88 @@ impl AllocationStore {
         self.dropped_writes.load(Ordering::Relaxed)
     }
 
+    /// P0 #16: relay ports of all live allocations. The node's reconciliation
+    /// pass uses this to find backend "zombies" — rows whose `Remove` event was
+    /// dropped under write-behind backpressure and would otherwise be adopted
+    /// (resurrected) on failover.
+    pub fn live_relay_ports(&self) -> Vec<u16> {
+        self.allocations
+            .iter()
+            .map(|e| e.value().relay_addr.port())
+            .collect()
+    }
+
+    /// P0 #16: re-emit the full authoritative live state as write-behind events.
+    ///
+    /// After a backpressure episode drops `WriteOp`s, the backend has diverged:
+    /// missing `Create`s, stale `Refresh`/permission/channel state. Replaying
+    /// every live allocation (plus its permissions and channel bindings) through
+    /// the writer restores those rows. The writer upserts, so this is idempotent
+    /// and safe to call repeatedly.
+    ///
+    /// Epoch timestamps are reconstructed from the monotonic `Instant`s via the
+    /// current wall clock (`epoch_ms()` + remaining lifetime). The absolute
+    /// value may differ slightly from the original `Create`, but the
+    /// remaining-lifetime semantics that drive expiry are preserved.
+    ///
+    /// No-op when no writer is attached (standalone mode).
+    pub fn resync_all(&self) {
+        if self.write_tx.get().is_none() {
+            return;
+        }
+        let now_i = Instant::now();
+        let now_e = epoch_ms();
+        let to_epoch = |t: Instant| -> u64 {
+            if t >= now_i {
+                now_e + t.duration_since(now_i).as_millis() as u64
+            } else {
+                now_e.saturating_sub(now_i.duration_since(t).as_millis() as u64)
+            }
+        };
+        for entry in self.allocations.iter() {
+            let a = entry.value();
+            let relay_port = a.relay_addr.port();
+            self.emit_write(WriteOp::Create {
+                relay_port,
+                client_addr: a.client_addr,
+                relay_addr: a.relay_addr,
+                username: a.username.clone(),
+                realm: a.realm.clone(),
+                created_at_ms: to_epoch(a.created_at),
+                expires_at_ms: to_epoch(a.expires_at),
+                allocation_id: a.allocation_id.clone(),
+                migration_epoch: a.migration_epoch,
+            });
+            for (ip, perm) in a.permissions.iter() {
+                self.emit_write(WriteOp::Permission {
+                    relay_port,
+                    peer_ip: *ip,
+                    expires_at_ms: to_epoch(perm.expires_at),
+                });
+            }
+            for (number, binding) in a.channel_bindings.iter() {
+                self.emit_write(WriteOp::Channel {
+                    relay_port,
+                    number: *number,
+                    peer_addr: binding.peer_addr,
+                    expires_at_ms: to_epoch(binding.expires_at),
+                });
+            }
+        }
+    }
+
+    /// Emit a reconcile ordering barrier through the write-behind channel
+    /// (P0.1). Returns `false` if the channel is missing/closed or full — a
+    /// dropped barrier means the caller must NOT trust any subsequent ack and
+    /// should stay Degraded. On success the writer publishes `generation` to its
+    /// reconcile-ack only after flushing all prior ops to the backend.
+    pub fn emit_reconcile_barrier(&self, generation: u64) -> bool {
+        match self.write_tx.get() {
+            Some(tx) => tx.try_send(WriteOp::Barrier { generation }).is_ok(),
+            None => false,
+        }
+    }
+
     /// Send a `WriteOp` if a writer is attached, **without blocking**.
     ///
     /// Three outcomes:
@@ -815,45 +1490,101 @@ impl AllocationStore {
         key: Vec<u8>,
         lifetime: u32,
     ) -> Result<(), SessionError> {
-        self.create_for_tenant(client_addr, relay_addr, username, key, lifetime, None)
+        self.create_for_identity(
+            client_addr,
+            relay_addr,
+            username,
+            key,
+            lifetime,
+            String::new(),
+            None,
+        )
     }
 
-    /// B1: atomically reserve one allocation slot against the global cap and,
-    /// for a tenanted allocation, the tenant cap. fetch_add→check→rollback so N
-    /// racing creates can never over-admit past a cap. On success the caller
-    /// MUST eventually `release_slot` (via `remove`/`force_remove`).
-    fn try_reserve_slot(&self, tenant_id: Option<&str>) -> Result<(), SessionError> {
-        if self.global_count.fetch_add(1, Ordering::AcqRel) >= self.max_allocations {
+    fn reserve_counters<'a>(
+        &'a self,
+        realm: &str,
+        tenant_id: Option<&str>,
+        username: &str,
+        max_per_user: usize,
+        allocations_disabled: bool,
+        max_global: usize,
+    ) -> Result<CounterReservation<'a>, SessionError> {
+        if allocations_disabled {
+            return Err(SessionError::MaxAllocationsPerUser);
+        }
+        let user_key = (
+            realm.to_string(),
+            tenant_id.map(ToOwned::to_owned),
+            username.to_string(),
+        );
+        let user = self
+            .user_counts
+            .entry(user_key.clone())
+            .or_insert_with(|| AtomicUsize::new(0));
+        if max_per_user > 0 && user.fetch_add(1, Ordering::AcqRel) >= max_per_user {
+            user.fetch_sub(1, Ordering::AcqRel);
+            return Err(SessionError::MaxAllocationsPerUser);
+        }
+        if max_per_user == 0 {
+            user.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(user);
+
+        let mut guard = CounterReservation {
+            store: self,
+            user_key,
+            tenant_id: tenant_id.map(ToOwned::to_owned),
+            user_reserved: true,
+            tenant_reserved: false,
+            global_reserved: false,
+            committed: false,
+        };
+
+        if let Some(tid) = tenant_id {
+            let cap = self.tenant_max_allocations(tid);
+            let entry = self
+                .tenant_counts
+                .entry(tid.to_string())
+                .or_insert_with(|| AtomicUsize::new(0));
+            if cap > 0 && entry.fetch_add(1, Ordering::AcqRel) >= cap {
+                entry.fetch_sub(1, Ordering::AcqRel);
+                return Err(SessionError::MaxAllocations);
+            }
+            if cap == 0 {
+                entry.fetch_add(1, Ordering::AcqRel);
+            }
+            guard.tenant_reserved = true;
+        }
+
+        if max_global > 0 && self.global_count.fetch_add(1, Ordering::AcqRel) >= max_global {
             self.global_count.fetch_sub(1, Ordering::AcqRel);
             return Err(SessionError::MaxAllocations);
         }
-        if let Some(tid) = tenant_id {
-            let cap = self.tenant_max_allocations(tid);
-            if cap > 0 {
-                let entry = self
-                    .tenant_counts
-                    .entry(tid.to_string())
-                    .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
-                if entry.fetch_add(1, Ordering::AcqRel) >= cap {
-                    entry.fetch_sub(1, Ordering::AcqRel);
-                    drop(entry);
-                    self.global_count.fetch_sub(1, Ordering::AcqRel);
-                    return Err(SessionError::MaxAllocations);
-                }
-            }
+        if max_global == 0 {
+            self.global_count.fetch_add(1, Ordering::AcqRel);
         }
-        Ok(())
+        guard.global_reserved = true;
+        Ok(guard)
     }
 
-    /// B1: release a slot reserved by `try_reserve_slot`. Called from every path
-    /// that drops an allocation (`remove`, `force_remove` — which cover Refresh
-    /// lifetime=0, the expiry sweep, and revocation). Moves (`re_key`) never call it.
-    fn release_slot(&self, tenant_id: Option<&str>) {
-        self.global_count.fetch_sub(1, Ordering::AcqRel);
+    fn release_counters(&self, realm: &str, tenant_id: Option<&str>, username: &str) {
+        let old = self.global_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(old > 0, "global allocation counter underflow");
         if let Some(tid) = tenant_id {
             if let Some(entry) = self.tenant_counts.get(tid) {
-                entry.fetch_sub(1, Ordering::AcqRel);
+                let old = entry.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(old > 0, "tenant allocation counter underflow");
             }
+        }
+        let user_key = (
+            realm.to_string(),
+            tenant_id.map(ToOwned::to_owned),
+            username.to_string(),
+        );
+        if let Some(entry) = self.user_counts.get(&user_key) {
+            let old = entry.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(old > 0, "user allocation counter underflow");
         }
     }
 
@@ -870,24 +1601,40 @@ impl AllocationStore {
         lifetime: u32,
         tenant_id: Option<String>,
     ) -> Result<(), SessionError> {
-        let user_key: UserKey = (tenant_id.clone(), username.clone());
+        self.create_for_identity(
+            client_addr,
+            relay_addr,
+            username,
+            key,
+            lifetime,
+            String::new(),
+            tenant_id,
+        )
+    }
 
-        // Check per-user limit (per-tenant override when the tenant sets one).
-        let max_per_user = self.effective_max_per_user(tenant_id.as_deref());
-        if max_per_user > 0 {
-            let count = self
-                .user_allocations
-                .get(&user_key)
-                .map(|v| v.len())
-                .unwrap_or(0);
-            if count >= max_per_user {
-                return Err(SessionError::MaxAllocationsPerUser);
-            }
-        }
-
-        // B1: atomic global + per-tenant reservation (replaces the old racy
-        // len()/scan checks). Released by remove()/force_remove().
-        self.try_reserve_slot(tenant_id.as_deref())?;
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_for_identity(
+        &self,
+        client_addr: SocketAddr,
+        relay_addr: SocketAddr,
+        username: String,
+        key: Vec<u8>,
+        lifetime: u32,
+        realm: String,
+        tenant_id: Option<String>,
+    ) -> Result<(), SessionError> {
+        let user_key: UserKey = (realm.clone(), tenant_id.clone(), username.clone());
+        let realm_for_write = realm.clone();
+        let effective = self.effective_user_limits(&realm, tenant_id.as_deref(), &username);
+        let runtime = self.runtime.load_full();
+        let mut reservation = self.reserve_counters(
+            &realm,
+            tenant_id.as_deref(),
+            &username,
+            effective.max_allocations,
+            effective.allocations_disabled || effective.lifetime_disabled,
+            runtime.max_allocations,
+        )?;
 
         let now = Instant::now();
         let allocation_id = self.mint_id();
@@ -898,7 +1645,9 @@ impl AllocationStore {
             relay_addr,
             username: username.clone(),
             key,
+            realm,
             tenant_id,
+            transport: TransportProto::Udp,
             permissions: HashMap::new(),
             channel_bindings: HashMap::new(),
             channels_reverse: HashMap::new(),
@@ -919,8 +1668,6 @@ impl AllocationStore {
             use dashmap::mapref::entry::Entry;
             match self.allocations.entry(client_addr) {
                 Entry::Occupied(_) => {
-                    // B1: reserved a slot but lost the insert race — give it back.
-                    self.release_slot(user_key.0.as_deref());
                     return Err(SessionError::AllocationExists);
                 }
                 Entry::Vacant(slot) => {
@@ -937,6 +1684,7 @@ impl AllocationStore {
                 }
             }
         }
+        reservation.commit();
 
         // Emit write-behind event — only after the in-memory state is
         // fully consistent (design doc §9 question 5).
@@ -946,6 +1694,7 @@ impl AllocationStore {
             client_addr,
             relay_addr,
             username: username.clone(),
+            realm: realm_for_write,
             created_at_ms: now_epoch,
             expires_at_ms: now_epoch + (lifetime as u64) * 1000,
             allocation_id,
@@ -994,6 +1743,7 @@ impl AllocationStore {
         client_addr: SocketAddr,
         relay_addr: SocketAddr,
         username: String,
+        realm: String,
         allocation_id: String,
         migration_epoch: u64,
         created_at_ms: u64,
@@ -1008,31 +1758,27 @@ impl AllocationStore {
             return Ok(false);
         }
 
-        let user_key: UserKey = (self.tenant_id_for_port(relay_addr.port()), username.clone());
-        if self.quota.max_per_user > 0 {
-            let count = self
-                .user_allocations
-                .get(&user_key)
-                .map(|v| v.len())
-                .unwrap_or(0);
-            if count >= self.quota.max_per_user {
-                return Err(SessionError::MaxAllocationsPerUser);
-            }
-        }
-
-        // B1: reserve the allocation slot (global + tenant) before the port so a
-        // cap rejection can't leak a port; release it if the port is taken.
-        self.try_reserve_slot(user_key.0.as_deref())?;
+        let tenant_id = self.tenant_id_for_port(relay_addr.port());
+        let user_key: UserKey = (realm.clone(), tenant_id.clone(), username.clone());
+        let effective = self.effective_user_limits(&realm, tenant_id.as_deref(), &username);
+        let runtime = self.runtime.load_full();
+        let mut reservation = self.reserve_counters(
+            &realm,
+            tenant_id.as_deref(),
+            &username,
+            effective.max_allocations,
+            effective.allocations_disabled || effective.lifetime_disabled,
+            runtime.max_allocations,
+        )?;
 
         // Reserve the port. If it's already taken, somebody else (live
         // create()? a duplicate record?) got there first. Route to the owning
         // pool by range so tenant-range ports are reserved in the tenant pool
         // (the base pool would reject an out-of-range port).
         self.pool_for_port(relay_addr.port())
-            .reserve(relay_addr.port())
-            .inspect_err(|_| {
-                self.release_slot(user_key.0.as_deref());
-            })?;
+            .reserve(relay_addr.port())?;
+        let mut port_reservation =
+            PortReservationGuard::new(self.pool_for_port(relay_addr.port()), relay_addr.port());
 
         // Convert wall-clock epoch_ms back into a monotonic `Instant` by
         // anchoring against `Instant::now()`. We lose accuracy of the
@@ -1046,8 +1792,9 @@ impl AllocationStore {
         let expires_at = now_inst + remaining;
 
         // Reconstruct permissions / channel bindings. We need them so
-        // existing clients can continue using their established
-        // permissions without re-issuing CreatePermission immediately.
+        // persisted metadata remains internally consistent. Whether a transport
+        // can reuse it depends on that transport recreating its relay endpoint;
+        // metadata restoration alone does not preserve an active media path.
         let mut perms_map: HashMap<std::net::IpAddr, Permission> = HashMap::new();
         for (peer_ip, perm_expires) in permissions {
             if perm_expires <= now_epoch {
@@ -1083,8 +1830,9 @@ impl AllocationStore {
 
         let alloc = Allocation {
             // Restore the persisted RFC 8016 identity so a MOBILITY-TICKET
-            // issued by the previous owner validates here after a cross-node
-            // failover. A row written before this field existed decodes to an
+            // issued by the previous owner can be validated by migration logic.
+            // This does not recreate the previous owner's live relay socket.
+            // A row written before this field existed decodes to an
             // empty id (serde default) — mint a fresh one then, matching the
             // old node-local behaviour (the old ticket simply won't be
             // portable, which is the pre-RFC-8016 status quo, not a regression).
@@ -1101,8 +1849,10 @@ impl AllocationStore {
             username: username.clone(),
             // See doc comment above — recomputed on first auth.
             key: Vec::new(),
+            realm,
             // Derived from the port's owning pool (tenant ranges are disjoint).
             tenant_id: self.tenant_id_for_port(relay_addr.port()),
+            transport: TransportProto::Udp,
             permissions: perms_map,
             channel_bindings: chan_map,
             channels_reverse: chans_reverse,
@@ -1114,19 +1864,31 @@ impl AllocationStore {
             bandwidth_window_start: Mutex::new(now_inst),
         };
 
-        // Reverse indices: relay→client, (relay_port, channel)→client.
-        self.relay_to_client.insert(relay_addr, client_addr);
-        self.id_to_client
-            .insert(alloc.allocation_id.clone(), client_addr);
-        for (&number, _) in alloc.channel_bindings.iter() {
-            self.channel_to_client
-                .insert((relay_addr.port(), number), client_addr);
+        // Publish all secondary indices and the allocation under one vacant
+        // primary-slot guard. A duplicate persisted row cannot overwrite a live
+        // allocation or leak its counter/port reservations.
+        {
+            use dashmap::mapref::entry::Entry;
+            match self.allocations.entry(client_addr) {
+                Entry::Occupied(_) => return Err(SessionError::AllocationExists),
+                Entry::Vacant(slot) => {
+                    self.relay_to_client.insert(relay_addr, client_addr);
+                    self.id_to_client
+                        .insert(alloc.allocation_id.clone(), client_addr);
+                    for &number in alloc.channel_bindings.keys() {
+                        self.channel_to_client
+                            .insert((relay_addr.port(), number), client_addr);
+                    }
+                    self.user_allocations
+                        .entry(user_key)
+                        .or_default()
+                        .push(client_addr);
+                    slot.insert(alloc);
+                }
+            }
         }
-        self.allocations.insert(client_addr, alloc);
-        self.user_allocations
-            .entry(user_key)
-            .or_default()
-            .push(client_addr);
+        reservation.commit();
+        port_reservation.commit();
 
         tracing::debug!(%client_addr, %relay_addr, %username,
                         remaining_ms = remaining.as_millis() as u64,
@@ -1220,6 +1982,7 @@ impl AllocationStore {
         let relay_port = relay_addr.port();
         let allocation_id = alloc.allocation_id.clone();
         let username = alloc.username.clone();
+        let realm = alloc.realm.clone();
         let tenant_id = alloc.tenant_id.clone();
 
         // Rewrite the owned copy, then re-insert under the new key.
@@ -1239,9 +2002,9 @@ impl AllocationStore {
             self.channel_to_client.insert((relay_port, ch), new_addr);
         }
         self.id_to_client.insert(allocation_id, new_addr);
-        if let Some(mut addrs) = self
-            .user_allocations
-            .get_mut(&(tenant_id.clone(), username.clone()))
+        if let Some(mut addrs) =
+            self.user_allocations
+                .get_mut(&(realm, tenant_id.clone(), username.clone()))
         {
             for a in addrs.iter_mut() {
                 if a == old_addr {
@@ -1261,6 +2024,18 @@ impl AllocationStore {
     }
 
     /// Add or refresh a permission (5 min lifetime per RFC).
+    /// Mark an allocation's relayed transport (RFC 6062 TCP). Called right
+    /// after creating a TCP allocation. Returns false if it's already gone.
+    pub fn set_transport(&self, client_addr: &SocketAddr, transport: TransportProto) -> bool {
+        match self.allocations.get_mut(client_addr) {
+            Some(mut alloc) => {
+                alloc.transport = transport;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn add_permission(
         &self,
         client_addr: &SocketAddr,
@@ -1385,7 +2160,14 @@ impl AllocationStore {
             .allocations
             .get(client_addr)
             .ok_or(SessionError::NotFound)?;
-        let limit = self.bandwidth_limit_for(alloc.tenant_id.as_deref());
+        let (limit, disabled) = self.bandwidth_policy_for_user(
+            &alloc.realm,
+            alloc.tenant_id.as_deref(),
+            &alloc.username,
+        );
+        if disabled {
+            return Err(SessionError::BandwidthExceeded(alloc.username.clone()));
+        }
         if limit == 0 {
             return Ok(()); // No limit
         }
@@ -1430,7 +2212,7 @@ impl AllocationStore {
         relay_addr: SocketAddr,
     ) -> Result<(), SessionError> {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
-            self.release_slot(alloc.tenant_id.as_deref());
+            self.release_counters(&alloc.realm, alloc.tenant_id.as_deref(), &alloc.username);
             self.accrue_tenant_traffic(&alloc);
             for &ch in alloc.channel_bindings.keys() {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
@@ -1441,10 +2223,11 @@ impl AllocationStore {
                 .release(relay_addr.port());
 
             // Remove from user tracking
-            if let Some(mut addrs) = self
-                .user_allocations
-                .get_mut(&(alloc.tenant_id.clone(), alloc.username.clone()))
-            {
+            if let Some(mut addrs) = self.user_allocations.get_mut(&(
+                alloc.realm.clone(),
+                alloc.tenant_id.clone(),
+                alloc.username.clone(),
+            )) {
                 addrs.retain(|a| a != client_addr);
             }
 
@@ -1556,17 +2339,19 @@ impl AllocationStore {
         }
 
         self.user_allocations.retain(|_, v| !v.is_empty());
+        self.user_counts
+            .retain(|_, v| v.load(Ordering::Acquire) > 0);
         count
     }
 
     /// Get count of allocations for a username.
     pub fn user_allocation_count(&self, username: &str) -> usize {
-        // B4: tracking is keyed by (tenant, username); keep the bare-username
-        // contract by summing this user across all tenants.
-        self.user_allocations
+        // Keep the legacy bare-username query by summing across realms and
+        // tenants. Admission control itself always uses the canonical key.
+        self.user_counts
             .iter()
-            .filter(|e| e.key().1 == username)
-            .map(|e| e.value().len())
+            .filter(|e| e.key().2 == username)
+            .map(|e| e.value().load(Ordering::Acquire))
             .sum()
     }
 
@@ -1580,7 +2365,7 @@ impl AllocationStore {
 
     pub fn force_remove(&self, client_addr: &std::net::SocketAddr) {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
-            self.release_slot(alloc.tenant_id.as_deref());
+            self.release_counters(&alloc.realm, alloc.tenant_id.as_deref(), &alloc.username);
             self.accrue_tenant_traffic(&alloc);
             self.relay_to_client.remove(&alloc.relay_addr);
             self.id_to_client.remove(&alloc.allocation_id);
@@ -1590,10 +2375,11 @@ impl AllocationStore {
             }
             let relay_port = alloc.relay_addr.port();
             self.pool_for_port(relay_port).release(relay_port);
-            if let Some(mut user_allocs) = self
-                .user_allocations
-                .get_mut(&(alloc.tenant_id.clone(), alloc.username.clone()))
-            {
+            if let Some(mut user_allocs) = self.user_allocations.get_mut(&(
+                alloc.realm.clone(),
+                alloc.tenant_id.clone(),
+                alloc.username.clone(),
+            )) {
                 user_allocs.retain(|a| a != client_addr);
             }
             self.emit_write(WriteOp::Remove { relay_port });
@@ -1684,6 +2470,62 @@ mod tests_write_behind {
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
 
+    /// P0 #16: `resync_all` re-emits the full live state (Create + one event
+    /// per permission + one per channel) so a reconcile pass can repair a
+    /// backend that dropped write-behind events.
+    #[tokio::test]
+    async fn resync_all_reemits_live_state() {
+        let store = make_store();
+        let (tx, mut rx) = mpsc::channel(64);
+        store.attach_writer(tx);
+
+        let c = client(1002);
+        let r = relay(40002);
+        let peer = SocketAddr::new("5.6.7.8".parse().unwrap(), 9000);
+        store.create(c, r, "carol".into(), vec![], 600).unwrap();
+        store
+            .add_permission(&c, "1.2.3.4".parse().unwrap())
+            .unwrap();
+        store.add_channel(&c, 0x4000, peer).unwrap();
+
+        // Drain the events emitted during setup.
+        while rx.try_recv().is_ok() {}
+
+        // Reconciliation re-emit of the authoritative live state.
+        store.resync_all();
+
+        let (mut creates, mut perms, mut chans, mut others) = (0, 0, 0, 0);
+        while let Ok(op) = rx.try_recv() {
+            match op {
+                WriteOp::Create {
+                    relay_port,
+                    username,
+                    ..
+                } => {
+                    assert_eq!(relay_port, 40002);
+                    assert_eq!(username, "carol");
+                    creates += 1;
+                }
+                WriteOp::Permission { relay_port, .. } => {
+                    assert_eq!(relay_port, 40002);
+                    perms += 1;
+                }
+                WriteOp::Channel {
+                    relay_port, number, ..
+                } => {
+                    assert_eq!(relay_port, 40002);
+                    assert_eq!(number, 0x4000);
+                    chans += 1;
+                }
+                _ => others += 1,
+            }
+        }
+        assert_eq!(creates, 1, "exactly one Create re-emitted");
+        assert_eq!(perms, 2, "explicit + channel-implicit permissions");
+        assert_eq!(chans, 1, "one channel binding");
+        assert_eq!(others, 0, "resync emits no Refresh/Remove/ReKey");
+    }
+
     /// A full lifecycle should emit Create, Refresh, Permission, Channel
     /// (+Permission), Remove — in that order. Note ChannelBind emits TWO
     /// events (Permission + Channel) per RFC implicit-permission rule.
@@ -1713,6 +2555,7 @@ mod tests_write_behind {
                 WriteOp::ReKey { .. } => "ReKey",
                 WriteOp::Permission { .. } => "Permission",
                 WriteOp::Channel { .. } => "Channel",
+                WriteOp::Barrier { .. } => "Barrier",
             }
         }
 
@@ -1845,6 +2688,7 @@ mod tests_write_behind {
                 client(3000),
                 relay(40050),
                 "alice".into(),
+                "turna".into(),
                 "rehy-alice".into(),
                 0,
                 now.saturating_sub(10_000),
@@ -1870,6 +2714,7 @@ mod tests_write_behind {
                 client(3001),
                 relay(40051),
                 "bob".into(),
+                "turna".into(),
                 "rehy-bob".into(),
                 0,
                 epoch_ms().saturating_sub(10_000),
@@ -1895,6 +2740,7 @@ mod tests_write_behind {
                 client(3002),
                 relay(40052),
                 "carol".into(),
+                "turna".into(),
                 "rehy-carol".into(),
                 0,
                 now.saturating_sub(120_000),
@@ -1925,6 +2771,7 @@ mod tests_write_behind {
                 client(3003),
                 relay(40053),
                 "dave".into(),
+                "turna".into(),
                 "rehy-dave".into(),
                 0,
                 now.saturating_sub(10_000),
@@ -1938,6 +2785,7 @@ mod tests_write_behind {
             client(3004),
             relay(40053),
             "eve".into(),
+            "turna".into(),
             "rehy-eve".into(),
             0,
             now.saturating_sub(10_000),
@@ -1964,6 +2812,7 @@ mod tests_write_behind {
                 client(3005),
                 relay(40054),
                 "frank".into(),
+                "turna".into(),
                 "rehy-frank".into(),
                 0,
                 now.saturating_sub(10_000),
@@ -2270,7 +3119,7 @@ mod tenant_quota_tests {
     async fn bandwidth_limit_resolves_tenant_then_global() {
         let store = AllocationStore::new(40000, 40099, 10_000)
             .with_quota(BandwidthQuota {
-                max_bytes_per_sec: 1000,
+                max_bytes_per_sec_per_allocation: 1000,
                 max_per_user: 0,
             })
             .with_tenant_pool(
@@ -2279,7 +3128,7 @@ mod tenant_quota_tests {
                 50099,
                 0,
                 BandwidthQuota {
-                    max_bytes_per_sec: 500,
+                    max_bytes_per_sec_per_allocation: 500,
                     max_per_user: 0,
                 },
             )
@@ -2289,7 +3138,7 @@ mod tenant_quota_tests {
                 51099,
                 0,
                 BandwidthQuota {
-                    max_bytes_per_sec: 0,
+                    max_bytes_per_sec_per_allocation: 0,
                     max_per_user: 0,
                 },
             );
@@ -2300,12 +3149,101 @@ mod tenant_quota_tests {
         assert_eq!(store.bandwidth_limit_for(Some("ghost")), 1000); // unknown → global
     }
 
+    #[test]
+    fn bandwidth_budget_is_per_allocation_not_aggregate() {
+        // §5: the effective bandwidth policy (global→tenant→user inheritance)
+        // yields a PER-ALLOCATION budget. Two allocations of the SAME user each
+        // get the full budget against their OWN window; there is no shared,
+        // user-wide aggregate bucket.
+        let store = AllocationStore::new(40000, 40099, 10_000).with_quota(BandwidthQuota {
+            max_bytes_per_sec_per_allocation: 1000,
+            max_per_user: 0,
+        });
+        // "alice" has no narrower override, so she inherits the global budget.
+        let limit = store.bandwidth_limit_for_user("example.org", None, "alice");
+        assert_eq!(limit, 1000, "effective per-allocation budget");
+
+        let client_a = addr(5000);
+        let client_b = addr(5001);
+        store
+            .create(client_a, addr(40000), "alice".into(), vec![1], 600)
+            .unwrap();
+        store
+            .create(client_b, addr(40001), "alice".into(), vec![2], 600)
+            .unwrap();
+
+        // Drain allocation A past its own per-allocation budget.
+        {
+            let a = store.allocations.get(&client_a).unwrap();
+            a.add_bytes(limit + 1);
+            assert!(
+                a.check_bandwidth(limit).is_err(),
+                "A exceeds its own per-allocation budget"
+            );
+        }
+        // Allocation B is untouched: it still has its FULL independent budget.
+        // A shared aggregate bucket, already drained by A, would wrongly deny B.
+        {
+            let b = store.allocations.get(&client_b).unwrap();
+            assert!(
+                b.check_bandwidth(limit).is_ok(),
+                "B has an independent per-allocation budget"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_limit_setters_take_effect_atomically() {
+        let store = AllocationStore::new(40000, 40999, 10_000).with_quota(BandwidthQuota {
+            max_bytes_per_sec_per_allocation: 1000,
+            max_per_user: 100,
+        });
+        // Seeded from with_quota / new.
+        assert_eq!(store.bandwidth_limit_for(None), 1000);
+        assert_eq!(store.effective_max_per_user(None), 100);
+        assert_eq!(store.live_limits(), (1000, 100, 10_000));
+
+        // S5: publish new per-user limits at runtime (shared &self).
+        store.set_user_quota(500, 5);
+        assert_eq!(store.bandwidth_limit_for(None), 500);
+        assert_eq!(store.effective_max_per_user(None), 5);
+
+        // S4: publish a new global allocation cap at runtime.
+        store.set_max_allocations(42);
+        assert_eq!(store.live_limits(), (500, 5, 42));
+
+        // Tenant overrides are unaffected by global runtime changes.
+        assert_eq!(store.bandwidth_limit_for(Some("acme")), 500); // no tenant here → global
+
+        // S4-3: the node handler's commit point publishes a whole snapshot in
+        // one atomic swap, carrying its version; readers observe one consistent
+        // snapshot (never a torn mix).
+        store.publish_runtime(RuntimeLimits {
+            version: 7,
+            max_bytes_per_sec_per_allocation: 2000,
+            max_per_user: 9,
+            max_allocations: 123,
+        });
+        let snap = store.runtime_snapshot();
+        assert_eq!(snap.version, 7);
+        assert_eq!(
+            (
+                snap.max_bytes_per_sec_per_allocation,
+                snap.max_per_user,
+                snap.max_allocations
+            ),
+            (2000, 9, 123)
+        );
+        assert_eq!(store.live_limits(), (2000, 9, 123));
+        assert_eq!(store.bandwidth_limit_for(None), 2000);
+    }
+
     #[tokio::test]
     async fn per_tenant_max_per_user_overrides_global() {
         // Global per-user cap disabled; acme caps at 2 per user.
         let store = AllocationStore::new(40000, 40999, 10_000)
             .with_quota(BandwidthQuota {
-                max_bytes_per_sec: 0,
+                max_bytes_per_sec_per_allocation: 0,
                 max_per_user: 0,
             })
             .with_tenant_pool(
@@ -2314,7 +3252,7 @@ mod tenant_quota_tests {
                 50999,
                 0,
                 BandwidthQuota {
-                    max_bytes_per_sec: 0,
+                    max_bytes_per_sec_per_allocation: 0,
                     max_per_user: 2,
                 },
             );
@@ -2595,7 +3533,7 @@ mod b4_tenant_scoped_user_key_tests {
         assert_eq!(
             store
                 .user_allocations
-                .get(&(Some("A".to_string()), "alice".to_string()))
+                .get(&(String::new(), Some("A".to_string()), "alice".to_string()))
                 .map(|v| v.len())
                 .unwrap_or(0),
             1
@@ -2603,7 +3541,7 @@ mod b4_tenant_scoped_user_key_tests {
         assert_eq!(
             store
                 .user_allocations
-                .get(&(Some("B".to_string()), "alice".to_string()))
+                .get(&(String::new(), Some("B".to_string()), "alice".to_string()))
                 .map(|v| v.len())
                 .unwrap_or(0),
             1
@@ -2672,6 +3610,421 @@ mod b1_atomic_quota_tests {
         assert!(store
             .create_for_tenant(addr(50001), addr(40001), "u".into(), vec![1], 600, None)
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod s5_runtime_limits_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Barrier};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn concurrent_user_limit_one_admits_exactly_one() {
+        let store = Arc::new(AllocationStore::new(40000, 40100, 100));
+        store.publish_runtime(RuntimeLimits {
+            version: 1,
+            max_bytes_per_sec_per_allocation: 0,
+            max_per_user: 1,
+            max_allocations: 100,
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for i in 0..2u16 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.create_for_identity(
+                    addr(50000 + i),
+                    addr(40000 + i),
+                    "alice".into(),
+                    vec![1],
+                    600,
+                    "example.org".into(),
+                    Some("tenant-a".into()),
+                )
+            }));
+        }
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(admitted, 1);
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.current_user_usage("example.org", Some("tenant-a"), "alice"),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_insert_rolls_back_all_usage_reservations() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        store.publish_runtime(RuntimeLimits {
+            version: 1,
+            max_bytes_per_sec_per_allocation: 0,
+            max_per_user: 10,
+            max_allocations: 100,
+        });
+        let client = addr(50000);
+        store
+            .create_for_identity(
+                client,
+                addr(40000),
+                "alice".into(),
+                vec![1],
+                600,
+                "example.org".into(),
+                Some("tenant-a".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.create_for_identity(
+                client,
+                addr(40001),
+                "alice".into(),
+                vec![1],
+                600,
+                "example.org".into(),
+                Some("tenant-a".into()),
+            ),
+            Err(SessionError::AllocationExists)
+        ));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.global_count.load(Ordering::Acquire), 1);
+        assert_eq!(store.current_tenant_usage("tenant-a"), 1);
+        assert_eq!(
+            store.current_user_usage("example.org", Some("tenant-a"), "alice"),
+            1
+        );
+    }
+
+    #[test]
+    fn rehydrate_port_failure_rolls_back_usage_reservations() {
+        let store = AllocationStore::new(40000, 40000, 100);
+        store.ports.reserve(40000).unwrap();
+        let now = epoch_ms();
+        let result = store.rehydrate(
+            addr(50000),
+            addr(40000),
+            "alice".into(),
+            "example.org".into(),
+            "alloc-1".into(),
+            0,
+            now,
+            now + 60_000,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        assert!(result.is_err());
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.global_count.load(Ordering::Acquire), 0);
+        assert_eq!(store.current_user_usage("example.org", None, "alice"), 0);
+    }
+
+    #[test]
+    fn duplicate_remove_never_underflows_usage() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        let client = addr(50000);
+        let relay = addr(40000);
+        store
+            .create_for_identity(
+                client,
+                relay,
+                "alice".into(),
+                vec![1],
+                600,
+                "example.org".into(),
+                None,
+            )
+            .unwrap();
+        store.remove(&client, relay).unwrap();
+        store.remove(&client, relay).unwrap();
+        assert_eq!(store.global_count.load(Ordering::Acquire), 0);
+        assert_eq!(store.current_user_usage("example.org", None, "alice"), 0);
+    }
+
+    #[test]
+    fn global_limit_usage_reports_highest_user_not_total_allocations() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        for (client, relay, username) in [
+            (50000, 40000, "alice"),
+            (50001, 40001, "alice"),
+            (50002, 40002, "bob"),
+        ] {
+            store
+                .create_for_identity(
+                    addr(client),
+                    addr(relay),
+                    username.into(),
+                    vec![1],
+                    600,
+                    "example.org".into(),
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.max_user_usage(), 2);
+    }
+
+    #[test]
+    fn same_username_is_isolated_by_realm() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        store.publish_runtime(RuntimeLimits {
+            version: 1,
+            max_bytes_per_sec_per_allocation: 0,
+            max_per_user: 1,
+            max_allocations: 100,
+        });
+        for (client, relay, realm) in [(50000, 40000, "a.example"), (50001, 40001, "b.example")] {
+            store
+                .create_for_identity(
+                    addr(client),
+                    addr(relay),
+                    "alice".into(),
+                    vec![1],
+                    600,
+                    realm.into(),
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            store.create_for_identity(
+                addr(50002),
+                addr(40002),
+                "alice".into(),
+                vec![1],
+                600,
+                "a.example".into(),
+                None,
+            ),
+            Err(SessionError::MaxAllocationsPerUser)
+        ));
+        assert_eq!(store.current_user_usage("a.example", None, "alice"), 1);
+        assert_eq!(store.current_user_usage("b.example", None, "alice"), 1);
+    }
+
+    #[test]
+    fn user_then_tenant_then_global_precedence_is_field_independent() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        store.publish_runtime(RuntimeLimits {
+            version: 1,
+            max_bytes_per_sec_per_allocation: 1_000,
+            max_per_user: 10,
+            max_allocations: 100,
+        });
+        let global = UserLimitsOverride {
+            max_allocations: Some(LimitU32 {
+                mode: LimitMode::Value,
+                value: 8,
+            }),
+            max_bytes_per_sec_per_allocation: Some(LimitU64 {
+                mode: LimitMode::Value,
+                value: 800,
+            }),
+            max_lifetime_secs: None,
+        };
+        store
+            .publish_user_limits(
+                store
+                    .limits_snapshot_with_override("global", "", "", "", global)
+                    .unwrap(),
+            )
+            .unwrap();
+        let tenant = UserLimitsOverride {
+            max_allocations: Some(LimitU32 {
+                mode: LimitMode::Value,
+                value: 4,
+            }),
+            max_bytes_per_sec_per_allocation: None,
+            max_lifetime_secs: None,
+        };
+        store
+            .publish_user_limits(
+                store
+                    .limits_snapshot_with_override("tenant", "example.org", "tenant-a", "", tenant)
+                    .unwrap(),
+            )
+            .unwrap();
+        let user = UserLimitsOverride {
+            max_allocations: None,
+            max_bytes_per_sec_per_allocation: Some(LimitU64 {
+                mode: LimitMode::Value,
+                value: 200,
+            }),
+            max_lifetime_secs: None,
+        };
+        store
+            .publish_user_limits(
+                store
+                    .limits_snapshot_with_override("user", "example.org", "tenant-a", "alice", user)
+                    .unwrap(),
+            )
+            .unwrap();
+        let effective = store.effective_user_limits("example.org", Some("tenant-a"), "alice");
+        assert_eq!(effective.max_allocations, 4);
+        assert_eq!(effective.max_bytes_per_sec_per_allocation, 200);
+    }
+
+    #[test]
+    fn user_limits_generation_overflow_errors_without_panic() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        // Seed the cache generation at the u64 ceiling.
+        store
+            .user_limits
+            .store(std::sync::Arc::new(UserLimitsSnapshot {
+                generation: u64::MAX,
+                ..UserLimitsSnapshot::empty()
+            }));
+        // A changed snapshot cannot advance past u64::MAX → error, no publish, no
+        // panic; the current snapshot is left intact.
+        let changed = UserLimitsSnapshot {
+            bootstrap_max_lifetime_secs: 123,
+            ..UserLimitsSnapshot::empty()
+        };
+        let err = store.publish_user_limits(changed).unwrap_err();
+        assert!(matches!(err, SessionError::CacheGenerationOverflow));
+        let after = store.user_limits_snapshot();
+        assert_eq!(after.generation, u64::MAX);
+        assert_eq!(after.bootstrap_max_lifetime_secs, 0);
+    }
+
+    #[test]
+    fn generation_bumps_only_on_actual_change() {
+        let store = AllocationStore::new(40000, 40100, 100);
+        let g0 = store.user_limits_snapshot().generation;
+        let changed = UserLimitsSnapshot {
+            bootstrap_max_lifetime_secs: 100,
+            ..UserLimitsSnapshot::empty()
+        };
+        // An actual content change bumps the generation once.
+        store.publish_user_limits(changed.clone()).unwrap();
+        let g1 = store.user_limits_snapshot().generation;
+        assert_eq!(g1, g0 + 1, "actual change bumps generation");
+        // Republishing identical content is a no-op: no store, no bump.
+        store.publish_user_limits(changed).unwrap();
+        let g2 = store.user_limits_snapshot().generation;
+        assert_eq!(g2, g1, "no-op publish does not bump generation");
+    }
+
+    #[test]
+    fn node_ceiling_is_not_bypassed_by_user_unlimited() {
+        // §7-B: a finite node bandwidth ceiling is a hard upper bound; a user
+        // UNLIMITED override is capped to it, not honoured as unlimited.
+        let store = AllocationStore::new(40000, 40099, 10_000).with_quota(BandwidthQuota {
+            max_bytes_per_sec_per_allocation: 1000,
+            max_per_user: 0,
+        });
+        store
+            .publish_user_limits(
+                store
+                    .limits_snapshot_with_override(
+                        "user",
+                        "example.org",
+                        "",
+                        "alice",
+                        UserLimitsOverride {
+                            max_bytes_per_sec_per_allocation: Some(LimitU64 {
+                                mode: LimitMode::Unlimited,
+                                value: 0,
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let eff = store.effective_user_limits("example.org", None, "alice");
+        assert_eq!(
+            eff.max_bytes_per_sec_per_allocation, 1000,
+            "capped to node ceiling"
+        );
+        assert!(!eff.bandwidth_disabled);
+        assert!(eff
+            .capped_fields
+            .iter()
+            .any(|f| f == "max_bytes_per_sec_per_allocation"));
+    }
+
+    #[test]
+    fn requested_allocation_cap_above_ceiling_is_capped() {
+        // §7-B: a requested per-user allocation cap above the finite node ceiling
+        // is clamped to the ceiling; enforcement uses the capped value.
+        let store = AllocationStore::new(40000, 40099, 10_000).with_quota(BandwidthQuota {
+            max_bytes_per_sec_per_allocation: 0,
+            max_per_user: 5,
+        });
+        store
+            .publish_user_limits(
+                store
+                    .limits_snapshot_with_override(
+                        "user",
+                        "example.org",
+                        "",
+                        "alice",
+                        UserLimitsOverride {
+                            max_allocations: Some(LimitU32 {
+                                mode: LimitMode::Value,
+                                value: 50,
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let eff = store.effective_user_limits("example.org", None, "alice");
+        assert_eq!(
+            eff.max_allocations, 5,
+            "requested 50 capped to node ceiling 5"
+        );
+        assert!(eff.capped_fields.iter().any(|f| f == "max_allocations"));
+    }
+
+    #[test]
+    fn runtime_readers_never_observe_a_mixed_snapshot() {
+        let store = Arc::new(AllocationStore::new(40000, 40100, 100));
+        let a = RuntimeLimits {
+            version: 10,
+            max_bytes_per_sec_per_allocation: 100,
+            max_per_user: 1,
+            max_allocations: 10,
+        };
+        let b = RuntimeLimits {
+            version: 20,
+            max_bytes_per_sec_per_allocation: 200,
+            max_per_user: 2,
+            max_allocations: 20,
+        };
+        store.publish_runtime(a.clone());
+        let writer_store = Arc::clone(&store);
+        let writer = std::thread::spawn(move || {
+            for i in 0..20_000 {
+                writer_store.publish_runtime(if i % 2 == 0 { a.clone() } else { b.clone() });
+            }
+        });
+        for _ in 0..20_000 {
+            let snapshot = store.runtime_snapshot();
+            let tuple = (
+                snapshot.version,
+                snapshot.max_bytes_per_sec_per_allocation,
+                snapshot.max_per_user,
+                snapshot.max_allocations,
+            );
+            assert!(
+                tuple == (10, 100, 1, 10) || tuple == (20, 200, 2, 20),
+                "mixed runtime snapshot observed: {tuple:?}"
+            );
+        }
+        writer.join().unwrap();
     }
 }
 

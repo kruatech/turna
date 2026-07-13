@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 
 use crate::hash_ring::ClusterNode;
@@ -104,6 +105,15 @@ impl GossipNode {
 pub async fn run_gossip<F>(
     cfg: GossipConfig,
     on_change: F,
+    // #6: set true when this node enters drain. While set, every periodic
+    // frame advertises `leaving` so peers evict this node from their hash ring
+    // at drain start (not only at final shutdown), stopping new-client
+    // redirects here and preventing a drain redirect loop.
+    draining: Arc<AtomicBool>,
+    // #6: pulsed the instant drain begins (false→true) so the leaving frame is
+    // sent immediately rather than on the next periodic tick — closing the
+    // up-to-one-interval window where peers could still route new clients here.
+    drain_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()>
 where
@@ -127,7 +137,11 @@ where
     let mut ticker = tokio::time::interval(interval);
     let mut seq = 0u64;
     let mut peers: HashMap<String, GossipNode> = HashMap::new();
-    let mut tombstones: HashMap<String, Instant> = HashMap::new();
+    // Tombstone: node_id -> (last_leaving_seq, expires_at). The seq lets a newer
+    // authenticated `leaving` EXTEND suppression even after the peer is removed,
+    // so a draining node can't be resurrected by stale indirect gossip while it
+    // keeps advertising leaving.
+    let mut tombstones: HashMap<String, (u64, Instant)> = HashMap::new();
     let mut last_topology: Vec<ClusterNode> = Vec::new();
     let mut rx_buf = vec![0u8; 65_535];
 
@@ -156,7 +170,12 @@ where
         tokio::select! {
             _ = ticker.tick() => {
                 seq = seq.wrapping_add(1);
-                if let Some(frame) = encode_frame(&cfg, seq, &peers, false) {
+                // #6: keep advertising `leaving` on every tick while draining
+                // (the initial one is sent immediately by the drain_notify branch
+                // below; this sustains it so a peer that missed the first frame
+                // still learns of it).
+                let leaving = draining.load(Ordering::Relaxed);
+                if let Some(frame) = encode_frame(&cfg, seq, &peers, leaving) {
                     broadcast(&socket, &cfg.seeds, &peers, &frame).await;
                 }
 
@@ -169,9 +188,21 @@ where
                     }
                     live
                 });
-                tombstones.retain(|_, until| *until > now);
+                tombstones.retain(|_, (_, until)| *until > now);
                 if peers.len() != before {
                     publish_topology(&cfg, &peers, &mut last_topology, &on_change);
+                }
+            }
+            _ = drain_notify.notified() => {
+                // #6: drain just began — advertise `leaving` at once instead of
+                // waiting for the next periodic tick, so peers evict this node
+                // from their hash ring within one round-trip and stop redirecting
+                // new clients here during the grace window.
+                if draining.load(Ordering::Relaxed) {
+                    seq = seq.wrapping_add(1);
+                    if let Some(frame) = encode_frame(&cfg, seq, &peers, true) {
+                        broadcast(&socket, &cfg.seeds, &peers, &frame).await;
+                    }
                 }
             }
             recv = socket.recv_from(&mut rx_buf) => {
@@ -338,7 +369,7 @@ async fn broadcast(
 fn observe_peer(
     local_id: &str,
     peers: &mut HashMap<String, GossipNode>,
-    tombstones: &mut HashMap<String, Instant>,
+    tombstones: &mut HashMap<String, (u64, Instant)>,
     node_id: &str,
     turn_addr: SocketAddr,
     gossip_addr: SocketAddr,
@@ -404,7 +435,7 @@ fn observe_peer(
 fn apply_leaving(
     local_id: &str,
     peers: &mut HashMap<String, GossipNode>,
-    tombstones: &mut HashMap<String, Instant>,
+    tombstones: &mut HashMap<String, (u64, Instant)>,
     node_id: &str,
     seq: u64,
     tombstone_grace: Duration,
@@ -412,15 +443,35 @@ fn apply_leaving(
     if node_id == local_id {
         return false;
     }
-    let fresh = peers.get(node_id).is_some_and(|node| seq > node.seq);
-    if !fresh {
-        debug!(%node_id, seq, "ignoring stale or unknown gossip leaving");
+    // Case 1: the node is still a live peer — evict it on a fresh seq and plant a
+    // seq-stamped tombstone.
+    if let Some(node) = peers.get(node_id) {
+        if seq > node.seq {
+            peers.remove(node_id);
+            tombstones.insert(node_id.to_string(), (seq, Instant::now() + tombstone_grace));
+            info!(%node_id, seq, "cluster gossip peer left");
+            return true;
+        }
+        debug!(%node_id, seq, "ignoring stale gossip leaving");
         return false;
     }
-    peers.remove(node_id);
-    tombstones.insert(node_id.to_string(), Instant::now() + tombstone_grace);
-    info!(%node_id, seq, "cluster gossip peer left");
-    true
+    // Case 2: the node was already evicted but a tombstone still exists. A newer
+    // authenticated `leaving` EXTENDS it, so the draining node stays suppressed
+    // against stale indirect gossip for as long as it keeps advertising leaving.
+    // Topology is unchanged (the peer is already absent) → return false.
+    if let Some((tseq, until)) = tombstones.get_mut(node_id) {
+        if seq > *tseq {
+            *tseq = seq;
+            *until = Instant::now() + tombstone_grace;
+            debug!(%node_id, seq, "extending gossip tombstone on repeated leaving");
+        }
+        return false;
+    }
+    // Case 3: unknown, untombstoned node — do nothing. Planting a tombstone for a
+    // node we have never seen would be a replay vector (an attacker could suppress
+    // arbitrary ids); a genuinely stale indirect entry self-heals via the reaper.
+    debug!(%node_id, seq, "ignoring leaving for unknown, untombstoned node");
+    false
 }
 
 fn publish_topology(
@@ -525,7 +576,7 @@ mod tests {
         let mut tomb = HashMap::new();
         tomb.insert(
             "node-b".to_string(),
-            Instant::now() + Duration::from_secs(60),
+            (5u64, Instant::now() + Duration::from_secs(60)),
         );
         let c1 = observe_peer(
             "node-a",
@@ -598,6 +649,105 @@ mod tests {
         );
     }
 
+    // #6 regression: once a draining node's `leaving` is applied, the tombstone
+    // suppresses INDIRECT re-learning (a third node still gossiping the draining
+    // node in its peer list) for the whole grace window, so the draining node is
+    // not silently re-inserted into the ring behind its back. Its own DIRECT
+    // frames are what would re-admit it — and while draining it sends
+    // `leaving=true` on every frame, so it stays out. This is the anti-loop
+    // guarantee: a draining node cannot be routed to via stale indirect gossip.
+    #[test]
+    fn draining_peer_not_reindexed_via_indirect_gossip_during_grace() {
+        let mut peers = HashMap::new();
+        let mut tomb = HashMap::new();
+        let grace = Duration::from_secs(5);
+
+        observe_peer(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            10,
+            true,
+        );
+        assert!(peers.contains_key("node-b"));
+
+        // Draining node advertises leaving (its immediate frame). Peer evicts it.
+        assert!(apply_leaving(
+            "node-a", &mut peers, &mut tomb, "node-b", 11, grace
+        ));
+        assert!(!peers.contains_key("node-b"), "evicted on leaving");
+
+        // A third node's peer list still mentions node-b (indirect, direct=false)
+        // at a higher seq. The tombstone must suppress this so node-b is not
+        // re-admitted to the ring while it drains.
+        let readmitted = observe_peer(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            12,
+            false,
+        );
+        assert!(!readmitted, "tombstone must suppress indirect re-admission");
+        assert!(
+            !peers.contains_key("node-b"),
+            "draining node must stay out of the ring against stale indirect gossip"
+        );
+    }
+
+    // #6 (seq-aware tombstone): a repeated, newer `leaving` for an already-removed
+    // node extends the tombstone so suppression outlives the initial grace as long
+    // as the draining node keeps advertising leaving; a stale repeat does not move
+    // it; and an unknown/untombstoned node is never tombstoned (replay guard).
+    #[test]
+    fn repeated_leaving_extends_tombstone_after_peer_removed() {
+        let mut peers = HashMap::new();
+        let mut tomb = HashMap::new();
+        let grace = Duration::from_secs(5);
+        observe_peer(
+            "node-a",
+            &mut peers,
+            &mut tomb,
+            "node-b",
+            addr(3479),
+            addr(7947),
+            10,
+            true,
+        );
+        assert!(apply_leaving(
+            "node-a", &mut peers, &mut tomb, "node-b", 11, grace
+        ));
+        assert_eq!(tomb.get("node-b").unwrap().0, 11);
+
+        // Newer leaving for the already-removed node extends it (topology
+        // unchanged → returns false, but the seq advances).
+        assert!(!apply_leaving(
+            "node-a", &mut peers, &mut tomb, "node-b", 15, grace
+        ));
+        assert_eq!(
+            tomb.get("node-b").unwrap().0,
+            15,
+            "newer leaving must advance the tombstone seq"
+        );
+
+        // Stale repeat does not move it.
+        assert!(!apply_leaving(
+            "node-a", &mut peers, &mut tomb, "node-b", 12, grace
+        ));
+        assert_eq!(tomb.get("node-b").unwrap().0, 15);
+
+        // Unknown, untombstoned node is never tombstoned.
+        assert!(!apply_leaving(
+            "node-a", &mut peers, &mut tomb, "node-z", 99, grace
+        ));
+        assert!(!tomb.contains_key("node-z"));
+    }
+
     #[test]
     fn leaving_for_unknown_node_is_ignored() {
         let mut peers = HashMap::new();
@@ -654,6 +804,149 @@ mod tests {
         let signed = sign_frame(None, b"payload".to_vec());
         assert_eq!(signed, b"payload");
         assert_eq!(verify_frame(None, b"payload"), Some(&b"payload"[..]));
+    }
+
+    #[tokio::test]
+    async fn socket_loops_propagate_immediate_drain_and_allow_clean_rejoin() {
+        fn free_udp_addr() -> SocketAddr {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.local_addr().unwrap()
+        }
+
+        async fn wait_for(
+            rx: &mut watch::Receiver<Vec<ClusterNode>>,
+            node_id: &str,
+            present: bool,
+            within: Duration,
+        ) {
+            tokio::time::timeout(within, async {
+                loop {
+                    let found = rx.borrow().iter().any(|node| node.node_id == node_id);
+                    if found == present {
+                        return;
+                    }
+                    rx.changed().await.expect("gossip topology sender dropped");
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "node {node_id} did not become present={present}; topology={:?}",
+                    rx.borrow().as_slice()
+                )
+            });
+        }
+
+        let gossip_a = free_udp_addr();
+        let gossip_b = free_udp_addr();
+        let secret = b"socket-level-gossip-test".to_vec();
+        let interval = Duration::from_millis(100);
+        let timeout = Duration::from_secs(30);
+
+        let config_a = GossipConfig {
+            node_id: "node-a".into(),
+            turn_addr: free_udp_addr(),
+            bind_addr: gossip_a,
+            seeds: vec![gossip_b.to_string()],
+            interval,
+            timeout,
+            cluster_name: "socket-test".into(),
+            advertise_addr: gossip_a,
+            secret: Some(secret.clone()),
+        };
+        let config_b = GossipConfig {
+            node_id: "node-b".into(),
+            turn_addr: free_udp_addr(),
+            bind_addr: gossip_b,
+            seeds: vec![gossip_a.to_string()],
+            interval,
+            timeout,
+            cluster_name: "socket-test".into(),
+            advertise_addr: gossip_b,
+            secret: Some(secret.clone()),
+        };
+
+        let draining_a = Arc::new(AtomicBool::new(false));
+        let draining_b = Arc::new(AtomicBool::new(false));
+        let notify_a = Arc::new(Notify::new());
+        let notify_b = Arc::new(Notify::new());
+        let (shutdown_a_tx, shutdown_a_rx) = watch::channel(false);
+        let (shutdown_b_tx, shutdown_b_rx) = watch::channel(false);
+        let (topology_a_tx, mut topology_a_rx) = watch::channel(Vec::<ClusterNode>::new());
+        let (topology_b_tx, mut topology_b_rx) = watch::channel(Vec::<ClusterNode>::new());
+
+        let task_a = tokio::spawn(run_gossip(
+            config_a,
+            move |nodes| {
+                let _ = topology_a_tx.send(nodes);
+            },
+            Arc::clone(&draining_a),
+            Arc::clone(&notify_a),
+            shutdown_a_rx,
+        ));
+        let task_b = tokio::spawn(run_gossip(
+            config_b,
+            move |nodes| {
+                let _ = topology_b_tx.send(nodes);
+            },
+            draining_b,
+            notify_b,
+            shutdown_b_rx,
+        ));
+
+        wait_for(&mut topology_a_rx, "node-b", true, Duration::from_secs(3)).await;
+        wait_for(&mut topology_b_rx, "node-a", true, Duration::from_secs(3)).await;
+
+        let drain_started = Instant::now();
+        draining_a.store(true, Ordering::Release);
+        notify_a.notify_one();
+        wait_for(&mut topology_b_rx, "node-a", false, Duration::from_secs(2)).await;
+        assert!(
+            drain_started.elapsed() < timeout,
+            "leaving must evict before periodic expiry"
+        );
+
+        // A stale indirect advertisement cannot resurrect A while its direct
+        // leaving frames keep extending the tombstone. Wait past the original
+        // minimum grace (5s) to prove repeated socket-level leaving frames moved
+        // the expiry forward, then inject a signed indirect entry for A.
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+        let injector = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stale = GossipMessage {
+            cluster_name: "socket-test".into(),
+            node_id: "node-b".into(),
+            turn_addr: free_udp_addr(),
+            seq: 1,
+            advertise_addr: injector.local_addr().unwrap(),
+            peers: vec![PeerEntry {
+                node_id: "node-a".into(),
+                turn_addr: free_udp_addr(),
+                gossip_addr: gossip_a,
+                seq: 1,
+            }],
+            leaving: false,
+        };
+        let frame = sign_frame(Some(&secret), serde_json::to_vec(&stale).unwrap());
+        injector.send_to(&frame, gossip_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !topology_b_rx
+                .borrow()
+                .iter()
+                .any(|node| node.node_id == "node-a"),
+            "stale indirect gossip must not resurrect a draining node"
+        );
+
+        // Undrain is an intentional new incarnation/sequence of direct live
+        // advertisements. The next periodic direct frame must remove the
+        // tombstone and re-admit A.
+        draining_a.store(false, Ordering::Release);
+        wait_for(&mut topology_b_rx, "node-a", true, Duration::from_secs(3)).await;
+
+        let _ = shutdown_a_tx.send(true);
+        let _ = shutdown_b_tx.send(true);
+        assert!(task_a.await.unwrap().is_ok());
+        assert!(task_b.await.unwrap().is_ok());
     }
 
     #[test]

@@ -105,6 +105,12 @@ impl RelayHandler {
 
             Action::CloseRelay { port } => ForwardAction::CloseRelay { port },
 
+            // RFC 6062 TCP relay listeners are bound synchronously in
+            // handle_allocate_tcp and adopted by the TLS bridge; they never
+            // travel the datagram send path, so there is nothing to forward
+            // here (mirrors the UDP dispatch paths in server.rs / sctp_bridge).
+            Action::RegisterTcpListener { .. } => ForwardAction::None,
+
             Action::None => ForwardAction::None,
         }
     }

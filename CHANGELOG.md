@@ -7,6 +7,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-14
+
+Production GA — all production blockers flagged in the `0.3.0-rc.2` external
+audit are closed; the management subsystem is code-verified (full Rust workspace
+suite with `--all-features`, plus the Tarantool stored-procedure TAP suites).
+Optional high-performance / alternative-transport datapaths and multi-node
+cluster mode remain feature-gated and **experimental**.
+
+### GA Highlights
+- Runtime config management: versioned updates, immutable snapshot, CAS, rollback.
+- User limits: global / tenant / user scopes, inheritance, reservations, exact replay.
+- Durable command log v2 with idempotency and lost-completion recovery.
+- Three-phase resumable migration: page-CAS, monotonic fencing generation, canonical hash.
+- Exact-u64 versioning (runtime, user-limits, fencing token); overflow refused.
+- Atomic observed confirmation (journal write + observed bump in one `box.atomic`).
+- Management / persistence / cluster profile separation; failover gated on `cluster_mode`.
+- Admin control-plane API and Admin UI.
+
+
+### Added
+- End-to-end node-targeted `update_config` with optional proto presence,
+  expected-version conflict detection, typed deterministic command payloads,
+  one-shot immutable snapshot publication, no-op semantics, rollback reporting,
+  and responses decoded from the target node's terminal result.
+- End-to-end `set_user_limits` for global, tenant, and realm/tenant/user scopes,
+  including independent inherit/value/unlimited/disabled modes, effective-limit
+  reporting, lower-than-current-usage behavior, and restart restore.
+- Durable desired/observed runtime and limits state for memory and Tarantool
+  backends, process-incarnation fencing, startup adoption/restore before
+  readiness, and a bounded, resumable, leased three-phase command-log migration
+  (`commands` → `idempotency` → `complete`) that recomputes legacy payload
+  hashes with the canonical Rust hash and terminally closes orphaned idempotency
+  rows. The idempotency phase is a fetch/apply pair guarded by a monotonic lease
+  fencing generation: apply commits under a full compare-and-swap (version,
+  phase, cursor, owner, token, unexpired lease) in a single `box.atomic`
+  transaction, so a stale page cannot land, partial-terminal rows are enriched
+  by consulting the linked command's status, and a GC'd-then-reused idempotency
+  key is never clobbered.
+- Concurrency-safe user/tenant/global allocation reservations with rollback and
+  local immutable limit lookup on allocation, refresh, and packet paths.
+- Node-scoped admin forms, desired/observed status, version conflict handling,
+  retry-stable idempotency keys, session-only admin token storage, and admin
+  container smoke coverage.
+- Socket-level gossip drain/leaving/rejoin integration coverage.
+
+### Changed
+- Runtime quota APIs consistently use `max_bytes_per_sec_per_allocation`; telemetry fields that
+  measure traffic remain explicitly named `bandwidth_bps` (bits/second).
+- The canonical Helm production example is standalone-first: one TURN pod per
+  public IP/relay range, Tokio transport, finite resources/bandwidth, and a
+  separately managed Tarantool backend for durable management state.
+- The Helm multi-node StatefulSet is explicitly experimental and no longer
+  presented as the canonical GA topology.
+- `UserLimitScope` numbering changed: `UNSPECIFIED = 0` (required-but-unset
+  guard), `GLOBAL = 1`, `TENANT = 2`, `USER = 3`. Numeric `0` is no longer
+  `GLOBAL`; an unset scope is rejected instead of silently treated as global.
+- `SetUserLimits` usage fields renamed for unambiguous meaning:
+  `current_usage` → `max_user_allocations_in_scope`,
+  `usage_above_limit` → `max_user_allocations_above_limit` (highest single-user
+  allocation count in the scope, not an aggregate total).
+- Command `done` now denotes completed transport processing, not necessarily
+  `applied`; the business outcome (`applied` / `no_op` / `conflict` / `failed` /
+  `superseded`) is carried in the typed result.
+- Management-plane persistence (command-log, runtime config, limits state) is
+  decoupled from allocation write-behind: the management backend is enabled
+  whenever a durable (Tarantool) backend is configured, independent of whether
+  allocation write-behind persistence is on.
+- Durable operation outcomes are persisted at the observed-version confirmation
+  — atomically with the observed bump and before command completion — keyed by
+  idempotency key, so a lost completion still recovers the original result even
+  after a later operation overwrites the single most-recent-applied slot; every
+  later journal write (completion, dead-letter, stale finalize) is guarded so a
+  terminal outcome is never downgraded. Non-mutating terminal outcomes (`no_op`,
+  version `conflict`, validation `failed`) are recorded into the same journal via
+  `record_command_outcome` before completion under the identical contract, and
+  the handler consults the journal before re-validating, so a replay after the
+  state has changed returns the original outcome rather than re-deriving a
+  different one.
+- Runtime and user-limits versions are exact unsigned 64-bit throughout the
+  Tarantool path: a single parser normalizes string/number/cdata to a u64,
+  comparisons and CAS never route a version through a float (exact above 2^53),
+  and an increment at `u64::MAX` is refused with an error rather than wrapping.
+- Management-plane readiness is surfaced on a distinct `turna_management_readiness`
+  gauge that reaches `ready` only after the mandatory migration phases complete;
+  the TURN dataplane readiness is independent. Allocation rehydrate and the
+  write-behind writer run only under an allocation-persistence profile, and
+  ownership adoption/failover only under the cluster profile.
+- Drain publishes `leaving` at the start of drain.
+- The local user-limits cache carries a monotonic generation independent of the
+  durable subject version; a no-op publish neither stores nor advances it.
+
+### Fixed
+- Proto/field drift between the wire contract and the Rust/TypeScript surfaces.
+- Optimistic-concurrency (expected-version) drift on runtime-config updates.
+- Helm allocation-cap value that could exceed the usable relay-port range.
+- Post-GC idempotency replay: a retry after the command row was collected now
+  resolves from the retained idempotency record instead of polling to timeout.
+- Lost-completion recovery: an applied operation whose completion was lost is
+  recovered from durable operation metadata and returns its original outcome
+  without re-applying the side effect.
+- Stale-incarnation command recovery: commands targeting a dead incarnation are
+  finalized as `superseded` and no longer accumulate as non-terminal rows.
+- Legacy idempotency migration for pre-existing Tarantool command rows.
+- Per-user allocation reservation race under concurrent Allocate.
+- Mixed runtime snapshot: readers now observe one atomic versioned snapshot.
+- Unsafe global default scope (`GLOBAL = 0`) removed.
+- Front-end/back-end field-name mismatch on the admin surface.
+- User-limits cache generation overflow now returns an explicit error instead of
+  panicking, leaving the current snapshot unpublished.
+
+### Compatibility
+- Protobuf field numbers are preserved; retired pre-GA fields are marked
+  `reserved` (numbers and names) rather than reused.
+- Source/JSON rename of the bandwidth quota field to
+  `max_bytes_per_sec_per_allocation`. Durable command/state JSON written with the
+  old `max_bytes_per_sec` key is still read (deserialization alias); telemetry
+  `bandwidth_bps` (bits/second) is unchanged.
+- `UserLimitScope` enum numeric change (`UNSPECIFIED = 0`); clients relying on
+  `GLOBAL = 0` must update.
+- Old Tarantool schema requires the bounded/resumable migration
+  (commands → idempotency → complete). See `RELEASE.md`.
+- Management API semantics: accepted is not applied; callers must inspect the
+  terminal business outcome, not only the gRPC status.
+- New mandatory mutation fields: `node_id`, `idempotency_key`,
+  `expected_version` (where applicable), and `reason`. Older clients may require
+  updates.
+
+### Known limitations
+- No transparent active-session failover; an existing media path does not
+  migrate to another node.
+- No general multi-replica shared-IP Helm topology; standalone-first is the
+  canonical GA profile.
+- Experimental transport backends (AF_XDP; io_uring/QUIC/DTLS per their stated
+  scope).
+- Admin token model: session-only bearer token; not a full RBAC/identity system.
+- Bandwidth enforcement is per-allocation (independent budget per allocation),
+  not an aggregate per-user limiter.
+- Limits atomicity is guaranteed within the limits domain, not necessarily
+  jointly with the runtime-config domain.
+
+### Verification boundary
+- These entries describe source changes only. Build, tests, Tarantool runtime,
+  frontend, Docker, Helm, migration upgrades, and live TURN scenarios must be
+  run on the exact release commit before assigning GA status.
+
 ## [0.3.0-rc.2] - 2026-07-12
 Second release candidate on top of `0.3.0-rc.1`. Lands the admin control-plane
 stage 2 (gRPC mutations) and DTLS fail-closed hardening, and records the
@@ -34,11 +179,14 @@ Verification completed (see `docs/`):
 
 ### Added
 - Admin console stage 2: mutating operations via a gRPC bridge to the
-  control-plane (`SetDraining`, `DeleteAllocation`, `AddUser`/`RemoveUser`/
-  `SetUserLimits`, `UpdateConfig`, plus reads). Operator mutations are gated by
-  an `X-Admin-Token`; the HTTP-to-node mutation path was removed in favour of
-  gRPC only. Verified live end-to-end (drain/undrain/stats/auth)
-  (`docs/admin/`).
+  control-plane (`SetDraining`, `DeleteAllocation`, `AddUser`/`RemoveUser`,
+  plus reads). Operator mutations are gated by an `X-Admin-Token`; the
+  HTTP-to-node mutation path was removed in favour of gRPC only. Verified live
+  end-to-end (drain/undrain/stats/auth) (`docs/admin/`).
+  - `SetUserLimits` and `UpdateConfig` are defined in the proto/surface but
+    still return `Unimplemented` — the live runtime-config snapshot (S4) and
+    limit enforcement (S5) that back them are in progress. They are NOT part of
+    the working mutation surface yet and must not be advertised as such.
 
 ### Security
 - Admin fail-closed hardening: a plaintext (`http://`) non-loopback gRPC address
@@ -48,8 +196,6 @@ Verification completed (see `docs/`):
 - DTLS transport now fails closed when a configured operator certificate cannot
   be loaded, instead of silently falling back to an ephemeral self-signed cert
   (`crates/transport/src/dtls.rs`).
-
-## [0.3.0-rc.1] - 2026-07-06
 
 ## [0.3.0-rc.1] - 2026-07-06
 
@@ -240,7 +386,9 @@ are experimental — see [README](README.md#status) and
   transitives remain. The full picture is tracked in
   `docs/security/dependency-dedup.md`.
 
-[Unreleased]: https://github.com/kruatech/turna/compare/v0.3.0-rc.1...HEAD
+[Unreleased]: https://github.com/kruatech/turna/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kruatech/turna/compare/v0.3.0-rc.2...v0.3.0
+[0.3.0-rc.2]: https://github.com/kruatech/turna/compare/v0.3.0-rc.1...v0.3.0-rc.2
 [0.3.0-rc.1]: https://github.com/kruatech/turna/compare/v0.3.0-beta.1...v0.3.0-rc.1
 [0.3.0-beta.1]: https://github.com/kruatech/turna/compare/v0.2.0-alpha.1...v0.3.0-beta.1
 [0.2.0-alpha.1]: https://github.com/kruatech/turna/compare/v0.1.0...v0.2.0-alpha.1

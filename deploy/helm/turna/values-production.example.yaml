@@ -8,23 +8,50 @@
 
 production: true
 
-# Host networking is recommended for production TURN: Service objects cannot
-# compactly expose the relay UDP port range, and ALTERNATE-SERVER redirects
-# need each pod to advertise a client-reachable address.
+# Host networking is recommended for production TURN because Service objects
+# cannot compactly expose the full relay UDP port range.
 hostNetwork: true
 
 turn:
   realm: "turn.example.com"
   # Address clients use to reach this deployment (set to your public IP/LB).
   externalIP: "203.0.113.10"
+  # Per-node UDP allocation cap. 8192 is the conservative ceiling for the
+  # default relay range under EVEN-PORT worst-case. Scale GA capacity with
+  # separate releases/public IPs rather than replicas sharing this address.
+  maxAllocations: 8192
   auth:
     # Provide the secret out-of-band; never inline it here.
     existingSecret: "turna-shared-secret"
     existingSecretKey: "shared-secret"
+  # Bandwidth: pick ONE. Either set a real per-allocation cap (recommended):
+  #   quota: { maxBytesPerSecPerAllocation: 2000000 }
+  # or explicitly accept running without one (validates, but no abuse ceiling):
+  quota:
+    # Finite per-allocation cap (bytes/sec) — the recommended production setting.
+    # Adjust to your workload. To intentionally run uncapped instead, remove this
+    # line and set `allowUnlimitedBandwidth: true` (accepts the DoS-amplification
+    # risk; the server otherwise refuses to start uncapped in production).
+    maxBytesPerSecPerAllocation: 2000000
 
-# Run more than one replica so the PodDisruptionBudget and spread constraints
-# are meaningful.
-replicaCount: 3
+# GA canonical topology: exactly one TURN dataplane pod owns this public IP and
+# relay range. Scale with separate releases/public IPs, not shared replicas.
+replicaCount: 1
+
+cluster:
+  enabled: false
+
+# Runtime config and user-limit desired/observed state persist in a separately
+# operated Tarantool instance. Create the password Secret out-of-band.
+state:
+  enabled: true
+  type: "tarantool"
+  uri: "tarantool.turna-management.svc.cluster.local:3301"
+  user: "turna"
+  existingSecret: "turna-tarantool"
+  existingSecretKey: "backend-password"
+  poolSize: 8
+  persistenceMode: "write_behind"
 
 resources:
   turn:
@@ -50,14 +77,10 @@ networkPolicy:
         matchLabels:
           kubernetes.io/metadata.name: monitoring
 
+# A PDB with minAvailable=1 would block voluntary eviction of the only pod.
 podDisruptionBudget:
-  enabled: true
-  minAvailable: 2
+  enabled: false
+  minAvailable: 1
 
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: topology.kubernetes.io/zone
-    whenUnsatisfiable: ScheduleAnyway
-    labelSelector:
-      matchLabels:
-        app.kubernetes.io/name: turna
+topologySpreadConstraints: []
+affinity: {}

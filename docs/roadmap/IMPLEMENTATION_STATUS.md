@@ -184,3 +184,11 @@ Confirmed (2026-06-11), IPv4 and IPv6:
 - `GET /health` - liveness (503 while draining).
 - `GET /ready`  - readiness: 200 only in state Ready and not draining.
 - `GET /metrics` - Prometheus text.
+
+## Unreleased management-plane implementation
+
+S4 runtime config, durable desired/observed restore, S5 scoped limits, atomic
+allocation reservations, bounded command-log migration, admin management UI,
+and the standalone-first chart profile are implemented in source. This section
+does not supersede the dated transport verification above: the new changes need
+a fresh workspace/Tarantool/frontend/container/Helm/live run on the exact commit.

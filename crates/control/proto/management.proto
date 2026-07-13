@@ -8,7 +8,7 @@ service TurnaManagement {
     rpc DeleteAllocation(DeleteAllocationRequest) returns (DeleteAllocationResponse);
     rpc WatchAllocations(WatchAllocationsRequest) returns (stream AllocationEvent);
 
-    rpc GetConfig(GetConfigRequest) returns (ServerConfig);
+    rpc GetConfig(GetConfigRequest) returns (NodeRuntimeConfig);
     rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
 
     rpc GetServerStats(GetServerStatsRequest) returns (ServerStats);
@@ -21,6 +21,10 @@ service TurnaManagement {
 
     rpc SetDraining(SetDrainingRequest) returns (SetDrainingResponse);
     rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+    // Tamper-evident audit log of privileged operations.
+    rpc VerifyAudit(VerifyAuditRequest) returns (VerifyAuditResponse);
+    rpc GetAuditLog(GetAuditLogRequest) returns (GetAuditLogResponse);
 }
 
 // --- Allocation ---
@@ -53,7 +57,7 @@ message TrafficStats {
 message ListAllocationsRequest { string username_filter = 1; string organization_filter = 2; uint32 page_size = 3; string page_token = 4; }
 message ListAllocationsResponse { repeated Allocation allocations = 1; string next_page_token = 2; uint32 total_count = 3; }
 message GetAllocationRequest { string id = 1; }
-message DeleteAllocationRequest { string id = 1; string reason = 2; }
+message DeleteAllocationRequest { string id = 1; string reason = 2; string idempotency_key = 3; }
 message DeleteAllocationResponse { bool success = 1; }
 message WatchAllocationsRequest { string username_filter = 1; string organization_filter = 2; }
 message AllocationEvent {
@@ -61,21 +65,56 @@ message AllocationEvent {
     Type event_type = 1; Allocation allocation = 2; string timestamp = 3; string reason = 4;
 }
 
-// --- Config ---
+// --- Node runtime config ---
 
-message GetConfigRequest {}
-message ServerConfig {
-    string realm = 1; uint32 min_port = 2; uint32 max_port = 3;
-    uint32 default_lifetime = 4; uint32 max_lifetime = 5;
-    uint32 max_allocations_per_user = 6; uint64 max_bandwidth_per_user_bps = 7;
-    bool draining = 8; string external_ipv4 = 9; string external_ipv6 = 10;
-    repeated string listen_addresses = 11; uint32 nonce_lifetime_seconds = 12;
+message RuntimeConfigSnapshot {
+    uint64 version = 1;
+    uint32 max_allocations = 2;
+    uint32 max_allocations_per_user = 3;
+    // Public runtime quota unit is bytes per second. 0 means unlimited only
+    // when the node bootstrap policy explicitly permits it.
+    uint64 max_bytes_per_sec_per_allocation = 4;
 }
+
+message GetConfigRequest { string node_id = 1; }
+message NodeRuntimeConfig {
+    string node_id = 1;
+    uint64 desired_version = 2;
+    uint64 observed_version = 3;
+    RuntimeConfigSnapshot observed = 4;
+    RuntimeConfigSnapshot pending_desired = 5;
+    string status = 6;
+    string last_apply_error = 7;
+    uint64 updated_at_ms = 8;
+}
+
 message UpdateConfigRequest {
-    optional uint32 max_lifetime = 1; optional uint32 max_allocations_per_user = 2;
-    optional uint64 max_bandwidth_per_user_bps = 3; optional bool draining = 4;
+    // Field numbers 1-4 belonged to the pre-GA local mutation contract
+    // (max_lifetime, max_allocations_per_user, max_bytes_per_sec_per_allocation, draining).
+    // They are intentionally retired rather than reused with new meanings.
+    reserved 1 to 4;
+    reserved "max_lifetime", "draining";
+    string node_id = 5;
+    string idempotency_key = 6;
+    uint64 expected_version = 7;
+    optional uint32 max_allocations = 8;
+    optional uint32 max_allocations_per_user = 9;
+    optional uint64 max_bytes_per_sec_per_allocation = 10;
+    string reason = 11;
 }
-message UpdateConfigResponse { bool success = 1; ServerConfig current = 2; repeated string warnings = 3; }
+message UpdateConfigResponse {
+    // Retire the old success/current/warnings response wire layout.
+    reserved 1 to 3;
+    reserved "success", "current", "warnings";
+    string request_id = 4;
+    uint64 previous_version = 5;
+    uint64 observed_version = 6;
+    bool changed = 7;
+    RuntimeConfigSnapshot applied = 8;
+    string terminal_status = 9;
+    string error = 10;
+    bool rolled_back = 11;
+}
 
 // --- Stats ---
 
@@ -85,6 +124,12 @@ message ServerStats {
     TrafficStats total_traffic = 4; uint32 active_users = 5; uint64 pps = 6;
     uint32 allocated_ports = 7; uint32 available_ports = 8; bool draining = 9;
     uint64 avg_latency_us = 10; uint64 p99_latency_us = 11; uint32 blocked_ips = 12;
+    // When true, a shared cluster backend is attached: the allocation figures
+    // (active/total allocations, bytes, users) are CLUSTER-WIDE, while the
+    // runtime gauges (ports, pps, latency, draining, blocked_ips) reflect only
+    // THIS control-plane node — often zero on a standalone control-plane. Lets a
+    // UI avoid presenting node-local gauges as if they were cluster-wide.
+    bool backend_mode = 13;
 }
 message GetTopTalkersRequest { uint32 limit = 1; string sort_by = 2; }
 message GetTopTalkersResponse { repeated TopTalker talkers = 1; }
@@ -92,18 +137,119 @@ message TopTalker { string username = 1; string organization = 2; uint32 allocat
 message WatchMetricsRequest { uint32 interval_seconds = 1; }
 message MetricsSnapshot { string timestamp = 1; ServerStats stats = 2; }
 
-// --- Users ---
+// --- Users and effective limits ---
 
 message AddUserRequest { string username = 1; string password = 2; string organization = 3; }
 message AddUserResponse { bool success = 1; }
 message RemoveUserRequest { string username = 1; bool force_delete_allocations = 2; }
 message RemoveUserResponse { bool success = 1; uint32 allocations_deleted = 2; }
-message SetUserLimitsRequest { string username = 1; uint32 max_allocations = 2; uint64 max_bandwidth_bps = 3; uint32 max_lifetime = 4; }
-message SetUserLimitsResponse { bool success = 1; }
+
+enum UserLimitScope {
+    // proto3 decodes an omitted enum as 0. 0 MUST be UNSPECIFIED and is always
+    // rejected in validation, so a client that forgets to set scope cannot
+    // silently perform a GLOBAL policy change. GA breaking change (was
+    // GLOBAL=0/TENANT=1/USER=2); see CHANGELOG.
+    USER_LIMIT_SCOPE_UNSPECIFIED = 0;
+    USER_LIMIT_SCOPE_GLOBAL = 1;
+    USER_LIMIT_SCOPE_TENANT = 2;
+    USER_LIMIT_SCOPE_USER = 3;
+}
+enum LimitMode {
+    LIMIT_MODE_INHERIT = 0;
+    LIMIT_MODE_VALUE = 1;
+    LIMIT_MODE_UNLIMITED = 2;
+    LIMIT_MODE_DISABLED = 3;
+}
+message UInt32Limit { LimitMode mode = 1; uint32 value = 2; }
+message UInt64Limit { LimitMode mode = 1; uint64 value = 2; }
+message UserLimitsPatch {
+    optional UInt32Limit max_allocations = 1;
+    optional UInt64Limit max_bytes_per_sec_per_allocation = 2;
+    optional UInt32Limit max_lifetime_secs = 3;
+}
+message UserLimitTarget {
+    UserLimitScope scope = 1;
+    string tenant = 2;
+    string realm = 3;
+    string username = 4;
+}
+message EffectiveUserLimits {
+    uint32 max_allocations = 1;
+    uint64 max_bytes_per_sec_per_allocation = 2;
+    uint32 max_lifetime_secs = 3;
+    repeated string inherited_fields = 4;
+    bool allocations_disabled = 5;
+    bool bandwidth_disabled = 6;
+    bool lifetime_disabled = 7;
+    // §7-B: fields clamped to a finite node ceiling.
+    repeated string capped_fields = 8;
+}
+message SetUserLimitsRequest {
+    // Retire the old username/max_allocations/max_bandwidth_bps/max_lifetime
+    // scalar request instead of assigning those numbers incompatible types.
+    reserved 1 to 4;
+    reserved "username", "max_allocations", "max_bandwidth_bps", "max_lifetime";
+    string node_id = 5;
+    UserLimitTarget target = 6;
+    string idempotency_key = 7;
+    uint64 expected_version = 8;
+    UserLimitsPatch patch = 9;
+    string reason = 10;
+}
+message SetUserLimitsResponse {
+    reserved 1;
+    reserved "success";
+    string request_id = 2;
+    uint64 previous_version = 3;
+    uint64 observed_version = 4;
+    EffectiveUserLimits effective = 5;
+    // Highest single-user allocation count in the target scope, checked against
+    // the effective per-user allocation cap. USER scope: the target user's live
+    // allocation count. GLOBAL / TENANT scope: the highest allocation count held
+    // by any ONE user in that scope (worst-case user for per-user cap
+    // enforcement) — NOT an aggregate total across the scope.
+    uint32 max_user_allocations_in_scope = 6;
+    // True when max_user_allocations_in_scope exceeds the effective per-user
+    // allocation cap, or the cap is DISABLED and any usage exists. Always false
+    // when the cap is UNLIMITED (max_allocations = 0, not disabled).
+    bool max_user_allocations_above_limit = 7;
+    string terminal_status = 8;
+    string error = 9;
+}
 
 // --- Server ---
 
-message SetDrainingRequest { bool draining = 1; }
+message SetDrainingRequest { bool draining = 1; string node_id = 2; string idempotency_key = 3; }
 message SetDrainingResponse { bool success = 1; uint32 active_allocations = 2; }
-message ShutdownRequest { bool graceful = 1; uint32 timeout_seconds = 2; }
+message ShutdownRequest { bool graceful = 1; uint32 timeout_seconds = 2; string node_id = 3; string idempotency_key = 4; }
 message ShutdownResponse { bool accepted = 1; uint32 remaining_allocations = 2; }
+
+// ── Audit ─────────────────────────────────────────────────────────────────
+message VerifyAuditRequest {}
+message VerifyAuditResponse {
+    bool   intact         = 1;  // true if the retained chain tail verifies
+    uint64 broken_at_seq  = 2;  // seq of first broken entry (0 when intact)
+    uint64 total_recorded = 3;  // chain head seq — all entries ever recorded
+    uint64 retained       = 4;  // entries currently held in memory
+    // Full on-disk chain (all rotated segments + live file). disk_checked is
+    // false when persistence is disabled.
+    bool   disk_checked       = 5;
+    bool   disk_intact        = 6;
+    uint64 disk_broken_at_seq = 7;
+    uint64 disk_entries       = 8;
+    uint64 disk_first_seq     = 9;
+    uint64 disk_last_seq      = 10;
+    uint64 disk_segments      = 11;
+}
+message GetAuditLogRequest { uint32 limit = 1; }  // 0 = all retained
+message AuditRecord {
+    uint64 seq        = 1;
+    uint64 ts_ms      = 2;
+    string actor      = 3;
+    string action     = 4;
+    string detail     = 5;
+    bool   outcome    = 6;
+    string prev_hash  = 7;  // hex
+    string entry_hash = 8;  // hex
+}
+message GetAuditLogResponse { repeated AuditRecord records = 1; uint64 total_recorded = 2; }

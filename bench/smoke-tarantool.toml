@@ -28,7 +28,7 @@ max_port        = 49200
 max_allocations = 100
 
 [turn.relay.quota]
-max_bytes_per_sec = 0
+max_bytes_per_sec_per_allocation = 0
 max_per_user      = 100
 
 [signaling]

@@ -61,13 +61,13 @@ token_ttl     = 86400
 [turn.relay]
 min_port        = 49152
 max_port        = 65535
-max_allocations = 50000
+max_allocations = 8192
 
 # Per-user bandwidth + allocation limits. Defaults: no bandwidth cap,
 # 100 simultaneous allocations per username. Set non-zero in prod to
 # make abuse uneconomic.
 [turn.relay.quota]
-max_bytes_per_sec = 0     # 0 = unlimited
+max_bytes_per_sec_per_allocation = 0     # 0 = unlimited
 max_per_user      = 100   # 0 = unlimited (NOT recommended for prod)
 
 # =============================================================================

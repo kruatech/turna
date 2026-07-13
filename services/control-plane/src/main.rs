@@ -34,16 +34,16 @@
 //! 3. The server waits up to `drain_timeout` seconds for streams to
 //!    close, then exits.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use turna_config::TurnaConfig;
 use turna_control::{start_grpc_server, GrpcConfig, GrpcTlsConfig, TurnCoreImpl};
-use turna_state_backend::{create_backend, Backend, BackendConfig};
+use turna_state_backend::{create_backend, now_ms, Backend, BackendConfig, CommandLogRetention};
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -74,10 +74,15 @@ async fn main() -> Result<(), AnyError> {
         }
     };
 
-    // ── Resolve effective settings (file → env override) ──────────────────────
-    let grpc_addr = resolve_grpc_addr(&file_cfg)?;
-    let external_ip = resolve_external_ip(&file_cfg);
-    let tls = resolve_tls(&file_cfg)?;
+    // ── Build the single effective configuration and validate it ──────────────
+    // P0 #5: fold env overrides into one config, then run the FULL validator
+    // BEFORE any listener binds — so an env override (e.g. TURNA_GRPC_ADDR to a
+    // non-loopback address with TLS disabled) cannot bypass a production guard
+    // that file-only validation would have caught.
+    let cfg = build_effective_config(&file_cfg)?;
+    let grpc_addr = cfg.management.listen;
+    let external_ip = effective_external_ip(&cfg);
+    let tls = build_tls(&cfg.grpc)?;
 
     let tls_state = match tls.as_ref() {
         Some(_) => "enabled",
@@ -110,6 +115,34 @@ async fn main() -> Result<(), AnyError> {
     );
     if let Some(backend) = user_backend {
         info!(%realm, "runtime user management enabled (state backend attached)");
+        // Advance the versioned legacy command-log migration in bounded,
+        // resumable batches. The backend persists cursor/completion state, so a
+        // process restart never restarts a whole-log Lua scan.
+        let clog = cfg.cluster.command_log.clone();
+        tokio::spawn(run_command_log_migration(
+            Arc::clone(&backend),
+            clog.batch_size.max(1),
+            Arc::clone(&metrics),
+            shutdown_tx.subscribe(),
+        ));
+
+        // Run command-log GC from the control-plane on the shared backend,
+        // gated on a configured sweep interval. It runs in its own task and is
+        // best-effort — GC never stalls the control-plane, only degrading
+        // readiness on a sustained growing backlog or repeated backend errors.
+        if clog.gc_enabled() {
+            info!(
+                interval_secs = clog.sweep_interval_secs,
+                batch = clog.batch_size,
+                "command-log GC enabled"
+            );
+            tokio::spawn(run_command_log_gc(
+                Arc::clone(&backend),
+                clog,
+                Arc::clone(&metrics),
+                shutdown_tx.subscribe(),
+            ));
+        }
         core_impl = core_impl.with_user_backend(backend);
     }
     let core = Arc::new(core_impl);
@@ -153,6 +186,261 @@ async fn main() -> Result<(), AnyError> {
 
     info!("control plane stopped");
     Ok(())
+}
+
+/// Advance the command-log schema migration one bounded backend batch at a
+/// time. Tarantool owns the durable cursor and completion marker; this task is
+/// only a retry/scheduling loop and never keeps migration state in process.
+async fn run_command_log_migration(
+    backend: Arc<Backend>,
+    batch_size: usize,
+    metrics: Arc<turna_health::Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    const ERROR_DEGRADE_THRESHOLD: u32 = 3;
+    let mut consecutive_errors = 0_u32;
+
+    // #4 (B): stable per-process lease owner for the command-log migration.
+    let migration_owner = format!("control-plane-{}", std::process::id());
+    loop {
+        if *shutdown.borrow() {
+            info!("command-log migration stopping (shutdown)");
+            return;
+        }
+
+        match backend
+            .migrate_command_log_batch(batch_size, &migration_owner)
+            .await
+        {
+            Ok(progress) => {
+                consecutive_errors = 0;
+                metrics
+                    .command_log_migration_processed_total
+                    .fetch_add(progress.processed_in_batch, Ordering::Relaxed);
+                metrics
+                    .command_log_migration_completed
+                    .store(u64::from(progress.completed), Ordering::Relaxed);
+
+                debug!(
+                    processed_in_batch = progress.processed_in_batch,
+                    total_processed = progress.total_processed,
+                    cursor = %progress.cursor,
+                    completed = progress.completed,
+                    "command-log migration batch complete"
+                );
+
+                if progress.completed {
+                    info!(
+                        total_processed = progress.total_processed,
+                        "command-log migration complete"
+                    );
+                    return;
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    _ = shutdown.changed() => {
+                        info!("command-log migration stopping (shutdown)");
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                metrics
+                    .command_log_migration_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                warn!(
+                    %error,
+                    consecutive_errors,
+                    "command-log migration batch failed"
+                );
+                if consecutive_errors >= ERROR_DEGRADE_THRESHOLD {
+                    metrics.set_readiness(turna_health::Readiness::Degraded);
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = shutdown.changed() => {
+                        info!("command-log migration stopping (shutdown)");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Command-log GC sweep. Periodically prunes terminal commands + aged
+/// idempotency records on the shared backend, exports counts/gauges, and
+/// degrades readiness on a sustained growing backlog or repeated backend errors.
+/// Best-effort: it never propagates failures. The degrade is sticky (no
+/// auto-recovery) so a cleared backlog does not silently mask another
+/// subsystem's degradation via the shared readiness gauge.
+async fn run_command_log_gc(
+    backend: Arc<Backend>,
+    cfg: turna_config::CommandLogConfig,
+    metrics: Arc<turna_health::Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let retention = CommandLogRetention {
+        done_ms: cfg.retain_done_secs.saturating_mul(1000),
+        failed_ms: cfg.retain_failed_secs.saturating_mul(1000),
+        superseded_ms: cfg.retain_superseded_secs.saturating_mul(1000),
+        expired_ms: cfg.retain_expired_secs.saturating_mul(1000),
+        idempotency_ms: cfg.retain_idempotency_secs.saturating_mul(1000),
+        batch: cfg.batch_size,
+        max_batches: cfg.max_batches_per_sweep,
+    };
+    let base = Duration::from_secs(cfg.sweep_interval_secs.max(1));
+    // Fixed per-process jitter (no rand dep): distinct pids desynchronise
+    // multiple control-plane instances so they do not sweep in lockstep.
+    let jitter = if cfg.sweep_jitter_secs > 0 {
+        Duration::from_secs((std::process::id() as u64) % (cfg.sweep_jitter_secs + 1))
+    } else {
+        Duration::ZERO
+    };
+
+    const ERROR_DEGRADE_THRESHOLD: u32 = 3;
+    const BACKLOG_GROWTH_THRESHOLD: u32 = 3;
+    let mut consecutive_errors: u32 = 0;
+    let mut backlog_growth_streak: u32 = 0;
+    let mut prev_backlog: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(base + jitter) => {}
+            _ = shutdown.changed() => {
+                info!("command-log GC sweep stopping (shutdown)");
+                return;
+            }
+        }
+
+        let stats = backend.gc_command_log(retention, now_ms()).await;
+
+        metrics
+            .command_log_gc_deleted_commands_total
+            .fetch_add(stats.deleted_commands, Ordering::Relaxed);
+        metrics
+            .command_log_gc_deleted_idempotency_total
+            .fetch_add(stats.deleted_idempotency, Ordering::Relaxed);
+        metrics
+            .command_log_terminal_remaining
+            .store(stats.terminal_remaining, Ordering::Relaxed);
+        metrics
+            .command_log_oldest_unfinished_ms
+            .store(stats.oldest_unfinished_age_ms, Ordering::Relaxed);
+
+        if stats.errors > 0 {
+            metrics
+                .command_log_gc_errors_total
+                .fetch_add(stats.errors, Ordering::Relaxed);
+            consecutive_errors = consecutive_errors.saturating_add(1);
+        } else {
+            consecutive_errors = 0;
+        }
+
+        if stats.terminal_remaining > prev_backlog {
+            backlog_growth_streak = backlog_growth_streak.saturating_add(1);
+        } else {
+            backlog_growth_streak = 0;
+        }
+        prev_backlog = stats.terminal_remaining;
+
+        if consecutive_errors >= ERROR_DEGRADE_THRESHOLD
+            || backlog_growth_streak >= BACKLOG_GROWTH_THRESHOLD
+        {
+            warn!(
+                consecutive_errors,
+                backlog_growth_streak,
+                terminal_remaining = stats.terminal_remaining,
+                "command-log GC unhealthy; marking control-plane Degraded"
+            );
+            metrics.set_readiness(turna_health::Readiness::Degraded);
+        }
+
+        debug!(
+            deleted_commands = stats.deleted_commands,
+            deleted_idempotency = stats.deleted_idempotency,
+            terminal_remaining = stats.terminal_remaining,
+            oldest_unfinished_ms = stats.oldest_unfinished_age_ms,
+            errors = stats.errors,
+            "command-log GC sweep complete"
+        );
+    }
+}
+
+/// Build the single effective configuration: start from the file (or all
+/// defaults in env-only mode), fold in the env overrides, then run the FULL
+/// validator. Nothing binds until this returns Ok. This is the P0 #5 guard —
+/// env overrides can no longer disable a production check that file-based
+/// validation would enforce.
+fn build_effective_config(file_cfg: &Option<TurnaConfig>) -> Result<TurnaConfig, AnyError> {
+    let mut cfg = file_cfg.clone().unwrap_or_default();
+
+    // Preserve the historical env-only bind (127.0.0.1:5350) when neither a
+    // file nor an explicit TURNA_GRPC_ADDR is given, instead of the config
+    // struct's [management].listen default. Keeps `cargo run` behaviour stable.
+    let grpc_addr_env_set = std::env::var("TURNA_GRPC_ADDR")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if file_cfg.is_none() && !grpc_addr_env_set {
+        cfg.management.listen = "127.0.0.1:5350".parse().expect("valid default addr");
+    }
+
+    if let Ok(v) = std::env::var("TURNA_GRPC_ADDR") {
+        if !v.is_empty() {
+            cfg.management.listen = v.parse().map_err(|e| -> AnyError {
+                format!("TURNA_GRPC_ADDR {v:?} is not a valid socket address: {e}").into()
+            })?;
+        }
+    }
+    if let Ok(v) = std::env::var("TURNA_EXTERNAL_IP") {
+        if !v.is_empty() {
+            cfg.turn.external_ip = v;
+        }
+    }
+    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_MODE") {
+        if !v.is_empty() {
+            cfg.grpc.tls_mode = v;
+        }
+    }
+    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_CERT") {
+        if !v.is_empty() {
+            cfg.grpc.tls_cert = v;
+        }
+    }
+    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_KEY") {
+        if !v.is_empty() {
+            cfg.grpc.tls_key = v;
+        }
+    }
+    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_CA") {
+        if !v.is_empty() {
+            cfg.grpc.tls_ca = v;
+        }
+    }
+
+    cfg.validate().map_err(|e| -> AnyError {
+        format!("effective configuration invalid after env overrides: {e}").into()
+    })?;
+    Ok(cfg)
+}
+
+/// Externally-visible IP: the effective config's `[turn].external_ip`, or a
+/// best-effort `0.0.0.0` with a warning when unset (production validation
+/// already requires it to be set when `production = true`).
+fn effective_external_ip(cfg: &TurnaConfig) -> String {
+    if cfg.turn.external_ip.is_empty() {
+        warn!("external_ip is not configured (neither TURNA_EXTERNAL_IP nor [turn].external_ip)");
+        "0.0.0.0".into()
+    } else {
+        cfg.turn.external_ip.clone()
+    }
 }
 
 /// Resolve the realm advertised to TURN clients. MUST match the nodes' realm,
@@ -214,81 +502,13 @@ async fn build_user_backend(
     Ok(Some(Arc::new(backend)))
 }
 
-/// Resolve the gRPC bind address from (in priority order):
-/// 1. `TURNA_GRPC_ADDR` env (highest)
-/// 2. `[management].listen` in the loaded config
-/// 3. `127.0.0.1:5350` (default)
-fn resolve_grpc_addr(file_cfg: &Option<TurnaConfig>) -> Result<SocketAddr, AnyError> {
-    if let Ok(s) = std::env::var("TURNA_GRPC_ADDR") {
-        if !s.is_empty() {
-            return s.parse().map_err(|e| -> AnyError {
-                format!("TURNA_GRPC_ADDR {s:?} is not a valid socket address: {e}").into()
-            });
-        }
-    }
-    if let Some(cfg) = file_cfg {
-        return Ok(cfg.management.listen);
-    }
-    Ok("127.0.0.1:5350".parse().unwrap())
-}
-
-/// Resolve the externally-visible IP from (in priority order):
-/// 1. `TURNA_EXTERNAL_IP` env
-/// 2. `[turn].external_ip` in the loaded config
-/// 3. `0.0.0.0` (best-effort, but warn — this should usually be set)
-fn resolve_external_ip(file_cfg: &Option<TurnaConfig>) -> String {
-    if let Ok(s) = std::env::var("TURNA_EXTERNAL_IP") {
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    if let Some(cfg) = file_cfg {
-        if !cfg.turn.external_ip.is_empty() {
-            return cfg.turn.external_ip.clone();
-        }
-    }
-    warn!("external_ip is not configured (neither TURNA_EXTERNAL_IP nor [turn].external_ip)");
-    "0.0.0.0".into()
-}
-
-/// Resolve TLS configuration. Same precedence as the other resolvers:
-/// env wins when non-empty, otherwise the file's `[grpc]` section, otherwise
-/// disabled.
-///
-/// We don't *just* read env here — we merge: if the file says `mtls` and
-/// only `TURNA_GRPC_TLS_CERT` is overridden via env, the merged config has
-/// the file's mode + ca and the env's cert. This lets operators ship a
-/// committed file with the "shape" of the TLS config and supply only the
-/// paths that differ per host (the usual pattern for cert rotation
-/// drivers).
-fn resolve_tls(file_cfg: &Option<TurnaConfig>) -> Result<Option<GrpcTlsConfig>, AnyError> {
-    // Start with whatever the file says (or all-defaults if no file).
-    let mut base = file_cfg
-        .as_ref()
-        .map(|c| c.grpc.clone())
-        .unwrap_or_default();
-
-    // Layer env overrides where the env value is non-empty.
-    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_MODE") {
-        if !v.is_empty() {
-            base.tls_mode = v;
-        }
-    }
-    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_CERT") {
-        if !v.is_empty() {
-            base.tls_cert = v;
-        }
-    }
-    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_KEY") {
-        if !v.is_empty() {
-            base.tls_key = v;
-        }
-    }
-    if let Ok(v) = std::env::var("TURNA_GRPC_TLS_CA") {
-        if !v.is_empty() {
-            base.tls_ca = v;
-        }
-    }
+/// Translate the (already-validated, env-folded) `[grpc]` section into a
+/// runtime `GrpcTlsConfig`. `build_effective_config` has already merged env
+/// overrides and validated the whole config, so no env reading or mode
+/// validation happens here — we only add a startup file-existence check
+/// (a nicer error than a first-client failure).
+fn build_tls(grpc: &turna_config::GrpcConfigSection) -> Result<Option<GrpcTlsConfig>, AnyError> {
+    let base = grpc.clone();
 
     match base.normalised_mode() {
         "disabled" => {
@@ -360,6 +580,8 @@ fn resolve_tls(file_cfg: &Option<TurnaConfig>) -> Result<Option<GrpcTlsConfig>, 
                 server_cert: PathBuf::from(&base.tls_cert),
                 server_key: PathBuf::from(&base.tls_key),
                 client_ca_cert: PathBuf::from(&base.tls_ca),
+                // "tls" => server-only; "mtls" => require & verify client cert.
+                require_client_auth: mode == "mtls",
             }))
         }
         _ => unreachable!("normalised_mode returns one of disabled|tls|mtls"),

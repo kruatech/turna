@@ -31,6 +31,7 @@ use turna_transport::migration::MigrationManager;
 use turna_transport::{TokioTransport, Transport};
 
 use crate::processor::{Action, ClusterRouting, PacketProcessor};
+use crate::tcp_relay::TcpRelayManager;
 
 // ── Internal message types ────────────────────────────────────────────────────
 
@@ -217,6 +218,14 @@ impl RelayEgress {
             Action::CloseRelay { port } => {
                 let _ = self.tx.send(OutMsg::CloseRelay { port }).await;
             }
+            Action::RegisterTcpListener { .. } => {
+                // Unreachable on the UDP path: a TCP allocation over non-TCP ingress
+                // is now rejected (400) in `handle_allocate` before any listener is
+                // bound. Kept for match exhaustiveness; drop defensively, no panic.
+                tracing::debug!(
+                    "unexpected RegisterTcpListener on the UDP dispatch path; dropping"
+                );
+            }
             // The tokio path never produces ForwardZeroCopy — `process()` emits
             // `Forward { data: Bytes }`. It is an io_uring / AF_XDP-only action.
             // Handle it defensively so the match stays exhaustive.
@@ -298,9 +307,16 @@ pub struct RelayServer {
     /// Registry of TLS/TCP client sinks (addr → writer channel). Shared with the
     /// relay return path so peer→client data reaches TURNS clients over TLS.
     client_sinks: ClientSinks,
+    /// RFC 6062 TCP relay engine; `None` disables TCP allocations. Read by the
+    /// TURNS bridge (CONNECT executor); unused when built without `tls`.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    tcp_relay: Option<Arc<TcpRelayManager>>,
     /// TURNS (TLS) listener config; `None` disables it.
     #[cfg(feature = "tls")]
     tls_config: Option<turna_transport::tcp_tls::TlsTransportConfig>,
+    /// TURN-over-SCTP listener config; `None` disables it.
+    #[cfg(feature = "sctp")]
+    sctp_config: Option<turna_transport::sctp::SctpTransportConfig>,
 }
 
 impl RelayServer {
@@ -322,7 +338,16 @@ impl RelayServer {
         metrics: Arc<Metrics>,
         cluster: Option<ClusterRouting>,
     ) -> Self {
-        Self::new_full(transport, store, auth, external_ip, metrics, cluster, None)
+        Self::new_full(
+            transport,
+            store,
+            auth,
+            external_ip,
+            metrics,
+            cluster,
+            None,
+            None,
+        )
     }
 
     /// Full constructor including the optional RFC 8016 migration ticket
@@ -336,10 +361,12 @@ impl RelayServer {
         metrics: Arc<Metrics>,
         cluster: Option<ClusterRouting>,
         migration: Option<MigrationManager>,
+        tcp_relay: Option<Arc<TcpRelayManager>>,
     ) -> Self {
         let processor = Arc::new(
             PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
-                .with_migration(migration),
+                .with_migration(migration)
+                .with_tcp_relay(tcp_relay.clone()),
         );
         Self {
             transport,
@@ -347,8 +374,11 @@ impl RelayServer {
             relay_sockets: Arc::new(DashMap::new()),
             external_ip,
             client_sinks: Arc::new(DashMap::new()),
+            tcp_relay,
             #[cfg(feature = "tls")]
             tls_config: None,
+            #[cfg(feature = "sctp")]
+            sctp_config: None,
         }
     }
 
@@ -357,6 +387,14 @@ impl RelayServer {
     #[cfg(feature = "tls")]
     pub fn with_tls(mut self, cfg: turna_transport::tcp_tls::TlsTransportConfig) -> Self {
         self.tls_config = Some(cfg);
+        self
+    }
+
+    /// Enable the TURN-over-SCTP listener. No-op unless built with the
+    /// `sctp` feature.
+    #[cfg(feature = "sctp")]
+    pub fn with_sctp(mut self, cfg: turna_transport::sctp::SctpTransportConfig) -> Self {
+        self.sctp_config = Some(cfg);
         self
     }
 
@@ -382,7 +420,7 @@ impl RelayServer {
         let relay_tasks: Arc<DashMap<u16, tokio::task::AbortHandle>> = Arc::new(DashMap::new());
 
         // ── Cleanup + metrics task ────────────────────────────────────────────
-        {
+        let cleanup_handle = {
             let store = self.processor.store().clone();
             let metrics = self.processor.metrics().clone();
             let rtp = self.processor.rtp_analyzer().clone();
@@ -443,8 +481,8 @@ impl RelayServer {
                     );
                     rtp.cleanup_stale();
                 }
-            });
-        }
+            })
+        };
 
         // ── Send channel: recv task → send task (backpressure) ───────────────
         let (send_tx, send_rx) = mpsc::channel::<OutMsg>(8192);
@@ -463,6 +501,16 @@ impl RelayServer {
             self.external_ip,
         );
 
+        // A configured listener must not die silently. We retain its handle so
+        // shutdown can abort it (previously it was leaked), and on an unexpected
+        // exit we cut this node from routing (Degraded) so a load balancer stops
+        // sending it new clients. The node is NOT force-killed — other transports
+        // may still be serving.
+        #[cfg(feature = "tls")]
+        let mut tls_handle: Option<tokio::task::JoinHandle<()>> = None;
+        #[cfg(feature = "sctp")]
+        let mut sctp_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         // ── TURNS (TLS-over-TCP) bridge ──────────────────────────────────────
         // Shares the relay send channel and the client-sink registry with the
         // UDP path: control responses go back over TLS, peer→client relay data
@@ -472,13 +520,43 @@ impl RelayServer {
             let proc = self.processor.clone();
             let relay_tx = send_tx.clone();
             let sinks = self.client_sinks.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::tls_bridge::run_tls_bridge(tls_cfg, proc, relay_tx, sinks).await
-                {
-                    error!(error = %e, "TURNS bridge exited");
+            let tcp_relay = self.tcp_relay.clone();
+            let listener_metrics = self.processor.metrics().clone();
+            let listener_shutdown = shutdown.clone();
+            tls_handle = Some(tokio::spawn(async move {
+                let res =
+                    crate::tls_bridge::run_tls_bridge(tls_cfg, proc, relay_tx, sinks, tcp_relay)
+                        .await;
+                if !*listener_shutdown.borrow() {
+                    match res {
+                        Ok(()) => error!("TURNS bridge exited unexpectedly"),
+                        Err(e) => error!(error = %e, "TURNS bridge failed"),
+                    }
+                    listener_metrics.set_readiness(turna_health::Readiness::Degraded);
                 }
-            });
+            }));
+        }
+
+        // ── TURN-over-SCTP bridge ────────────────────────────────────────────
+        // Same sharing model as the TURNS bridge: control over SCTP, relay UDP.
+        #[cfg(feature = "sctp")]
+        if let Some(sctp_cfg) = self.sctp_config.clone() {
+            let proc = self.processor.clone();
+            let relay_tx = send_tx.clone();
+            let sinks = self.client_sinks.clone();
+            let listener_metrics = self.processor.metrics().clone();
+            let listener_shutdown = shutdown.clone();
+            sctp_handle = Some(tokio::spawn(async move {
+                let res =
+                    crate::sctp_bridge::run_sctp_bridge(sctp_cfg, proc, relay_tx, sinks).await;
+                if !*listener_shutdown.borrow() {
+                    match res {
+                        Ok(()) => error!("TURN-over-SCTP bridge exited unexpectedly"),
+                        Err(e) => error!(error = %e, "TURN-over-SCTP bridge failed"),
+                    }
+                    listener_metrics.set_readiness(turna_health::Readiness::Degraded);
+                }
+            }));
         }
 
         // ── Recv workers (hot path) ──────────────────────────────────────
@@ -598,6 +676,13 @@ impl RelayServer {
                                         break;
                                     }
                                 }
+                                Action::RegisterTcpListener { .. } => {
+                                    // Unreachable (see dispatch path): TCP-allocate over
+                                    // non-TCP ingress is rejected at handle_allocate.
+                                    tracing::debug!(
+                                        "unexpected RegisterTcpListener on the UDP recvmmsg path; dropping"
+                                    );
+                                }
                                 // io_uring / AF_XDP-only; never produced by the
                                 // tokio `process()` path. Defensive, keeps the
                                 // match exhaustive.
@@ -623,11 +708,62 @@ impl RelayServer {
 
         info!(workers = workers.len(), %listen_addr, "recv workers started");
 
+        // Wait for shutdown, but also watch the datapath. If every recv worker
+        // has exited, or the relay egress / cleanup task has died while we are NOT
+        // shutting down, the node can no longer serve — mark it Degraded so a load
+        // balancer stops trusting it and stop waiting so shutdown/restart proceeds.
+        // One dead worker is tolerated (SO_REUSEPORT leaves the others receiving);
+        // all-dead is fatal.
         loop {
-            if shutdown.changed().await.is_err() {
-                break;
+            tokio::select! {
+                res = shutdown.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
             if *shutdown.borrow() {
+                break;
+            }
+            if !workers.is_empty() && workers.iter().all(|w| w.is_finished()) {
+                error!("all recv workers exited — datapath is dead");
+                self.processor
+                    .metrics()
+                    .set_readiness(turna_health::Readiness::Degraded);
+                break;
+            }
+            if sender_task.is_finished() {
+                error!("relay egress task exited — datapath is dead");
+                self.processor
+                    .metrics()
+                    .set_readiness(turna_health::Readiness::Degraded);
+                break;
+            }
+            if cleanup_handle.is_finished() {
+                error!("cleanup/metrics task exited unexpectedly");
+                self.processor
+                    .metrics()
+                    .set_readiness(turna_health::Readiness::Degraded);
+                break;
+            }
+            // Watch the listener bridges directly. Their own tasks set Degraded on
+            // a normal unexpected exit, but a *panic* aborts before that runs — so
+            // check the JoinHandle here, which flips to finished on panic too.
+            #[cfg(feature = "tls")]
+            if tls_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                error!("TURNS/TLS listener task exited unexpectedly (possible panic) — degraded");
+                self.processor
+                    .metrics()
+                    .set_readiness(turna_health::Readiness::Degraded);
+                break;
+            }
+            #[cfg(feature = "sctp")]
+            if sctp_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                error!("SCTP listener task exited unexpectedly (possible panic) — degraded");
+                self.processor
+                    .metrics()
+                    .set_readiness(turna_health::Readiness::Degraded);
                 break;
             }
         }
@@ -638,6 +774,15 @@ impl RelayServer {
             w.abort();
         }
         sender_task.abort();
+        cleanup_handle.abort();
+        #[cfg(feature = "tls")]
+        if let Some(h) = tls_handle {
+            h.abort();
+        }
+        #[cfg(feature = "sctp")]
+        if let Some(h) = sctp_handle {
+            h.abort();
+        }
         Ok(())
     }
 

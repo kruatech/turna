@@ -39,3 +39,15 @@ each entry is revisited at the version named under "Review by".
   0.5/0.6, `hashbrown`, `getrandom`, plus dev-only `proptest`/`criterion`
   trees); tracked in `docs/security/dependency-dedup.md`.
 - **Review by:** closed; residuals tracked in the dedup roadmap.
+
+## RISK — active-session HA remains experimental
+
+**Scope:** multi-node gossip/redirect/failover tooling.
+**Accepted boundary:** GA does not promise relay-socket rehydration, preservation
+of the old relay IP, conflict-free relay-port adoption, or media continuity after
+owner death. Durable metadata is not equivalent to a live socket.
+**Mitigation:** canonical production deployment is standalone-first, one public
+IP/range per node; use drain for planned maintenance, monitor remaining
+allocations, and treat cluster StatefulSet mode as experimental.
+**Exit condition:** a separately verified socket/port ownership protocol and
+end-to-end media continuity tests across process/node death.

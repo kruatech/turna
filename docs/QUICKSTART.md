@@ -131,3 +131,15 @@ value.
 You set `TURNA_PRODUCTION=true` without real secrets and/or `external_ip`.
 Generate a secret with `openssl rand -hex 32`, set `TURNA_EXTERNAL_IP`, or unset
 `TURNA_PRODUCTION` for local development.
+
+
+## Runtime management quick check
+
+Runtime mutations are node-scoped durable commands. They require a configured
+state backend, a live node heartbeat/incarnation, a non-empty idempotency key,
+and the current observed version. The dynamic whitelist is limited to global
+allocation count, default per-user allocation count, and
+`max_bytes_per_sec_per_allocation` (bytes/second). `set_user_limits` resolves each field through
+user → tenant → node runtime defaults → bootstrap defaults. The admin UI keeps
+its bearer token only in `sessionStorage`; production mutations without a token
+are rejected.

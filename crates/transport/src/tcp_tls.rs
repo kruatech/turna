@@ -16,14 +16,16 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -187,7 +189,7 @@ impl TcpFrameCodec {
 pub struct TcpConnectionId(u64);
 
 impl TcpConnectionId {
-    fn next(counter: &std::sync::atomic::AtomicU64) -> Self {
+    pub(crate) fn next(counter: &std::sync::atomic::AtomicU64) -> Self {
         Self(counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 }
@@ -227,6 +229,81 @@ pub struct TcpSendCommand {
 }
 
 // ---------------------------------------------------------------------------
+// RFC 6062 connection role transition (framed control -> raw data)
+// ---------------------------------------------------------------------------
+
+/// A connection detached from framed TURN mode after a successful RFC 6062
+/// ConnectionBind. `AsyncRead` yields any bytes buffered past the ConnectionBind
+/// frame first (`prebuffer`) and then the live decrypted stream, so consumers
+/// see one uninterrupted application byte stream; `AsyncWrite` passes straight
+/// through. This lets the (generic) TCP relay splice a TLS client stream to the
+/// plaintext peer stream without losing the unread prebuffer.
+pub struct DetachedConn {
+    pub connection_id: u32,
+    pub peer_addr: SocketAddr,
+    inner: tokio_rustls::server::TlsStream<TcpStream>,
+    prebuffer: BytesMut,
+}
+
+impl AsyncRead for DetachedConn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.get_mut();
+        if !me.prebuffer.is_empty() {
+            let n = std::cmp::min(me.prebuffer.len(), buf.remaining());
+            let chunk = me.prebuffer.split_to(n);
+            buf.put_slice(&chunk);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut me.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DetachedConn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Request (from the relay bridge, after a validated ConnectionBind) to detach a
+/// framed connection into raw relay mode. `success` is the ConnectionBind success
+/// response, written before the switch (RFC 6062 Â§4.4: success precedes raw mode).
+pub struct DetachRequest {
+    pub conn_id: TcpConnectionId,
+    pub connection_id: u32,
+    pub success: Vec<u8>,
+}
+
+/// Internal per-connection control message.
+enum ConnCtl {
+    Send(Vec<u8>),
+    Detach {
+        connection_id: u32,
+        success: Vec<u8>,
+    },
+}
+
+/// Outcome of `handle_conn`: a normal close (emit ConnectionClosed) vs a detach
+/// (ownership moved to the raw relay; not a close).
+enum HandleOutcome {
+    Closed(String),
+    Detached,
+}
+
+// ---------------------------------------------------------------------------
 // TLS Server
 // ---------------------------------------------------------------------------
 
@@ -249,20 +326,80 @@ impl TlsTransportServer {
     pub async fn run(
         self,
         event_tx: mpsc::Sender<TcpTransportEvent>,
+        send_rx: mpsc::Receiver<TcpSendCommand>,
+    ) -> Result<()> {
+        // No RFC 6062 detach: a detach-request channel that never fires and a
+        // handoff sink that is never read.
+        let (_never_tx, never_rx) = mpsc::channel::<DetachRequest>(1);
+        let (out_tx, _out_rx) = mpsc::channel::<DetachedConn>(1);
+        self.run_with_detach(event_tx, send_rx, never_rx, out_tx)
+            .await
+    }
+
+    /// Like [`run`], plus RFC 6062 connection role transition: a `DetachRequest`
+    /// (sent after a validated ConnectionBind) makes the owning connection write
+    /// the success response, stop framing, and hand its raw stream (plus any
+    /// unread bytes) to `detach_out_tx` for raw relaying.
+    pub async fn run_with_detach(
+        self,
+        event_tx: mpsc::Sender<TcpTransportEvent>,
         mut send_rx: mpsc::Receiver<TcpSendCommand>,
+        mut detach_req_rx: mpsc::Receiver<DetachRequest>,
+        detach_out_tx: mpsc::Sender<DetachedConn>,
     ) -> Result<()> {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
         info!(addr = %self.config.listen_addr, max = self.config.max_connections, "TURNS listening");
 
-        let conns: Arc<tokio::sync::RwLock<HashMap<TcpConnectionId, mpsc::Sender<Vec<u8>>>>> =
+        let conns: Arc<tokio::sync::RwLock<HashMap<TcpConnectionId, mpsc::Sender<ConnCtl>>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
-        let conns_send = conns.clone();
+        // Route outbound sends AND detach requests to the owning connection over
+        // the same per-connection queue, so a ConnectionBind success is always
+        // written before the detach that follows it.
+        let conns_route = conns.clone();
         tokio::spawn(async move {
-            while let Some(cmd) = send_rx.recv().await {
-                let c = conns_send.read().await;
-                if let Some(tx) = c.get(&cmd.conn_id) {
-                    let _ = tx.try_send(cmd.data);
+            loop {
+                tokio::select! {
+                    cmd = send_rx.recv() => match cmd {
+                        Some(cmd) => {
+                            let c = conns_route.read().await;
+                            if let Some(tx) = c.get(&cmd.conn_id) {
+                                let _ = tx.try_send(ConnCtl::Send(cmd.data));
+                            }
+                        }
+                        None => break,
+                    },
+                    req = detach_req_rx.recv() => match req {
+                        Some(req) => {
+                            // Clone the owning conn's sender and release the map lock
+                            // before delivering, then hand off on a task so a slow or
+                            // blocked connection cannot stall routing for every other
+                            // connection.
+                            let conn_id = req.conn_id;
+                            let tx = conns_route.read().await.get(&conn_id).cloned();
+                            match tx {
+                                Some(tx) => {
+                                    let ctl = ConnCtl::Detach {
+                                        connection_id: req.connection_id,
+                                        success: req.success,
+                                    };
+                                    tokio::spawn(async move {
+                                        // Bounded send, NOT try_send: a transiently full
+                                        // per-conn queue must not silently drop the
+                                        // detach (which would strand the client framed).
+                                        // On error the conn has closed (ctl_rx dropped) —
+                                        // surface it; the relay side already released its
+                                        // claim on its own send failure.
+                                        if tx.send(ctl).await.is_err() {
+                                            warn!(conn_id = %conn_id, "RFC 6062 detach not delivered; connection closed");
+                                        }
+                                    });
+                                }
+                                None => warn!(conn_id = %conn_id, "RFC 6062 detach for unknown/closed connection"),
+                            }
+                        }
+                        None => break,
+                    },
                 }
             }
         });
@@ -278,34 +415,46 @@ impl TlsTransportServer {
             }
 
             let conn_id = TcpConnectionId::next(&self.conn_counter);
-            let (conn_tx, conn_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (conn_tx, conn_rx) = mpsc::channel::<ConnCtl>(256);
             conns.write().await.insert(conn_id, conn_tx);
 
             let tls = self.tls_acceptor.clone();
             let etx = event_tx.clone();
             let cfg = self.config.clone();
             let conns = conns.clone();
+            let dout = detach_out_tx.clone();
 
             tokio::spawn(async move {
-                let reason =
-                    match handle_conn(conn_id, stream, peer, tls, &cfg, etx.clone(), conn_rx).await
-                    {
-                        Ok(()) => "clean close".into(),
-                        Err(e) => format!("{e}"),
-                    };
+                let outcome =
+                    handle_conn(conn_id, stream, peer, tls, &cfg, etx.clone(), conn_rx, dout).await;
                 conns.write().await.remove(&conn_id);
-                let _ = etx
-                    .send(TcpTransportEvent::ConnectionClosed {
-                        conn_id,
-                        peer_addr: peer,
-                        reason,
-                    })
-                    .await;
+                match outcome {
+                    Ok(HandleOutcome::Detached) => { /* moved to raw relay; not a close */ }
+                    Ok(HandleOutcome::Closed(reason)) => {
+                        let _ = etx
+                            .send(TcpTransportEvent::ConnectionClosed {
+                                conn_id,
+                                peer_addr: peer,
+                                reason,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = etx
+                            .send(TcpTransportEvent::ConnectionClosed {
+                                conn_id,
+                                peer_addr: peer,
+                                reason: format!("{e}"),
+                            })
+                            .await;
+                    }
+                }
             });
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(conn = %id, peer = %peer))]
 async fn handle_conn(
     id: TcpConnectionId,
@@ -314,8 +463,9 @@ async fn handle_conn(
     tls: TlsAcceptor,
     cfg: &TlsTransportConfig,
     etx: mpsc::Sender<TcpTransportEvent>,
-    mut send_rx: mpsc::Receiver<Vec<u8>>,
-) -> Result<()> {
+    mut ctl_rx: mpsc::Receiver<ConnCtl>,
+    detach_out_tx: mpsc::Sender<DetachedConn>,
+) -> Result<HandleOutcome> {
     let tls_stream = timeout(cfg.handshake_timeout, tls.accept(stream))
         .await
         .map_err(|_| TlsError::HandshakeTimeout(cfg.handshake_timeout))?
@@ -336,7 +486,7 @@ async fn handle_conn(
         tokio::select! {
             res = timeout(cfg.read_timeout, rd.read_buf(&mut buf)) => {
                 match res {
-                    Ok(Ok(0)) => return Ok(()),
+                    Ok(Ok(0)) => return Ok(HandleOutcome::Closed("clean close".into())),
                     Ok(Ok(_)) => {
                         while let Some(frame) = codec.decode(&mut buf)? {
                             etx.send(TcpTransportEvent::PacketReceived { conn_id: id, peer_addr: peer, data: frame })
@@ -344,19 +494,47 @@ async fn handle_conn(
                         }
                     }
                     Ok(Err(e)) => return Err(TlsError::Io(e)),
-                    Err(_) => return Ok(()), // idle timeout
+                    Err(_) => return Ok(HandleOutcome::Closed("idle timeout".into())),
                 }
             }
-            Some(data) = send_rx.recv() => {
-                let mut out = BytesMut::with_capacity(2 + data.len());
-                codec.encode(&data, &mut out)?;
-                wr.write_all(&out).await?;
-                wr.flush().await?;
+            Some(ctl) = ctl_rx.recv() => {
+                match ctl {
+                    ConnCtl::Send(data) => {
+                        let mut out = BytesMut::with_capacity(2 + data.len());
+                        codec.encode(&data, &mut out)?;
+                        wr.write_all(&out).await?;
+                        wr.flush().await?;
+                    }
+                    ConnCtl::Detach { connection_id, success } => {
+                        // RFC 6062 4.4: write the ConnectionBind success, then the
+                        // connection stops being a framed control connection and
+                        // becomes a raw data connection.
+                        let mut out = BytesMut::with_capacity(2 + success.len());
+                        codec.encode(&success, &mut out)?;
+                        wr.write_all(&out).await?;
+                        wr.flush().await?;
+                        let stream = rd.unsplit(wr);
+                        let prebuffer = std::mem::take(&mut buf);
+                        if detach_out_tx
+                            .send(DetachedConn { connection_id, peer_addr: peer, inner: stream, prebuffer })
+                            .await
+                            .is_err()
+                        {
+                            // The raw-relay receiver is gone; the detached stream is
+                            // dropped here (closing the TCP connection). Report a close
+                            // so the session layer tears the claim down instead of
+                            // believing the hand-off succeeded.
+                            warn!(conn = %id, "RFC 6062 detach hand-off failed; closing connection");
+                            return Ok(HandleOutcome::Closed("detach hand-off failed".into()));
+                        }
+                        return Ok(HandleOutcome::Detached);
+                    }
+                }
             }
             else => break,
         }
     }
-    Ok(())
+    Ok(HandleOutcome::Closed("clean close".into()))
 }
 
 // ---------------------------------------------------------------------------

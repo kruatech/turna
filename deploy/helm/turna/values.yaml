@@ -4,7 +4,7 @@ production: false
 
 image:
   repository: turna
-  tag: "0.2.0-alpha.1"
+  tag: "0.3.0-rc.2"
   pullPolicy: IfNotPresent
 
 turn:
@@ -12,16 +12,26 @@ turn:
   listenPort: 3478
   healthPort: 9090
   managementPort: 5350
-  externalIP: "" # Required when production=true or cluster.enabled=true without hostNetwork announce override
-  transport: "tokio" # tokio | auto | io_uring
+  externalIP: "" # Required when production=true; must belong to this node/pod
+  nodeId: "turna-standalone" # Stable durable-state key for the standalone node
+  transport: "tokio" # GA production backend; auto/io_uring remain opt-in
   turnUrl: "turn:127.0.0.1:3478"
   relayPortRange:
     min: 49152
     max: 65535
-  maxAllocations: 50000
+  # Per-node UDP allocation cap. 8192 is the conservative ceiling for the default
+  # relay range (49152-65535 = 16384 ports) under EVEN-PORT worst-case, where one
+  # allocation may reserve a second port. Scale total capacity by replicas
+  # (N nodes ~= N x 8192), not by raising this or widening the range.
+  maxAllocations: 8192
   quota:
-    maxBytesPerSec: 0
+    maxBytesPerSecPerAllocation: 0
     maxPerUser: 100
+    # In production (production=true) an unlimited per-allocation bandwidth
+    # cap (maxBytesPerSecPerAllocation=0) is refused unless this explicit accepted-risk
+    # flag is set (P0 #7). Prefer a real maxBytesPerSecPerAllocation cap; set this true
+    # only when you have deliberately accepted running without one.
+    allowUnlimitedBandwidth: false
   auth:
     # TURN long-term/shared secret. It is NEVER written into the ConfigMap; the
     # config references it as ${TURNA_SHARED_SECRET} and it is injected as an
@@ -152,9 +162,23 @@ networkPolicy:
 #         app.kubernetes.io/name: turna
 topologySpreadConstraints: []
 
-# Multi-node cluster (gossip discovery + TURN-redirect load balancing).
-# When enabled, the TURN workload is deployed as a StatefulSet (stable per-pod
-# node_id) with a headless Service for gossip, instead of a Deployment.
+# Durable state backend. Enable this for runtime update_config/set_user_limits
+# persistence and restart restore even when cluster.enabled=false. The chart does
+# not install Tarantool; point uri at a separately managed instance.
+state:
+  enabled: false
+  type: "memory" # memory | tarantool
+  uri: ""
+  user: ""
+  existingSecret: ""
+  existingSecretKey: "backend-password"
+  poolSize: 8
+  persistenceMode: "disabled" # disabled | write_behind
+  userRefreshSecs: 30
+
+# EXPERIMENTAL multi-node profile (gossip + TURN 300 redirects). It does not
+# provide transparent active-allocation continuity or zero-gap rolling upgrades.
+# GA is standalone-first; when enabled this uses a StatefulSet and per-pod IDs.
 cluster:
   enabled: false
   name: "turna" # cluster identity; MUST match across all pods

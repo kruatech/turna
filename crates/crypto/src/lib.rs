@@ -71,6 +71,43 @@ pub fn long_term_key_sha256(username: &str, realm: &str, password: &str) -> Vec<
     Sha256::digest(input.as_bytes()).to_vec()
 }
 
+/// Raw SHA-256 of `data` (32 bytes). Used by the control-plane audit log to
+/// hash-chain privileged operations.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// HMAC-SHA256 (RFC 2104) of `data` under `key`, returning 32 bytes. Used by the
+/// control-plane audit log to key its hash chain so that an attacker with write
+/// access to the log files cannot forge a consistent chain without the key.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Vec::with_capacity(BLOCK + data.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(data);
+    let inner_hash = sha256(&inner);
+    let mut outer = Vec::with_capacity(BLOCK + 32);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer)
+}
+
 /// Generate time-limited TURN credentials (REST API style).
 pub fn generate_turn_credentials(
     user_id: &str,
@@ -132,5 +169,23 @@ mod tests {
         assert_eq!(k, Sha256::digest(b"user:realm:pass").to_vec());
         // Distinct from the MD5 long-term key.
         assert_ne!(k, long_term_key("user", "realm", "pass"));
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_case_1() {
+        // RFC 4231 Test Case 1: key = 0x0b*20, data = "Hi There".
+        let key = [0x0bu8; 20];
+        let mac = hmac_sha256(&key, b"Hi There");
+        let expected = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+        let got: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hmac_sha256_is_key_dependent() {
+        let a = hmac_sha256(b"key-a", b"same data");
+        let b = hmac_sha256(b"key-b", b"same data");
+        assert_ne!(a, b);
+        assert_eq!(a, hmac_sha256(b"key-a", b"same data"));
     }
 }

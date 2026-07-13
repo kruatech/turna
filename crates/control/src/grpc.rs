@@ -34,6 +34,16 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 use turna_health::Metrics;
+use turna_state_backend::{
+    command_payload_hash, LimitMode as BackendLimitMode, LimitU32 as BackendLimitU32,
+    LimitU64 as BackendLimitU64, NodeRuntimeState,
+    SetUserLimitsCommand as BackendSetUserLimitsCommand, SetUserLimitsResult,
+    UpdateConfigCommand as BackendUpdateConfigCommand, UpdateConfigResult,
+    UserLimitScope as BackendUserLimitScope, UserLimitTarget as BackendUserLimitTarget,
+    UserLimitsPatch as BackendUserLimitsPatch,
+};
+
+use crate::audit::AuditLog;
 
 // ── Proto generated code ──────────────────────────────────────────────────────
 
@@ -63,7 +73,13 @@ pub struct GrpcConfig {
 pub struct GrpcTlsConfig {
     pub server_cert: PathBuf,
     pub server_key: PathBuf,
+    /// Path to the CA that signs client certificates. Only read when
+    /// `require_client_auth` is true (mTLS). Ignored in server-only TLS.
     pub client_ca_cert: PathBuf,
+    /// `true` => mTLS: the server requires and verifies a client certificate
+    /// against `client_ca_cert`. `false` => server-only TLS: clients are NOT
+    /// asked for a certificate (authenticate them by another mechanism).
+    pub require_client_auth: bool,
 }
 
 impl Default for GrpcConfig {
@@ -91,16 +107,36 @@ pub trait TurnCore: Send + Sync + 'static {
     ) -> Result<(Vec<AllocationInfo>, Option<String>, usize), CoreError>;
 
     async fn get_allocation(&self, id: &str) -> Result<AllocationInfo, CoreError>;
-    async fn delete_allocation(&self, id: &str, reason: &str) -> Result<(), CoreError>;
+    async fn delete_allocation(
+        &self,
+        id: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> Result<(), CoreError>;
     async fn server_stats(&self) -> ServerStatsInfo;
     async fn top_talkers(&self, limit: usize, sort_by: &str) -> Vec<TopTalkerInfo>;
-    async fn update_config(&self, update: ConfigUpdate) -> Result<(), CoreError>;
+    async fn update_config(&self, update: ConfigUpdate) -> Result<UpdateConfigResult, CoreError>;
+    async fn set_user_limits(
+        &self,
+        update: UserLimitsUpdate,
+    ) -> Result<SetUserLimitsResult, CoreError>;
     async fn add_user(&self, user: &str, pass: &str, org: Option<&str>) -> Result<(), CoreError>;
     async fn remove_user(&self, user: &str, force: bool) -> Result<u32, CoreError>;
-    async fn set_draining(&self, draining: bool) -> Result<u32, CoreError>;
-    async fn shutdown(&self, graceful: bool, timeout: Duration) -> Result<u32, CoreError>;
+    async fn set_draining(
+        &self,
+        node_id: &str,
+        draining: bool,
+        idempotency_key: &str,
+    ) -> Result<u32, CoreError>;
+    async fn shutdown(
+        &self,
+        node_id: &str,
+        graceful: bool,
+        timeout: Duration,
+        idempotency_key: &str,
+    ) -> Result<u32, CoreError>;
     fn subscribe_events(&self) -> broadcast::Receiver<AllocationEvent>;
-    fn get_config(&self) -> CurrentConfig;
+    async fn get_config(&self, node_id: &str) -> Result<NodeRuntimeState, CoreError>;
 }
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -147,6 +183,10 @@ pub struct ServerStatsInfo {
     pub avg_latency_us: u64,
     pub p99_latency_us: u64,
     pub blocked_ips: u32,
+    /// True when a shared cluster backend is attached: the allocation figures
+    /// above are cluster-wide, but the runtime gauges (ports/pps/latency/
+    /// draining/blocked_ips) are this control-plane node's local view only.
+    pub backend_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,25 +200,23 @@ pub struct TopTalkerInfo {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigUpdate {
-    pub max_lifetime: Option<u32>,
+    pub node_id: String,
+    pub idempotency_key: String,
+    pub expected_version: u64,
+    pub max_allocations: Option<u32>,
     pub max_allocations_per_user: Option<u32>,
-    pub max_bandwidth_per_user_bps: Option<u64>,
-    pub draining: Option<bool>,
+    pub max_bytes_per_sec_per_allocation: Option<u64>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct CurrentConfig {
-    pub realm: String,
-    pub min_port: u32,
-    pub max_port: u32,
-    pub default_lifetime: u32,
-    pub max_lifetime: u32,
-    pub max_allocations_per_user: u32,
-    pub max_bandwidth_per_user_bps: u64,
-    pub draining: bool,
-    pub external_ipv4: String,
-    pub listen_addresses: Vec<String>,
-    pub nonce_lifetime_seconds: u32,
+pub struct UserLimitsUpdate {
+    pub node_id: String,
+    pub idempotency_key: String,
+    pub expected_version: u64,
+    pub target: BackendUserLimitTarget,
+    pub patch: BackendUserLimitsPatch,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +242,8 @@ pub enum CoreError {
     AlreadyExists(String),
     #[error("invalid: {0}")]
     Invalid(String),
+    #[error("failed precondition: {0}")]
+    FailedPrecondition(String),
     #[error("internal: {0}")]
     Internal(String),
     #[error("unimplemented: {0}")]
@@ -216,6 +256,7 @@ impl From<CoreError> for Status {
             CoreError::NotFound(m) => Status::not_found(m),
             CoreError::AlreadyExists(m) => Status::already_exists(m),
             CoreError::Invalid(m) => Status::invalid_argument(m),
+            CoreError::FailedPrecondition(m) => Status::failed_precondition(m),
             CoreError::Internal(m) => Status::internal(m),
             CoreError::Unimplemented(m) => Status::unimplemented(m),
         }
@@ -360,6 +401,11 @@ struct TurnaManagementService {
     shutdown_token: CancellationToken,
     /// Counts currently open streaming RPCs.
     active_streams: Arc<AtomicU64>,
+    /// Tamper-evident audit log of privileged operations.
+    audit: Arc<AuditLog>,
+    /// #9 high-assurance: require an idempotency key on destructive ops
+    /// (delete_allocation / set_draining / shutdown).
+    require_idempotency_key: bool,
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -411,11 +457,41 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<DeleteAllocationRequest>,
     ) -> Result<Response<DeleteAllocationResponse>, Status> {
+        // D-enforcement (fail-closed): never perform a destructive/privileged
+        // operation we cannot record. If the audit log is degraded (write or
+        // rotation failure), refuse rather than act unaudited.
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing destructive operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
         let r = req.into_inner();
-        self.core
-            .delete_allocation(&r.id, &r.reason)
-            .await
-            .map_err(Status::from)?;
+        // #9 high-assurance: destructive ops require an idempotency key so a
+        // lost-response retry cannot create a second effect.
+        if self.require_idempotency_key && r.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "idempotency_key is required for this operation (high-assurance mode)",
+            ));
+        }
+        let detail = format!("id={} reason={}", r.id, r.reason);
+        // #2 durable intent: persist that we are about to act BEFORE the effect;
+        // refuse if it cannot be made durable (never perform an unauditable op).
+        if !self
+            .audit
+            .record_checked(&actor, "delete_allocation.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        let outcome = self
+            .core
+            .delete_allocation(&r.id, &r.reason, &r.idempotency_key)
+            .await;
+        self.audit
+            .record(&actor, "delete_allocation", detail, outcome.is_ok());
+        outcome.map_err(Status::from)?;
         Ok(Response::new(DeleteAllocationResponse { success: true }))
     }
 
@@ -474,59 +550,121 @@ impl TurnaManagement for TurnaManagementService {
 
     async fn get_config(
         &self,
-        _req: Request<GetConfigRequest>,
-    ) -> Result<Response<ServerConfig>, Status> {
-        let c = self.core.get_config();
-        Ok(Response::new(ServerConfig {
-            realm: c.realm,
-            min_port: c.min_port,
-            max_port: c.max_port,
-            default_lifetime: c.default_lifetime,
-            max_lifetime: c.max_lifetime,
-            max_allocations_per_user: c.max_allocations_per_user,
-            max_bandwidth_per_user_bps: c.max_bandwidth_per_user_bps,
-            draining: c.draining,
-            external_ipv4: c.external_ipv4,
-            external_ipv6: String::new(),
-            listen_addresses: c.listen_addresses,
-            nonce_lifetime_seconds: c.nonce_lifetime_seconds,
-        }))
+        req: Request<GetConfigRequest>,
+    ) -> Result<Response<NodeRuntimeConfig>, Status> {
+        let node_id = req.into_inner().node_id;
+        if node_id.trim().is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        let state = self.core.get_config(&node_id).await.map_err(Status::from)?;
+        Ok(Response::new(node_runtime_to_proto(state)))
     }
 
     async fn update_config(
         &self,
         req: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing privileged operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
         let r = req.into_inner();
-        let update = ConfigUpdate {
-            max_lifetime: r.max_lifetime,
+        if r.node_id.trim().is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        if r.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument("idempotency_key is required"));
+        }
+        if r.max_allocations.is_none()
+            && r.max_allocations_per_user.is_none()
+            && r.max_bytes_per_sec_per_allocation.is_none()
+        {
+            return Err(Status::invalid_argument(
+                "patch must contain at least one field",
+            ));
+        }
+        let mut update = ConfigUpdate {
+            node_id: r.node_id,
+            idempotency_key: r.idempotency_key,
+            expected_version: r.expected_version,
+            max_allocations: r.max_allocations,
             max_allocations_per_user: r.max_allocations_per_user,
-            max_bandwidth_per_user_bps: r.max_bandwidth_per_user_bps,
-            draining: r.draining,
+            max_bytes_per_sec_per_allocation: r.max_bytes_per_sec_per_allocation,
+            reason: r.reason,
         };
-        self.core
-            .update_config(update)
-            .await
-            .map_err(Status::from)?;
-        let c = self.core.get_config();
-        Ok(Response::new(UpdateConfigResponse {
-            success: true,
-            current: Some(ServerConfig {
-                realm: c.realm,
-                min_port: c.min_port,
-                max_port: c.max_port,
-                default_lifetime: c.default_lifetime,
-                max_lifetime: c.max_lifetime,
-                max_allocations_per_user: c.max_allocations_per_user,
-                max_bandwidth_per_user_bps: c.max_bandwidth_per_user_bps,
-                draining: c.draining,
-                external_ipv4: c.external_ipv4,
-                external_ipv6: String::new(),
-                listen_addresses: c.listen_addresses,
-                nonce_lifetime_seconds: c.nonce_lifetime_seconds,
-            }),
-            warnings: vec![],
-        }))
+        let changed_fields = [
+            update.max_allocations.map(|_| "max_allocations"),
+            update
+                .max_allocations_per_user
+                .map(|_| "max_allocations_per_user"),
+            update
+                .max_bytes_per_sec_per_allocation
+                .map(|_| "max_bytes_per_sec_per_allocation"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        // §7: reason is mandatory for audit-critical mutations. Reject empty
+        // input at ingress so it never enters the command log (InvalidArgument).
+        update.reason = normalize_reason(&update.reason, "update_config")?;
+        let audit_command = BackendUpdateConfigCommand {
+            schema_version: 1,
+            expected_version: update.expected_version,
+            max_allocations: update.max_allocations.map(|value| value as usize),
+            max_allocations_per_user: update.max_allocations_per_user.map(|value| value as usize),
+            max_bytes_per_sec_per_allocation: update.max_bytes_per_sec_per_allocation,
+            reason: update.reason.clone(),
+        };
+        let audit_payload = serde_json::to_string(&audit_command).map_err(|error| {
+            Status::internal(format!("audit payload serialization failed: {error}"))
+        })?;
+        let payload_hash = command_payload_hash("update_config", &[], &audit_payload);
+        let detail = format!(
+            "node={} key={} payload_hash={} expected_version={} changed_fields={} reason={}",
+            update.node_id,
+            update.idempotency_key,
+            payload_hash,
+            update.expected_version,
+            changed_fields.join(","),
+            update.reason,
+        );
+        if !self
+            .audit
+            .record_checked(&actor, "update_config.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        match self.core.update_config(update).await {
+            Ok(result) => {
+                let complete = format!(
+                    "{} previous_version={} observed_version={} changed={} status={} error={} rolled_back={}",
+                    detail,
+                    result.previous_version,
+                    result.observed_version,
+                    result.changed,
+                    result.terminal_status,
+                    result.error,
+                    result.rolled_back,
+                );
+                let success = matches!(result.terminal_status.as_str(), "applied" | "no_op");
+                self.audit
+                    .record(&actor, "update_config", complete, success);
+                Ok(Response::new(update_config_result_to_proto(result)))
+            }
+            Err(error) => {
+                self.audit.record(
+                    &actor,
+                    "update_config",
+                    format!("{detail} error={error}"),
+                    false,
+                );
+                Err(Status::from(error))
+            }
+        }
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
@@ -556,6 +694,7 @@ impl TurnaManagement for TurnaManagementService {
             avg_latency_us: s.avg_latency_us,
             p99_latency_us: s.p99_latency_us,
             blocked_ips: s.blocked_ips,
+            backend_mode: s.backend_mode,
         }))
     }
 
@@ -617,6 +756,7 @@ impl TurnaManagement for TurnaManagementService {
                         avg_latency_us: s.avg_latency_us,
                         p99_latency_us: s.p99_latency_us,
                         blocked_ips: s.blocked_ips,
+                        backend_mode: s.backend_mode,
                     }),
                 })
             }
@@ -634,11 +774,35 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<AddUserRequest>,
     ) -> Result<Response<AddUserResponse>, Status> {
+        // D-enforcement (fail-closed): never perform a destructive/privileged
+        // operation we cannot record. If the audit log is degraded (write or
+        // rotation failure), refuse rather than act unaudited.
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing destructive operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
         let r = req.into_inner();
-        self.core
+        // Record identifiers only — never the password.
+        let detail = format!("user={} org={:?}", r.username, opt_str(&r.organization));
+        // #2 durable intent: persist that we are about to act BEFORE the effect;
+        // refuse if it cannot be made durable (never perform an unauditable op).
+        if !self
+            .audit
+            .record_checked(&actor, "add_user.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        let outcome = self
+            .core
             .add_user(&r.username, &r.password, opt_str(&r.organization))
-            .await
-            .map_err(Status::from)?;
+            .await;
+        self.audit
+            .record(&actor, "add_user", detail, outcome.is_ok());
+        outcome.map_err(Status::from)?;
         Ok(Response::new(AddUserResponse { success: true }))
     }
 
@@ -646,12 +810,34 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<RemoveUserRequest>,
     ) -> Result<Response<RemoveUserResponse>, Status> {
+        // D-enforcement (fail-closed): never perform a destructive/privileged
+        // operation we cannot record. If the audit log is degraded (write or
+        // rotation failure), refuse rather than act unaudited.
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing destructive operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
         let r = req.into_inner();
-        let deleted = self
+        let detail = format!("user={} force={}", r.username, r.force_delete_allocations);
+        // #2 durable intent: persist that we are about to act BEFORE the effect;
+        // refuse if it cannot be made durable (never perform an unauditable op).
+        if !self
+            .audit
+            .record_checked(&actor, "remove_user.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        let outcome = self
             .core
             .remove_user(&r.username, r.force_delete_allocations)
-            .await
-            .map_err(Status::from)?;
+            .await;
+        self.audit
+            .record(&actor, "remove_user", detail, outcome.is_ok());
+        let deleted = outcome.map_err(Status::from)?;
         Ok(Response::new(RemoveUserResponse {
             success: true,
             allocations_deleted: deleted,
@@ -660,15 +846,119 @@ impl TurnaManagement for TurnaManagementService {
 
     async fn set_user_limits(
         &self,
-        _req: Request<SetUserLimitsRequest>,
+        req: Request<SetUserLimitsRequest>,
     ) -> Result<Response<SetUserLimitsResponse>, Status> {
-        // The per-user rate limiter this RPC was meant to drive was dead code
-        // (never wired to the datapath) and has been removed (M3). Returning a
-        // fake `success: true` created a false sense of enforcement; report it
-        // honestly as unimplemented instead.
-        Err(Status::unimplemented(
-            "per-user rate limits are not implemented",
-        ))
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing privileged operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
+        let r = req.into_inner();
+        if r.node_id.trim().is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        if r.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument("idempotency_key is required"));
+        }
+        let target = r
+            .target
+            .ok_or_else(|| Status::invalid_argument("target is required"))?;
+        let patch = r
+            .patch
+            .ok_or_else(|| Status::invalid_argument("patch is required"))?;
+        let mut update = UserLimitsUpdate {
+            node_id: r.node_id,
+            idempotency_key: r.idempotency_key,
+            expected_version: r.expected_version,
+            target: user_limit_target_from_proto(target)?,
+            patch: user_limits_patch_from_proto(patch)?,
+            reason: r.reason,
+        };
+        if update.patch.is_empty() {
+            return Err(Status::invalid_argument(
+                "patch must contain at least one field",
+            ));
+        }
+        let changed_fields = [
+            update
+                .patch
+                .max_allocations
+                .as_ref()
+                .map(|_| "max_allocations"),
+            update
+                .patch
+                .max_bytes_per_sec_per_allocation
+                .as_ref()
+                .map(|_| "max_bytes_per_sec_per_allocation"),
+            update
+                .patch
+                .max_lifetime_secs
+                .as_ref()
+                .map(|_| "max_lifetime_secs"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        // §7: reason is mandatory for audit-critical mutations. Reject empty
+        // input at ingress so it never enters the command log (InvalidArgument).
+        update.reason = normalize_reason(&update.reason, "set_user_limits")?;
+        let audit_command = BackendSetUserLimitsCommand {
+            schema_version: 1,
+            expected_version: update.expected_version,
+            target: update.target.clone(),
+            patch: update.patch.clone(),
+            reason: update.reason.clone(),
+        };
+        let audit_payload = serde_json::to_string(&audit_command).map_err(|error| {
+            Status::internal(format!("audit payload serialization failed: {error}"))
+        })?;
+        let payload_hash = command_payload_hash("set_user_limits", &[], &audit_payload);
+        let detail = format!(
+            "node={} key={} payload_hash={} expected_version={} subject={} changed_fields={} reason={}",
+            update.node_id,
+            update.idempotency_key,
+            payload_hash,
+            update.expected_version,
+            update.target.subject_key(),
+            changed_fields.join(","),
+            update.reason,
+        );
+        if !self
+            .audit
+            .record_checked(&actor, "set_user_limits.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        match self.core.set_user_limits(update).await {
+            Ok(result) => {
+                let complete = format!(
+                    "{} previous_version={} observed_version={} max_user_allocations_in_scope={} max_user_allocations_above_limit={} status={} error={}",
+                    detail,
+                    result.previous_version,
+                    result.observed_version,
+                    result.max_user_allocations_in_scope,
+                    result.max_user_allocations_above_limit,
+                    result.terminal_status,
+                    result.error,
+                );
+                let success = matches!(result.terminal_status.as_str(), "applied" | "no_op");
+                self.audit
+                    .record(&actor, "set_user_limits", complete, success);
+                Ok(Response::new(set_user_limits_result_to_proto(result)))
+            }
+            Err(error) => {
+                self.audit.record(
+                    &actor,
+                    "set_user_limits",
+                    format!("{detail} error={error}"),
+                    false,
+                );
+                Err(Status::from(error))
+            }
+        }
     }
 
     // ── Server control ────────────────────────────────────────────────────────
@@ -677,12 +967,41 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<SetDrainingRequest>,
     ) -> Result<Response<SetDrainingResponse>, Status> {
+        // D-enforcement (fail-closed): never perform a destructive/privileged
+        // operation we cannot record. If the audit log is degraded (write or
+        // rotation failure), refuse rather than act unaudited.
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing destructive operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
         let r = req.into_inner();
-        let active = self
+        // #9 high-assurance: destructive ops require an idempotency key so a
+        // lost-response retry cannot create a second effect.
+        if self.require_idempotency_key && r.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "idempotency_key is required for this operation (high-assurance mode)",
+            ));
+        }
+        let detail = format!("node={} draining={}", r.node_id, r.draining);
+        // #2 durable intent: persist that we are about to act BEFORE the effect;
+        // refuse if it cannot be made durable (never perform an unauditable op).
+        if !self
+            .audit
+            .record_checked(&actor, "set_draining.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        let outcome = self
             .core
-            .set_draining(r.draining)
-            .await
-            .map_err(Status::from)?;
+            .set_draining(&r.node_id, r.draining, &r.idempotency_key)
+            .await;
+        self.audit
+            .record(&actor, "set_draining", detail, outcome.is_ok());
+        let active = outcome.map_err(Status::from)?;
         Ok(Response::new(SetDrainingResponse {
             success: true,
             active_allocations: active,
@@ -693,15 +1012,125 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        // D-enforcement (fail-closed): never perform a destructive/privileged
+        // operation we cannot record. If the audit log is degraded (write or
+        // rotation failure), refuse rather than act unaudited.
+        if !self.audit.is_healthy() {
+            return Err(Status::failed_precondition(
+                "audit log degraded; refusing destructive operation (fail-closed)",
+            ));
+        }
+        let actor = actor_of(&req);
         let r = req.into_inner();
-        let remaining = self
+        // #9 high-assurance: destructive ops require an idempotency key so a
+        // lost-response retry cannot create a second effect.
+        if self.require_idempotency_key && r.idempotency_key.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "idempotency_key is required for this operation (high-assurance mode)",
+            ));
+        }
+        let detail = format!(
+            "node={} graceful={} timeout_s={}",
+            r.node_id, r.graceful, r.timeout_seconds
+        );
+        // #2 durable intent: persist that we are about to act BEFORE the effect;
+        // refuse if it cannot be made durable (never perform an unauditable op).
+        if !self
+            .audit
+            .record_checked(&actor, "shutdown.intent", &detail, true)
+        {
+            return Err(Status::failed_precondition(
+                "audit intent not durable; refusing operation (fail-closed)",
+            ));
+        }
+        let outcome = self
             .core
-            .shutdown(r.graceful, Duration::from_secs(r.timeout_seconds as u64))
-            .await
-            .map_err(Status::from)?;
+            .shutdown(
+                &r.node_id,
+                r.graceful,
+                Duration::from_secs(r.timeout_seconds as u64),
+                &r.idempotency_key,
+            )
+            .await;
+        self.audit
+            .record(&actor, "shutdown", detail, outcome.is_ok());
+        let remaining = outcome.map_err(Status::from)?;
         Ok(Response::new(ShutdownResponse {
             accepted: true,
             remaining_allocations: remaining,
+        }))
+    }
+
+    // ── Audit ─────────────────────────────────────────────────────────────────
+
+    async fn verify_audit(
+        &self,
+        _req: Request<VerifyAuditRequest>,
+    ) -> Result<Response<VerifyAuditResponse>, Status> {
+        let (intact, broken_at_seq) = match self.audit.verify() {
+            Ok(_) => (true, 0),
+            Err(seq) => (false, seq),
+        };
+        let mut resp = VerifyAuditResponse {
+            intact,
+            broken_at_seq,
+            total_recorded: self.audit.total_recorded(),
+            retained: self.audit.len() as u64,
+            disk_checked: false,
+            disk_intact: false,
+            disk_broken_at_seq: 0,
+            disk_entries: 0,
+            disk_first_seq: 0,
+            disk_last_seq: 0,
+            disk_segments: 0,
+        };
+        // When persistence is enabled, also verify the full on-disk chain across
+        // every rotated segment plus the live file.
+        if let Some(result) = self.audit.verify_persisted_self() {
+            resp.disk_checked = true;
+            match result {
+                Ok(v) => {
+                    resp.disk_intact = true;
+                    resp.disk_entries = v.entries;
+                    resp.disk_first_seq = v.first_seq;
+                    resp.disk_last_seq = v.last_seq;
+                    resp.disk_segments = v.segments as u64;
+                }
+                Err(crate::audit::AuditVerifyError::ChainBreak { seq }) => {
+                    resp.disk_broken_at_seq = seq;
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(Response::new(resp))
+    }
+
+    async fn get_audit_log(
+        &self,
+        req: Request<GetAuditLogRequest>,
+    ) -> Result<Response<GetAuditLogResponse>, Status> {
+        let limit = req.into_inner().limit as usize;
+        let mut snap = self.audit.snapshot();
+        if limit != 0 && snap.len() > limit {
+            // Keep the most recent `limit` entries.
+            snap = snap.split_off(snap.len() - limit);
+        }
+        let records = snap
+            .into_iter()
+            .map(|e| AuditRecord {
+                seq: e.seq,
+                ts_ms: e.ts_ms,
+                actor: e.actor,
+                action: e.action,
+                detail: e.detail,
+                outcome: e.outcome,
+                prev_hash: crate::audit::hex32(&e.prev_hash),
+                entry_hash: crate::audit::hex32(&e.entry_hash),
+            })
+            .collect();
+        Ok(Response::new(GetAuditLogResponse {
+            records,
+            total_recorded: self.audit.total_recorded(),
         }))
     }
 }
@@ -710,6 +1139,28 @@ impl TurnaManagement for TurnaManagementService {
 type AllocationEvent_ = proto::AllocationEvent;
 
 // ── Server launcher ───────────────────────────────────────────────────────────
+
+/// Retained in-memory audit entries (tail); the complete chain is emitted on the
+/// `audit` tracing target regardless of this cap.
+const AUDIT_RING_CAPACITY: usize = 1024;
+
+/// Caller identity for the audit log. Prefers the authenticated mTLS client
+/// credential: a SHA-256 fingerprint of the peer's leaf certificate uniquely
+/// identifies the client without parsing the X.509 structure (no extra
+/// dependency). Falls back to the peer socket address when no client
+/// certificate is presented (server-only TLS / loopback).
+fn actor_of<T>(req: &Request<T>) -> String {
+    if let Some(certs) = req.peer_certs() {
+        if let Some(leaf) = certs.first() {
+            let der: &[u8] = leaf.as_ref();
+            let fp = turna_crypto::sha256(der);
+            return format!("cert:{}", crate::audit::hex32(&fp));
+        }
+    }
+    req.remote_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 
 /// Start the gRPC management server with graceful shutdown support.
 ///
@@ -734,10 +1185,70 @@ pub async fn start_grpc_server(
     let shutdown_token = CancellationToken::new();
     let active_streams = Arc::new(AtomicU64::new(0));
 
+    // Audit sink. Persistent + tamper-evident when TURNA_AUDIT_LOG_PATH is set;
+    // the HMAC key comes from TURNA_AUDIT_HMAC_KEY (hex, out-of-band — never in
+    // the log). If persistence is requested but the existing chain fails to open
+    // or verify, we FAIL CLOSED (refuse to start) rather than silently downgrade
+    // to in-memory, which would hide tampering.
+    let audit = {
+        // Distinguish "unset" (unkeyed integrity-only is allowed) from "set but
+        // invalid" (a typo would silently disable tamper-evidence — fail closed).
+        let key = match std::env::var("TURNA_AUDIT_HMAC_KEY") {
+            Ok(h) if !h.is_empty() => match crate::audit::parse_hex_key(&h) {
+                Some(k) if k.len() >= 32 => Some(k),
+                Some(_) => {
+                    return Err("TURNA_AUDIT_HMAC_KEY must be at least 32 bytes \
+                                (64 hex chars) of random key material"
+                        .into());
+                }
+                None => {
+                    return Err("TURNA_AUDIT_HMAC_KEY is set but is not valid hex; \
+                                refusing to start (a typo would silently disable \
+                                the audit log's tamper-evidence)"
+                        .into());
+                }
+            },
+            _ => None,
+        };
+        match std::env::var("TURNA_AUDIT_LOG_PATH") {
+            Ok(p) if !p.is_empty() => {
+                if key.is_none() {
+                    warn!(
+                        "TURNA_AUDIT_LOG_PATH set without a valid TURNA_AUDIT_HMAC_KEY:                          the audit log is integrity-only, not tamper-evident against a                          privileged attacker"
+                    );
+                }
+                match AuditLog::open(AUDIT_RING_CAPACITY, &p, key) {
+                    Ok(log) => {
+                        info!(path = %p, "management audit log persistence enabled");
+                        Arc::new(log)
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "audit log open/verify failed for {p}: {e:?} (refusing to                              start; persistence was explicitly requested)"
+                        )
+                        .into());
+                    }
+                }
+            }
+            _ => Arc::new(AuditLog::new(AUDIT_RING_CAPACITY)),
+        }
+    };
+
+    // #9: high-assurance mode — require an idempotency key on destructive ops so a
+    // lost-response retry cannot create a second effect. Off by default.
+    let require_idempotency_key = matches!(
+        std::env::var("TURNA_REQUIRE_IDEMPOTENCY_KEY")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+
     let svc = TurnaManagementServer::new(TurnaManagementService {
         core,
         shutdown_token: shutdown_token.clone(),
         active_streams: Arc::clone(&active_streams),
+        audit,
+        require_idempotency_key,
     })
     .max_decoding_message_size(config.max_message_size)
     .max_encoding_message_size(config.max_message_size);
@@ -747,12 +1258,21 @@ pub async fn start_grpc_server(
     if let Some(tls_cfg) = &config.tls {
         let cert = std::fs::read(&tls_cfg.server_cert)?;
         let key = std::fs::read(&tls_cfg.server_key)?;
-        let ca = std::fs::read(&tls_cfg.client_ca_cert)?;
-        let tls = ServerTlsConfig::new()
-            .identity(Identity::from_pem(&cert, &key))
-            .client_ca_root(Certificate::from_pem(&ca));
-        builder = builder.tls_config(tls)?;
-        info!(addr = %config.listen_addr, "gRPC management server starting (mTLS)");
+        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert, &key));
+        if tls_cfg.require_client_auth {
+            // mTLS: require and verify a client certificate against the CA.
+            let ca = std::fs::read(&tls_cfg.client_ca_cert)?;
+            tls = tls.client_ca_root(Certificate::from_pem(&ca));
+            builder = builder.tls_config(tls)?;
+            info!(addr = %config.listen_addr,
+                  "gRPC management server starting (mTLS — client certificate required)");
+        } else {
+            // server-only TLS: do NOT set client_ca_root, so clients are not
+            // asked for a certificate. Authenticate them by another mechanism.
+            builder = builder.tls_config(tls)?;
+            info!(addr = %config.listen_addr,
+                  "gRPC management server starting (TLS — server-only, no client certificate)");
+        }
     } else {
         info!(addr = %config.listen_addr, "gRPC management server starting (no TLS — dev mode)");
     }
@@ -807,6 +1327,209 @@ pub async fn start_grpc_server(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn runtime_snapshot_to_proto(
+    snapshot: turna_state_backend::RuntimeConfigSnapshot,
+) -> RuntimeConfigSnapshot {
+    RuntimeConfigSnapshot {
+        version: snapshot.version,
+        max_allocations: snapshot.max_allocations.min(u32::MAX as usize) as u32,
+        max_allocations_per_user: snapshot.max_allocations_per_user.min(u32::MAX as usize) as u32,
+        max_bytes_per_sec_per_allocation: snapshot.max_bytes_per_sec_per_allocation,
+    }
+}
+
+fn node_runtime_to_proto(state: NodeRuntimeState) -> NodeRuntimeConfig {
+    let pending = if state.desired_version != state.observed_version || state.status != "observed" {
+        Some(runtime_snapshot_to_proto(state.desired_snapshot))
+    } else {
+        None
+    };
+    NodeRuntimeConfig {
+        node_id: state.node_id,
+        desired_version: state.desired_version,
+        observed_version: state.observed_version,
+        observed: Some(runtime_snapshot_to_proto(state.observed_snapshot)),
+        pending_desired: pending,
+        status: state.status,
+        last_apply_error: state.last_error,
+        updated_at_ms: state.updated_at_ms,
+    }
+}
+
+fn update_config_result_to_proto(result: UpdateConfigResult) -> UpdateConfigResponse {
+    UpdateConfigResponse {
+        request_id: result.request_id,
+        previous_version: result.previous_version,
+        observed_version: result.observed_version,
+        changed: result.changed,
+        applied: Some(runtime_snapshot_to_proto(result.applied)),
+        terminal_status: result.terminal_status,
+        error: result.error,
+        rolled_back: result.rolled_back,
+    }
+}
+
+fn limit_mode_from_proto(mode: i32) -> Result<BackendLimitMode, Status> {
+    match LimitMode::try_from(mode).map_err(|_| Status::invalid_argument("invalid limit mode"))? {
+        LimitMode::Inherit => Ok(BackendLimitMode::Inherit),
+        LimitMode::Value => Ok(BackendLimitMode::Value),
+        LimitMode::Unlimited => Ok(BackendLimitMode::Unlimited),
+        LimitMode::Disabled => Ok(BackendLimitMode::Disabled),
+    }
+}
+
+fn limit_u32_from_proto(value: UInt32Limit) -> Result<BackendLimitU32, Status> {
+    let mode = limit_mode_from_proto(value.mode)?;
+    if mode == BackendLimitMode::Value && value.value == 0 {
+        return Err(Status::invalid_argument(
+            "VALUE requires a non-zero value; use UNLIMITED or DISABLED explicitly",
+        ));
+    }
+    if mode != BackendLimitMode::Value && value.value != 0 {
+        return Err(Status::invalid_argument(
+            "limit value must be zero unless mode is VALUE",
+        ));
+    }
+    Ok(BackendLimitU32 {
+        mode,
+        value: value.value,
+    })
+}
+
+fn limit_u64_from_proto(value: UInt64Limit) -> Result<BackendLimitU64, Status> {
+    let mode = limit_mode_from_proto(value.mode)?;
+    if mode == BackendLimitMode::Value && value.value == 0 {
+        return Err(Status::invalid_argument(
+            "VALUE requires a non-zero value; use UNLIMITED or DISABLED explicitly",
+        ));
+    }
+    if mode != BackendLimitMode::Value && value.value != 0 {
+        return Err(Status::invalid_argument(
+            "limit value must be zero unless mode is VALUE",
+        ));
+    }
+    Ok(BackendLimitU64 {
+        mode,
+        value: value.value,
+    })
+}
+
+fn user_limits_patch_from_proto(patch: UserLimitsPatch) -> Result<BackendUserLimitsPatch, Status> {
+    Ok(BackendUserLimitsPatch {
+        max_allocations: patch
+            .max_allocations
+            .map(limit_u32_from_proto)
+            .transpose()?,
+        max_bytes_per_sec_per_allocation: patch
+            .max_bytes_per_sec_per_allocation
+            .map(limit_u64_from_proto)
+            .transpose()?,
+        max_lifetime_secs: patch
+            .max_lifetime_secs
+            .map(limit_u32_from_proto)
+            .transpose()?,
+    })
+}
+
+/// §7-B: maximum accepted length (in characters) of an audit `reason`.
+const MAX_REASON_LEN: usize = 500;
+
+/// §7-B: normalise an audit-critical `reason`. Trim surrounding whitespace,
+/// reject empty input, cap the length, and forbid control characters so that a
+/// single-line, bounded, normalised value is what enters the command log and
+/// audit trail. Returns InvalidArgument on any violation.
+fn normalize_reason(reason: &str, op: &str) -> Result<String, Status> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{op}: reason is required and must not be empty"
+        )));
+    }
+    if trimmed.chars().count() > MAX_REASON_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{op}: reason must be at most {MAX_REASON_LEN} characters"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(Status::invalid_argument(format!(
+            "{op}: reason must not contain control characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn user_limit_target_from_proto(target: UserLimitTarget) -> Result<BackendUserLimitTarget, Status> {
+    let scope = match UserLimitScope::try_from(target.scope)
+        .map_err(|_| Status::invalid_argument("invalid user-limit scope"))?
+    {
+        UserLimitScope::Unspecified => {
+            return Err(Status::invalid_argument(
+                "user-limit scope is required and must not be UNSPECIFIED",
+            ));
+        }
+        UserLimitScope::Global => BackendUserLimitScope::Global,
+        UserLimitScope::Tenant => BackendUserLimitScope::Tenant,
+        UserLimitScope::User => BackendUserLimitScope::User,
+    };
+    match scope {
+        BackendUserLimitScope::Global => {
+            if !target.tenant.is_empty() || !target.realm.is_empty() || !target.username.is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "global target must not contain realm, tenant, or username",
+                ));
+            }
+        }
+        BackendUserLimitScope::Tenant => {
+            if target.realm.trim().is_empty() || target.tenant.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "tenant target requires non-empty realm and tenant",
+                ));
+            }
+            if !target.username.is_empty() {
+                return Err(Status::invalid_argument(
+                    "tenant target must not contain username",
+                ));
+            }
+        }
+        BackendUserLimitScope::User => {
+            if target.realm.trim().is_empty() || target.username.trim().is_empty() {
+                return Err(Status::invalid_argument(
+                    "user target requires non-empty realm and username; tenant may be empty for the base realm",
+                ));
+            }
+        }
+    }
+    Ok(BackendUserLimitTarget {
+        scope,
+        tenant: target.tenant,
+        realm: target.realm,
+        username: target.username,
+    })
+}
+
+fn set_user_limits_result_to_proto(result: SetUserLimitsResult) -> SetUserLimitsResponse {
+    SetUserLimitsResponse {
+        request_id: result.request_id,
+        previous_version: result.previous_version,
+        observed_version: result.observed_version,
+        effective: Some(EffectiveUserLimits {
+            max_allocations: result.effective.max_allocations,
+            max_bytes_per_sec_per_allocation: result.effective.max_bytes_per_sec_per_allocation,
+            max_lifetime_secs: result.effective.max_lifetime_secs,
+            inherited_fields: result.effective.inherited_fields,
+            capped_fields: result.effective.capped_fields,
+            allocations_disabled: result.effective.allocations_disabled,
+            bandwidth_disabled: result.effective.bandwidth_disabled,
+            lifetime_disabled: result.effective.lifetime_disabled,
+        }),
+        max_user_allocations_in_scope: result.max_user_allocations_in_scope,
+        max_user_allocations_above_limit: result.max_user_allocations_above_limit,
+        terminal_status: result.terminal_status,
+        error: result.error,
+    }
+}
 
 fn opt_str(s: &str) -> Option<&str> {
     if s.is_empty() {
@@ -868,6 +1591,64 @@ mod tests {
     }
 
     #[test]
+    fn update_config_optional_zero_roundtrips_with_presence() {
+        use prost::Message;
+
+        let absent = UpdateConfigRequest {
+            node_id: "node-a".into(),
+            idempotency_key: "key-a".into(),
+            expected_version: 0,
+            max_allocations: None,
+            max_allocations_per_user: None,
+            max_bytes_per_sec_per_allocation: None,
+            reason: String::new(),
+        };
+        let explicit_zero = UpdateConfigRequest {
+            max_bytes_per_sec_per_allocation: Some(0),
+            ..absent.clone()
+        };
+
+        let decoded_absent =
+            UpdateConfigRequest::decode(absent.encode_to_vec().as_slice()).unwrap();
+        let decoded_zero =
+            UpdateConfigRequest::decode(explicit_zero.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded_absent.max_bytes_per_sec_per_allocation, None);
+        assert_eq!(decoded_zero.max_bytes_per_sec_per_allocation, Some(0));
+    }
+
+    #[test]
+    fn user_limit_modes_do_not_overload_zero() {
+        assert_eq!(
+            limit_u32_from_proto(UInt32Limit {
+                mode: LimitMode::Unlimited as i32,
+                value: 0,
+            })
+            .unwrap()
+            .mode,
+            BackendLimitMode::Unlimited
+        );
+        assert_eq!(
+            limit_u32_from_proto(UInt32Limit {
+                mode: LimitMode::Disabled as i32,
+                value: 0,
+            })
+            .unwrap()
+            .mode,
+            BackendLimitMode::Disabled
+        );
+        assert!(limit_u32_from_proto(UInt32Limit {
+            mode: LimitMode::Value as i32,
+            value: 0,
+        })
+        .is_err());
+        assert!(limit_u32_from_proto(UInt32Limit {
+            mode: LimitMode::Inherit as i32,
+            value: 1,
+        })
+        .is_err());
+    }
+
+    #[test]
     fn stream_guard_increments_and_decrements() {
         let counter = Arc::new(AtomicU64::new(0));
         {
@@ -899,5 +1680,24 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(s);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn normalize_reason_trims_and_validates() {
+        // Valid input is trimmed.
+        assert_eq!(
+            normalize_reason("  tighten quota  ", "update_config").unwrap(),
+            "tighten quota"
+        );
+        // Empty / whitespace-only is rejected.
+        assert!(normalize_reason("", "update_config").is_err());
+        assert!(normalize_reason("   ", "set_user_limits").is_err());
+        // Control characters (newline, tab, NUL) are rejected.
+        assert!(normalize_reason("line1\nline2", "update_config").is_err());
+        assert!(normalize_reason("tab\there", "update_config").is_err());
+        assert!(normalize_reason("nul\0", "set_user_limits").is_err());
+        // At the length limit is accepted; over the limit is rejected.
+        assert!(normalize_reason(&"x".repeat(MAX_REASON_LEN), "update_config").is_ok());
+        assert!(normalize_reason(&"x".repeat(MAX_REASON_LEN + 1), "update_config").is_err());
     }
 }

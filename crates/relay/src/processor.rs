@@ -32,10 +32,11 @@ use turna_proto_stun::method::Method;
 use turna_proto_turn as turn;
 use turna_qos::{TieredLimits, TieredRateLimiter};
 use turna_rtp_analyzer::RtpAnalyzer;
-use turna_session::{AllocationStore, SessionError};
+use turna_session::{AllocationStore, SessionError, TransportProto};
 use turna_transport::migration::MigrationManager;
 
 use crate::peer_filter::{is_forbidden_peer, normalize_addr, normalize_ip};
+use crate::tcp_relay::TcpRelayManager;
 
 /// Action to take after processing a packet.
 ///
@@ -91,6 +92,20 @@ pub enum Action {
         /// RFC 8016 sharded ownership: the owning allocation id, threaded to
         /// the io_uring worker so it registers the relay route on bind.
         allocation_id: String,
+    },
+
+    /// Register a relayed TCP listener for RFC 6062 §4.4 peer-initiated
+    /// connections. The listener is bound synchronously in `handle_allocate_tcp`
+    /// (on `0.0.0.0:relay_port`, mirroring the UDP relay pool) before the Allocate
+    /// success is emitted. The TLS bridge adopts it, accepts peer connections,
+    /// registers each with the TCP relay manager, and notifies the client with a
+    /// ConnectionAttempt indication routed by `client_addr`. `owner_key` is the
+    /// allocation's long-term key, so a later ConnectionBind must match (O#1).
+    RegisterTcpListener {
+        relay_port: u16,
+        listener: std::net::TcpListener,
+        client_addr: SocketAddr,
+        owner_key: Vec<u8>,
     },
 
     /// Close and unregister the relay socket for this port (on release), so
@@ -302,6 +317,13 @@ impl ClusterRouting {
         self.draining.store(true, Ordering::Relaxed);
     }
 
+    /// Leave lame-duck mode (undrain): resume owning new clients. Without this,
+    /// an undrain command could not reverse the routing drain flag, leaving the
+    /// node excluded from routing while it reports Ready (P0.5).
+    pub fn end_drain(&self) {
+        self.draining.store(false, Ordering::Relaxed);
+    }
+
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Relaxed)
     }
@@ -313,6 +335,35 @@ impl ClusterRouting {
 }
 
 /// Pure packet processor — shared between async (tokio) and io_uring modes.
+/// Outcome of validating an RFC 6062 CONNECT request. The async outbound TCP
+/// connect is performed by the TCP-relay bridge, not the sync processor.
+pub enum ConnectDecision {
+    /// Validation passed: open a TCP connection to `peer`, group it under this
+    /// allocation's `relay_port`, and sign the response with `key`.
+    Proceed {
+        peer: SocketAddr,
+        key: Vec<u8>,
+        relay_port: u16,
+    },
+    /// Validation failed (auth challenge / error): send these actions as-is.
+    Reject(Vec<Action>),
+}
+
+/// Outcome of validating an RFC 6062 ConnectionBind request. The atomic claim of
+/// the pending peer connection and the raw stream handoff are done by the caller
+/// (TCP-relay bridge), since they need the live stream.
+pub enum ConnBindDecision {
+    /// `key` is the authenticated client's long-term key — the caller passes it
+    /// to `TcpRelayManager::claim` so a ConnectionBind can only bind a peer
+    /// connection owned by the same credentials (RFC 6062 §4.4, O#1).
+    Proceed {
+        connection_id: u32,
+        key: Vec<u8>,
+        success: Vec<u8>,
+    },
+    Reject(Vec<Action>),
+}
+
 pub struct PacketProcessor {
     store: Arc<AllocationStore>,
     auth: Arc<AuthRegistry>,
@@ -327,6 +378,9 @@ pub struct PacketProcessor {
     /// `Some` holds the ticket signer/verifier. Only `&self` methods are used,
     /// so no interior mutability is needed.
     migration: Option<MigrationManager>,
+    /// RFC 6062 TCP relay engine. `None` = TCP allocations disabled (Allocate
+    /// with REQUESTED-TRANSPORT=TCP → 442).
+    tcp_relay: Option<Arc<TcpRelayManager>>,
 }
 
 impl PacketProcessor {
@@ -414,6 +468,7 @@ impl PacketProcessor {
             mtu,
             cluster,
             migration: None,
+            tcp_relay: None,
         }
     }
 
@@ -426,6 +481,14 @@ impl PacketProcessor {
     /// this when `turn.migration.enabled`.
     pub fn with_migration(mut self, migration: Option<MigrationManager>) -> Self {
         self.migration = migration;
+        self
+    }
+
+    /// Attach an RFC 6062 TCP relay engine (builder-style; call sites
+    /// untouched). When present, Allocate with REQUESTED-TRANSPORT=TCP is
+    /// accepted instead of 442.
+    pub fn with_tcp_relay(mut self, tcp_relay: Option<Arc<TcpRelayManager>>) -> Self {
+        self.tcp_relay = tcp_relay;
         self
     }
 
@@ -461,6 +524,19 @@ impl PacketProcessor {
     /// let actions = processor.process(raw, src);
     /// ```
     pub fn process(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
+        // UDP / SCTP / borrowed-slice ingress — not a TCP control connection, so
+        // an RFC 6062 TCP allocation request is rejected in `handle_allocate`.
+        self.process_impl(raw, src, false)
+    }
+
+    /// TLS/TCP control-connection ingress (the TURNS bridge). Permits RFC 6062
+    /// TCP allocations, which MUST arrive over a TCP/TLS control connection
+    /// (§4.1); all other ingress uses [`process`] with UDP semantics.
+    pub fn process_tcp_control(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
+        self.process_impl(raw, src, true)
+    }
+
+    fn process_impl(&self, raw: Bytes, src: SocketAddr, ingress_tcp: bool) -> Vec<Action> {
         self.metrics
             .packets_received
             .fetch_add(1, Ordering::Relaxed);
@@ -517,13 +593,13 @@ impl PacketProcessor {
         }
         if should_sample() {
             let t0 = std::time::Instant::now();
-            let actions = self.process_stun(raw, src);
+            let actions = self.process_stun(raw, src, ingress_tcp);
             self.metrics
                 .histograms
                 .observe("turna_stun_request_duration_seconds", t0.elapsed());
             return actions;
         }
-        self.process_stun(raw, src)
+        self.process_stun(raw, src, ingress_tcp)
     }
 
     /// Entry point for the borrowed-slice ingress paths (io_uring / AF_XDP),
@@ -619,9 +695,13 @@ impl PacketProcessor {
         // ChannelData hot path already drops early; bring this path in line.
         // B2: enforce the per-allocation bandwidth quota on the peer->client
         // direction too. Note `add_bytes`/`check_bandwidth` share one per-alloc
-        // window, so `max_bytes_per_sec` now bounds both directions combined.
-        let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
-        if bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err() {
+        // window, so `max_bytes_per_sec_per_allocation` now bounds both directions combined.
+        let (bw_limit, bandwidth_disabled) = self.store.bandwidth_policy_for_user(
+            &alloc.realm,
+            alloc.tenant_id.as_deref(),
+            &alloc.username,
+        );
+        if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
             drop(alloc);
             debug!(%peer_addr, "bandwidth quota exceeded, dropping relay->client packet");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
@@ -695,8 +775,12 @@ impl PacketProcessor {
         }
         let peer_addr = alloc.get_channel_peer(channel).copied()?;
 
-        let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
-        if bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err() {
+        let (bw_limit, bandwidth_disabled) = self.store.bandwidth_policy_for_user(
+            &alloc.realm,
+            alloc.tenant_id.as_deref(),
+            &alloc.username,
+        );
+        if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
             debug!(%src, "bandwidth quota exceeded, dropping packet");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -773,7 +857,7 @@ impl PacketProcessor {
         r
     }
 
-    fn process_stun(&self, raw: Bytes, src: SocketAddr) -> Vec<Action> {
+    fn process_stun(&self, raw: Bytes, src: SocketAddr, ingress_tcp: bool) -> Vec<Action> {
         let msg = match StunMessage::decode(&raw) {
             Ok(m) => m,
             Err(e) => {
@@ -811,7 +895,7 @@ impl PacketProcessor {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                     return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
                 }
-                self.handle_allocate(&msg, &raw, src)
+                self.handle_allocate(&msg, &raw, src, ingress_tcp)
             }
             (MessageClass::Request, Method::Refresh) => self.handle_refresh(&msg, &raw, src),
             (MessageClass::Request, Method::CreatePermission) => {
@@ -979,7 +1063,13 @@ impl PacketProcessor {
         }]
     }
 
-    fn handle_allocate(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
+    fn handle_allocate(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        src: SocketAddr,
+        ingress_tcp: bool,
+    ) -> Vec<Action> {
         if self.metrics.is_draining() {
             return self.encode_error(msg, src, 508, "Server Draining");
         }
@@ -1009,15 +1099,49 @@ impl PacketProcessor {
         // Tenant identity is the result of auth resolution — derived ONLY from
         // the authenticated realm (see turna_auth::AuthRegistry). Network/listener
         // hints never enter here.
+        let token_max_lifetime = resolution.max_lifetime_secs;
         let key = resolution.key;
+        let realm = resolution.realm;
         let tenant_id = resolution.tenant_id;
+
+        // RFC 7635 §6.1: an OAuth token with no remaining lifetime cannot
+        // authorize a new allocation — capping the granted lifetime by it would
+        // yield a 0-second (already-dead) allocation. Reject with 401 so the
+        // client re-authorizes with a fresh token. (A token expired beyond the
+        // clock-skew grace is already refused in decrypt_access_token; this
+        // catches the in-grace, zero-remaining boundary, before any relay port is
+        // allocated.) `None` = non-OAuth (long-term) auth, which has no cap.
+        if token_max_lifetime == Some(0) {
+            self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return self.encode_error(msg, src, 401, "Unauthorized");
+        }
 
         // Post-auth checks (A3-L1): only an authenticated client reaches here.
         if self.store.get(&src).is_some() {
             return self.encode_error(msg, src, 437, "Allocation Mismatch");
         }
-        if msg.get_requested_transport() != Some(turn::TRANSPORT_UDP) {
+        let requested_transport = msg.get_requested_transport();
+        let want_tcp = requested_transport == Some(turn::TRANSPORT_TCP) && self.tcp_relay.is_some();
+        if requested_transport != Some(turn::TRANSPORT_UDP) && !want_tcp {
             return self.encode_error(msg, src, 442, "Unsupported Transport Protocol");
+        }
+        if want_tcp && !ingress_tcp {
+            // RFC 6062 §4.1: a TCP allocation MUST be requested over a TCP/TLS
+            // control connection. A TCP-transport request arriving over UDP /
+            // SCTP / any non-TCP ingress is rejected here (previously it created
+            // a half-working allocation whose relayed listener was then dropped).
+            return self.encode_error(msg, src, 400, "Bad Request");
+        }
+        if want_tcp {
+            // RFC 6062 TCP allocation: no relay UDP socket, no RegisterRelay.
+            return self.handle_allocate_tcp(
+                msg,
+                src,
+                key.clone(),
+                realm.clone(),
+                tenant_id.clone(),
+                token_max_lifetime,
+            );
         }
 
         // RFC 8656 §14.1 / §7.2: REQUESTED-ADDRESS-FAMILY. This build is
@@ -1079,21 +1203,44 @@ impl PacketProcessor {
         }
 
         let relay_addr = SocketAddr::new(self.external_ip, relay_port);
-        let lifetime = msg
+        let mut port_reservation = turna_session::PortReservationGuard::new(
+            self.store.pool_for_port(relay_port),
+            relay_port,
+        );
+        let mut lifetime = msg
             .get_lifetime()
             .unwrap_or(turn::DEFAULT_LIFETIME)
             .min(turn::MAX_LIFETIME);
+        // RFC 7635 §6.1: never grant an allocation longer than the authorizing
+        // OAuth token's remaining lifetime.
+        if let Some(max) = token_max_lifetime {
+            lifetime = lifetime.min(max);
+        }
         let username = msg.get_username().unwrap_or("").to_string();
+        let (dynamic_lifetime, lifetime_disabled) =
+            self.store
+                .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &username);
+        if lifetime_disabled {
+            if let Some(token) = issued_token.as_ref() {
+                self.store
+                    .pool_for_port(relay_port)
+                    .cancel_reservation(token);
+            }
+            return self.encode_error(msg, src, 486, "Allocation Quota Reached");
+        }
+        if dynamic_lifetime > 0 {
+            lifetime = lifetime.min(dynamic_lifetime);
+        }
 
-        if let Err(e) = self.store.create_for_tenant(
+        if let Err(e) = self.store.create_for_identity(
             src,
             relay_addr,
             username,
             key.clone(),
             lifetime,
+            realm.clone(),
             tenant_id.clone(),
         ) {
-            self.store.pool_for_port(relay_port).release(relay_port);
             // I9: an EVEN-PORT (R=1) allocate reserved the next-higher port and
             // issued a token; if create bookkeeping failed, cancel it too so the
             // reserved odd port isn't held until the reservation-expiry sweep.
@@ -1112,6 +1259,7 @@ impl PacketProcessor {
             };
         }
 
+        port_reservation.commit();
         self.metrics
             .active_allocations
             .fetch_add(1, Ordering::Relaxed);
@@ -1176,6 +1324,303 @@ impl PacketProcessor {
         ]
     }
 
+    /// RFC 6062 TCP allocation. Reserves a relay port WITHOUT binding a UDP
+    /// socket and records the allocation with `transport = Tcp`. No
+    /// RegisterRelay is emitted (there is no relay UDP socket); CONNECT /
+    /// CONNECTION-BIND drive the datapath via the TCP relay bridge.
+    fn handle_allocate_tcp(
+        &self,
+        msg: &StunMessage,
+        src: SocketAddr,
+        key: Vec<u8>,
+        realm: String,
+        tenant_id: Option<String>,
+        token_max_lifetime: Option<u32>,
+    ) -> Vec<Action> {
+        // RFC 6062 §4.1: EVEN-PORT / RESERVATION-TOKEN / DONT-FRAGMENT MUST NOT
+        // appear with a TCP allocation.
+        let has_df = msg
+            .attributes
+            .iter()
+            .any(|a| matches!(a, turna_proto_stun::attribute::Attribute::DontFragment));
+        if msg.get_even_port().is_some() || msg.get_reservation_token().is_some() || has_df {
+            return self.encode_error(msg, src, 400, "Bad Request");
+        }
+        // IPv4-only build (mirrors the UDP path): refuse an explicit IPv6 family.
+        if matches!(
+            msg.get_requested_address_family(),
+            Some(turna_proto_stun::attribute::AddressFamily::Ipv6)
+        ) {
+            return self.encode_error(msg, src, 440, "Address Family not Supported");
+        }
+
+        let mut lifetime = msg
+            .get_lifetime()
+            .unwrap_or(turn::DEFAULT_LIFETIME)
+            .min(turn::MAX_LIFETIME);
+        if let Some(max) = token_max_lifetime {
+            lifetime = lifetime.min(max);
+        }
+        let username = msg.get_username().unwrap_or("").to_string();
+        let (dynamic_lifetime, lifetime_disabled) =
+            self.store
+                .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &username);
+        if lifetime_disabled {
+            return self.encode_error(msg, src, 486, "Allocation Quota Reached");
+        }
+        if dynamic_lifetime > 0 {
+            lifetime = lifetime.min(dynamic_lifetime);
+        }
+
+        // Reserve a relay port without a UDP socket (TCP relay has none).
+        let relay_port = match self.store.pool(tenant_id.as_deref()).allocate() {
+            Ok(p) => p,
+            Err(_) => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
+        };
+        let relay_addr = SocketAddr::new(self.external_ip, relay_port);
+        let mut port_reservation = turna_session::PortReservationGuard::new(
+            self.store.pool_for_port(relay_port),
+            relay_port,
+        );
+
+        // RFC 6062 §4.4: the relayed TCP listener is part of a *successful* TCP
+        // allocation (peer-initiated connections require it). Bind it before
+        // committing the allocation; on failure, release the port and reject the
+        // Allocate rather than hand back a half-working allocation.
+        let listener = match std::net::TcpListener::bind(("0.0.0.0", relay_port)) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
+                return self.encode_error(msg, src, 508, "Insufficient Capacity");
+            }
+        };
+
+        if let Err(e) = self.store.create_for_identity(
+            src,
+            relay_addr,
+            username,
+            key.clone(),
+            lifetime,
+            realm,
+            tenant_id.clone(),
+        ) {
+            return match e {
+                SessionError::AllocationExists => {
+                    self.encode_error(msg, src, 437, "Allocation Mismatch")
+                }
+                _ => self.encode_error(msg, src, 508, "Insufficient Capacity"),
+            };
+        }
+        port_reservation.commit();
+        // Mark as TCP so CONNECT is permitted (RFC 6062).
+        self.store.set_transport(&src, TransportProto::Tcp);
+
+        self.metrics
+            .active_allocations
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .total_allocations
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(t) = tenant_id.as_deref() {
+            self.metrics.record_tenant_allocation(t);
+        }
+
+        let resp = turn::build_allocate_response(msg.transaction_id, relay_addr, src, lifetime);
+        let mut buf = [0u8; 1024];
+        let len = encode_or_drop!(
+            encode_with_integrity_auto(&resp, &mut buf, &key, msg),
+            vec![Action::None]
+        );
+        info!(%src, %relay_addr, lifetime, "TCP allocation created (RFC 6062)");
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+
+        // Hand the pre-bound relayed listener to the bridge, which runs the
+        // peer-initiated accept loop; emit it before the Allocate success so the
+        // listener is live by the time the client learns its relayed address.
+        vec![
+            Action::RegisterTcpListener {
+                relay_port,
+                listener,
+                client_addr: src,
+                owner_key: key.clone(),
+            },
+            Action::Send {
+                data: Bytes::copy_from_slice(&buf[..len]),
+                target: src,
+            },
+        ]
+    }
+
+    /// RFC 6062 §4.3 CONNECT validation (sync). Authenticates, requires a TCP
+    /// allocation on this 5-tuple, a XOR-PEER-ADDRESS, and an existing
+    /// permission for that peer. The async outbound connect is done by the
+    /// caller (the TCP-relay bridge).
+    pub fn connect_decision(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        src: SocketAddr,
+    ) -> ConnectDecision {
+        if msg.get_username().is_none() {
+            return ConnectDecision::Reject(self.encode_auth_challenge(msg, src));
+        }
+        if let Some(stale) = self.validate_nonce(msg, src) {
+            return ConnectDecision::Reject(stale);
+        }
+        let key = match self.auth_validate(msg, raw) {
+            Ok(r) => r.key,
+            Err(e) => {
+                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, turna_auth::AuthError::BadRequest) {
+                    return ConnectDecision::Reject(self.encode_error(
+                        msg,
+                        src,
+                        400,
+                        "Bad Request",
+                    ));
+                }
+                return ConnectDecision::Reject(self.encode_auth_challenge(msg, src));
+            }
+        };
+        let peer = match msg.get_xor_peer_address() {
+            Some(p) => p,
+            None => {
+                return ConnectDecision::Reject(self.encode_error(msg, src, 400, "Bad Request"))
+            }
+        };
+        // Must be an existing TCP allocation on this 5-tuple, with a permission
+        // for the peer (RFC 6062 §4.3 → 437 / 400 / 403).
+        let (is_tcp, has_perm, relay_port) = match self.store.get(&src) {
+            Some(a) => (
+                a.transport == TransportProto::Tcp,
+                a.has_permission(&peer),
+                a.relay_addr.port(),
+            ),
+            None => {
+                return ConnectDecision::Reject(self.encode_error(
+                    msg,
+                    src,
+                    437,
+                    "Allocation Mismatch",
+                ))
+            }
+        };
+        if !is_tcp {
+            return ConnectDecision::Reject(self.encode_error(msg, src, 400, "Bad Request"));
+        }
+        if !has_perm {
+            return ConnectDecision::Reject(self.encode_error(msg, src, 403, "Forbidden"));
+        }
+        ConnectDecision::Proceed {
+            peer,
+            key,
+            relay_port,
+        }
+    }
+
+    /// Build a signed RFC 6062 CONNECT success response carrying CONNECTION-ID.
+    pub fn build_connect_success(
+        &self,
+        conn_id: u32,
+        key: &[u8],
+        orig: &StunMessage,
+    ) -> Option<Vec<u8>> {
+        let mut resp = turn::build_success_response(Method::Connect, orig.transaction_id);
+        resp.add(Attribute::ConnectionId(conn_id));
+        let mut buf = [0u8; 512];
+        match encode_with_integrity_auto(&resp, &mut buf, key, orig) {
+            Ok(len) => Some(buf[..len].to_vec()),
+            Err(_) => None,
+        }
+    }
+
+    /// Encode an RFC 6062 CONNECT failure (e.g. 447) for the bridge to send.
+    pub fn encode_connect_error(
+        &self,
+        orig: &StunMessage,
+        src: SocketAddr,
+        code: u16,
+        reason: &str,
+    ) -> Vec<Action> {
+        self.encode_error(orig, src, code, reason)
+    }
+
+    /// RFC 6062 §4.4 ConnectionBind validation (sync): authenticate and extract
+    /// CONNECTION-ID + a signed success response. The claim of the pending
+    /// connection and raw handoff are done by the caller via the relay manager.
+    pub fn connection_bind_decision(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        src: SocketAddr,
+    ) -> ConnBindDecision {
+        if msg.get_username().is_none() {
+            return ConnBindDecision::Reject(self.encode_auth_challenge(msg, src));
+        }
+        if let Some(stale) = self.validate_nonce(msg, src) {
+            return ConnBindDecision::Reject(stale);
+        }
+        let key = match self.auth_validate(msg, raw) {
+            Ok(r) => r.key,
+            Err(e) => {
+                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(e, turna_auth::AuthError::BadRequest) {
+                    return ConnBindDecision::Reject(self.encode_error(
+                        msg,
+                        src,
+                        400,
+                        "Bad Request",
+                    ));
+                }
+                return ConnBindDecision::Reject(self.encode_auth_challenge(msg, src));
+            }
+        };
+        let connection_id = match msg.get_connection_id() {
+            Some(id) => id,
+            None => {
+                return ConnBindDecision::Reject(self.encode_error(msg, src, 400, "Bad Request"))
+            }
+        };
+        match self.build_connection_bind_success(&key, msg) {
+            Some(success) => ConnBindDecision::Proceed {
+                connection_id,
+                key,
+                success,
+            },
+            None => ConnBindDecision::Reject(self.encode_error(msg, src, 500, "Server Error")),
+        }
+    }
+
+    /// Build a signed RFC 6062 ConnectionBind success (no attributes beyond
+    /// MESSAGE-INTEGRITY, per §4.4).
+    pub fn build_connection_bind_success(&self, key: &[u8], orig: &StunMessage) -> Option<Vec<u8>> {
+        let resp = turn::build_success_response(Method::ConnectionBind, orig.transaction_id);
+        let mut buf = [0u8; 256];
+        match encode_with_integrity_auto(&resp, &mut buf, key, orig) {
+            Ok(len) => Some(buf[..len].to_vec()),
+            Err(_) => None,
+        }
+    }
+
+    /// Encode an RFC 6062 ConnectionAttempt indication (peer-initiated, §4.4) for
+    /// delivery to the client over its control connection. Unauthenticated (see
+    /// `turn::build_connection_attempt`); returns `None` only on an encode error.
+    pub fn build_connection_attempt_indication(
+        &self,
+        connection_id: u32,
+        peer: SocketAddr,
+    ) -> Option<Vec<u8>> {
+        let ind = turn::build_connection_attempt(connection_id, peer);
+        let mut buf = [0u8; 256];
+        match ind.encode(&mut buf) {
+            Ok(len) => Some(buf[..len].to_vec()),
+            Err(_) => None,
+        }
+    }
+
     fn handle_refresh(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
         if msg.get_username().is_none() {
             return self.encode_auth_challenge(msg, src);
@@ -1183,8 +1628,8 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth_validate(msg, raw) {
-            Ok(r) => r.key,
+        let resolution = match self.auth_validate(msg, raw) {
+            Ok(r) => r,
             Err(e) => {
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
@@ -1193,11 +1638,42 @@ impl PacketProcessor {
                 return self.encode_auth_challenge(msg, src);
             }
         };
+        let key = resolution.key;
+        let token_max_lifetime = resolution.max_lifetime_secs;
+        let realm = resolution.realm;
+        let tenant_id = resolution.tenant_id;
 
-        let lifetime = msg
+        let mut lifetime = msg
             .get_lifetime()
             .unwrap_or(turn::DEFAULT_LIFETIME)
             .min(turn::MAX_LIFETIME);
+        // RFC 7635 §6.1: an OAuth token with no remaining lifetime can no longer
+        // authorize *extending* an allocation. Reject (401) rather than let the
+        // cap silently force the lifetime to 0 and release the allocation out
+        // from under a client that asked to keep it. An explicit release
+        // (client-sent LIFETIME == 0) is always honoured, since releasing never
+        // extends the allocation beyond the token. At this point `lifetime` is
+        // still the client's requested value (the cap is applied just below).
+        if token_max_lifetime == Some(0) && lifetime > 0 {
+            self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return self.encode_error(msg, src, 401, "Unauthorized");
+        }
+        // Otherwise cap the granted lifetime by the token's remaining life.
+        if let Some(max) = token_max_lifetime {
+            lifetime = lifetime.min(max);
+        }
+        if lifetime > 0 {
+            let username = msg.get_username().unwrap_or("");
+            let (dynamic_max, lifetime_disabled) =
+                self.store
+                    .lifetime_policy_for_user(&realm, tenant_id.as_deref(), username);
+            if lifetime_disabled {
+                return self.encode_error(msg, src, 486, "Allocation Quota Reached");
+            }
+            if dynamic_max > 0 {
+                lifetime = lifetime.min(dynamic_max);
+            }
+        }
 
         // RFC 8016 Connection Migration: a Refresh arriving from an address with
         // no allocation may be a migrating client presenting a MOBILITY-TICKET
@@ -1533,9 +2009,13 @@ impl PacketProcessor {
 
         // B2: enforce the per-allocation bandwidth quota on the Send-indication
         // egress path too, not only ChannelData — otherwise a client bypasses
-        // `max_bytes_per_sec` entirely by relaying via Send/Data Indications.
-        let bw_limit = self.store.bandwidth_limit_for(alloc.tenant_id.as_deref());
-        if bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err() {
+        // `max_bytes_per_sec_per_allocation` entirely by relaying via Send/Data Indications.
+        let (bw_limit, bandwidth_disabled) = self.store.bandwidth_policy_for_user(
+            &alloc.realm,
+            alloc.tenant_id.as_deref(),
+            &alloc.username,
+        );
+        if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
             debug!(%src, "bandwidth quota exceeded, dropping Send indication");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
@@ -1592,12 +2072,21 @@ impl PacketProcessor {
     }
 
     fn encode_auth_challenge(&self, msg: &StunMessage, dst: SocketAddr) -> Vec<Action> {
-        let resp = turn::build_auth_challenge(
-            msg.method,
-            msg.transaction_id,
-            self.auth.default_realm(),
-            &self.nonce_mgr.issue(dst),
-        );
+        let realm = self.auth.default_realm();
+        let nonce = self.nonce_mgr.issue(dst);
+        // RFC 7635 §6.1: when the base realm uses OAuth, advertise the
+        // authorization server in the 401 so a token-less client learns where to
+        // obtain a token; otherwise send the standard credential challenge.
+        let resp = match self.auth.base_oauth_identity() {
+            Some(as_id) => turn::build_oauth_challenge(
+                msg.method,
+                msg.transaction_id,
+                realm,
+                &nonce,
+                as_id.as_bytes(),
+            ),
+            None => turn::build_auth_challenge(msg.method, msg.transaction_id, realm, &nonce),
+        };
         let mut buf = [0u8; 512];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);

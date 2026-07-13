@@ -1,6 +1,6 @@
 # Roadmap
 
-`turna` is beta (`0.3.0-beta.x`). This roadmap is intentionally
+`turna` is Production GA (`0.3.0`). This roadmap is intentionally
 direction-only — no committed dates — and points to the living documents that
 track detail.
 

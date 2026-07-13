@@ -1,6 +1,6 @@
 # turna — protocol compliance & deliberate constraints
 
-Scope: STUN/TURN protocol behaviour of `turna` v0.3.0-beta.1. Every row marked
+Scope: STUN/TURN protocol behaviour of `turna` v0.3.0. Every row marked
 **Verified** was read directly in the source during this review (crate paths
 given). Rows marked **Confirm** were *not* verified against code here and must be
 checked before this document is published as a compliance claim.
@@ -64,7 +64,7 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
 
 ## 4. Beta scope (what is supported as stable)
 
-For a `v0.3.0-beta.1` cut, the supported surface is exactly the Verified rows
+For the `v0.3.0` release, the supported surface is exactly the Verified rows
 above; the rest is experimental, out of scope, or unverified.
 
 **Supported (stable):** UDP TURN relay (non-UDP → 442); IPv4 relay; long-term

@@ -33,8 +33,11 @@ data:
     max_allocations = {{ .Values.turn.maxAllocations }}
 
     [turn.relay.quota]
-    max_bytes_per_sec = {{ .Values.turn.quota.maxBytesPerSec }}
+    max_bytes_per_sec_per_allocation = {{ .Values.turn.quota.maxBytesPerSecPerAllocation }}
     max_per_user = {{ .Values.turn.quota.maxPerUser }}
+    {{- if .Values.turn.quota.allowUnlimitedBandwidth }}
+    allow_unlimited_bandwidth = true
+    {{- end }}
 
     [health]
     # Bind to all interfaces so kubelet probes and Prometheus can reach it.
@@ -54,12 +57,13 @@ data:
     turn_url = {{ .Values.turn.turnUrl | quote }}
     turn_shared_secret = "${TURNA_SHARED_SECRET:-}"
 
-    {{- if .Values.cluster.enabled }}
     [cluster]
-    cluster_mode = true
-    # node_id and gossip_advertise_addr are per-pod, injected via env by the
-    # StatefulSet (TURNA_NODE_ID = pod name, TURNA_GOSSIP_ADVERTISE = pod IP).
-    node_id = "${TURNA_NODE_ID}"
+    cluster_mode = {{ .Values.cluster.enabled }}
+    # Stable standalone id from values; the experimental StatefulSet overrides
+    # it with the pod name through TURNA_NODE_ID.
+    node_id = "${TURNA_NODE_ID:-{{ .Values.turn.nodeId }}}"
+    {{- if .Values.cluster.enabled }}
+    # gossip_advertise_addr is per-pod, injected by the StatefulSet.
     cluster_name = {{ .Values.cluster.name | quote }}
     gossip_bind = "0.0.0.0:{{ .Values.cluster.gossipPort }}"
     gossip_advertise_addr = "${TURNA_GOSSIP_ADVERTISE}"
@@ -72,3 +76,17 @@ data:
     cluster_secret = "${TURNA_CLUSTER_SECRET:-}"
     drain_grace_secs = {{ .Values.cluster.drainGraceSecs }}
     {{- end }}
+
+    [cluster.backend]
+    type = {{ ternary .Values.state.type "memory" .Values.state.enabled | quote }}
+    uri = {{ ternary .Values.state.uri "" .Values.state.enabled | quote }}
+    user = {{ ternary .Values.state.user "" .Values.state.enabled | quote }}
+    password = "${TURNA_BACKEND_PASSWORD:-}"
+    pool_size = {{ .Values.state.poolSize }}
+
+    [cluster.persistence]
+    mode = {{ ternary .Values.state.persistenceMode "disabled" .Values.state.enabled | quote }}
+    channel_capacity = 65536
+    batch_max_size = 256
+    batch_max_delay_ms = 100
+    user_refresh_secs = {{ .Values.state.userRefreshSecs }}

@@ -436,14 +436,586 @@ impl TarantoolBackend {
         call_bool(&resp)
     }
 
+    // ── Durable runtime configuration / limits ───────────────────────────
+
+    pub async fn get_runtime_state(&self, node_id: &str) -> Result<Option<NodeRuntimeState>> {
+        let resp = self.call("turna_get_runtime_state", &[node_id]).await?;
+        call_optional(&resp)
+    }
+
+    pub async fn adopt_node_incarnation(&self, node_id: &str, incarnation: &str) -> Result<()> {
+        self.call("turna_adopt_node_incarnation", &[node_id, incarnation])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn cas_runtime_desired(
+        &self,
+        node_id: &str,
+        expected_observed_version: u64,
+        incarnation: &str,
+        desired: &RuntimeConfigSnapshot,
+    ) -> Result<bool> {
+        let expected = expected_observed_version.to_string();
+        let json = serde_json::to_string(desired)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let resp = self
+            .call(
+                "turna_cas_runtime_desired",
+                &[node_id, &expected, incarnation, &json],
+            )
+            .await?;
+        call_bool(&resp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn confirm_runtime_observed(
+        &self,
+        node_id: &str,
+        desired_version: u64,
+        incarnation: &str,
+        observed: &RuntimeConfigSnapshot,
+        status: &str,
+        error: &str,
+        applied: Option<&AppliedOperation>,
+    ) -> Result<bool> {
+        let version = desired_version.to_string();
+        let json = serde_json::to_string(observed)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let applied_json = match applied {
+            Some(op) => {
+                serde_json::to_string(op).map_err(|e| BackendError::Serialization(e.to_string()))?
+            }
+            None => String::new(),
+        };
+        let resp = self
+            .call(
+                "turna_confirm_runtime_observed",
+                &[
+                    node_id,
+                    &version,
+                    incarnation,
+                    &json,
+                    status,
+                    error,
+                    &applied_json,
+                ],
+            )
+            .await?;
+        call_bool(&resp)
+    }
+
+    pub async fn get_user_limits_state(
+        &self,
+        node_id: &str,
+        subject_key: &str,
+    ) -> Result<Option<UserLimitsState>> {
+        let resp = self
+            .call("turna_get_user_limits_state", &[node_id, subject_key])
+            .await?;
+        call_optional(&resp)
+    }
+
+    pub async fn list_user_limits_states(&self, node_id: &str) -> Result<Vec<UserLimitsState>> {
+        let resp = self
+            .call("turna_list_user_limits_states", &[node_id])
+            .await?;
+        call_list(&resp)
+    }
+
+    pub async fn cas_user_limits_desired(
+        &self,
+        node_id: &str,
+        subject_key: &str,
+        expected_observed_version: u64,
+        incarnation: &str,
+        target: &UserLimitTarget,
+        desired: &UserLimitsPatch,
+    ) -> Result<bool> {
+        let expected = expected_observed_version.to_string();
+        let target_json = serde_json::to_string(target)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let desired_json = serde_json::to_string(desired)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let resp = self
+            .call(
+                "turna_cas_user_limits_desired",
+                &[
+                    node_id,
+                    subject_key,
+                    &expected,
+                    incarnation,
+                    &target_json,
+                    &desired_json,
+                ],
+            )
+            .await?;
+        call_bool(&resp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn confirm_user_limits_observed(
+        &self,
+        node_id: &str,
+        subject_key: &str,
+        desired_version: u64,
+        incarnation: &str,
+        observed: &UserLimitsPatch,
+        outcome: ObservationOutcome<'_>,
+        applied: Option<&AppliedOperation>,
+    ) -> Result<bool> {
+        let version = desired_version.to_string();
+        let json = serde_json::to_string(observed)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let applied_json = match applied {
+            Some(op) => {
+                serde_json::to_string(op).map_err(|e| BackendError::Serialization(e.to_string()))?
+            }
+            None => String::new(),
+        };
+        let resp = self
+            .call(
+                "turna_confirm_user_limits_observed",
+                &[
+                    node_id,
+                    subject_key,
+                    &version,
+                    incarnation,
+                    &json,
+                    outcome.status,
+                    outcome.error,
+                    &applied_json,
+                ],
+            )
+            .await?;
+        call_bool(&resp)
+    }
+
+    // ── Command log (P0 #4) ────────────────────────────────────
+
+    pub async fn enqueue_command(&self, cmd: &PendingCommand) -> Result<String> {
+        // The full command (incl. `idempotency_key`) is serialized as JSON.
+        // NOTE (P0.3): `turna_enqueue_command(request_id, target_node_id, json)`
+        // must be idempotent on `idempotency_key`: if the JSON's non-empty
+        // `idempotency_key` already maps to a command, DO NOT insert a second row
+        // — return the ORIGINAL row's `request_id` (whatever its status).
+        // Otherwise insert and return the new `request_id`. The key→request_id
+        // index shares the command's retention. See docs/command-log-lease.md;
+        // memory.rs is the reference implementation.
+        let json =
+            serde_json::to_string(cmd).map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let payload_hash = crate::command_payload_hash(&cmd.op, &cmd.args, &cmd.payload_json);
+        let resp = self
+            .call(
+                "turna_enqueue_command",
+                &[&cmd.request_id, &cmd.target_node_id, &json, &payload_hash],
+            )
+            .await?;
+        // The proc returns `(canonical_request_id, conflict)`. A `true` conflict
+        // flag means the key was reused with a different payload (durable
+        // semantics). Older 1-value procs return no flag → treated as no
+        // conflict, preserving prior behaviour during a rolling upgrade.
+        let data = parse_call_data(&resp).ok().unwrap_or_default();
+        if matches!(data.get(1), Some(rmpv::Value::Boolean(true))) {
+            return Err(BackendError::Conflict(format!(
+                "idempotency key {:?} reused with a different payload",
+                cmd.idempotency_key
+            )));
+        }
+        let canonical = data
+            .into_iter()
+            .next()
+            .and_then(|v| match v {
+                rmpv::Value::String(s) => s.into_str(),
+                _ => None,
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cmd.request_id.clone());
+        Ok(canonical)
+    }
+
+    pub async fn claim_commands(
+        &self,
+        node_id: &str,
+        incarnation: &str,
+        max: usize,
+        lease_ms: u64,
+    ) -> Result<Vec<PendingCommand>> {
+        let max_s = max.to_string();
+        let lease_s = lease_ms.to_string();
+        let now_s = now_ms().to_string();
+        // NOTE (P0.2/P0.4): `turna_claim_commands(node_id, incarnation, max, lease_ms, now_ms)`
+        // must, atomically per row:
+        //   * claim rows with status == "pending"; AND
+        //   * reclaim rows with status == "in_progress" AND lease_until_ms <= now_ms,
+        //     EXCEPT when attempts >= MAX_COMMAND_ATTEMPTS (5): then set
+        //     status="failed", result="dead_letter: ..." and do NOT return the row
+        //     (P0.2 retry bound);
+        // otherwise set status="in_progress", claimed_by=node_id,
+        // lease_until_ms = now_ms + lease_ms, attempts = attempts + 1, and mint a
+        // fresh unique claim_token per claimed row (P0.4 fencing — completion must
+        // present it). See docs/command-log-lease.md; memory.rs is the reference.
+        let resp = self
+            .call(
+                "turna_claim_commands",
+                &[node_id, incarnation, &max_s, &lease_s, &now_s],
+            )
+            .await?;
+        call_list(&resp)
+    }
+
+    pub async fn complete_command(
+        &self,
+        request_id: &str,
+        claimed_by: &str,
+        claim_token: &str,
+        status: &str,
+        result: &str,
+    ) -> Result<bool> {
+        // NOTE (P0.4): `turna_complete_command(request_id, claimed_by, claim_token,
+        // status, result)` must fence the write — apply status/result ONLY if the
+        // row is "in_progress" AND claimed_by == <claimed_by> AND claim_token ==
+        // <claim_token>; otherwise a no-op. It MUST return a boolean: true if
+        // applied, false if the completion was stale/foreign (a superseded
+        // claimant holds an old token and must be rejected even when its node id
+        // matches). See docs/command-log-lease.md; memory.rs is the reference.
+        let resp = self
+            .call(
+                "turna_complete_command",
+                &[request_id, claimed_by, claim_token, status, result],
+            )
+            .await?;
+        // The proc returns a Lua boolean; parse it through the iproto framing
+        // (the raw first byte is the response envelope, not the value).
+        call_bool(&resp)
+    }
+
+    pub async fn finalize_stale_command(
+        &self,
+        request_id: &str,
+        current_incarnation: &str,
+        result: &str,
+    ) -> Result<bool> {
+        let resp = self
+            .call(
+                "turna_finalize_stale_command",
+                &[request_id, current_incarnation, result],
+            )
+            .await?;
+        call_bool(&resp)
+    }
+
+    pub async fn list_stale_commands(
+        &self,
+        node_id: &str,
+        current_incarnation: &str,
+        max: usize,
+    ) -> Result<Vec<PendingCommand>> {
+        let max_s = max.to_string();
+        let resp = self
+            .call(
+                "turna_list_stale_commands",
+                &[node_id, current_incarnation, &max_s],
+            )
+            .await?;
+        call_list(&resp)
+    }
+
+    pub async fn get_command(&self, request_id: &str) -> Result<Option<PendingCommand>> {
+        let resp = self.call("turna_get_command", &[request_id]).await?;
+        call_optional(&resp)
+    }
+
+    pub async fn get_idempotency(&self, key: &str) -> Result<Option<IdempotencyRecord>> {
+        // `turna_get_idempotency` returns the record as a JSON object (same
+        // wire shape `get_command` uses for a command), so `call_optional`
+        // deserializes it directly into `IdempotencyRecord`.
+        let resp = self.call("turna_get_idempotency", &[key]).await?;
+        call_optional(&resp)
+    }
+
+    /// #4: durably persist a non-mutating terminal business outcome into the
+    /// keyed idempotency journal before `complete_command`. The stored proc
+    /// `turna_record_command_outcome(key, req, hash, final_status, result,
+    /// completed_at_ms)` touches only the existing canonical row, verifies
+    /// request_id + payload_hash, and never downgrades a terminal record; it
+    /// returns a status code string.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_command_outcome(
+        &self,
+        request_id: &str,
+        idempotency_key: &str,
+        payload_hash: &str,
+        final_status: &str,
+        result: &str,
+        completed_at_ms: u64,
+    ) -> Result<bool> {
+        if idempotency_key.is_empty() {
+            return Ok(false);
+        }
+        let completed = completed_at_ms.to_string();
+        let resp = self
+            .call(
+                "turna_record_command_outcome",
+                &[
+                    idempotency_key,
+                    request_id,
+                    payload_hash,
+                    final_status,
+                    result,
+                    &completed,
+                ],
+            )
+            .await?;
+        let code = match parse_call_data(&resp)?.into_iter().next() {
+            Some(rmpv::Value::String(s)) => s.into_str().unwrap_or_default(),
+            other => {
+                return Err(BackendError::Serialization(format!(
+                    "record_command_outcome: expected status string, got {other:?}"
+                )))
+            }
+        };
+        match code.as_str() {
+            "ok" | "ok_same" => Ok(true),
+            // Empty key is handled above; treat any no-op signal as "not recorded".
+            "no_key" => Ok(false),
+            "no_record" => Err(BackendError::Conflict(format!(
+                "record_command_outcome: no canonical idempotency record for key {idempotency_key}"
+            ))),
+            "req_mismatch" => Err(BackendError::Conflict(format!(
+                "record_command_outcome: request_id {request_id} does not own key {idempotency_key}"
+            ))),
+            "hash_mismatch" => Err(BackendError::Conflict(format!(
+                "record_command_outcome: payload hash mismatch for key {idempotency_key}"
+            ))),
+            "conflict" => Err(BackendError::Conflict(format!(
+                "record_command_outcome: different terminal outcome for key {idempotency_key}"
+            ))),
+            other => Err(BackendError::Serialization(format!(
+                "record_command_outcome: unexpected status {other:?}"
+            ))),
+        }
+    }
+
+    /// Execute one bounded, resumable legacy command-log backfill batch.
+    ///
+    /// The `commands` and `complete` phases run entirely in Lua. The
+    /// `idempotency` phase recomputes each restorable legacy record's payload
+    /// hash with the canonical Rust [`command_payload_hash`] — never a divergent
+    /// Lua copy: Lua fetches a bounded page (no mutation), Rust hashes, Lua
+    /// applies and advances the cursor only after the durable write, so a
+    /// reprocessed page is idempotent.
+    pub async fn migrate_command_log_batch(
+        &self,
+        batch_size: usize,
+        owner: &str,
+    ) -> Result<CommandLogMigrationProgress> {
+        let batch = batch_size.clamp(1, 1000).to_string();
+        // Bounded lease window: the migration row is re-leased on every batch, so
+        // a crashed owner's lease expires and the next node resumes the cursor.
+        let lease_ttl = "30000".to_string();
+        let resp = self
+            .call(
+                "turna_migrate_command_log_batch",
+                &[&batch, owner, &lease_ttl],
+            )
+            .await?;
+        let progress = migration_progress_from(&parse_call_data(&resp)?);
+        if progress.phase != "idempotency" {
+            // `commands` (still normalizing rows) or `complete` — done this call.
+            return Ok(progress);
+        }
+
+        // Idempotency phase: Lua fetches a bounded page (no mutation), Rust
+        // recomputes the canonical hash for each restorable row, Lua applies and
+        // advances the cursor. Modern rows already carry the hash and are skipped.
+        let fetch_resp = self
+            .call("turna_migration_idem_fetch", &[&batch, owner, &lease_ttl])
+            .await?;
+        let page_json = parse_call_data(&fetch_resp)?
+            .into_iter()
+            .next()
+            .and_then(|v| match v {
+                rmpv::Value::String(s) => s.into_str(),
+                _ => None,
+            })
+            .unwrap_or_else(|| "{}".to_string());
+        let page: IdemMigrationPage = serde_json::from_str(&page_json)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+
+        let now = now_ms();
+        let mut errors_delta: u64 = 0;
+        let updates: Vec<IdemApplyUpdate> = page
+            .rows
+            .iter()
+            .map(|r| {
+                if r.orphan {
+                    // Linked command gone/undecodable → explicit terminal outcome
+                    // so the record participates in retention/GC and replays clearly.
+                    errors_delta += 1;
+                    IdemApplyUpdate {
+                        key: r.key.clone(),
+                        req: r.req.clone(),
+                        payload_hash: String::new(),
+                        final_status: "failed".to_string(),
+                        result: r#"{"code":"legacy_outcome_unavailable"}"#.to_string(),
+                        created_at_ms: r.created,
+                        completed_at_ms: now,
+                    }
+                } else {
+                    // Canonical Rust hash — identical to the enqueue path.
+                    // #3.3: recognize the full terminal set (done/failed/expired/
+                    // superseded/dead_letter and any other non-empty terminal
+                    // status), not only done/failed; only pending/in_progress (or
+                    // an empty status) stays a pending record.
+                    let terminal =
+                        !r.status.is_empty() && r.status != "pending" && r.status != "in_progress";
+                    IdemApplyUpdate {
+                        key: r.key.clone(),
+                        req: r.req.clone(),
+                        payload_hash: command_payload_hash(&r.op, &r.args, &r.payload_json),
+                        final_status: if terminal {
+                            r.status.clone()
+                        } else {
+                            String::new()
+                        },
+                        result: if terminal {
+                            r.result.clone()
+                        } else {
+                            String::new()
+                        },
+                        created_at_ms: r.created,
+                        completed_at_ms: if terminal {
+                            if r.updated > 0 {
+                                r.updated
+                            } else {
+                                now
+                            }
+                        } else {
+                            0
+                        },
+                    }
+                }
+            })
+            .collect();
+
+        let updates_json = serde_json::to_string(&updates)
+            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+        let done_s = page.done.to_string();
+        let scanned_s = page.scanned.to_string();
+        let errors_s = errors_delta.to_string();
+        // #2: echo the fetch's CAS context so apply can refuse a stale page.
+        let expected_token_s = page.lease_token.to_string();
+        let apply_resp = self
+            .call(
+                "turna_migration_idem_apply",
+                &[
+                    owner,
+                    &updates_json,
+                    &page.cursor_next,
+                    &done_s,
+                    &scanned_s,
+                    &errors_s,
+                    &lease_ttl,
+                    &page.expected_cursor,
+                    &expected_token_s,
+                    &page.phase,
+                ],
+            )
+            .await?;
+        Ok(migration_progress_from(&parse_call_data(&apply_resp)?))
+    }
+
+    /// Bounded command-log GC (best effort). Each `turna_gc_command_log` CALL prunes at most
+    /// one bounded batch (<= `batch` command + `batch` idempotency deletes, so
+    /// the implicit Tarantool transaction stays small) and returns a `more`
+    /// flag; loop up to `max_batches` while more remains. A failed sweep logs
+    /// and returns the partial stats gathered so far — GC never stalls the
+    /// dataplane.
+    pub async fn gc_command_log(&self, r: CommandLogRetention, now_ms: u64) -> GcStats {
+        let mut stats = GcStats::default();
+        let (now_s, done_s, failed_s, sup_s, exp_s, idem_s, batch_s) = (
+            now_ms.to_string(),
+            r.done_ms.to_string(),
+            r.failed_ms.to_string(),
+            r.superseded_ms.to_string(),
+            r.expired_ms.to_string(),
+            r.idempotency_ms.to_string(),
+            r.batch.to_string(),
+        );
+        for _ in 0..r.max_batches.max(1) {
+            let resp = match self
+                .call(
+                    "turna_gc_command_log",
+                    &[
+                        &now_s, &done_s, &failed_s, &sup_s, &exp_s, &idem_s, &batch_s,
+                    ],
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(%e, "command-log GC sweep call failed; returning partial stats");
+                    stats.errors += 1;
+                    break;
+                }
+            };
+            let data = parse_call_data(&resp).ok().unwrap_or_default();
+            let u = |i: usize| data.get(i).and_then(|v| v.as_u64()).unwrap_or(0);
+            stats.deleted_commands += u(0);
+            stats.deleted_idempotency += u(1);
+            stats.terminal_remaining = u(2); // latest snapshot
+            stats.oldest_unfinished_age_ms = u(3);
+            let more = matches!(data.get(4), Some(rmpv::Value::Boolean(true)));
+            if !more {
+                break;
+            }
+        }
+        stats
+    }
+
     // ── iproto CALL + EVAL ────────────────────────────────────────────────────
+
+    /// P0 #12: hard upper bound on a single Tarantool request round-trip. The
+    /// 5s connect/greeting timeout does NOT cover an in-flight call on a
+    /// live socket — a half-open TCP, a slow Lua function, or a paused
+    /// instance would otherwise block the writer / flush / shutdown forever.
+    const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Wrap one `call_once` attempt in the operation deadline. On elapse the
+    /// slot is poisoned (dropped) so the next request reconnects instead of
+    /// reusing a connection left mid-frame, and `Timeout` is returned. Timeout
+    /// is deliberately NOT the `Connection` variant, so `call` does not
+    /// auto-retry it — keeping non-idempotent calls (e.g. claim_allocation's
+    /// CAS) safe from accidental duplication.
+    async fn call_once_deadlined(
+        &self,
+        slot_idx: usize,
+        func: &str,
+        args: &[&str],
+    ) -> Result<Vec<u8>> {
+        match tokio::time::timeout(Self::OP_DEADLINE, self.call_once(slot_idx, func, args)).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.slot_state[slot_idx].store(2, Ordering::Relaxed);
+                *self.pool[slot_idx].lock().await = None;
+                warn!(
+                    slot = slot_idx,
+                    deadline_secs = Self::OP_DEADLINE.as_secs(),
+                    "Tarantool call exceeded the operation deadline; slot poisoned for reconnect"
+                );
+                Err(BackendError::Timeout)
+            }
+        }
+    }
 
     /// Invoke a Tarantool stored function by name via iproto CALL (0x0a).
     /// All args are encoded as msgpack strings (matching Rust's `&[&str]`).
-    /// Round-robin slot selection with single-retry reconnect on failure.
+    /// Round-robin slot selection with single-retry reconnect on failure. Each
+    /// attempt is bounded by `OP_DEADLINE` (P0 #12).
     async fn call(&self, func: &str, args: &[&str]) -> Result<Vec<u8>> {
         let slot_idx = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.pool.len();
-        match self.call_once(slot_idx, func, args).await {
+        match self.call_once_deadlined(slot_idx, func, args).await {
             Ok(r) => Ok(r),
             Err(BackendError::Connection(e)) => {
                 warn!(slot = slot_idx, %e,
@@ -453,7 +1025,7 @@ impl TarantoolBackend {
                 *self.pool[slot_idx].lock().await = Some(stream);
                 self.slot_state[slot_idx].store(0, Ordering::Relaxed);
                 info!(slot = slot_idx, "reconnected slot to Tarantool");
-                self.call_once(slot_idx, func, args).await
+                self.call_once_deadlined(slot_idx, func, args).await
             }
             Err(e) => Err(e),
         }
@@ -554,7 +1126,6 @@ impl TarantoolBackend {
         (idle, busy, broken)
     }
 
-    /// Send a Lua eval request and return the raw iproto response body.
     /// Send a Lua eval request and return the raw iproto response body.
     /// Picks a pool slot via round-robin; on connection failure, the
     /// slot is reconnected and the request retried exactly once. Other
@@ -746,6 +1317,89 @@ fn parse_call_data(resp: &[u8]) -> Result<Vec<rmpv::Value>> {
         Some(v) => Ok(vec![v]), // unexpected shape — be lenient
         None => Ok(vec![]),
     }
+}
+
+/// Map the 5-tuple `(processed_in_batch, cursor, total_processed, completed,
+/// phase)` returned by the migration stored procedures onto the progress DTO.
+/// Shared by `turna_migrate_command_log_batch` (commands/complete) and
+/// `turna_migration_idem_apply` (idempotency), which use the same shape.
+fn migration_progress_from(data: &[rmpv::Value]) -> CommandLogMigrationProgress {
+    CommandLogMigrationProgress {
+        processed_in_batch: data.first().and_then(rmpv::Value::as_u64).unwrap_or(0),
+        cursor: data
+            .get(1)
+            .and_then(rmpv::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        total_processed: data.get(2).and_then(rmpv::Value::as_u64).unwrap_or(0),
+        completed: matches!(data.get(3), Some(rmpv::Value::Boolean(true))),
+        phase: data
+            .get(4)
+            .and_then(rmpv::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// One bounded page returned by `turna_migration_idem_fetch`: the legacy/partial
+/// idempotency rows (empty payload hash) plus the linked command inputs the
+/// caller needs to recompute the canonical hash. Modern rows are not included.
+#[derive(Debug, serde::Deserialize)]
+struct IdemMigrationPage {
+    #[serde(default)]
+    rows: Vec<IdemFetchRow>,
+    #[serde(default)]
+    cursor_next: String,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    scanned: u64,
+    /// #2: full-page CAS context — echoed back to `turna_migration_idem_apply`
+    /// so a stale page (fetched under a since-superseded lease) cannot apply.
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    expected_cursor: String,
+    #[serde(default)]
+    lease_token: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IdemFetchRow {
+    key: String,
+    req: String,
+    /// Linked command gone/undecodable → close terminally as an orphan.
+    #[serde(default)]
+    orphan: bool,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    payload_json: String,
+    /// Linked command's transport status (`done`/`failed`/…), for the outcome.
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    result: String,
+    #[serde(default)]
+    created: u64,
+    #[serde(default)]
+    updated: u64,
+}
+
+/// One idempotency row rewrite sent to `turna_migration_idem_apply`. The
+/// `payload_hash` is the canonical Rust hash (empty only for an orphan, which
+/// has no restorable payload).
+#[derive(Debug, serde::Serialize)]
+struct IdemApplyUpdate {
+    key: String,
+    req: String,
+    payload_hash: String,
+    final_status: String,
+    result: String,
+    created_at_ms: u64,
+    completed_at_ms: u64,
 }
 
 // ── Typed decode helpers (shared logic) ───────────────────────────────────────

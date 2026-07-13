@@ -51,7 +51,7 @@ export default function App() {
         <main className="flex-1 overflow-y-auto p-5">
           {page === 'overview'    && <OverviewPage    {...props} />}
           {page === 'allocations' && <AllocationsPage {...props} />}
-          {page === 'users'       && <UsersPage />}
+          {page === 'users'       && <UsersPage {...props} />}
           {page === 'nodes'       && <NodesPage       {...props} />}
           {page === 'cluster'     && <ClusterPage     {...props} />}
           {page === 'events'      && <EventsPage      {...props} />}

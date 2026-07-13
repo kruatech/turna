@@ -30,6 +30,11 @@ struct Cli {
     mode: Mode,
     #[arg(short, long, default_value = "30")]
     duration: u64,
+    /// P0 #14: steady-state warmup in seconds. Traffic runs this long first,
+    /// then stats are RESET and the reported window is the next `--duration`
+    /// seconds only (excludes connection/allocation ramp-up). 0 = disabled.
+    #[arg(long, default_value = "0")]
+    warmup: u64,
     /// Emit a single JSON object to stdout instead of the human report.
     /// Use for `bench/run.sh` and other automation.
     #[arg(long)]
@@ -101,6 +106,9 @@ struct Stats {
     lat_sum: AtomicU64,
     lat_min: AtomicU64,
     lat_max: AtomicU64,
+    /// P0 #14: elapsed-ns from `start` when the steady-state measurement
+    /// window began (after warmup). 0 = measure from construction.
+    measure_start_ns: AtomicU64,
     start: Instant,
     running: AtomicBool,
 }
@@ -116,6 +124,7 @@ impl Stats {
             lat_buckets: Default::default(),
             lat_sum: 0.into(),
             lat_min: AtomicU64::new(u64::MAX),
+            measure_start_ns: AtomicU64::new(0),
             lat_max: 0.into(),
             start: Instant::now(),
             running: true.into(),
@@ -160,6 +169,25 @@ impl Stats {
             _ => 9,
         };
         self.lat_buckets[b].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        // P0 #14: begin the steady-state window. Discard everything collected
+        // during warmup so the report reflects steady state only, not
+        // connection setup / allocation handshakes / ramp-up.
+        self.sent.store(0, Ordering::Relaxed);
+        self.recv.store(0, Ordering::Relaxed);
+        self.errs.store(0, Ordering::Relaxed);
+        self.bytes_out.store(0, Ordering::Relaxed);
+        self.bytes_in.store(0, Ordering::Relaxed);
+        self.lat_sum.store(0, Ordering::Relaxed);
+        self.lat_min.store(u64::MAX, Ordering::Relaxed);
+        self.lat_max.store(0, Ordering::Relaxed);
+        for b in &self.lat_buckets {
+            b.store(0, Ordering::Relaxed);
+        }
+        self.measure_start_ns
+            .store(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn is_running(&self) -> bool {
@@ -214,15 +242,24 @@ impl Stats {
     }
 
     fn snapshot(&self, label: &str, mode: &str) -> Snapshot {
-        let el = self.start.elapsed().as_secs_f64();
+        // P0 #14: measure only the steady-state window (total minus warmup).
+        let total = self.start.elapsed().as_secs_f64();
+        let win_start = self.measure_start_ns.load(Ordering::Relaxed) as f64 / 1e9;
+        let el = (total - win_start).max(0.0);
+        let sent = self.sent.load(Ordering::Relaxed);
         let recv = self.recv.load(Ordering::Relaxed);
+        let errs = self.errs.load(Ordering::Relaxed);
         Snapshot {
             label: label.into(),
             mode: mode.into(),
             duration_s: el,
-            sent: self.sent.load(Ordering::Relaxed),
+            sent,
             recv,
-            errs: self.errs.load(Ordering::Relaxed),
+            errs,
+            // P0 #14: sends that got neither a response nor a counted error.
+            // Closed-loop (binding/allocate): ~0 after join = convergence.
+            // Open-loop (channeldata): the real relay drop count.
+            loss: sent.saturating_sub(recv + errs),
             bytes_out: self.bytes_out.load(Ordering::Relaxed),
             bytes_in: self.bytes_in.load(Ordering::Relaxed),
             rps: if el > 0.0 { recv as f64 / el } else { 0.0 },
@@ -263,6 +300,7 @@ struct Snapshot {
     sent: u64,
     recv: u64,
     errs: u64,
+    loss: u64,
     bytes_out: u64,
     bytes_in: u64,
     rps: f64,
@@ -294,6 +332,12 @@ impl Snapshot {
             0.0
         };
         println!("  Errors:      {} ({:.2}%)", self.errs, err_pct);
+        let loss_pct = if self.sent > 0 {
+            self.loss as f64 / self.sent as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!("  Loss:        {} ({:.2}%)", self.loss, loss_pct);
         println!("  RPS:         {:.0}", self.rps);
         println!(
             "  Throughput:  {} out / {} in",
@@ -344,6 +388,7 @@ impl Snapshot {
 \"sent\":{sent},\
 \"recv\":{recv},\
 \"errs\":{errs},\
+\"loss\":{loss},\
 \"bytes_out\":{bytes_out},\
 \"bytes_in\":{bytes_in},\
 \"rps\":{rps:.3},\
@@ -362,6 +407,7 @@ impl Snapshot {
             sent = self.sent,
             recv = self.recv,
             errs = self.errs,
+            loss = self.loss,
             bytes_out = self.bytes_out,
             bytes_in = self.bytes_in,
             rps = self.rps,
@@ -424,6 +470,7 @@ async fn run_binding(
     server: SocketAddr,
     concurrency: usize,
     duration: Duration,
+    warmup: Duration,
     json: bool,
 ) -> Arc<Stats> {
     let stats = Arc::new(Stats::new());
@@ -481,7 +528,7 @@ async fn run_binding(
                     "\r  [{:>3}s] {:>8} resp | {:>6} rps | {:>4} err",
                     stats2.start.elapsed().as_secs(),
                     cur,
-                    cur - prev,
+                    cur.saturating_sub(prev),
                     stats2.errs.load(Ordering::Relaxed)
                 );
                 prev = cur;
@@ -490,6 +537,11 @@ async fn run_binding(
         });
     }
 
+    // P0 #14: run warmup, then reset to measure only steady state.
+    if !warmup.is_zero() {
+        tokio::time::sleep(warmup).await;
+        stats.reset();
+    }
     tokio::time::sleep(duration).await;
     stats.stop();
     for h in handles {
@@ -508,6 +560,7 @@ async fn run_allocate(
     server: SocketAddr,
     concurrency: usize,
     duration: Duration,
+    warmup: Duration,
     json: bool,
     creds: Creds,
     rtt_ms: u64,
@@ -541,6 +594,11 @@ async fn run_allocate(
 
     barrier.wait().await;
     progress_reporter(&stats, json);
+    // P0 #14: run warmup, then reset to measure only steady state.
+    if !warmup.is_zero() {
+        tokio::time::sleep(warmup).await;
+        stats.reset();
+    }
     tokio::time::sleep(duration).await;
     stats.stop();
     for h in handles {
@@ -563,6 +621,7 @@ async fn run_channeldata(
     pps: u64,
     payload: usize,
     duration: Duration,
+    warmup: Duration,
     json: bool,
     creds: Creds,
     rtt_ms: u64,
@@ -675,6 +734,11 @@ async fn run_channeldata(
 
     barrier.wait().await;
     progress_reporter(&stats, json);
+    // P0 #14: run warmup, then reset to measure only steady state.
+    if !warmup.is_zero() {
+        tokio::time::sleep(warmup).await;
+        stats.reset();
+    }
     tokio::time::sleep(duration).await;
     stats.stop();
     for h in handles {
@@ -701,7 +765,7 @@ fn progress_reporter(stats: &Arc<Stats>, json: bool) {
                 "\r  [{:>3}s] {:>8} resp | {:>6} rps | {:>4} err",
                 stats2.start.elapsed().as_secs(),
                 cur,
-                cur - prev,
+                cur.saturating_sub(prev),
                 stats2.errs.load(Ordering::Relaxed)
             );
             prev = cur;
@@ -714,6 +778,7 @@ fn progress_reporter(stats: &Arc<Stats>, json: bool) {
 async fn main() {
     let cli = Cli::parse();
     let dur = Duration::from_secs(cli.duration);
+    let wu = Duration::from_secs(cli.warmup);
     let mode_name = cli.mode.name();
 
     if !cli.json {
@@ -741,7 +806,7 @@ async fn main() {
             if !cli.json {
                 eprintln!("Mode: STUN Binding (c={concurrency})");
             }
-            run_binding(cli.server, concurrency, dur, cli.json).await
+            run_binding(cli.server, concurrency, dur, wu, cli.json).await
         }
         Mode::Allocate { concurrency } => {
             if !cli.json {
@@ -751,6 +816,7 @@ async fn main() {
                 cli.server,
                 concurrency,
                 dur,
+                wu,
                 cli.json,
                 creds,
                 cli.rtt_timeout_ms,
@@ -771,6 +837,7 @@ async fn main() {
                 pps,
                 payload,
                 dur,
+                wu,
                 cli.json,
                 creds,
                 cli.rtt_timeout_ms,
@@ -862,5 +929,28 @@ mod tests {
         s.record_latency(Duration::from_micros(600));
         assert_eq!(s.percentile(0.50), 500);
         assert_eq!(s.percentile(0.99), 1000);
+    }
+
+    /// P0 #14: `reset()` starts the steady-state window — everything from the
+    /// warmup phase (counters, latency histogram, loss) is discarded.
+    #[test]
+    fn reset_clears_warmup_window() {
+        let s = Stats::new();
+        s.sent.fetch_add(100, Ordering::Relaxed);
+        s.recv.fetch_add(90, Ordering::Relaxed);
+        s.errs.fetch_add(5, Ordering::Relaxed);
+        s.record_latency(Duration::from_micros(500));
+
+        s.reset();
+
+        // Only post-reset activity is measured.
+        s.sent.fetch_add(10, Ordering::Relaxed);
+        s.recv.fetch_add(10, Ordering::Relaxed);
+        let snap = s.snapshot("x", "binding");
+        assert_eq!(snap.sent, 10, "warmup sends discarded");
+        assert_eq!(snap.recv, 10, "warmup recvs discarded");
+        assert_eq!(snap.errs, 0, "warmup errors discarded");
+        assert_eq!(snap.loss, 0, "sent == recv + errs → no loss");
+        assert_eq!(snap.lat_min_us, 0, "latency histogram cleared");
     }
 }

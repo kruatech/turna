@@ -224,3 +224,25 @@ service:
   is active.
 - A Grafana dashboard JSON is not shipped yet. Use the PromQL examples above as
   the initial dashboard source.
+
+
+## Runtime management and migration metrics
+
+The following label-free metrics are exported by the node/control plane:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `turna_management_commands_accepted_total` | counter | Durable management commands accepted. |
+| `turna_config_update_applied_total` / `turna_config_update_noop_total` | counter | Applied and no-op runtime config outcomes. |
+| `turna_config_update_conflicts_total` / `turna_config_update_failures_total` | counter | Version conflicts and failures. |
+| `turna_config_update_rollback_total` | counter | Publications rolled back after observed-state confirmation failed. |
+| `turna_config_observed_version` | gauge | Local node observed runtime config version. |
+| `turna_config_desired_observed_mismatch` | gauge | Whether durable desired and observed config differ. |
+| `turna_config_oldest_unapplied_ms` | gauge | Age of the current unapplied desired config. |
+| `turna_user_limits_*` | counter/gauge | Applied/no-op/conflict/failure outcomes and over-limit subjects. |
+| `turna_command_log_migration_*` | counter/gauge | Bounded migration progress, errors, and completion. |
+| `turna_runtime_config_apply_duration_seconds` | histogram | Node-side config/limit apply latency. |
+
+No `node_id`, realm, tenant, or username labels are emitted. Use the management
+read API for per-node desired/observed details and audit logs for subject-level
+investigation.

@@ -12,6 +12,13 @@ use std::net::SocketAddr;
 
 /// UDP transport protocol number for REQUESTED-TRANSPORT.
 pub const TRANSPORT_UDP: u8 = 17;
+/// RFC 6062 TCP relayed transport (REQUESTED-TRANSPORT protocol value).
+pub const TRANSPORT_TCP: u8 = 6;
+/// SCTP (IANA protocol number 132, RFC 4960). NOTE: there is NO TURN RFC that
+/// defines SCTP as a *relayed* transport — this constant exists for TURN-over-SCTP
+/// as a client *control* transport (relayed side stays UDP). Do not treat it as a
+/// standardized relayed-transport value.
+pub const TRANSPORT_SCTP: u8 = 132;
 
 /// Default TURN allocation lifetime in seconds.
 pub const DEFAULT_LIFETIME: u32 = 600;
@@ -84,6 +91,20 @@ pub fn build_channel_bind_request(
     msg
 }
 
+/// Build an RFC 6062 §4.4 ConnectionAttempt indication — sent to the client over
+/// its (already authenticated) control connection when a peer opens a TCP
+/// connection to the relayed transport address. The client answers by opening a
+/// new connection and ConnectionBind-ing `connection_id`. Indications carry no
+/// MESSAGE-INTEGRITY (the control channel authenticates the server, and the
+/// subsequent ConnectionBind requires the client's own credentials + ownership
+/// check, so the id is useless to anyone else).
+pub fn build_connection_attempt(connection_id: u32, peer_addr: SocketAddr) -> StunMessage {
+    let mut msg = StunMessage::new(Method::ConnectionAttempt, MessageClass::Indication);
+    msg.add(Attribute::ConnectionId(connection_id));
+    msg.add(Attribute::XorPeerAddress(peer_addr));
+    msg
+}
+
 /// Build a simple success response (for CreatePermission, ChannelBind, Refresh).
 pub fn build_success_response(method: Method, tid: [u8; 12]) -> StunMessage {
     StunMessage::with_transaction_id(method, MessageClass::SuccessResponse, tid)
@@ -145,6 +166,21 @@ pub fn build_auth_challenge(
         attr_type: ATTR_PASSWORD_ALGORITHMS,
         value: algos,
     });
+    msg
+}
+
+/// RFC 7635 §6.1 third-party (OAuth) 401 challenge: a standard auth challenge
+/// plus a THIRD-PARTY-AUTHORIZATION attribute advertising the authorization
+/// server identity, so a client without a token learns where to obtain one.
+pub fn build_oauth_challenge(
+    method: Method,
+    tid: [u8; 12],
+    realm: &str,
+    nonce: &str,
+    as_identity: &[u8],
+) -> StunMessage {
+    let mut msg = build_auth_challenge(method, tid, realm, nonce);
+    msg.add(Attribute::ThirdPartyAuthorization(as_identity.to_vec()));
     msg
 }
 

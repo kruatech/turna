@@ -247,6 +247,10 @@ pub fn run_af_xdp(
                             .store(relay_ports.len() as u64, Relaxed);
                         tracing::debug!(port, "AF_XDP: relay port closed");
                     }
+                    // RFC 6062 TCP relay listeners are bound synchronously
+                    // elsewhere and never traverse the af-xdp datagram send
+                    // path, so there is nothing to do here.
+                    Action::RegisterTcpListener { .. } => {}
                     Action::None => {}
                 }
             }
@@ -405,10 +409,12 @@ mod tests {
 
     #[test]
     fn preflight_rejects_bad_geometry_and_missing_iface() {
-        let mut cfg = turna_config::AfXdpSection::default();
-        cfg.interface = "turna_no_such_iface_xyz".to_string();
-        cfg.fill_ring_size = 3000; // not a power of two
-        cfg.frame_size = 1000; // < 2048 and not a power of two
+        let cfg = turna_config::AfXdpSection {
+            interface: "turna_no_such_iface_xyz".to_string(),
+            fill_ring_size: 3000, // not a power of two
+            frame_size: 1000,     // < 2048 and not a power of two
+            ..Default::default()
+        };
         let err = preflight_af_xdp(&cfg).expect_err("invalid config must fail preflight");
         assert!(err.iter().any(|p| p.contains("fill_ring_size")), "{err:?}");
         assert!(err.iter().any(|p| p.contains("frame_size")), "{err:?}");

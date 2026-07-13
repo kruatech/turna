@@ -21,9 +21,30 @@ expectations rather than imply everything is production-grade.
 | WebTransport (`web-transport`)             | experimental            | Feature-gated. |
 | io_uring data path (`io-uring`)            | experimental, Linux-only | Compile-gated; hardware-dependent. |
 | AF_XDP data path (`af-xdp`)                | experimental, Linux-only | Kernel-bypass; requires NIC/kernel support. |
-| Runtime user CRUD (management API)         | not implemented / partial | See `docs/PRODUCTION_READINESS.md`. |
+| Runtime user CRUD (`AddUser`/`RemoveUser`) | supported (needs mgmt backend) | Requires the Tarantool management backend; unavailable on an in-memory backend. |
 
 Default builds use the tokio UDP data path; everything marked *experimental* is
 opt-in via Cargo features and is not yet covered by the same testing/hardening
 bar as the core path. The Linux-only data paths do not build on macOS (see the
 `af-xdp`/`io-uring` notes in `CONTRIBUTING.md`).
+
+## GA management feature matrix
+
+| Capability | Source status | Verification required before GA |
+|---|---|---|
+| Node-targeted `update_config` | implemented | workspace + live update/restart |
+| Durable desired/observed config | memory + Tarantool implemented | clean/upgrade/outage tests |
+| Global/tenant/user limits | implemented | concurrency + restart + packet tests |
+| Atomic allocation reservations | implemented | race/rollback/rehydrate tests |
+| Admin config/limits UI | implemented | npm build + container smoke + live CP |
+| Standalone Helm profile | implemented | lint/render/kubeconform + live deploy |
+| `SetDraining` (drain/undrain) | implemented | drain/leaving + grace deadline tests |
+| `DeleteAllocation` | implemented | idempotent not-found retry test |
+| Idempotent management retry | implemented + covered by tests | lost-completion + replay tests |
+| Restart restore (config + limits) | implemented + covered by tests | clean/upgrade/outage runs |
+| Per-allocation bandwidth enforcement | implemented + covered by tests | two-allocation independence test |
+| Audit log (tamper-evident) | implemented | fail-closed on unhealthy audit |
+| Transparent active-session HA | not GA | future milestone; media path does not migrate |
+
+“Implemented” here is a source-level statement, not a claim that the current
+working tree has passed the release verification commands.

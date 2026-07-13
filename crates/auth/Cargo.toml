@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
+
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace    = true

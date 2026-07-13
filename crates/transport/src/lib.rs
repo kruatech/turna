@@ -36,6 +36,11 @@ pub use tcp_tls::{
     TlsTransportServer,
 };
 
+#[cfg(feature = "sctp")]
+pub mod sctp;
+#[cfg(feature = "sctp")]
+pub use sctp::{SctpError, SctpTransportConfig, SctpTransportServer};
+
 use std::net::SocketAddr;
 use thiserror::Error;
 

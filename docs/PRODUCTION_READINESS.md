@@ -6,6 +6,12 @@ verified path.
 
 ## Recommended production profile
 
+
+The canonical GA topology is one TURN dataplane process/pod per public IP and
+relay range. Use `transport = "tokio"`, keep gossip cluster mode disabled, and
+run control-plane/admin separately. Runtime management persistence requires a
+shared Tarantool backend even in standalone dataplane mode:
+
 Use this profile unless you are deliberately testing an experimental datapath:
 
 ```toml
@@ -20,13 +26,31 @@ shared_secret = "file:///etc/turna/secrets/shared_secret"
 
 [turn.relay.quota]
 max_per_user = 100
-max_bytes_per_sec = 0
+# Finite per-user byte/s cap. Under production = true the validator REJECTS an
+# unlimited cap (max_bytes_per_sec_per_allocation = 0) unless you also set
+# allow_unlimited_bandwidth = true to explicitly accept that risk.
+max_bytes_per_sec_per_allocation = 12500000   # ~100 Mbit/s per user; set to your ceiling
 
 [health]
 listen = "0.0.0.0:9090"
 
 [management]
 listen = "127.0.0.1:5350"
+
+
+[cluster]
+node_id = "turna-prod-1"
+cluster_mode = false
+
+[cluster.backend]
+type = "tarantool"
+uri = "tarantool.internal:3301"
+user = "turna"
+password = "file:///run/secrets/tarantool-password"
+pool_size = 8
+
+[cluster.persistence]
+mode = "write_behind"
 ```
 
 Production checklist:
@@ -191,3 +215,54 @@ starter alert set.
 
 When in doubt, choose the explicit `tokio` transport and prove every additional
 feature before enabling it in front of users.
+
+## Runtime management invariants
+
+- `update_config` accepts only allocation count, default per-user allocation
+  count, and `max_bytes_per_sec_per_allocation`. Listener addresses, external IP, relay range,
+  worker/backend/identity/secrets, safety flags, and drain are immutable or have
+  dedicated operations.
+- The target node checks `expected_version` inside a serialized apply section,
+  persists desired state, publishes one immutable snapshot, then confirms
+  observed state. A no-op succeeds without increasing the version.
+- `set_user_limits` resolves each field independently in this order: user,
+  tenant, node runtime default, bootstrap default. Lowering a limit below usage
+  does not destroy allocations; it rejects new allocations until usage falls.
+- Startup loads the last confirmed observed config and limits before readiness.
+  A backend/load/validation failure does not silently enable unlimited defaults.
+- `max_bytes_per_sec_per_allocation` is bytes/second. `TopTalker.bandwidth_bps` and load metrics
+  are telemetry in bits/second and are intentionally separate.
+
+## HA boundary
+
+The multi-node chart/profile is experimental. Durable allocation metadata and
+mobility tooling do not recreate a dead owner's relay socket or guarantee media
+continuity. The GA claim is standalone recovery of management state, not
+transparent active-session failover.
+
+## Desired/observed convergence gate
+
+Before promoting a managed node, confirm on every managed node:
+
+- `desired_version == observed_version` (via `GetConfig`).
+- No node is stuck `applying` / with an unconfirmed `pending_desired`.
+- No unresolved rollback states (`failed` with `rolled_back`); a failed desired
+  state is retained for diagnosis and is not auto-applied on restart.
+- Stale-incarnation commands are not accumulating (they are finalized as
+  `superseded` by the sweeper; a growing backlog is a signal to investigate).
+
+## Sign-off
+
+| Area             | Owner | Evidence | Status |
+| ---------------- | ----- | -------- | ------ |
+| Config           |       |          |        |
+| Security         |       |          |        |
+| Management state |       |          |        |
+| Migration        |       |          |        |
+| Admin            |       |          |        |
+| Dataplane        |       |          |        |
+| Backup/rollback  |       |          |        |
+| Documentation    |       |          |        |
+
+Each row is signed off against concrete evidence (a verification run, drill, or
+audit reference), not a source-review assertion.

@@ -113,6 +113,47 @@ impl StunMessage {
         })
     }
 
+    /// First ORIGIN attribute (draft-ietf-tram-stun-origin), if present. The
+    /// value is a forgeable client hint — never treat it as auth/tenant truth.
+    pub fn get_origin(&self) -> Option<&str> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::Origin(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// All ORIGIN attributes (senders MAY include several per the draft).
+    pub fn origins(&self) -> impl Iterator<Item = &str> {
+        self.attributes.iter().filter_map(|a| match a {
+            Attribute::Origin(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// RFC 6062 CONNECTION-ID, if present.
+    pub fn get_connection_id(&self) -> Option<u32> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::ConnectionId(id) => Some(*id),
+            _ => None,
+        })
+    }
+
+    /// RFC 7635 ACCESS-TOKEN bytes (opaque, still encrypted), if present.
+    pub fn get_access_token(&self) -> Option<&[u8]> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::AccessToken(t) => Some(t.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// RFC 7635 THIRD-PARTY-AUTHORIZATION bytes, if present.
+    pub fn get_third_party_authorization(&self) -> Option<&[u8]> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::ThirdPartyAuthorization(t) => Some(t.as_slice()),
+            _ => None,
+        })
+    }
+
     /// Whether a MOBILITY-TICKET attribute is present at all (the Allocate
     /// opt-in signal — value may be empty).
     pub fn has_mobility_ticket(&self) -> bool {

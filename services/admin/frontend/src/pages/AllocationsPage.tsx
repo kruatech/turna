@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { Card } from '../ui/Card'
 import { Badge } from '../ui/Badge'
 import { MiniChart } from '../ui/MiniChart'
@@ -16,10 +16,21 @@ export function AllocationsPage({ status, metrics, history, frozen }: PanelProps
   const [allocs, setAllocs]   = useState<AllocEntry[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError]     = useState<string | null>(null)
-  const [killing, setKilling] = useState<number | null>(null)
+  const [killing, setKilling] = useState<string | null>(null)
   const [toast, setToast]     = useState<string | null>(null)
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 2500) }
+
+  // High-assurance idempotency: one stable key per kill INTENT (per allocation
+  // id), reused across retries so a network-timeout retry dedups on the backend
+  // instead of creating a second command. A fresh UUID per retry would defeat
+  // dedup. Cleared on success so a later, distinct kill gets a new key. Required
+  // when the backend runs with TURNA_REQUIRE_IDEMPOTENCY_KEY=true.
+  const killKeys = useRef<Record<string, string>>({})
+  const newKey = () =>
+    (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
   const loadAllocs = useCallback(async () => {
     setLoading(true); setError(null)
@@ -31,14 +42,17 @@ export function AllocationsPage({ status, metrics, history, frozen }: PanelProps
     } finally { setLoading(false) }
   }, [t])
 
-  const killAlloc = useCallback(async (port: number) => {
-    if (!confirm(t('alloc.killConfirm') + port)) return
-    setKilling(port)
+  const killAlloc = useCallback(async (id: string) => {
+    if (!id) return
+    if (!confirm(t('alloc.killConfirm') + id)) return
+    const key = killKeys.current[id] ?? (killKeys.current[id] = newKey())
+    setKilling(id)
     try {
-      await api.manage.allocKill(port)
-      showToast(t('alloc.killed') + ' ' + port)
-      setAllocs(prev => prev ? prev.filter(a => a.relay_port !== port) : prev)
-    } catch { showToast(t('nodes.actionError')) }
+      await api.manage.allocKill(id, undefined, key)
+      showToast(t('alloc.killed') + ' ' + id)
+      delete killKeys.current[id] // intent complete — a later kill is a new intent
+      setAllocs(prev => prev ? prev.filter(a => a.id !== id) : prev)
+    } catch { showToast(t('nodes.actionError')) } // keep key so a retry reuses it
     finally { setKilling(null) }
   }, [t])
 
@@ -131,20 +145,20 @@ export function AllocationsPage({ status, metrics, history, frozen }: PanelProps
             <div className="divide-y divide-[--border] max-h-[60vh] overflow-y-auto">
               {allocs.map((a, i) => (
                 <div key={i} className="grid grid-cols-[auto_1fr_1fr_auto_auto_auto] gap-0 items-center px-4 py-2.5 hover:bg-[--raised] transition-colors font-mono text-xs">
-                  <span className="pr-4 text-teal-400 font-semibold">{a.relay_port ?? '—'}</span>
+                  <span className="pr-4 text-teal-400 font-semibold">{a.relay_address ?? '—'}</span>
                   <span className="pr-4 text-[--ink] truncate">{a.username ?? '—'}</span>
-                  <span className="pr-4 text-[--muted] truncate">{a.peer ?? '—'}</span>
+                  <span className="pr-4 text-[--muted] truncate">{a.client_address ?? '—'}</span>
                   <span className="pr-4">
                     {a.transport && (
                       <Badge kind="neutral" label={String(a.transport)} />
                     )}
                   </span>
-                  <span className="pr-4 text-[--muted]">{a.lifetime !== undefined ? a.lifetime + 's' : '—'}</span>
+                  <span className="pr-4 text-[--muted]">{a.remaining_lifetime !== undefined ? a.remaining_lifetime + 's' : '—'}</span>
                   <button
-                    onClick={() => killAlloc(a.relay_port ?? 0)}
-                    disabled={killing === a.relay_port || !a.relay_port}
+                    onClick={() => killAlloc(a.id ?? '')}
+                    disabled={killing === a.id || !a.id}
                     className="rounded-lg border border-rose-400/30 bg-rose-400/8 px-2.5 py-1 text-xs font-medium text-rose-400 hover:bg-rose-400/15 disabled:opacity-40 transition-all">
-                    {killing === a.relay_port
+                    {killing === a.id
                       ? <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-rose-400 border-t-transparent"/>
                       : t('alloc.kill')}
                   </button>

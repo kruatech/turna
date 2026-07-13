@@ -62,8 +62,8 @@ while validating the name turna.krutilin.pro (SSH tunnel to a CP with a trusted 
   the CP over loopback. For loopback, mTLS is unnecessary — TLS plus --auth-token
   is enough. mTLS is needed only when admin and CP traverse a network.
 - The node's read-only management plane (:9090) is loopback-only by design.
-- Recommendation (not yet implemented): symmetric fail-closed — if admin --listen
-  is non-loopback AND --auth-token is unset, refuse to start (currently only a WARN).
+- Symmetric fail-closed is enforced: a non-loopback admin listener without
+  `--auth-token` / `TURNA_ADMIN_AUTH_TOKEN` is rejected at startup.
 
 ## Development (Node required)
 
@@ -109,3 +109,22 @@ full admin→gRPC→CP chain executes mutations, not a stub.
   (per crates/health/src/lib.rs).
 - The mTLS mode is implemented in code; live testing used plaintext-loopback +
   token. Production deployment (mTLS, exposed) has not been exercised.
+
+## GA management behavior
+
+The admin image is a release artifact. `/healthz` reports bridge process health
+without requiring the control plane to be available at container startup;
+actual API calls return an explicit upstream error while it is unavailable.
+Static frontend assets are required at startup and are checked by CI container
+smoke.
+
+For non-loopback admin listeners, `TURNA_ADMIN_AUTH_TOKEN` is mandatory. The
+frontend sends it in `x-admin-token`, never in the URL, and keeps a manually
+entered token only in `sessionStorage` (not localStorage or persistent config).
+Mutation without the token is rejected. Read endpoints follow the bridge's
+explicit route policy; deployment networking must still keep admin private.
+
+Config and Users pages operate on target-node desired/observed state. A retry
+following a lost response reuses the same idempotency key; a new user intent
+creates a new key. Version conflicts are displayed separately and refresh the
+observed version rather than reporting false success.

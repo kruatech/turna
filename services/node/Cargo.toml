@@ -6,6 +6,7 @@ edition.workspace = true
 
 [features]
 tls = ["turna-relay/tls", "turna-transport/tls"]
+sctp = ["turna-relay/sctp", "turna-transport/sctp"]
 default = []
 io-uring = ["turna-transport/io-uring", "turna-relay/io-uring"]
 # Raw QUIC datapath. WebTransport (browser H3) builds on it.
@@ -31,5 +32,8 @@ turna-health.workspace = true
 hostname.workspace = true
 # PR2 (task #3): write-behind writer task uses the state backend.
 turna-state-backend.workspace = true
+turna-proto-turn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 # PR A (task 2.4): system resource metrics in heartbeat.
 sysinfo = "0.30"

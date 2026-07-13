@@ -15,7 +15,7 @@
 //!   does not crash the node; in-memory state remains authoritative.
 //! - On shutdown we flush whatever is in the partial batch, then exit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -63,6 +63,102 @@ pub struct WriterCounters {
 }
 
 // ---------------------------------------------------------------------------
+// P0 #16: reconciliation
+// ---------------------------------------------------------------------------
+
+/// Outcome of one reconciliation pass.
+#[derive(Debug, Default)]
+pub struct ReconcileStats {
+    /// Backend rows for this node deleted because they are no longer live
+    /// (a dropped `Remove` left them behind).
+    pub zombies_deleted: u64,
+    /// Live allocations re-emitted to the writer to repair missing/stale rows
+    /// (dropped `Create`/`Refresh`/permission/channel events).
+    pub live_resynced: u64,
+    /// Whether the re-emit completed without the writer channel dropping any of
+    /// the resync events. When `false`, the backend is NOT yet known-consistent
+    /// (live state was re-dropped under backpressure) and readiness must stay
+    /// `Degraded` until a later pass succeeds (P0.1).
+    pub resync_complete: bool,
+    /// Monotonic generation of the ordering barrier enqueued after the resync
+    /// events (P0.1). The caller awaits the writer's reconcile-ack reaching this
+    /// value to confirm the backend was actually flushed up to the resync — not
+    /// merely that the queue accepted the events.
+    pub barrier_generation: u64,
+    /// Whether the barrier was accepted by the writer channel. `false` means the
+    /// channel was full/closed and the ack will never advance — the caller must
+    /// stay `Degraded` and retry rather than await an ack that cannot arrive.
+    pub barrier_enqueued: bool,
+}
+
+/// Monotonic source for reconcile barrier generations (P0.1). One writer + one
+/// reconcile caller, so a plain relaxed counter suffices; starts at 0 so the
+/// first barrier is generation 1 (the reconcile-ack initial value is 0).
+static RECONCILE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Reconcile the backend with this node's authoritative live state after a
+/// write-behind backpressure episode dropped events (P0 #16).
+///
+/// Two divergence classes are closed:
+///
+/// 1. **Zombies** — a dropped `Remove` leaves a row in the backend for an
+///    allocation that no longer exists. Adopting one on failover would
+///    resurrect a dead allocation. We delete every backend row owned by this
+///    node whose `relay_port` is not in the live set. This step is synchronous
+///    (awaited) so the caller can gate readiness on it.
+///
+/// 2. **Missing / stale** — a dropped `Create`/`Refresh`/permission/channel
+///    leaves the backend without a live allocation, or with stale expiry. We
+///    ask the store to re-emit its full live state (`resync_all`) through the
+///    writer, which upserts. Because that path re-uses the same bounded channel,
+///    we compare the drop counter across the call and report `resync_complete`:
+///    when it is `false` the re-emit itself lost events, so the caller must not
+///    declare Ready — it stays Degraded and a later pass retries (self-healing).
+///
+/// Returns the pass's stats, or a `BackendError` if the zombie sweep could not
+/// complete (the caller should stay `Degraded` and retry).
+pub async fn reconcile(
+    store: &AllocationStore,
+    backend: &Backend,
+    node_id: &str,
+) -> Result<ReconcileStats, BackendError> {
+    let live: HashSet<u16> = store.live_relay_ports().into_iter().collect();
+
+    let mut zombies_deleted = 0u64;
+    for row in backend.find_by_node(node_id).await? {
+        if !live.contains(&row.relay_port) {
+            backend.remove_allocation(row.relay_port).await?;
+            zombies_deleted += 1;
+        }
+    }
+
+    // Re-emit live state to repair missing/stale rows. `resync_all` enqueues into
+    // the same bounded writer channel, which drops on backpressure; detect that by
+    // comparing the drop counter across the call. If it grew, some live state was
+    // re-dropped and the backend is not yet consistent — the caller must stay
+    // Degraded and retry rather than declare Ready over a partial resync (P0.1).
+    let dropped_before = store.dropped_writes_count();
+    store.resync_all();
+    let resync_complete = store.dropped_writes_count() == dropped_before;
+
+    // P0.1: enqueue an ordering barrier after the resync events, through the
+    // SAME FIFO channel. The writer flushes everything before it to the backend
+    // and only then publishes `barrier_generation` to its reconcile-ack, so the
+    // caller can await genuine backend catch-up. A dropped barrier
+    // (`barrier_enqueued == false`) means the caller must stay Degraded.
+    let barrier_generation = RECONCILE_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let barrier_enqueued = store.emit_reconcile_barrier(barrier_generation);
+
+    Ok(ReconcileStats {
+        zombies_deleted,
+        live_resynced: live.len() as u64,
+        resync_complete,
+        barrier_generation,
+        barrier_enqueued,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Internal batch model
 // ---------------------------------------------------------------------------
 
@@ -91,6 +187,7 @@ struct CreateData {
     client_addr: SocketAddr,
     relay_addr: SocketAddr,
     username: String,
+    realm: String,
     /// RFC 8016 stable identity, persisted so a MOBILITY-TICKET survives a
     /// cross-node failover (see `StoredAllocation::allocation_id`).
     allocation_id: String,
@@ -162,6 +259,7 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
             client_addr,
             relay_addr,
             username,
+            realm,
             created_at_ms,
             expires_at_ms,
             allocation_id,
@@ -172,6 +270,7 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
                 client_addr,
                 relay_addr,
                 username,
+                realm,
                 allocation_id,
                 migration_epoch,
                 created_at_ms,
@@ -290,6 +389,8 @@ fn apply(batch: &mut HashMap<u16, PortBatch>, op: WriteOp) -> bool {
                 .insert(number, (peer_addr, expires_at_ms))
                 .is_some()
         }
+        // Never reached: barriers are intercepted by run_writer before apply.
+        WriteOp::Barrier { .. } => false,
     }
 }
 
@@ -382,7 +483,11 @@ fn build_stored(
         client_addr: data.client_addr.to_string(),
         relay_addr: data.relay_addr.to_string(),
         user_id: data.username.clone(),
-        realm: realm.to_string(),
+        realm: if data.realm.is_empty() {
+            realm.to_string()
+        } else {
+            data.realm.clone()
+        },
         node_id: node_id.to_string(),
         created_at_ms: data.created_at_ms,
         expires_at_ms,
@@ -504,6 +609,7 @@ pub async fn run_writer(
     config: WriterConfig,
     metrics: Arc<Metrics>,
     counters: Arc<WriterCounters>,
+    reconcile_ack: Arc<AtomicU64>,
     mut rx: mpsc::Receiver<WriteOp>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -552,6 +658,24 @@ pub async fn run_writer(
             // 2) New event from the store.
             recv = rx.recv() => {
                 match recv {
+                    Some(WriteOp::Barrier { generation }) => {
+                        // P0.1: every op enqueued before this barrier has now
+                        // been dequeued (FIFO). Flush the batch to the backend,
+                        // then publish the generation so a reconcile waiter
+                        // learns the backend is caught up to this point — not
+                        // merely that the queue accepted the events. Backend
+                        // write failures during the flush are counted in
+                        // `counters.backend_errors`, which the waiter also checks.
+                        if !batch.is_empty() {
+                            flush_batch(&backend, &config.node_id, &realm,
+                                        std::mem::take(&mut batch),
+                                        &counters, &metrics).await;
+                            sync_metrics(&metrics, &counters,
+                                          store.dropped_writes_count());
+                        }
+                        deadline = None;
+                        reconcile_ack.store(generation, Ordering::Release);
+                    }
                     Some(op) => {
                         let coalesced = apply(&mut batch, op);
                         if coalesced { counters.coalesced.fetch_add(1, Ordering::Relaxed); }
@@ -647,8 +771,20 @@ mod tests {
         let st_c = store.clone();
         let ct_c = counters.clone();
         let mt_c = metrics.clone();
+        let ack = Arc::new(AtomicU64::new(0));
         let handle = tokio::spawn(async move {
-            run_writer(bk_c, st_c, "test-realm".into(), cfg, mt_c, ct_c, rx, sd_rx).await;
+            run_writer(
+                bk_c,
+                st_c,
+                "test-realm".into(),
+                cfg,
+                mt_c,
+                ct_c,
+                ack,
+                rx,
+                sd_rx,
+            )
+            .await;
         });
         (tx, sd_tx, counters, metrics, handle)
     }
@@ -666,6 +802,7 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9000),
             relay_addr: ipv4(10, 0, 0, 1, 40000),
             username: "alice".into(),
+            realm: "turna".into(),
             allocation_id: "wr-id-1".into(),
             migration_epoch: 0,
             created_at_ms: 1000,
@@ -689,6 +826,80 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// P0.1: a reconcile barrier flushes all ops enqueued before it to the
+    /// backend and publishes its generation to the reconcile-ack ONLY after that
+    /// flush — so a waiter that sees ack >= generation knows the backend is
+    /// caught up, not merely that the queue accepted the events.
+    #[tokio::test]
+    async fn reconcile_barrier_acks_only_after_backend_flush() {
+        let backend = fresh_backend().await;
+        let store = fresh_store();
+        let (tx, rx) = mpsc::channel(1024);
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let counters = Arc::new(WriterCounters::default());
+        let metrics = Arc::new(Metrics::new());
+        let ack = Arc::new(AtomicU64::new(0));
+        // Huge batch size + long deadline: nothing flushes except via the barrier.
+        let cfg = WriterConfig {
+            channel_capacity: 1024,
+            batch_max_size: 100,
+            batch_max_delay: Duration::from_secs(3600),
+            node_id: "test-node".into(),
+        };
+        let ack_c = ack.clone();
+        let bk_c = backend.clone();
+        let st_c = store.clone();
+        let handle = tokio::spawn(async move {
+            run_writer(
+                bk_c,
+                st_c,
+                "test-realm".into(),
+                cfg,
+                metrics,
+                counters,
+                ack_c,
+                rx,
+                sd_rx,
+            )
+            .await;
+        });
+
+        tx.send(WriteOp::Create {
+            relay_port: 40005,
+            client_addr: ipv4(127, 0, 0, 1, 9000),
+            relay_addr: ipv4(10, 0, 0, 1, 40005),
+            username: "barrier".into(),
+            realm: "turna".into(),
+            allocation_id: "b-id".into(),
+            migration_epoch: 0,
+            created_at_ms: 1000,
+            expires_at_ms: 1_600_000,
+        })
+        .await
+        .unwrap();
+        tx.send(WriteOp::Barrier { generation: 7 }).await.unwrap();
+
+        let mut acked = false;
+        for _ in 0..100 {
+            if ack.load(Ordering::Acquire) >= 7 {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            acked,
+            "barrier generation must be published after the flush"
+        );
+        assert!(
+            backend.get_allocation(40005).await.unwrap().is_some(),
+            "barrier must flush prior ops to the backend before acking"
+        );
+
+        sd_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
     /// Create then Remove in the same batch → backend never sees the alloc.
     #[tokio::test]
     async fn create_then_remove_coalesces_to_nothing() {
@@ -703,6 +914,7 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9001),
             relay_addr: ipv4(10, 0, 0, 1, 40001),
             username: "bob".into(),
+            realm: "turna".into(),
             allocation_id: "wr-id-2".into(),
             migration_epoch: 0,
             created_at_ms: 1000,
@@ -748,6 +960,7 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9002),
             relay_addr: ipv4(10, 0, 0, 1, 40002),
             username: "carol".into(),
+            realm: "turna".into(),
             allocation_id: "wr-id-3".into(),
             migration_epoch: 0,
             created_at_ms: 1000,
@@ -794,6 +1007,7 @@ mod tests {
                 client_addr: ipv4(127, 0, 0, 1, 9000 + i),
                 relay_addr: ipv4(10, 0, 0, 1, 40010 + i),
                 username: format!("u{i}"),
+                realm: "turna".into(),
                 allocation_id: "wr-id-4".into(),
                 migration_epoch: 0,
                 created_at_ms: 1000,
@@ -833,6 +1047,7 @@ mod tests {
             client_addr: ipv4(127, 0, 0, 1, 9020),
             relay_addr: ipv4(10, 0, 0, 1, 40020),
             username: "dave".into(),
+            realm: "turna".into(),
             allocation_id: "wr-id-5".into(),
             migration_epoch: 0,
             created_at_ms: 1000,
@@ -872,6 +1087,7 @@ mod tests {
             client_addr: old_client,
             relay_addr: relay,
             username: "mobile".into(),
+            realm: "turna".into(),
             allocation_id: "wr-id-6".into(),
             migration_epoch: 0,
             created_at_ms: 1000,
@@ -936,6 +1152,7 @@ mod tests {
             client_addr: old_client,
             relay_addr: relay,
             username: "mobile2".into(),
+            realm: "turna".into(),
             allocation_id: "wr-id-7".into(),
             migration_epoch: 0,
             created_at_ms: 1000,

@@ -41,6 +41,9 @@ use turna_state_backend::{Backend, NodeHeartbeat};
 #[derive(Debug, Clone)]
 pub struct HeartbeatConfig {
     pub node_id: String,
+    /// Unique for this process start. Durable commands are fenced to it so a
+    /// command claimed by an older process cannot mutate a restarted node.
+    pub incarnation: String,
     /// Address other nodes should use to reach us. Typically
     /// `external_ip:turn_port`. Used by PR 5 failover to know where the
     /// (now-dead) node's clients were routed.
@@ -65,6 +68,7 @@ fn build_heartbeat(
 ) -> NodeHeartbeat {
     NodeHeartbeat {
         node_id: cfg.node_id.clone(),
+        incarnation: cfg.incarnation.clone(),
         addr: cfg.addr.clone(),
         active_allocations: metrics.active_allocations.load(Ordering::Relaxed),
         total_bandwidth_bps: bw_bps,
@@ -200,6 +204,7 @@ mod tests {
     fn make_cfg() -> HeartbeatConfig {
         HeartbeatConfig {
             node_id: "test-node".into(),
+            incarnation: "test-incarnation".into(),
             addr: "127.0.0.1:3478".into(),
             version: "0.1.0-test".into(),
             interval: Duration::from_millis(30),

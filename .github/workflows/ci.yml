@@ -194,6 +194,66 @@ jobs:
             cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
       - name: Docker build
         run: docker build -f deploy/Dockerfile -t turna:ci .
+      - name: Docker build (admin)
+        # Build the admin image in ordinary CI so a Dockerfile.admin error is
+        # caught on every push/PR, not only at tag release (release.yml's
+        # docker-admin job). Admin is now a required release artifact.
+        run: docker build -f deploy/Dockerfile.admin -t turna-admin:ci .
+      - name: Admin container smoke
+        run: |
+          set -euo pipefail
+          name=turna-admin-ci-smoke
+          cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name "$name" -p 18080:8080 \
+            -e TURNA_ADMIN_LISTEN=0.0.0.0:8080 \
+            -e TURNA_ADMIN_AUTH_TOKEN=ci-admin-token \
+            -e TURNA_ADMIN_GRPC_ADDR=http://127.0.0.1:5350 \
+            turna-admin:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' "$name" | grep -qx true; then
+              docker logs "$name"
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18080/healthz >/dev/null
+          curl -fsS http://127.0.0.1:18080/ >/dev/null
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'content-type: application/json' \
+            -d '{"command":"ping","params":{}}' \
+            http://127.0.0.1:18080/api/manage)" = 401
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H 'content-type: application/json' \
+            -H 'x-admin-token: ci-admin-token' \
+            -d '{"command":"ping","params":{}}' \
+            http://127.0.0.1:18080/api/manage)" = 502
+          docker stop -t 10 "$name" >/dev/null
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$name")" = 0
+
+  frontend:
+    name: admin frontend build (npm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # SHA-pinned to match the repo's pinned-actions policy. Resolve/update with:
+      #   git ls-remote https://github.com/actions/setup-node refs/tags/v4
+      # Node major aligned with deploy/Dockerfile.admin (node:22) so the frontend
+      # CI job and the real container build share one toolchain.
+      - uses: actions/setup-node@1e60f620b9541d16bece96c5465dc8ee9832be0b # v4.0.3
+        with:
+          node-version: '22'
+      # This is the contour that catches admin TypeScript <-> backend contract
+      # drift before release. Requires services/admin/frontend/package-lock.json
+      # to be committed (npm ci refuses to run without it).
+      - name: Install and build admin frontend
+        working-directory: services/admin/frontend
+        run: |
+          npm ci
+          npm run build
 
   deny:
     name: cargo-deny (лицензии, advisories)
@@ -308,3 +368,49 @@ jobs:
       - name: Tarantool logs (on failure)
         if: failure()
         run: docker logs turna-tnt || true
+
+  # ── P0 §7.3 / §24: deployment consistency gate ──────────────────────────────
+  # Fails the build if the relay UDP port range diverges across turn.toml,
+  # docker-compose, and the Helm values — the exact class of drift that let
+  # allocations succeed while their relay traffic was silently dropped (P0 #13).
+  deploy-consistency:
+    name: deploy consistency (relay range)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Check relay range agrees across turn.toml / compose / helm
+        run: bash scripts/check-deploy-consistency.sh
+
+  # ── P0 §7.3 / §24: Helm chart render + schema validation ────────────────────
+  # `helm lint` + `helm template` (default AND production-example values) piped
+  # through kubeconform (offline k8s-schema validation, no cluster). Catches
+  # malformed manifests before they reach a cluster. NOTE: kubeconform validates
+  # structure/schema, not semantic policy (e.g. hostPort collisions) — those are
+  # covered by the production values' required podAntiAffinity, not by this gate.
+  helm-validate:
+    name: helm lint + render + kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install helm + kubeconform (pinned)
+        run: |
+          set -euo pipefail
+          HELM_VER=v3.16.3
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz" | tar xz
+          sudo mv linux-amd64/helm /usr/local/bin/helm
+          KC_VER=v0.6.7
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KC_VER}/kubeconform-linux-amd64.tar.gz" | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/kubeconform
+          helm version
+          kubeconform -v
+      - name: helm lint
+        run: helm lint deploy/helm/turna
+      - name: Render + validate (default values)
+        run: |
+          helm template turna deploy/helm/turna \
+            | kubeconform -strict -summary -kubernetes-version 1.29.0
+      - name: Render + validate (production-example values)
+        run: |
+          helm template turna deploy/helm/turna \
+            -f deploy/helm/turna/values-production.example.yaml \
+            | kubeconform -strict -summary -kubernetes-version 1.29.0

@@ -189,10 +189,11 @@ sudo install -o turna -g turna -m 0755 target/release/turna-node /usr/local/bin/
 sudo systemctl restart turna-node
 ```
 
-In single-node mode this still costs every client a re-Allocate
-(roughly 1–2 seconds of glitchy audio per ongoing call). In cluster
-mode with persistence enabled, active sessions are restored from the
-backend on startup — see [CLUSTER.md](CLUSTER.md).
+A node restart still costs every client a re-Allocate. Persistence restores
+metadata, runtime configuration, limits, and accounting invariants; it does not
+recreate the old relay socket or preserve an active media path. Transparent
+active-session continuity remains experimental/future work — see
+[CLUSTER.md](CLUSTER.md).
 
 ## Container-based deployment (sketch)
 
@@ -238,3 +239,18 @@ rule that only allows Prometheus.
 `Restart=always` plus the default `RestartSec=5` gives a ~5s window
 where the server is down. For single-node this means brief client
 re-connects. For zero-gap upgrades, see [CLUSTER.md](CLUSTER.md).
+
+
+## Standalone GA topology and durable management
+
+The canonical production topology is one `turna-node` pod/process per public IP,
+Tokio transport, and the complete relay range directly reachable. Keep
+`cluster_mode = false`; attach Tarantool through `[cluster.backend]` and enable
+`[cluster.persistence]` so `update_config`, `set_user_limits`, command outcomes,
+and desired/observed state survive process restarts. A node that cannot load
+that durable state during startup remains not ready instead of silently using
+unlimited/bootstrap values.
+
+The Helm `values-production.example.yaml` follows this profile with
+`replicaCount: 1`. The StatefulSet/cluster profile is retained as experimental
+and must not be interpreted as transparent active-session HA.

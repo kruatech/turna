@@ -4,17 +4,22 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 
 [![CI](https://github.com/kruatech/turna/actions/workflows/ci.yml/badge.svg)](https://github.com/kruatech/turna/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-beta-yellow.svg)
+![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)
 
 > Turna is the Turkish name of the crane — a migratory bird that relays itself
 > across continents. This server does the same for your packets.
 
 ## Status
 
-**Release candidate (`0.3.0-rc.1`).** The default **tokio UDP datapath** is the
-primary supported path: STUN binding, the full TURN allocation lifecycle,
-long-term-credential and JWT auth, Prometheus/OpenTelemetry, config validation,
-and graceful drain / RFC 8016 migration are exercised here.
+**Production GA (`0.3.0`).** The default **Tokio datapath** is the primary supported path:
+STUN binding, the TURN allocation lifecycle, long-term-credential and JWT auth,
+Prometheus/OpenTelemetry, config validation, durable runtime configuration,
+per-subject limits, and graceful drain.
+
+The new GA management changes are implemented in source but are **not considered
+verified by this document** until the exact release commit passes the workspace,
+Tarantool, frontend, container, Helm, migration, restart, and live relay gates in
+[RELEASE.md](RELEASE.md).
 
 The high-performance and alternative-transport backends are **experimental**,
 gated behind Cargo features, and not yet runtime-verified for production: the
@@ -24,21 +29,54 @@ TLS-over-TCP (`tls`) transports. Treat them as preview until further validation
 
 ## Why turna
 
+
+### GA management contract
+
+`update_config` dynamically changes only `max_allocations`,
+`max_allocations_per_user`, and `max_bytes_per_sec_per_allocation` (bytes/second). Changes are
+published as one immutable versioned snapshot on the target node. `set_user_limits`
+supports global, tenant, and realm/tenant/user overrides for allocation count,
+bytes/second, and lifetime. Every field independently supports inherit, a finite
+value, unlimited, or disabled where valid. Both RPCs require a target node,
+expected version, and idempotency key; their responses come from the node's
+durable terminal result rather than control-plane-local state.
+
 - **Memory-safe core in Rust** with continuously fuzzed STUN/TURN parsers
   (`fuzz/`) and an [audited `unsafe` inventory](docs/unsafe-audit.md) confined to
   the transport/relay datapaths.
 - **Batched UDP I/O** — `SO_REUSEPORT` recv workers with `recvmmsg`/`sendmmsg`
   and per-batch arena buffers; optional `io_uring` and `AF_XDP` datapaths behind
   features for kernel-bypass throughput.
-- **Clustering** — gossip discovery, a hash ring, and TURN-redirect load
-  balancing, with a pluggable state backend (in-memory or Tarantool) for shared
-  allocation state.
+- **Standalone-first management** — node-targeted, idempotent runtime config
+  and user-limit commands with desired/observed versions and Tarantool-backed
+  restart restore.
+- **Experimental clustering** — gossip discovery, a hash ring, TURN redirects,
+  and allocation-state tooling. It does **not** guarantee transparent survival
+  of active allocations, relay-socket rehydration, or zero-gap rolling upgrades.
 - **Operable** — gRPC control plane + `turnactl` CLI, Prometheus metrics and
   OpenTelemetry tracing, graceful drain and RFC 8016 session migration.
 
 For a longer comparison and the design rationale, see
 [docs/why-turna.md](docs/why-turna.md). Reproducible benchmarks against coturn
 live in [bench/README.md](bench/README.md).
+
+### Guarantees and limitations
+
+| Guarantee                                     | Status                                        |
+| --------------------------------------------- | --------------------------------------------- |
+| Idempotent retry of management commands       | Supported                                     |
+| Runtime config restore after restart          | Supported (management-backend profile)        |
+| User-limits restore after restart             | Supported                                     |
+| Existing allocation survives process crash    | Not guaranteed                                |
+| Existing media path migrates to another node  | Not guaranteed                                |
+| Drain waits indefinitely                       | No — bounded by `drain_grace_secs`            |
+| Multi-node ownership/state failover            | Experimental / limited scope                  |
+| Transparent active-session (media) failover    | Out of GA scope                               |
+
+"Supported" is a source-level statement pending the release verification gates
+in [RELEASE.md](RELEASE.md); see [docs/feature-support.md](docs/feature-support.md)
+for the full matrix and [docs/MANAGEMENT_API.md](docs/MANAGEMENT_API.md) for the
+RPC contract.
 
 ## Features
 
@@ -167,7 +205,7 @@ Workspace crates can be consumed via a git dependency:
 
 ```toml
 [dependencies]
-turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.0-rc.1" }
+turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.0" }
 ```
 
 ## Development

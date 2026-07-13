@@ -10,16 +10,20 @@ mod dtls_listener;
 mod failover;
 mod heartbeat;
 mod quic_listener;
+mod runtime_management;
 mod writer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use turna_auth::{AuthMode, AuthRegistry, UserKeys};
 use turna_cluster::gossip::{run_gossip, GossipConfig};
 use turna_cluster::{ClusterNode, HashRing};
-use turna_config::{ClusterConfig, TurnConfig, TurnaConfig};
+use turna_config::{
+    ClusterConfig, RuntimeSnapshot as ConfigRuntimeSnapshot, RuntimeValidationCtx, TurnConfig,
+    TurnaConfig,
+};
 use turna_health::Metrics;
 use turna_observability::{SamplingConfig, TelemetryConfig};
 use turna_relay::processor::ClusterRouting;
@@ -53,9 +57,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (config, cluster, health_listen, tls_cfg, tenants) = match config_path {
+    let (
+        config,
+        cluster,
+        health_listen,
+        tls_cfg,
+        tenants,
+        runtime_validation_ctx,
+        bootstrap_runtime,
+    ) = match config_path {
         Some(path) => {
             let root = TurnaConfig::load(&path)?;
+            let runtime_validation_ctx = RuntimeValidationCtx::from_config(&root);
+            let bootstrap_runtime = ConfigRuntimeSnapshot::from_config(&root);
             let health_listen = root.health.listen;
             let tls_cfg = root.tls.clone();
             (
@@ -64,17 +78,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health_listen,
                 tls_cfg,
                 root.tenants,
+                runtime_validation_ctx,
+                bootstrap_runtime,
             )
         }
         None => {
             turna_observability::init();
             info!("no config file, using defaults");
+            let root = TurnaConfig::default();
+            let runtime_validation_ctx = RuntimeValidationCtx::from_config(&root);
+            let bootstrap_runtime = ConfigRuntimeSnapshot::from_config(&root);
             (
-                TurnConfig::default(),
-                ClusterConfig::default(),
+                root.turn,
+                root.cluster,
                 "0.0.0.0:9090".parse().unwrap(),
-                turna_config::TlsConfig::default(),
-                Vec::new(),
+                root.tls,
+                root.tenants,
+                runtime_validation_ctx,
+                bootstrap_runtime,
             )
         }
     };
@@ -142,7 +163,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Base ([turn]) auth backend.
-    let base_auth = if config.auth.static_users.is_empty() {
+    let base_auth = if config.auth.oauth.enabled {
+        // RFC 7635 third-party auth on the base realm. Keys are validated as hex
+        // (16/32 B) in config::validate, so decoding here does not fail.
+        let as_rs_keys: Vec<Vec<u8>> = config
+            .auth
+            .oauth
+            .as_rs_keys
+            .iter()
+            .filter_map(|h| decode_hex(h))
+            .collect();
+        // RFC 7635 kid-tagged keys (each `key` validated as hex in config::validate).
+        let kid_keys: Vec<(String, Vec<u8>)> = config
+            .auth
+            .oauth
+            .keys
+            .iter()
+            .filter_map(|k| decode_hex(&k.key).map(|bytes| (k.kid.clone(), bytes)))
+            .collect();
+        info!(
+            realm = %config.realm,
+            keys = as_rs_keys.len(),
+            kid_keys = kid_keys.len(),
+            server_name = %config.auth.oauth.server_name,
+            "OAuth (RFC 7635) auth enabled on base realm"
+        );
+        AuthMode::oauth_full(
+            config.realm.clone(),
+            as_rs_keys,
+            kid_keys,
+            config.auth.oauth.strict_kid,
+            config.auth.oauth.server_name.clone(),
+            config.auth.oauth.as_identity.clone(),
+        )
+    } else if config.auth.static_users.is_empty() {
         AuthMode::SharedSecret {
             realm: config.realm.clone(),
             secret: config.auth.shared_secret.as_bytes().to_vec(),
@@ -187,10 +241,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.relay.max_port,
             config.relay.max_allocations,
         );
-        s.quota = turna_session::BandwidthQuota {
-            max_bytes_per_sec: config.relay.quota.max_bytes_per_sec,
-            max_per_user: config.relay.quota.max_per_user,
-        };
+        // Publish the complete boot snapshot once. Config values never live in
+        // independent atomics; runtime updates replace this whole value.
+        s.publish_runtime(turna_session::RuntimeLimits {
+            version: bootstrap_runtime.version,
+            max_bytes_per_sec_per_allocation: bootstrap_runtime
+                .limits
+                .max_bytes_per_sec_per_allocation,
+            max_per_user: bootstrap_runtime.limits.max_per_user,
+            max_allocations: bootstrap_runtime.limits.max_allocations,
+        });
+        s.set_bootstrap_max_lifetime(turna_proto_turn::MAX_LIFETIME);
         // Multi-tenancy: isolated relay-port pool per tenant (disjoint ranges).
         for t in &tenants {
             s = s.with_tenant_pool(
@@ -199,7 +260,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t.relay_port_range[1],
                 t.max_allocations,
                 turna_session::BandwidthQuota {
-                    max_bytes_per_sec: t.quota.max_bytes_per_sec,
+                    max_bytes_per_sec_per_allocation: t.quota.max_bytes_per_sec_per_allocation,
                     max_per_user: t.quota.max_per_user,
                 },
             );
@@ -228,6 +289,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics,
         health_listen,
         tls_cfg,
+        runtime_validation_ctx,
+        bootstrap_runtime,
     )
 }
 
@@ -250,6 +313,222 @@ fn build_tls_transport_config(
     }
 }
 
+/// Map `[turn.tcp_relay]` config to the relay-layer `TcpRelayConfig`.
+fn build_tcp_relay_config(
+    c: &turna_config::TcpRelaySection,
+) -> turna_relay::tcp_relay::TcpRelayConfig {
+    turna_relay::tcp_relay::TcpRelayConfig {
+        connect_timeout: std::time::Duration::from_secs(c.connect_timeout_secs),
+        idle_timeout: std::time::Duration::from_secs(c.idle_timeout_secs),
+        max_per_allocation: c.max_per_allocation,
+        max_total: c.max_total,
+        buffer_size: c.buffer_size,
+    }
+}
+
+/// Map the config-layer [`turna_config::SctpSection`] to the transport-layer
+/// `SctpTransportConfig`. Experimental TURN-over-SCTP control transport.
+#[cfg(feature = "sctp")]
+fn build_sctp_transport_config(
+    c: &turna_config::SctpSection,
+) -> turna_transport::sctp::SctpTransportConfig {
+    turna_transport::sctp::SctpTransportConfig {
+        listen_addr: c.listen,
+        max_frame_size: c.max_frame_size,
+        read_timeout: std::time::Duration::from_secs(c.read_timeout_secs),
+        max_connections: c.max_connections,
+        backlog: c.backlog,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// P0 #8: upper bound on how long shutdown waits for the write-behind
+/// persistence writer to flush its queue before the process exits. Part of
+/// the total shutdown budget that `terminationGracePeriodSeconds` must
+/// exceed. Conservative default; revisit with batch sizing / backend latency.
+const PERSISTENCE_FLUSH_TIMEOUT_SECS: u64 = 10;
+
+/// P0 #8/#11: per-task join budget on shutdown for supervised background tasks
+/// other than the persistence writer (heartbeat, failover). They only need to
+/// observe the shutdown signal and stop; the writer gets the larger flush budget.
+const TASK_JOIN_TIMEOUT_SECS: u64 = 5;
+/// P0.2: how long a claimed command's lease is held before another claim may
+/// reclaim it (the claimant is expected to complete well within this window).
+const COMMAND_LEASE_MS: u64 = 30_000;
+
+/// P0.1: how long the readiness monitor waits for the writer to flush a
+/// reconcile barrier to the backend before giving up and staying Degraded.
+/// Must comfortably exceed a batch flush; the monitor ticks every 5s.
+const RECONCILE_BARRIER_WAIT_SECS: u64 = 10;
+
+/// #5: which optional workers each deployment profile runs. Centralizes the
+/// gate decisions so the profile matrix (management / allocation-persistence /
+/// cluster-failover) lives — and is tested — in one place instead of scattered
+/// inline conditions that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProfileGates {
+    /// Durable management plane: command log, runtime/limits restore, migration,
+    /// command worker, and the presence/incarnation heartbeat used for command
+    /// targeting. Enabled by ANY durable backend, independent of allocation
+    /// write-behind.
+    management: bool,
+    /// Rehydrate persisted allocations at startup — allocation-persistence only.
+    bulk_load: bool,
+    /// Write-behind allocation writer + reconcile — allocation-persistence only.
+    writer: bool,
+    /// Ownership adoption / failover sweep — CLUSTER profile only. Gated on the
+    /// explicit `cluster_mode`, never inferred from persistence being enabled: a
+    /// standalone (or management-only) persistent node must not adopt ownership
+    /// or run failover for peers.
+    failover: bool,
+    /// Gossip membership / redirects — cluster profile only.
+    gossip: bool,
+}
+
+/// Resolve the deployment-profile worker gates from cluster config. Pure and
+/// side-effect free so the profile matrix (see the `profile_gates_matrix` test)
+/// is verifiable without booting a node.
+fn profile_gates(cluster: &turna_config::ClusterConfig) -> ProfileGates {
+    let persistence = cluster.persistence.is_enabled();
+    let durable_backend = cluster.backend.r#type.as_str() == "tarantool";
+    ProfileGates {
+        management: persistence || durable_backend,
+        bulk_load: persistence,
+        writer: persistence,
+        failover: cluster.cluster_mode,
+        gossip: cluster.cluster_mode,
+    }
+}
+
+/// P0.1: await the writer publishing `target` (a reconcile barrier's
+/// generation) to `ack` — i.e. every op enqueued before the barrier has been
+/// flushed to the backend. Returns `false` on timeout or shutdown so the caller
+/// stays Degraded rather than declaring Ready over an unconfirmed resync.
+async fn await_reconcile_barrier(
+    ack: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    target: u64,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(RECONCILE_BARRIER_WAIT_SECS);
+    loop {
+        if ack.load(Ordering::Acquire) >= target {
+            return true;
+        }
+        if *shutdown.borrow() || tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = shutdown.changed() => return false,
+        }
+    }
+}
+
+/// Decode an even-length hex string into bytes. `None` on invalid hex. Used for
+/// OAuth AS-RS keys (validated as hex in config::validate before we reach here).
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// P0 #11: spawn a MANDATORY background task under supervision. If the task's
+/// future completes while the node is NOT shutting down, that is an unexpected
+/// exit (a panic surfaces here as task completion too): mark the node Degraded
+/// so a load balancer / failover controller stops trusting it, and initiate an
+/// orderly shutdown so the orchestrator restarts the pod. Returns the handle so
+/// shutdown can join it within the budget.
+fn spawn_supervised<F>(
+    name: &'static str,
+    metrics: Arc<Metrics>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    fut: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let shutting_down = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        fut.await;
+        if *shutting_down.borrow() {
+            info!(task = name, "background task stopped (shutdown)");
+        } else {
+            tracing::error!(
+                task = name,
+                "mandatory background task exited unexpectedly; marking node \
+                 Degraded and initiating shutdown"
+            );
+            metrics.set_readiness(turna_health::Readiness::Degraded);
+            let _ = shutdown_tx.send(true);
+        }
+    })
+}
+
+/// P0 #8/#11: join a supervised task within a bounded budget on shutdown, so a
+/// mandatory task is never left detached to be aborted by the runtime drop.
+async fn join_within_budget(
+    name: &'static str,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    budget: Duration,
+) {
+    let Some(handle) = handle else { return };
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(())) => info!(task = name, "task stopped cleanly during shutdown"),
+        Ok(Err(e)) => warn!(task = name, error = %e, "task panicked during shutdown"),
+        Err(_) => warn!(
+            task = name,
+            budget_secs = budget.as_secs(),
+            "task did not stop within the shutdown budget"
+        ),
+    }
+}
+
+/// P0 #4: apply one claimed command to this node's real runtime state and
+/// return (status, result) for the command log. Only node-local mutations
+/// are handled; unknown ops fail explicitly so the control-plane learns the
+/// command was not honoured (never a silent success).
+fn apply_command(
+    cmd: &turna_state_backend::PendingCommand,
+    store: &Arc<AllocationStore>,
+    metrics: &Arc<Metrics>,
+) -> (&'static str, String) {
+    match cmd.op.as_str() {
+        "delete_allocation" => {
+            let Some(relay_id) = cmd.args.first() else {
+                return (
+                    "failed",
+                    "delete_allocation: missing relay id arg".to_string(),
+                );
+            };
+            // Find the live allocation by its relay address and remove it from
+            // the real store. Persistence propagates via the write-behind path.
+            match store
+                .iter_all()
+                .find(|a| a.relay_addr.to_string() == *relay_id)
+            {
+                Some(a) => {
+                    store.force_remove(&a.client_addr);
+                    metrics
+                        .active_allocations
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    ("done", String::new())
+                }
+                // Already gone => idempotent success.
+                None => (
+                    "done",
+                    "allocation not present (already removed)".to_string(),
+                ),
+            }
+        }
+        other => ("failed", format!("unknown command op: {other}")),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tokio(
     config: TurnConfig,
@@ -260,6 +539,8 @@ fn run_tokio(
     metrics: Arc<Metrics>,
     health_listen: std::net::SocketAddr,
     tls_cfg: turna_config::TlsConfig,
+    runtime_validation_ctx: RuntimeValidationCtx,
+    bootstrap_runtime: ConfigRuntimeSnapshot,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `tls_cfg` is only consumed when the `tls` feature is enabled.
     #[cfg(not(feature = "tls"))]
@@ -284,11 +565,31 @@ fn run_tokio(
 
     rt.block_on(async {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // #5: resolve the deployment-profile worker gates once, up front.
+        let gates = profile_gates(&cluster);
+        let node_incarnation = format!(
+            "{}:{}:{}",
+            cluster.node_id,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        // #6: shared drain signal for the cluster hash ring. Set when this node
+        // enters drain so the gossip loop advertises `leaving` immediately (not
+        // only at final shutdown), evicting this node from peers' routing so new
+        // clients stop being redirected here mid-drain (no redirect loop).
+        let gossip_draining =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // #6: edge signal pulsed the instant drain begins so gossip sends the
+        // leaving frame immediately, not on the next periodic tick.
+        let gossip_drain_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // Health check server is started below, after cluster_routing is built,
         // so it can also expose GET /cluster (gossip ring membership).
 
-        let cluster_routing = if cluster.cluster_mode {
+        let cluster_routing = if gates.gossip {
             // node_id MUST be unique per host. The default placeholder collides
             // across nodes; identical ids are deduped into a single ring entry,
             // so every node serves locally and no redirect/balancing happens.
@@ -324,22 +625,35 @@ fn run_tokio(
             let gossip_shutdown = shutdown_rx.clone();
             let ring_for_gossip = hash_ring.clone();
             let metrics_for_gossip = metrics.clone();
-            tokio::spawn(async move {
-                if let Err(e) = run_gossip(
-                    gossip_cfg,
-                    move |nodes| {
-                        metrics_for_gossip
-                            .cluster_nodes
-                            .store(nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        ring_for_gossip.write().update_nodes(nodes);
-                    },
-                    gossip_shutdown,
-                )
-                .await
-                {
-                    warn!(%e, "cluster gossip stopped with error");
-                }
-            });
+            let gossip_draining_g = gossip_draining.clone();
+            let gossip_drain_notify_g = gossip_drain_notify.clone();
+            // P0 #11: gossip is a mandatory cluster task. Supervise it so an
+            // unexpected exit marks the node Degraded and initiates shutdown,
+            // instead of silently leaving a stale hash ring while /ready stays
+            // 200 and routing keeps trusting dead membership.
+            spawn_supervised(
+                "cluster-gossip",
+                metrics.clone(),
+                shutdown_tx.clone(),
+                async move {
+                    if let Err(e) = run_gossip(
+                        gossip_cfg,
+                        move |nodes| {
+                            metrics_for_gossip
+                                .cluster_nodes
+                                .store(nodes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            ring_for_gossip.write().update_nodes(nodes);
+                        },
+                        gossip_draining_g,
+                        gossip_drain_notify_g,
+                        gossip_shutdown,
+                    )
+                    .await
+                    {
+                        warn!(%e, "cluster gossip stopped with error");
+                    }
+                },
+            );
 
             info!(
                 node_id = %cluster.node_id,
@@ -418,8 +732,36 @@ fn run_tokio(
             });
         }
 
+        // P0 #8: keep the writer's JoinHandle so shutdown can wait for its
+        // final flush instead of the runtime drop aborting it mid-write.
+        let mut writer_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut heartbeat_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut failover_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut command_log_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         // ── PR2: write-behind writer task ─────────────────────────────────────
-        if cluster.persistence.is_enabled() {
+        // P0 #16: hoisted so the readiness monitor (spawned below, outside this
+        // block) can run reconciliation against the backend after write-drops.
+        let mut reconcile_backend: Option<Arc<turna_state_backend::Backend>> = None;
+        // P0.1: hoisted so the readiness monitor (below, outside the writer
+        // block) can await the writer flushing a reconcile barrier to the
+        // backend (`reconcile_ack`) and detect backend write failures during the
+        // drain (`reconcile_counters`) before returning the node to Ready.
+        let reconcile_ack = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut reconcile_counters: Option<Arc<writer::WriterCounters>> = None;
+        // #6: the management backend (durable command log, runtime/limits
+        // restore, migration, command worker, and the heartbeat that publishes
+        // this node's incarnation for command targeting) is enabled whenever a
+        // durable backend is configured — independent of allocation write-behind.
+        // Allocation persistence (writer, reconcile) is gated on persistence and
+        // ownership/failover on cluster_mode — see `profile_gates`.
+        let management_enabled = gates.management;
+        if !management_enabled {
+            // No management plane on this node → nothing to gate; mark the
+            // management-readiness sub-signal Ready so it never sticks at Starting.
+            metrics.set_management_readiness(turna_health::Readiness::Ready);
+        }
+        if management_enabled {
             let backend_cfg = match cluster.backend.r#type.as_str() {
                 "memory" => BackendConfig::Memory,
                 "tarantool" => BackendConfig::Tarantool {
@@ -441,9 +783,14 @@ fn run_tokio(
                     },
                 },
                 other => {
-                    warn!(backend = %other,
-                          "unknown [cluster.backend.type]; falling back to memory");
-                    BackendConfig::Memory
+                    // P0 #10: refuse to silently fall back to a process-local
+                    // in-memory store. TurnaConfig::validate already rejects
+                    // unknown backend types at load; this is defence in depth.
+                    return Err(format!(
+                        "unknown [cluster.backend].type = {other:?}; use \"memory\" or \
+                         \"tarantool\" (refusing to fall back to in-memory)"
+                    )
+                    .into());
                 }
             };
 
@@ -454,12 +801,38 @@ fn run_tokio(
                         format!("state backend init failed: {e}").into()
                     })?;
             let backend = Arc::new(backend);
+            reconcile_backend = Some(backend.clone());
 
-            let bulk_stats = bulk_load::bulk_load(&backend, &store, &cluster.node_id).await;
-            metrics.active_allocations.fetch_add(
-                bulk_stats.rehydrated as u64,
-                std::sync::atomic::Ordering::Relaxed,
+            // Durable runtime state is restored before allocation rehydration
+            // and before readiness. A backend outage is fatal here: silently
+            // falling back to bootstrap/unlimited values would violate the
+            // management-plane desired state.
+            let runtime_management = runtime_management::RuntimeManagement::new(
+                cluster.node_id.clone(),
+                node_incarnation.clone(),
+                store.clone(),
+                backend.clone(),
+                metrics.clone(),
+                runtime_validation_ctx,
             );
+            runtime_management
+                .restore(&bootstrap_runtime)
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error> {
+                    format!("runtime state restore failed: {error}").into()
+                })?;
+
+            // #6 (4.4): rehydrate persisted allocations ONLY under allocation
+            // persistence. A management-only node (durable backend, persistence
+            // disabled) must NOT load old allocations — that is an allocation
+            // persistence concern, not a management-plane one.
+            if gates.bulk_load {
+                let bulk_stats = bulk_load::bulk_load(&backend, &store, &cluster.node_id).await;
+                metrics.active_allocations.fetch_add(
+                    bulk_stats.rehydrated as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
 
             // R8: rehydrate runtime long-term users from the shared backend into
             // the in-memory AuthRegistry. Variant B — the backend holds two
@@ -571,6 +944,9 @@ fn run_tokio(
                 });
             }
 
+            // #6: allocation write-behind persistence — gated independently of
+            // the management backend above.
+            if gates.writer {
             let (tx, rx) = tokio::sync::mpsc::channel::<turna_session::WriteOp>(
                 cluster.persistence.channel_capacity,
             );
@@ -583,6 +959,7 @@ fn run_tokio(
                 node_id: cluster.node_id.clone(),
             };
             let counters = Arc::new(writer::WriterCounters::default());
+            reconcile_counters = Some(counters.clone());
             let realm = config.realm.clone();
             let writer_shutdown = shutdown_rx.clone();
 
@@ -598,19 +975,27 @@ fn run_tokio(
             let writer_backend = backend.clone();
             let writer_store = store.clone();
             let writer_metrics = metrics.clone();
-            tokio::spawn(async move {
-                writer::run_writer(
-                    writer_backend,
-                    writer_store,
-                    realm,
-                    writer_cfg,
-                    writer_metrics,
-                    counters,
-                    rx,
-                    writer_shutdown,
-                )
-                .await;
-            });
+            let writer_ack = reconcile_ack.clone();
+            writer_handle = Some(spawn_supervised(
+                "persistence-writer",
+                metrics.clone(),
+                shutdown_tx.clone(),
+                async move {
+                    writer::run_writer(
+                        writer_backend,
+                        writer_store,
+                        realm,
+                        writer_cfg,
+                        writer_metrics,
+                        counters,
+                        writer_ack,
+                        rx,
+                        writer_shutdown,
+                    )
+                    .await;
+                },
+            ));
+            } // #6: end allocation write-behind persistence
 
             // ── PR4: heartbeat task ───────────────────────────────────────
             let hb_backend = backend.clone();
@@ -618,6 +1003,7 @@ fn run_tokio(
             let hb_shutdown = shutdown_rx.clone();
             let hb_cfg = heartbeat::HeartbeatConfig {
                 node_id: cluster.node_id.clone(),
+                incarnation: node_incarnation.clone(),
                 addr: std::net::SocketAddr::new(external_ip, config.listen.port()).to_string(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 interval: std::time::Duration::from_secs(
@@ -630,11 +1016,21 @@ fn run_tokio(
                 interval = ?hb_cfg.interval,
                 "heartbeat task starting"
             );
-            tokio::spawn(async move {
-                heartbeat::run_heartbeat(hb_backend, hb_metrics, hb_cfg, hb_shutdown).await;
-            });
+            heartbeat_handle = Some(spawn_supervised(
+                "heartbeat",
+                metrics.clone(),
+                shutdown_tx.clone(),
+                async move {
+                    heartbeat::run_heartbeat(hb_backend, hb_metrics, hb_cfg, hb_shutdown).await;
+                },
+            ));
 
             // ── PR5: failover claim task ──────────────────────────────────
+            // #5 (§5.2/§5.3): ownership adoption / failover is a CLUSTER concern
+            // gated on the explicit `cluster_mode`, NOT on persistence. A
+            // standalone or management-only persistent node must never adopt
+            // peers' allocations or run the failover sweep.
+            if gates.failover {
             let fo_backend = backend.clone();
             let fo_store = store.clone();
             let fo_metrics = metrics.clone(); // PR A: pass metrics for counters
@@ -655,11 +1051,279 @@ fn run_tokio(
                 live_window    = ?fo_cfg.live_window,
                 "failover task starting"
             );
-            tokio::spawn(async move {
-                let _ =
-                    failover::run_failover(fo_backend, fo_store, fo_cfg, fo_metrics, fo_shutdown)
-                        .await;
-            });
+            failover_handle = Some(spawn_supervised(
+                "failover",
+                metrics.clone(),
+                shutdown_tx.clone(),
+                async move {
+                    let _ = failover::run_failover(
+                        fo_backend, fo_store, fo_cfg, fo_metrics, fo_shutdown,
+                    )
+                    .await;
+                },
+            ));
+            } // #5: end ownership adoption / failover (cluster profile only)
+
+            // ── P0 #4: command-log apply loop ─────────────────────────────
+            // Claim commands the control-plane targeted at THIS node and apply
+            // them to the real runtime state, then confirm. This is the node
+            // half of the control-plane→node command channel.
+            // ── §3: command-log backfill migration (one-shot, resumable) ──
+            // Drain the bounded/resumable idem+status backfill in the background.
+            // Idempotent and safe on every node: once complete each call returns
+            // immediately; an interrupted run resumes on the next startup. A plain
+            // task (not spawn_supervised) because completion is the goal — its exit
+            // must NOT be treated as a failed mandatory task.
+            {
+                let mig_backend = backend.clone();
+                let mig_owner = cluster.node_id.clone();
+                let mig_metrics = metrics.clone();
+                let mut mig_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering;
+                    loop {
+                        if *mig_shutdown.borrow() {
+                            break;
+                        }
+                        match mig_backend.migrate_command_log_batch(500, &mig_owner).await {
+                            Ok(progress) => {
+                                mig_metrics
+                                    .command_log_migration_processed_total
+                                    .store(progress.total_processed, Ordering::Relaxed);
+                                if progress.completed {
+                                    mig_metrics
+                                        .command_log_migration_completed
+                                        .store(1, Ordering::Relaxed);
+                                    // #6/#4.5: the management plane is fully ready
+                                    // only once the mandatory migration phases
+                                    // complete — a signal distinct from the
+                                    // dataplane readiness flag, so TURN keeps
+                                    // serving while the backfill runs.
+                                    mig_metrics
+                                        .set_management_readiness(turna_health::Readiness::Ready);
+                                    if progress.total_processed > 0 {
+                                        info!(
+                                            total = progress.total_processed,
+                                            "command-log backfill migration complete"
+                                        );
+                                    }
+                                    break;
+                                }
+                                debug!(
+                                    phase = %progress.phase,
+                                    processed = progress.total_processed,
+                                    "command-log backfill migration progress"
+                                );
+                            }
+                            Err(error) => {
+                                mig_metrics
+                                    .command_log_migration_errors_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                warn!(%error,
+                                      "command-log backfill migration batch failed; retrying");
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                                    _ = mig_shutdown.changed() => break,
+                                }
+                                continue;
+                            }
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            _ = mig_shutdown.changed() => break,
+                        }
+                    }
+                });
+            }
+
+            {
+                let cmd_backend = backend.clone();
+                let cmd_store = store.clone();
+                let cmd_metrics = metrics.clone();
+                let cmd_node_id = cluster.node_id.clone();
+                let cmd_incarnation = node_incarnation.clone();
+                let cmd_runtime_management = runtime_management.clone();
+                let cmd_routing = cluster_routing.clone();
+                let cmd_gossip_draining = gossip_draining.clone();
+                let cmd_gossip_notify = gossip_drain_notify.clone();
+                let cmd_shutdown_tx = shutdown_tx.clone();
+                let mut cmd_shutdown = shutdown_rx.clone();
+                // P0.7: the command-log apply loop is a mandatory cluster task —
+                // supervise it like writer/heartbeat/failover so an unexpected
+                // exit marks the node Degraded and triggers shutdown instead of
+                // leaving it Ready while commands silently stop being applied.
+                command_log_handle = Some(spawn_supervised(
+                    "command-log",
+                    cmd_metrics.clone(),
+                    shutdown_tx.clone(),
+                    async move {
+                    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = ticker.tick() => {}
+                            _ = cmd_shutdown.changed() => break,
+                        }
+                        if *cmd_shutdown.borrow() {
+                            break;
+                        }
+                        let claimed = match cmd_backend
+                            .claim_commands(&cmd_node_id, &cmd_incarnation, 32, COMMAND_LEASE_MS)
+                            .await
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(%e, "command-log claim failed");
+                                continue;
+                            }
+                        };
+                        for cmd in claimed {
+                            // claim_commands fences by incarnation: every claimed
+                            // command targets this incarnation (or is unversioned).
+                            // Stale-incarnation commands are never claimed here — the
+                            // §2.4 sweeper resolves them to `done` + superseded.
+                            let (status, result): (&'static str, String) =
+                                match cmd.op.as_str() {
+                                "update_config" => {
+                                    cmd_runtime_management.apply_update_config(&cmd).await
+                                }
+                                "set_user_limits" => {
+                                    cmd_runtime_management.apply_set_user_limits(&cmd).await
+                                }
+                                // Drain / undrain this node's real readiness + routing.
+                                "set_draining" => {
+                                    let on =
+                                        cmd.args.first().map(|s| s == "true").unwrap_or(false);
+                                    cmd_metrics.set_draining(on);
+                                    if on {
+                                        cmd_metrics.refresh_readiness();
+                                        if let Some(r) = &cmd_routing {
+                                            r.begin_drain();
+                                        }
+                                        // #6: advertise leaving via gossip now.
+                                        cmd_gossip_draining.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        cmd_gossip_notify.notify_one();
+                                    } else {
+                                        // Undrain (P0.5 derived readiness): drop the
+                                        // routing lame-duck flag and recompute readiness
+                                        // from inputs. Divergence is a separate input
+                                        // (backend_diverged), so an undrain returns to
+                                        // Ready only when no divergence is active — it can
+                                        // no longer clobber a real Degraded.
+                                        if let Some(r) = &cmd_routing {
+                                            r.end_drain();
+                                        }
+                                        // #6: stop advertising leaving; peers re-admit
+                                        // after the tombstone grace expires.
+                                        cmd_gossip_draining.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        cmd_metrics.refresh_readiness();
+                                    }
+                                    // #8: report the node's live active-allocation count
+                                    // (same wire format as shutdown) so the control-plane
+                                    // returns a real number, not a fabricated 0.
+                                    let remaining = cmd_metrics
+                                        .active_allocations
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    ("done", format!("remaining_allocations={remaining}"))
+                                }
+                                // Begin draining and signal this node's own shutdown.
+                                "shutdown" => {
+                                    // P0.6: honour graceful/timeout args — reject new
+                                    // allocations + lame-duck redirect, then drain active
+                                    // allocations (up to the timeout) before signalling
+                                    // shutdown, reporting the real remaining count.
+                                    let graceful = cmd
+                                        .args
+                                        .first()
+                                        .map(|s| s != "false")
+                                        .unwrap_or(true);
+                                    let timeout_secs = cmd
+                                        .args
+                                        .get(1)
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                        .unwrap_or(0);
+                                    cmd_metrics.set_draining(true);
+                                    cmd_metrics.refresh_readiness();
+                                    if let Some(r) = &cmd_routing {
+                                        r.begin_drain();
+                                    }
+                                    // #6: advertise leaving via gossip at drain start.
+                                    cmd_gossip_draining.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    cmd_gossip_notify.notify_one();
+                                    // Graceful: wait for allocations to drain, finishing
+                                    // early once empty and never past the timeout.
+                                    if graceful && timeout_secs > 0 {
+                                        let deadline = tokio::time::Instant::now()
+                                            + Duration::from_secs(timeout_secs);
+                                        loop {
+                                            let n = cmd_metrics
+                                                .active_allocations
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            if n == 0 || tokio::time::Instant::now() >= deadline {
+                                                break;
+                                            }
+                                            tokio::time::sleep(Duration::from_millis(500)).await;
+                                        }
+                                    }
+                                    let remaining = cmd_metrics
+                                        .active_allocations
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    info!(graceful, timeout_secs, remaining,
+                                          "shutdown command drained");
+                                    let _ = cmd_shutdown_tx.send(true);
+                                    ("done", format!("remaining_allocations={remaining}"))
+                                }
+                                // delete_allocation (and unknown ops) handled here.
+                                _ => apply_command(&cmd, &cmd_store, &cmd_metrics),
+                                };
+                            if status == runtime_management::RETRY_LATER_STATUS {
+                                // #4: the terminal outcome could not be made durable.
+                                // Do NOT complete — leave the command claimed so its
+                                // lease expires and it is reclaimed + re-applied,
+                                // rather than completing with an un-journaled outcome
+                                // a lost completion could later re-validate.
+                                warn!(request_id = %cmd.request_id, op = %cmd.op,
+                                      "command outcome not durably recorded; \
+                                       leaving claimed for reclaim");
+                            } else {
+                            info!(request_id = %cmd.request_id, op = %cmd.op, status,
+                                  "applied control-plane command");
+                            match cmd_backend
+                                .complete_command(
+                                    &cmd.request_id,
+                                    &cmd_node_id,
+                                    &cmd.claim_token,
+                                    status,
+                                    &result,
+                                )
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    // Fencing rejected us (P0.4): our lease was lost
+                                    // and the claim superseded. Do NOT assume success
+                                    // — the command will be reclaimed or dead-lettered.
+                                    warn!(request_id = %cmd.request_id,
+                                          "command completion rejected as stale (lease lost)");
+                                }
+                                Err(e) => {
+                                    warn!(%e, request_id = %cmd.request_id,
+                                          "failed to record command completion");
+                                }
+                            }
+                            }
+                        }
+                        // §2.4: finalize stale-incarnation commands targeting this
+                        // node that a prior incarnation left non-terminal — claim
+                        // fences them out, so nothing else resolves them. Bounded
+                        // per tick; a backlog drains over subsequent ticks.
+                        let swept = cmd_runtime_management.sweep_stale_commands().await;
+                        if swept > 0 {
+                            info!(swept, "finalized stale-incarnation commands");
+                        }
+                    }
+                }));
+            }
 
             let _ = backend;
         }
@@ -698,9 +1362,18 @@ fn run_tokio(
             mode,
             "turna ready"
         );
-        // 2.4: startup validation passed and listeners are coming up -> mark
-        // the node ready so `/ready` returns 200 (flips to 503 on drain).
-        metrics.set_readiness(turna_health::Readiness::Ready);
+        // 2.4: startup validation passed. The supported Tokio datapath marks
+        // Ready only AFTER its listener is actually bound (see the Tokio arm
+        // below), closing the P2 window where `/ready` returned 200 before
+        // TokioTransport::bind. The opt-in AfXdp/io_uring datapaths bind inside
+        // the datapath loop with no observable post-bind hook here, so they are
+        // marked Ready at this point (behaviour unchanged for them).
+        if !matches!(
+            transport_decision.backend,
+            turna_transport::TransportBackend::Tokio
+        ) {
+            metrics.set_readiness(turna_health::Readiness::Ready);
+        }
 
         // I6: in cluster mode, persistence write-drops mean in-memory state has
         // diverged from the backend. Surface that as `Degraded` (/ready → 503) so
@@ -711,6 +1384,11 @@ fn run_tokio(
         if cluster.cluster_mode {
             let mon_metrics = metrics.clone();
             let mut mon_shutdown = shutdown_rx.clone();
+            let mon_store = store.clone();
+            let mon_backend = reconcile_backend.clone();
+            let mon_counters = reconcile_counters.clone();
+            let mon_ack = reconcile_ack.clone();
+            let mon_node_id = cluster.node_id.clone();
             tokio::spawn(async move {
                 let mut last = mon_metrics
                     .tarantool_writes_dropped
@@ -725,24 +1403,122 @@ fn run_tokio(
                         break;
                     }
                     // Drain is terminal — never override it.
-                    if mon_metrics.readiness() == turna_health::Readiness::Draining {
+                    if mon_metrics.is_draining() {
                         break;
                     }
                     let now = mon_metrics
                         .tarantool_writes_dropped
                         .load(std::sync::atomic::Ordering::Relaxed);
                     if now > last {
-                        mon_metrics.set_readiness(turna_health::Readiness::Degraded);
-                    } else if mon_metrics.readiness() == turna_health::Readiness::Degraded {
-                        mon_metrics.set_readiness(turna_health::Readiness::Ready);
+                        // In-memory state has diverged from the backend. Go
+                        // Degraded and attempt a reconcile pass now (P0 #16).
+                        mon_metrics.set_backend_diverged(true);
+                        mon_metrics.refresh_readiness();
+                        if let Some(be) = &mon_backend {
+                            match writer::reconcile(&mon_store, be, &mon_node_id).await {
+                                Ok(s) => info!(
+                                    zombies_deleted = s.zombies_deleted,
+                                    live_resynced = s.live_resynced,
+                                    "reconcile pass while drops active"
+                                ),
+                                Err(e) => warn!(%e, "reconcile failed"),
+                            }
+                        }
+                    } else if mon_metrics.backend_diverged() {
+                        // Drops have stopped. Only return to Ready once a reconcile
+                        // pass confirms the backend is consistent with live state —
+                        // not merely because drops paused (P0 #16).
+                        match (&mon_backend, &mon_counters) {
+                            (Some(be), Some(cnt)) => {
+                                // Snapshot backend write errors BEFORE the pass so
+                                // failures during this reconcile's flush are seen.
+                                let errors_before = cnt
+                                    .backend_errors
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                match writer::reconcile(&mon_store, be, &mon_node_id).await {
+                                    Ok(s) if s.resync_complete && s.barrier_enqueued => {
+                                        // Queue accepted the full resync AND the
+                                        // barrier. Wait for the writer to actually
+                                        // flush everything up to the barrier into the
+                                        // backend, and confirm no backend write failed
+                                        // meanwhile — only then is the backend truly
+                                        // consistent with live state (P0.1). Mere queue
+                                        // acceptance is NOT enough to declare Ready.
+                                        let acked = await_reconcile_barrier(
+                                            &mon_ack,
+                                            s.barrier_generation,
+                                            &mut mon_shutdown,
+                                        )
+                                        .await;
+                                        let errors_after = cnt
+                                            .backend_errors
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        if acked && errors_after == errors_before {
+                                            info!(
+                                                zombies_deleted = s.zombies_deleted,
+                                                live_resynced = s.live_resynced,
+                                                generation = s.barrier_generation,
+                                                "reconcile flushed to backend — returning to Ready"
+                                            );
+                                            mon_metrics.set_backend_diverged(false);
+                                            mon_metrics.refresh_readiness();
+                                        } else {
+                                            warn!(
+                                                barrier_acked = acked,
+                                                backend_write_errors =
+                                                    errors_after.saturating_sub(errors_before),
+                                                "reconcile barrier not confirmed — staying Degraded"
+                                            );
+                                        }
+                                    }
+                                    Ok(s) => {
+                                        // Resync re-dropped, or the barrier itself was
+                                        // dropped under backpressure: backend is not
+                                        // known-consistent, so stay Degraded and retry
+                                        // on a later tick (P0.1).
+                                        warn!(
+                                            resync_complete = s.resync_complete,
+                                            barrier_enqueued = s.barrier_enqueued,
+                                            "reconcile could not enqueue full resync — staying Degraded"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(%e, "reconcile failed — staying Degraded")
+                                    }
+                                }
+                            }
+                            // No backend/counters to reconcile against (cluster
+                            // without persistence): fall back to prior behaviour.
+                            _ => {
+                                mon_metrics.set_backend_diverged(false);
+                                mon_metrics.refresh_readiness();
+                            }
+                        }
                     }
                     last = now;
                 }
             });
         }
 
+        // P0 #8: surface the shutdown budget so operators can size
+        // terminationGracePeriodSeconds >= this. Budget = lame-duck drain
+        // grace + persistence flush budget + a small safety margin.
+        let shutdown_budget_secs =
+            cluster.drain_grace_secs + PERSISTENCE_FLUSH_TIMEOUT_SECS
+                + 2 * TASK_JOIN_TIMEOUT_SECS
+                + 2;
+        info!(
+            drain_grace_secs = cluster.drain_grace_secs,
+            persistence_flush_secs = PERSISTENCE_FLUSH_TIMEOUT_SECS,
+            shutdown_budget_secs,
+            "shutdown budget computed — set terminationGracePeriodSeconds >= \
+             shutdown_budget_secs"
+        );
+
         // Signal handler → shutdown (shared by both backends).
         let drain_routing = cluster_routing.clone();
+        let drain_gossip_draining = gossip_draining.clone();
+        let drain_gossip_notify = gossip_drain_notify.clone();
         let drain_metrics = metrics.clone();
         let drain_grace = cluster.drain_grace_secs;
         tokio::spawn(async move {
@@ -767,18 +1543,41 @@ fn run_tokio(
             // another node during the grace window. Existing sessions keep
             // running until they expire / the worker drain tears them down.
             drain_metrics.set_draining(true);
-            drain_metrics.set_readiness(turna_health::Readiness::Draining);
-            if let Some(routing) = &drain_routing {
-                if drain_grace > 0 {
+            drain_metrics.refresh_readiness();
+            if drain_grace > 0 {
+                if let Some(routing) = &drain_routing {
+                    // Cluster: lame-duck redirect (300 Try Alternate) new clients.
                     routing.begin_drain();
-                    info!(grace_secs = drain_grace, "lame-duck: draining new clients before shutdown");
-                    tokio::time::sleep(Duration::from_secs(drain_grace)).await;
+                    // #6: advertise leaving via gossip at drain start (k8s/systemd
+                    // rolling upgrade path) so peers stop redirecting new clients here.
+                    drain_gossip_draining.store(true, std::sync::atomic::Ordering::Relaxed);
+                    drain_gossip_notify.notify_one();
+                }
+                info!(grace_secs = drain_grace, "draining active allocations before shutdown");
+                // P0.6: poll for allocations to drain instead of sleeping the full grace
+                // unconditionally — finish as soon as the node is empty, but never wait
+                // past the deadline (keeps shutdown within the computed budget).
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(drain_grace);
+                loop {
+                    let remaining = drain_metrics
+                        .active_allocations
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if remaining == 0 {
+                        info!("drain complete — no active allocations remaining");
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(remaining, "drain grace elapsed with allocations still active");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
             let _ = shutdown_tx.send(true);
         });
 
-        match transport_decision.backend {
+        let datapath_result: Result<(), Box<dyn std::error::Error>> =
+            match transport_decision.backend {
             // AF_XDP ring datapath (Linux + af-xdp feature). Opt-in backend;
             // handles the main TURN socket via the xsk-rs datapath.
             turna_transport::TransportBackend::AfXdp => {
@@ -813,7 +1612,18 @@ fn run_tokio(
                 } else {
                     turna_transport::TokioTransport::bind(config.listen).await?
                 };
+                // #8: the TURN listener is now bound — only now is it honest to
+                // report Ready, so `/ready=200` implies the socket is accepting.
+                metrics.set_readiness(turna_health::Readiness::Ready);
                 let migration = build_migration_manager(&config.migration);
+                let tcp_relay = if config.tcp_relay.enabled {
+                    info!("RFC 6062 TCP relay enabled");
+                    Some(std::sync::Arc::new(turna_relay::tcp_relay::TcpRelayManager::new(
+                        build_tcp_relay_config(&config.tcp_relay),
+                    )))
+                } else {
+                    None
+                };
                 let server = turna_relay::RelayServer::new_full(
                     transport,
                     store,
@@ -822,11 +1632,19 @@ fn run_tokio(
                     metrics.clone(),
                     cluster_routing.clone(),
                     migration,
+                    tcp_relay,
                 );
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
                     info!(listen = %tls_cfg.listen, cert = %tls_cfg.cert_path.display(), "TURNS (TLS) enabled");
                     server.with_tls(build_tls_transport_config(&tls_cfg))
+                } else {
+                    server
+                };
+                #[cfg(feature = "sctp")]
+                let server = if config.sctp.enabled {
+                    info!(listen = %config.sctp.listen, "TURN-over-SCTP (experimental) enabled");
+                    server.with_sctp(build_sctp_transport_config(&config.sctp))
                 } else {
                     server
                 };
@@ -1086,7 +1904,42 @@ fn run_tokio(
                     )
                 }
             }
-        }
+        };
+
+        // ── P0 #8: bounded shutdown — flush persistence deterministically ─────
+        // The datapath has returned (shutdown observed). Wait for the
+        // write-behind writer to flush its queue and exit within the budget,
+        // rather than letting the runtime drop abort it mid-flush. This is the
+        // difference between "persistence queue flushed" and "detached task
+        // killed on exit".
+        // The writer flush is correctness-critical (persistence queue must be
+        // drained); heartbeat/failover only need to observe shutdown and stop.
+        join_within_budget(
+            "persistence-writer",
+            writer_handle,
+            Duration::from_secs(PERSISTENCE_FLUSH_TIMEOUT_SECS),
+        )
+        .await;
+        join_within_budget(
+            "heartbeat",
+            heartbeat_handle,
+            Duration::from_secs(TASK_JOIN_TIMEOUT_SECS),
+        )
+        .await;
+        join_within_budget(
+            "failover",
+            failover_handle,
+            Duration::from_secs(TASK_JOIN_TIMEOUT_SECS),
+        )
+        .await;
+        join_within_budget(
+            "command-log",
+            command_log_handle,
+            Duration::from_secs(TASK_JOIN_TIMEOUT_SECS),
+        )
+        .await;
+
+        datapath_result
     })
 }
 
@@ -1262,7 +2115,10 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("max_allocations = {}", t.relay.max_allocations);
     println!();
     println!("[turn.relay.quota]");
-    println!("max_bytes_per_sec = {}", t.relay.quota.max_bytes_per_sec);
+    println!(
+        "max_bytes_per_sec_per_allocation = {}",
+        t.relay.quota.max_bytes_per_sec_per_allocation
+    );
     println!("max_per_user      = {}", t.relay.quota.max_per_user);
     println!();
     println!("[turn.migration]");
@@ -1349,4 +2205,78 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("read_timeout_secs     = {}", t.read_timeout_secs);
     println!("max_connections       = {}", t.max_connections);
     println!("enable_alpn           = {}", t.enable_alpn);
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{profile_gates, ProfileGates};
+    use turna_config::ClusterConfig;
+
+    fn cfg(backend_type: &str, persistence_mode: &str, cluster_mode: bool) -> ClusterConfig {
+        let mut c = ClusterConfig::default();
+        c.backend.r#type = backend_type.into();
+        c.persistence.mode = persistence_mode.into();
+        c.cluster_mode = cluster_mode;
+        c
+    }
+
+    // §5.6: deployment-profile worker matrix.
+    #[test]
+    fn profile_gates_matrix() {
+        // Standalone, no durable backend → nothing optional runs.
+        assert_eq!(
+            profile_gates(&cfg("memory", "disabled", false)),
+            ProfileGates {
+                management: false,
+                bulk_load: false,
+                writer: false,
+                failover: false,
+                gossip: false,
+            }
+        );
+        // Management-only (durable backend, persistence off) → management plane
+        // only; no bulk load, writer, failover, or gossip.
+        assert_eq!(
+            profile_gates(&cfg("tarantool", "disabled", false)),
+            ProfileGates {
+                management: true,
+                bulk_load: false,
+                writer: false,
+                failover: false,
+                gossip: false,
+            }
+        );
+        // Management + persistence → adds allocation load + writer; still NO
+        // failover/gossip.
+        assert_eq!(
+            profile_gates(&cfg("tarantool", "write_behind", false)),
+            ProfileGates {
+                management: true,
+                bulk_load: true,
+                writer: true,
+                failover: false,
+                gossip: false,
+            }
+        );
+        // Cluster + persistence + failover → everything.
+        assert_eq!(
+            profile_gates(&cfg("tarantool", "write_behind", true)),
+            ProfileGates {
+                management: true,
+                bulk_load: true,
+                writer: true,
+                failover: true,
+                gossip: true,
+            }
+        );
+    }
+
+    // The core #5 invariant: allocation persistence (even "scaffold") must NOT
+    // enable failover — only cluster_mode does.
+    #[test]
+    fn failover_never_follows_persistence_alone() {
+        assert!(!profile_gates(&cfg("tarantool", "write_behind", false)).failover);
+        assert!(!profile_gates(&cfg("tarantool", "scaffold", false)).failover);
+        assert!(profile_gates(&cfg("tarantool", "write_behind", true)).failover);
+    }
 }

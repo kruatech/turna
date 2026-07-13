@@ -17,9 +17,9 @@ testable. P0 blockers are closed in code.
 | F1 | proto-stun `integrity.rs` | SHA256 MESSAGE-INTEGRITY rejects tags with length `<16`, `>32`, or not a multiple of 4 before truncated verify — closes the SHA256 downgrade/forgery path. |
 | B1 | session `create_for_tenant` | Duplicate-client insert made atomic via `entry()` (loser → `AllocationExists` → 437). |
 | B1-quotas | session | Global + per-tenant caps now use atomic counters (`fetch_add`→check→rollback) instead of racy `len()`/scan; released on `remove`/`force_remove` (covers Refresh lifetime=0, expiry sweep, revocation). `re_key` is a move and does not touch counters. Stress test: 100 racing Allocate at max=10 → stored count ≤ 10. |
-| B2 | relay `processor.rs` | Bandwidth cap enforced on all three relay paths (channel-data, Send indication egress, peer→client). Note: `max_bytes_per_sec` now bounds both directions on a shared per-allocation window. |
+| B2 | relay `processor.rs` | Bandwidth cap enforced on all three relay paths (channel-data, Send indication egress, peer→client). Note: `max_bytes_per_sec_per_allocation` now bounds both directions on a shared per-allocation window. |
 | B3 | config | `cluster_mode=true` with an empty `cluster_secret` is a hard startup error. |
-| B4 | session | Per-user allocation tracking re-keyed from bare `username` to `(tenant, username)` — closes cross-tenant per-user-quota collision. Key is always derived from the allocation's own `tenant_id`. |
+| B4 | session | Per-user allocation tracking re-keyed from bare `username` to `(realm, tenant, username)` — closes cross-realm and cross-tenant quota collisions. The key is derived from the authenticated realm and the allocation's tenant. |
 | B5 | session + processor | Per-allocation caps: 256 permissions, 256 channel bindings (refresh exempt; over-cap → 486); 32 peers per CreatePermission (→ 400). |
 | I1 | proto-stun `message.rs` | MESSAGE-INTEGRITY / -SHA256 verification fails if any non-FINGERPRINT attribute follows it (closes trailing-attribute signature bypass). |
 | I2 | proto-stun `attribute.rs` | Strict exact-length parsing for REQUESTED-TRANSPORT, CHANNEL-NUMBER, DONT-FRAGMENT, EVEN-PORT (+reserved bits), RESERVATION-TOKEN. |
@@ -77,7 +77,7 @@ drop-on-miss are safe defaults; revisit them if you enable these transports at
 scale.
 
 ### 2.5 Bandwidth cap is bidirectional on a shared window (B2)
-`max_bytes_per_sec` now accounts for both client→peer and peer→client bytes on
+`max_bytes_per_sec_per_allocation` now accounts for both client→peer and peer→client bytes on
 one per-allocation window. If you previously reasoned about it as one-directional,
 budget accordingly.
 
@@ -118,14 +118,9 @@ team's to run, not fixable in a patch.
 
 ---
 
-## 5. Open code items blocked on inputs (not yet done)
+## 5. Remaining runtime verification
 
-- **B2-config:** in production, `max_bytes_per_sec == 0` (unlimited) without an
-  explicit `allow_unlimited_bandwidth` flag should be a startup error. Not yet
-  implemented.
-- **I5:** the node's user-refresh loop propagates additions but not deletions to
-  live nodes (revocation isn't pushed until restart / `remove --force`). Needs a
-  diff-sync (list minus local → delete) or an explicit documented procedure.
-- **I9:** EVEN-PORT reserved odd port can leak on a create-error path after
-  `allocate_even_and_bind` (only the relay port is freed). Fixable with the files
-  already in hand (`processor.rs` + `session`).
+The production unlimited-bandwidth guard, live user deletion diff-sync, and
+EVEN-PORT create-error cleanup are implemented in source. They remain subject to
+the final workspace, Tarantool, and live TURN verification gates listed in §4;
+this document does not claim those runtime checks have been executed.

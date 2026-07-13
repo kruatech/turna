@@ -116,6 +116,7 @@ pub(crate) fn apply_one(
             client_addr,
             relay_addr,
             stored.user_id.clone(),
+            stored.realm.clone(),
             stored.allocation_id.clone(),
             stored.migration_epoch,
             stored.created_at_ms,

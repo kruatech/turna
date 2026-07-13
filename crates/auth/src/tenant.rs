@@ -32,6 +32,10 @@ pub struct AuthResolution {
     pub realm: String,
     /// Derived long-term key, for response MESSAGE-INTEGRITY.
     pub key: Vec<u8>,
+    /// For OAuth (RFC 7635): the token's remaining lifetime in seconds, so the
+    /// allocation lifetime can be capped to it (§6.1). `None` for long-term /
+    /// shared-secret auth (no token lifetime to bind).
+    pub max_lifetime_secs: Option<u32>,
 }
 
 /// Multi-tenant auth: a base [`AuthMode`] (the `[turn]` realm) plus per-realm
@@ -75,6 +79,13 @@ impl AuthRegistry {
         self.base.realm()
     }
 
+    /// The base realm's authorization-server identity for a 401 THIRD-PARTY-
+    /// AUTHORIZATION challenge (RFC 7635 §6.1), or `None` when the base realm is
+    /// not OAuth. Pre-auth challenges use the base realm only.
+    pub fn base_oauth_identity(&self) -> Option<&str> {
+        self.base.oauth_identity()
+    }
+
     /// Resolve the tenant and validate credentials in one step.
     ///
     /// The realm carried by the (integrity-protected) request selects the
@@ -87,19 +98,21 @@ impl AuthRegistry {
 
         if let Some((tenant_id, auth)) = self.tenants.get(realm_ref) {
             // Tenant realm: validate against the tenant's backend.
-            let key = auth.validate(msg, raw)?;
+            let (key, max_lifetime_secs) = auth.validate_with_lifetime(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: Some(tenant_id.clone()),
                 realm: realm_ref.to_string(),
                 key,
+                max_lifetime_secs,
             })
         } else if realm_ref == self.base.realm() {
             // Base realm: default/single-tenant.
-            let key = self.base.validate(msg, raw)?;
+            let (key, max_lifetime_secs) = self.base.validate_with_lifetime(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: None,
                 realm: realm_ref.to_string(),
                 key,
+                max_lifetime_secs,
             })
         } else {
             // Unknown realm — no backend to authenticate against. Reject; never

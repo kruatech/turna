@@ -23,7 +23,9 @@ stores snapshots (`*.snap`) and the write-ahead log (`*.xlog`) under its
 ## 1. What to back up
 
 Everything under `work_dir` (`/var/lib/tarantool`): the latest `*.snap` plus all
-`*.xlog` newer than that snapshot. Together they reconstruct full state on start.
+`*.xlog` newer than that snapshot. Together they reconstruct allocations,
+command/idempotency rows, node runtime desired/observed snapshots, scoped user
+limits, and resumable migration cursors on start.
 
 ## 2. Taking a backup (online)
 
@@ -55,8 +57,11 @@ between snapshots the `*.xlog` still lets you recover to the last committed writ
 
 turna tolerates a brief backend outage:
 
-- While Tarantool is down, nodes go `degraded` (readiness 2) but keep serving
-  from local state; cluster reads (failover, user management) pause.
+- A node that was already running can continue serving from its local immutable
+  snapshots while Tarantool is briefly unavailable, but management mutations,
+  failover reads, and durable confirmations pause. A node starting during the
+  outage does **not** become ready because it cannot prove the last observed
+  runtime/limits state.
 - Alerts `TarantoolConnectionNotConnected` / `TurnaBackendDegraded` fire — this
   is expected during a planned restart.
 - On reconnect, readiness returns to ready. No data loss for already-local
@@ -89,3 +94,13 @@ schema). Fresh installs are unaffected. See docs/failover/v0.3.0-rc.1.md
 - **Automated failover of Tarantool itself** (replication/HA) is out of scope
   here — this runbook covers single-instance backup/restore. For HA, use
   Tarantool replication and adapt §3–4 accordingly.
+
+
+## 7. Runtime-state recovery checks
+
+After restore, query each node through the management API and compare
+`desired_version`, `observed_version`, status, and observed snapshot. Restart one
+node and verify it restores the same observed runtime config and scoped limits
+before readiness. Also verify `turna_command_log_migration_completed` and the
+migration cursor survived the backup. Do not delete `turna_runtime_state`,
+`turna_user_limits`, or `turna_migrations` as part of ordinary command-log GC.

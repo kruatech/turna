@@ -163,19 +163,117 @@ impl TurnaConfig {
                 self.turn.relay.min_port, self.turn.relay.max_port
             ));
         }
+        // Capacity: each allocation consumes at least one relay port, so a cap
+        // above the usable range is physically unreachable — hard error. A cap
+        // above half the range is only a *worst-case* EVEN-PORT concern
+        // (RFC 8656 §7.2 can reserve the next-higher port), so it is a warning,
+        // not a failure — real traffic mixes rarely hit 2 ports per allocation.
+        if self.turn.relay.min_port < self.turn.relay.max_port {
+            let usable = (self.turn.relay.max_port - self.turn.relay.min_port) as usize + 1;
+            if self.turn.relay.max_allocations > usable {
+                errors.push(format!(
+                    "turn.relay.max_allocations ({}) exceeds usable relay ports ({}) \
+                     for range [{}, {}] — a cap above the port count is unreachable",
+                    self.turn.relay.max_allocations,
+                    usable,
+                    self.turn.relay.min_port,
+                    self.turn.relay.max_port
+                ));
+            } else if self.turn.relay.max_allocations > usable / 2 {
+                warn!(
+                    "turn.relay.max_allocations ({}) exceeds half the usable relay \
+                     ports ({}/2 = {}); under worst-case EVEN-PORT reservations the \
+                     range may exhaust before the cap is reached",
+                    self.turn.relay.max_allocations,
+                    usable,
+                    usable / 2
+                );
+            }
+        }
         // B2: an unlimited per-allocation bandwidth cap in production is a DoS
         // amplifier — a single authenticated client can relay without bound.
         // Require an explicit opt-in to run that way.
         if prod
-            && self.turn.relay.quota.max_bytes_per_sec == 0
+            && self.turn.relay.quota.max_bytes_per_sec_per_allocation == 0
             && !self.turn.relay.quota.allow_unlimited_bandwidth
         {
             errors.push(
-                "turn.relay.quota.max_bytes_per_sec is 0 (unlimited) in production; \
+                "turn.relay.quota.max_bytes_per_sec_per_allocation is 0 (unlimited) in production; \
                  set a per-allocation byte/sec cap, or explicitly set \
                  turn.relay.quota.allow_unlimited_bandwidth = true to accept the risk"
                     .into(),
             );
+        }
+        // Experimental transports are not production-ready: RFC 6062 TCP relay is
+        // partial/experimental, and TURN-over-SCTP is experimental. Refuse to
+        // enable either under `production` so an unfinished datapath is never
+        // shipped as if it were supported.
+        if prod && self.turn.tcp_relay.enabled {
+            errors.push(
+                "turn.tcp_relay.enabled = true in production, but RFC 6062 TCP relay is experimental/partial and not supported in production"
+                    .into(),
+            );
+        }
+        if prod && self.turn.sctp.enabled {
+            errors.push(
+                "turn.sctp.enabled = true in production, but TURN-over-SCTP is experimental and not supported in production"
+                    .into(),
+            );
+        }
+        // RFC 7635 OAuth is experimental: refuse in production, and when enabled
+        // require a server_name plus at least one valid AES keyring entry.
+        if self.turn.auth.oauth.enabled {
+            if prod {
+                errors.push(
+                    "turn.auth.oauth.enabled = true in production, but RFC 7635 OAuth                      is experimental and not supported in production"
+                        .into(),
+                );
+            }
+            if self.turn.auth.oauth.server_name.is_empty() {
+                errors.push(
+                    "turn.auth.oauth.enabled but turn.auth.oauth.server_name is empty                      (it is the AEAD associated-data binding tokens to this server)"
+                        .into(),
+                );
+            }
+            if self.turn.auth.oauth.as_rs_keys.is_empty() && self.turn.auth.oauth.keys.is_empty() {
+                errors.push(
+                    "turn.auth.oauth.enabled but no AS-RS keys configured (need at least \
+                     one of turn.auth.oauth.as_rs_keys or turn.auth.oauth.keys)"
+                        .into(),
+                );
+            }
+            for (i, k) in self.turn.auth.oauth.as_rs_keys.iter().enumerate() {
+                let hex_ok = k.len().is_multiple_of(2) && k.bytes().all(|b| b.is_ascii_hexdigit());
+                if !hex_ok || !matches!(k.len() / 2, 16 | 32) {
+                    errors.push(format!(
+                        "turn.auth.oauth.as_rs_keys[{i}] must be hex encoding a 16- or 32-byte \
+                         AES key (got {} hex chars)",
+                        k.len()
+                    ));
+                }
+            }
+            // RFC 7635 kid-tagged keys: same hex/length rule, plus a non-empty,
+            // unique kid so USERNAME-based key selection is unambiguous.
+            let mut seen_kids = std::collections::HashSet::new();
+            for (i, entry) in self.turn.auth.oauth.keys.iter().enumerate() {
+                if entry.kid.is_empty() {
+                    errors.push(format!("turn.auth.oauth.keys[{i}].kid must not be empty"));
+                } else if !seen_kids.insert(entry.kid.as_str()) {
+                    errors.push(format!(
+                        "turn.auth.oauth.keys[{i}].kid '{}' is duplicated",
+                        entry.kid
+                    ));
+                }
+                let k = &entry.key;
+                let hex_ok = k.len().is_multiple_of(2) && k.bytes().all(|b| b.is_ascii_hexdigit());
+                if !hex_ok || !matches!(k.len() / 2, 16 | 32) {
+                    errors.push(format!(
+                        "turn.auth.oauth.keys[{i}].key must be hex encoding a 16- or 32-byte \
+                         AES key (got {} hex chars)",
+                        k.len()
+                    ));
+                }
+            }
         }
         if self.turn.external_ip.is_empty() {
             if prod {
@@ -252,8 +350,48 @@ impl TurnaConfig {
         if let Err(persistence_errs) = self.cluster.persistence.validate() {
             errors.extend(persistence_errs);
         }
+        if let Err(command_log_errs) = self.cluster.command_log.validate() {
+            errors.extend(command_log_errs);
+        }
         if let Err(cluster_errs) = self.cluster.validate_redirect_mode(&self.turn) {
             errors.extend(cluster_errs);
+        }
+
+        // P0 #10: the state backend must be explicit and valid. A typo must
+        // never silently downgrade the deployment to a process-local
+        // in-memory store, and clustering cannot run on such a store.
+        {
+            let backend_type = self.cluster.backend.r#type.trim();
+            match backend_type {
+                // "" defaults to memory (BackendConfigSection::default).
+                "" | "memory" | "tarantool" => {}
+                other => errors.push(format!(
+                    "cluster.backend.type = {other:?} is not a known backend; \
+                     use \"memory\" (single-node) or \"tarantool\" (cluster)"
+                )),
+            }
+            let is_memory = matches!(backend_type, "" | "memory");
+            // Clustering fundamentally cannot share a process-local store —
+            // refuse regardless of the production flag (same rationale as the
+            // cluster_secret requirement above).
+            if self.cluster.cluster_mode && is_memory {
+                errors.push(
+                    "cluster.cluster_mode = true requires a shared state backend; \
+                     set cluster.backend.type = \"tarantool\" (the in-memory backend \
+                     is process-local and cannot be shared across nodes)"
+                        .into(),
+                );
+            }
+            // Write-behind persistence to a process-local store provides no
+            // durability or cross-node sharing; refuse it in production.
+            if prod && self.cluster.persistence.mode == "write_behind" && is_memory {
+                errors.push(
+                    "cluster.persistence.mode = \"write_behind\" with an in-memory backend \
+                     provides no durable persistence in production; set \
+                     cluster.backend.type = \"tarantool\""
+                        .into(),
+                );
+            }
         }
 
         // gRPC TLS validation (PR6).
@@ -288,6 +426,26 @@ impl TurnaConfig {
                         "tenant '{}' relay_port_range [{lo}, {hi}] is empty or inverted",
                         t.id
                     ));
+                }
+                // Capacity per tenant: cap must fit the tenant's isolated range
+                // (0 = unlimited → skip). Hard error above range size; EVEN-PORT
+                // worst-case (> half) is a warning, mirroring the base check.
+                if lo < hi && t.max_allocations > 0 {
+                    let usable = (hi - lo) as usize + 1;
+                    if t.max_allocations > usable {
+                        errors.push(format!(
+                            "tenant '{}' max_allocations ({}) exceeds usable ports \
+                             ({}) in its relay range [{lo}, {hi}]",
+                            t.id, t.max_allocations, usable
+                        ));
+                    } else if t.max_allocations > usable / 2 {
+                        warn!(
+                            "tenant '{}' max_allocations ({}) exceeds half its usable \
+                             relay ports ({}); worst-case EVEN-PORT reservations may \
+                             exhaust the range early",
+                            t.id, t.max_allocations, usable
+                        );
+                    }
                 }
                 if t.shared_secret.is_empty() && t.static_users.is_empty() {
                     errors.push(format!(
@@ -422,6 +580,13 @@ pub struct TurnConfig {
     /// Requires the node binary built with `--features dtls`.
     #[serde(default)]
     pub dtls: DtlsSection,
+    /// TURN-over-SCTP control transport (experimental). Disabled by default.
+    /// Requires the node binary built with `--features sctp`.
+    #[serde(default)]
+    pub sctp: SctpSection,
+    /// RFC 6062 TCP relay. Disabled by default; requires `[tls]` enabled.
+    #[serde(default)]
+    pub tcp_relay: TcpRelaySection,
     /// Peer-address filtering policy (M1). Defaults to `internet-facing`
     /// (denies RFC 1918 / ULA peers). Set `profile = "lan"` to allow private
     /// relaying. See `docs/security/peer-filter.md`.
@@ -444,6 +609,8 @@ impl Default for TurnConfig {
             io_uring: IoUringSection::default(),
             af_xdp: AfXdpSection::default(),
             dtls: DtlsSection::default(),
+            sctp: SctpSection::default(),
+            tcp_relay: TcpRelaySection::default(),
             peer_filter: PeerFilterConfig::default(),
         }
     }
@@ -543,6 +710,8 @@ pub struct AuthConfig {
     pub shared_secret: String,
     pub token_ttl: u64,
     pub static_users: Vec<StaticUser>,
+    /// RFC 7635 third-party (OAuth) authorization on the base realm.
+    pub oauth: OAuthConfig,
 }
 
 impl Default for AuthConfig {
@@ -551,8 +720,51 @@ impl Default for AuthConfig {
             shared_secret: DEFAULT_SHARED_SECRET.into(),
             token_ttl: 86400,
             static_users: Vec::new(),
+            oauth: OAuthConfig::default(),
         }
     }
+}
+
+/// RFC 7635 third-party (OAuth 2.0) authorization. Disabled by default and
+/// experimental — refused under `production=true` (see `validate`). When
+/// enabled, the base realm authenticates clients by an AEAD-sealed ACCESS-TOKEN
+/// from an authorization server instead of USERNAME/REALM credentials.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    /// Enable OAuth on the base realm.
+    pub enabled: bool,
+    /// AEAD associated-data binding tokens to THIS server (RFC 7635 §6.2). A
+    /// token sealed for a different `server_name` will not decrypt here.
+    pub server_name: String,
+    /// Authorization-server identity advertised in the 401 THIRD-PARTY-
+    /// AUTHORIZATION challenge (RFC 7635 §6.1). Empty → falls back to server_name.
+    pub as_identity: String,
+    /// AS-RS symmetric keys shared with the authorization server, hex-encoded
+    /// (each decoding to 16 B → AES-128-GCM or 32 B → AES-256-GCM). List more
+    /// than one to roll keys: a token sealed with any listed key validates.
+    pub as_rs_keys: Vec<String>,
+    /// RFC 7635 §6.1 kid-tagged AS-RS keys. When the client's USERNAME carries a
+    /// matching `kid`, the server selects that key directly instead of trial-
+    /// decrypting the whole keyring; on no match it falls back to trial-decrypt
+    /// (incl. `as_rs_keys`). Each `key` is hex (16 B → AES-128-GCM, 32 B →
+    /// AES-256-GCM); `kid` must be non-empty and unique.
+    pub keys: Vec<OAuthKey>,
+    /// RFC 7635 §6.1 strict key selection. When true, a request whose USERNAME
+    /// names an unknown `kid` — or omits USERNAME entirely — is rejected instead
+    /// of falling back to trial-decrypt. Default false keeps the rotation-friendly
+    /// trial-decrypt behaviour; enable for a strict RFC / high-assurance profile.
+    pub strict_kid: bool,
+}
+
+/// RFC 7635 kid-tagged AS-RS key (see [`OAuthConfig::keys`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthKey {
+    /// Key identifier, matched against the client's USERNAME (RFC 7635 §6.1).
+    pub kid: String,
+    /// Hex-encoded AES key (16 B → AES-128-GCM, 32 B → AES-256-GCM).
+    pub key: String,
 }
 
 /// RFC 8016 "Mobility with TURN" (Connection Migration).
@@ -636,11 +848,11 @@ impl Default for RelayConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaConfig {
     /// Max bytes/second relayed per allocation. 0 = unlimited.
-    pub max_bytes_per_sec: u64,
+    pub max_bytes_per_sec_per_allocation: u64,
     /// Max simultaneous allocations per username. 0 = unlimited.
     pub max_per_user: usize,
     /// B2: acknowledge running with NO per-allocation bandwidth cap in
-    /// production. `max_bytes_per_sec = 0` (unlimited) is refused in production
+    /// production. `max_bytes_per_sec_per_allocation = 0` (unlimited) is refused in production
     /// unless this is explicitly set — an unbounded relay is a DoS amplifier.
     pub allow_unlimited_bandwidth: bool,
 }
@@ -648,7 +860,7 @@ pub struct QuotaConfig {
 impl Default for QuotaConfig {
     fn default() -> Self {
         Self {
-            max_bytes_per_sec: 0, // unlimited — matches session default
+            max_bytes_per_sec_per_allocation: 0, // unlimited — matches session default
             max_per_user: 100,
             allow_unlimited_bandwidth: false,
         }
@@ -787,9 +999,15 @@ pub struct ClusterConfig {
     /// (logs a warning). Set it so only trusted hosts can change the ring.
     pub cluster_secret: String,
     /// Lame-duck window: on shutdown the node announces it is leaving and keeps
-    /// redirecting new clients away for this many seconds before exiting, so a
-    /// rolling deploy doesn't drop new sessions. Existing sessions are never
-    /// interrupted. `0` = exit immediately.
+    /// redirecting *new* clients away for up to this many seconds before
+    /// exiting, so a rolling deploy doesn't drop new sessions. Existing sessions
+    /// get the SAME window to finish — the node waits until active allocations
+    /// reach zero OR this deadline elapses, then proceeds with shutdown **even
+    /// if allocations are still active** (logged as "drain grace elapsed with
+    /// allocations still active"). So existing sessions are NOT guaranteed to
+    /// survive: the default (5s) is far too short to preserve real TURN sessions
+    /// across a rolling upgrade — raise it to cover your expected session length
+    /// if uninterrupted sessions matter. `0` = exit immediately.
     pub drain_grace_secs: u64,
     pub backend: BackendConfigSection,
     /// Allocation persistence (PR1 scaffolding — task #3).
@@ -798,6 +1016,9 @@ pub struct ClusterConfig {
     /// no writer task is spawned, no `WriteOp` events are emitted.
     /// See `docs/design/allocation-store-persistence.md`.
     pub persistence: PersistenceConfig,
+    /// Durable command-log retention, bounded migration, and GC settings for
+    /// the control plane.
+    pub command_log: CommandLogConfig,
     /// Heartbeat / failover timing (detection speed vs. false-failover margin).
     pub failure_detection: FailureDetectionConfig,
 }
@@ -820,6 +1041,7 @@ impl Default for ClusterConfig {
             drain_grace_secs: 5,
             backend: BackendConfigSection::default(),
             persistence: PersistenceConfig::default(),
+            command_log: CommandLogConfig::default(),
             failure_detection: FailureDetectionConfig::default(),
         }
     }
@@ -972,6 +1194,107 @@ impl PersistenceConfig {
         }
         if self.batch_max_size == 0 {
             errors.push("cluster.persistence.batch_max_size must be > 0".into());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Durable command-log retention + garbage-collection settings (control-plane).
+///
+/// Terminal commands are pruned by age *per status*; idempotency records are
+/// retained independently and, by the GC sweep's ordering rule, never dropped
+/// before the command they guard. Non-terminal states (pending/claimed/running)
+/// are never pruned by TTL — stuck commands are handled by claim reclaim and
+/// dead-lettering, not by GC.
+///
+/// The control plane uses these limits for bounded, resumable migration and
+/// per-backend command-log garbage collection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandLogConfig {
+    /// Retain `done` commands this many seconds after completion (default 7d).
+    pub retain_done_secs: u64,
+    /// Retain `failed` commands this many seconds after completion (default 30d).
+    pub retain_failed_secs: u64,
+    /// Retain `superseded` commands this many seconds after completion (7d).
+    pub retain_superseded_secs: u64,
+    /// Retain `expired` commands this many seconds after completion (7d).
+    pub retain_expired_secs: u64,
+    /// Minimum retention for idempotency records (default 30d). They are never
+    /// pruned before the command they reference regardless of this value.
+    pub retain_idempotency_secs: u64,
+    /// GC sweep cadence in seconds (default 900 = 15 min). `0` disables GC.
+    pub sweep_interval_secs: u64,
+    /// Max records deleted per batch inside a sweep (default 1000). Bounds the
+    /// per-transaction work so GC never holds a long transaction.
+    pub batch_size: usize,
+    /// Max batches per sweep pass (default 10): a large backlog drains across
+    /// several sweeps rather than one long run.
+    pub max_batches_per_sweep: u32,
+    /// Random jitter (seconds) added to each sweep start so multiple
+    /// control-plane instances don't sweep in lockstep (default 60).
+    pub sweep_jitter_secs: u64,
+}
+
+impl Default for CommandLogConfig {
+    fn default() -> Self {
+        Self {
+            retain_done_secs: 7 * 24 * 3600,
+            retain_failed_secs: 30 * 24 * 3600,
+            retain_superseded_secs: 7 * 24 * 3600,
+            retain_expired_secs: 7 * 24 * 3600,
+            retain_idempotency_secs: 30 * 24 * 3600,
+            sweep_interval_secs: 900,
+            batch_size: 1000,
+            max_batches_per_sweep: 10,
+            sweep_jitter_secs: 60,
+        }
+    }
+}
+
+impl CommandLogConfig {
+    /// GC runs only when a sweep interval is configured.
+    pub fn gc_enabled(&self) -> bool {
+        self.sweep_interval_secs > 0
+    }
+
+    /// Returns Err with a list of validation issues, if any.
+    pub(crate) fn validate(&self) -> std::result::Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.gc_enabled() {
+            if self.batch_size == 0 {
+                errors.push("cluster.command_log.batch_size must be > 0 when GC is enabled".into());
+            }
+            if self.max_batches_per_sweep == 0 {
+                errors.push(
+                    "cluster.command_log.max_batches_per_sweep must be > 0 when GC is enabled"
+                        .into(),
+                );
+            }
+            // Idempotency records guard destructive replays; they MUST outlive
+            // every command they can guard. Commands live under four independent
+            // terminal windows (done/failed/superseded/expired), so the record
+            // window must be >= the LONGEST of them — otherwise a command in the
+            // longest-retained state (e.g. a 60d `done`) could still exist after
+            // its 30d idempotency record was pruned, and a replay would slip
+            // through with the command row gone.
+            let max_terminal = self
+                .retain_done_secs
+                .max(self.retain_failed_secs)
+                .max(self.retain_superseded_secs)
+                .max(self.retain_expired_secs);
+            if self.retain_idempotency_secs < max_terminal {
+                errors.push(format!(
+                    "cluster.command_log.retain_idempotency_secs ({}) must be >= the longest \
+                     terminal retention (max of done/failed/superseded/expired = {}) so an \
+                     idempotency record can never be pruned before a command it guards",
+                    self.retain_idempotency_secs, max_terminal
+                ));
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -1198,6 +1521,73 @@ impl Default for DtlsSection {
             mtu: 1200,
             outbound_queue_capacity: 1024,
             max_sessions_per_ip: 0,
+        }
+    }
+}
+
+/// TURN-over-SCTP listener (experimental client CONTROL transport; the relayed
+/// side stays UDP). No TURN RFC defines SCTP relaying — see docs/protocol-gap.md.
+/// Disabled by default. Requires the node binary built with `--features sctp`
+/// and a host with the SCTP kernel module.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SctpSection {
+    /// Enable the SCTP listener.
+    pub enabled: bool,
+    /// Listen address (no standardized TURN-over-SCTP port; 3478 by default).
+    pub listen: SocketAddr,
+    /// Max framed STUN/ChannelData message size, bytes.
+    pub max_frame_size: usize,
+    /// Per-connection idle read timeout, seconds.
+    pub read_timeout_secs: u64,
+    /// Max concurrent SCTP connections.
+    pub max_connections: usize,
+    /// listen(2) backlog.
+    pub backlog: i32,
+}
+
+impl Default for SctpSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "0.0.0.0:3478".parse().unwrap(),
+            max_frame_size: 64 * 1024,
+            read_timeout_secs: 300,
+            max_connections: 10_000,
+            backlog: 1024,
+        }
+    }
+}
+
+/// RFC 6062 TCP relay (client uses CONNECT/CONNECTION-BIND to reach a peer over
+/// TCP; the relayed transport is TCP, not UDP). Disabled by default; the control
+/// channel uses the TURNS (TLS) listener, so `[tls]` must also be enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpRelaySection {
+    /// Enable RFC 6062 TCP relaying (accept Allocate with REQUESTED-TRANSPORT=TCP).
+    pub enabled: bool,
+    /// Outbound connect timeout to the peer, seconds.
+    pub connect_timeout_secs: u64,
+    /// Idle timeout for a connected-but-unbound peer connection, seconds.
+    pub idle_timeout_secs: u64,
+    /// Max concurrent TCP relay connections per allocation.
+    pub max_per_allocation: usize,
+    /// Max concurrent TCP relay connections total.
+    pub max_total: usize,
+    /// Per-direction relay buffer size, bytes.
+    pub buffer_size: usize,
+}
+
+impl Default for TcpRelaySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            connect_timeout_secs: 30,
+            idle_timeout_secs: 30,
+            max_per_allocation: 10,
+            max_total: 50_000,
+            buffer_size: 16384,
         }
     }
 }
@@ -1529,6 +1919,448 @@ max_duration_secs = 7200
 }
 
 // ---------------------------------------------------------------------------
+// S4: runtime-config update mechanism (versioned immutable snapshot)
+// ---------------------------------------------------------------------------
+//
+// The control-plane `update_config` command changes a *whitelisted* subset of
+// configuration on a live node without a restart. The design rules are
+// enforced jointly by the config domain, node apply path, durable backend and
+// management RPC layer:
+//
+//   * Immutable snapshot: a change never mutates fields in place. It builds a
+//     whole new `RuntimeSnapshot`, validates it in full, and only then publishes
+//     it atomically through the node's `ArcSwap`. Validation failure changes
+//     nothing.
+//   * Optimistic concurrency: the caller passes `expected_version`; the apply
+//     is rejected unless it equals the current snapshot version, so a stale
+//     writer can never silently clobber a newer state.
+//   * Observed version: every successful *change* bumps `version` by 1. A
+//     command is terminal only after the node reports the resulting observed
+//     snapshot.
+//   * Whitelist only: fields that require rebinding/restart (listeners,
+//     transport, relay port range, identity, backend credentials, production
+//     safety flags) are NOT in `DynamicLimits` and are rejected up front as
+//     `RestartRequired` — never applied "half way".
+//
+// The live read points are in `turna-session::AllocationStore`: bandwidth is
+// read from the immutable limits snapshot on the packet path, while per-user,
+// tenant and global allocation caps are enforced through atomic reservations.
+
+/// The whitelisted, runtime-changeable configuration subset.
+///
+/// `0` keeps the existing "unlimited" convention for the quota fields and
+/// "no per-user cap" for `max_per_user`, matching `QuotaConfig`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicLimits {
+    /// Per-allocation bytes/sec cap. 0 = unlimited.
+    pub max_bytes_per_sec_per_allocation: u64,
+    /// Simultaneous allocations per username. 0 = no per-user cap.
+    pub max_per_user: usize,
+    /// Global allocation cap for this node.
+    pub max_allocations: usize,
+}
+
+/// Immutable context needed to validate a `DynamicLimits` change. These are
+/// restart-only fields (they are NOT changeable at runtime) but the dynamic
+/// fields are validated against them — e.g. a global cap can never exceed the
+/// usable relay-port count, which is fixed for the process lifetime.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeValidationCtx {
+    pub min_port: u16,
+    pub max_port: u16,
+    pub production: bool,
+    pub allow_unlimited_bandwidth: bool,
+}
+
+impl RuntimeValidationCtx {
+    pub fn from_config(cfg: &TurnaConfig) -> Self {
+        Self {
+            min_port: cfg.turn.relay.min_port,
+            max_port: cfg.turn.relay.max_port,
+            production: cfg.is_production(),
+            allow_unlimited_bandwidth: cfg.turn.relay.quota.allow_unlimited_bandwidth,
+        }
+    }
+}
+
+impl DynamicLimits {
+    pub fn from_config(cfg: &TurnaConfig) -> Self {
+        Self {
+            max_bytes_per_sec_per_allocation: cfg.turn.relay.quota.max_bytes_per_sec_per_allocation,
+            max_per_user: cfg.turn.relay.quota.max_per_user,
+            max_allocations: cfg.turn.relay.max_allocations,
+        }
+    }
+
+    /// Validate this candidate against the immutable context. Mirrors the
+    /// relevant rules in `TurnaConfig::validate` so a runtime change can never
+    /// reach a state the startup validator would have rejected. Returns the
+    /// list of hard errors (empty = valid). Reducing a limit below current
+    /// live usage is intentionally NOT an error here — the store blocks new
+    /// reservations until usage falls, without tearing active allocations.
+    pub fn validate(&self, ctx: &RuntimeValidationCtx) -> Vec<String> {
+        let mut errors = Vec::new();
+        if ctx.min_port < ctx.max_port {
+            let usable = (ctx.max_port - ctx.min_port) as usize + 1;
+            if self.max_allocations > usable {
+                errors.push(format!(
+                    "max_allocations ({}) exceeds usable relay ports ({}) for range \
+                     [{}, {}] — a cap above the port count is unreachable",
+                    self.max_allocations, usable, ctx.min_port, ctx.max_port
+                ));
+            }
+        }
+        if ctx.production
+            && self.max_bytes_per_sec_per_allocation == 0
+            && !ctx.allow_unlimited_bandwidth
+        {
+            errors.push(
+                "max_bytes_per_sec_per_allocation is 0 (unlimited) in production; set a per-allocation \
+                 byte/sec cap (allow_unlimited_bandwidth is a restart-only opt-in)"
+                    .into(),
+            );
+        }
+        errors
+    }
+}
+
+/// A partial change request. `None` fields are left unchanged. The apply step
+/// builds the full candidate, validates it, and either swaps the whole thing
+/// or rejects the whole thing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DynamicLimitsPatch {
+    pub max_bytes_per_sec_per_allocation: Option<u64>,
+    pub max_per_user: Option<usize>,
+    pub max_allocations: Option<usize>,
+}
+
+impl DynamicLimitsPatch {
+    pub fn is_empty(&self) -> bool {
+        self.max_bytes_per_sec_per_allocation.is_none()
+            && self.max_per_user.is_none()
+            && self.max_allocations.is_none()
+    }
+}
+
+/// The versioned, immutable runtime snapshot published on the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    /// Monotonic observed version. The boot snapshot is version 0; every
+    /// successful *change* increments it by 1.
+    pub version: u64,
+    pub limits: DynamicLimits,
+}
+
+/// Result of a successful apply. `changed = false` means the patch was a no-op
+/// (already at the desired state): the version is unchanged and the caller
+/// reports the current observed version — an idempotent success, not an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedConfig {
+    pub snapshot: RuntimeSnapshot,
+    pub changed: bool,
+}
+
+/// Why a runtime config update was refused. Maps onto gRPC status codes in the
+/// RPC mapping: `VersionMismatch`/`RestartRequired` → FailedPrecondition,
+/// `ValidationFailed` → InvalidArgument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigUpdateError {
+    /// `expected_version` did not match the node's current version.
+    VersionMismatch { expected: u64, actual: u64 },
+    /// The candidate snapshot failed validation; nothing was changed.
+    ValidationFailed(Vec<String>),
+    /// One or more requested keys require a restart and were not applied.
+    RestartRequired(Vec<String>),
+    /// The version counter would overflow `u64`; nothing was changed.
+    VersionOverflow,
+}
+
+impl std::fmt::Display for ConfigUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigUpdateError::VersionMismatch { expected, actual } => write!(
+                f,
+                "version mismatch: expected {expected}, node is at {actual}"
+            ),
+            ConfigUpdateError::ValidationFailed(errs) => {
+                write!(f, "config validation failed: {}", errs.join("; "))
+            }
+            ConfigUpdateError::RestartRequired(keys) => write!(
+                f,
+                "these fields require a restart and were not applied: {}",
+                keys.join(", ")
+            ),
+            ConfigUpdateError::VersionOverflow => {
+                write!(f, "config version counter overflow")
+            }
+        }
+    }
+}
+impl std::error::Error for ConfigUpdateError {}
+
+impl RuntimeSnapshot {
+    /// The boot snapshot (version 0) derived from the startup config.
+    pub fn from_config(cfg: &TurnaConfig) -> Self {
+        Self {
+            version: 0,
+            limits: DynamicLimits::from_config(cfg),
+        }
+    }
+
+    /// Apply a patch under optimistic concurrency. On success returns the next
+    /// snapshot (version bumped) or a no-op (version unchanged). On any error
+    /// the current snapshot is untouched — there is no partial application.
+    pub fn apply(
+        &self,
+        patch: &DynamicLimitsPatch,
+        expected_version: u64,
+        ctx: &RuntimeValidationCtx,
+    ) -> std::result::Result<AppliedConfig, ConfigUpdateError> {
+        if expected_version != self.version {
+            return Err(ConfigUpdateError::VersionMismatch {
+                expected: expected_version,
+                actual: self.version,
+            });
+        }
+        let mut candidate = self.limits.clone();
+        if let Some(v) = patch.max_bytes_per_sec_per_allocation {
+            candidate.max_bytes_per_sec_per_allocation = v;
+        }
+        if let Some(v) = patch.max_per_user {
+            candidate.max_per_user = v;
+        }
+        if let Some(v) = patch.max_allocations {
+            candidate.max_allocations = v;
+        }
+        if candidate == self.limits {
+            // No-op: idempotent success at the current version.
+            return Ok(AppliedConfig {
+                snapshot: self.clone(),
+                changed: false,
+            });
+        }
+        let errors = candidate.validate(ctx);
+        if !errors.is_empty() {
+            return Err(ConfigUpdateError::ValidationFailed(errors));
+        }
+        let next_version = self
+            .version
+            .checked_add(1)
+            .ok_or(ConfigUpdateError::VersionOverflow)?;
+        Ok(AppliedConfig {
+            snapshot: RuntimeSnapshot {
+                version: next_version,
+                limits: candidate,
+            },
+            changed: true,
+        })
+    }
+}
+
+/// Whether a fully-qualified config key may be changed at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldClass {
+    /// In the runtime whitelist — expressible as a `DynamicLimitsPatch` field.
+    Dynamic,
+    /// Requires a restart (rebinding, identity, credentials, safety flags).
+    RestartRequired,
+    /// Not a recognised config key.
+    Unknown,
+}
+
+/// Classify a fully-qualified config key for the `update_config` RPC. The RPC
+/// rejects `RestartRequired`/`Unknown` keys up front (FailedPrecondition /
+/// InvalidArgument) rather than silently ignoring them.
+pub fn classify_config_key(key: &str) -> FieldClass {
+    match key {
+        "turn.relay.max_allocations"
+        | "turn.relay.quota.max_bytes_per_sec_per_allocation"
+        | "turn.relay.quota.max_per_user" => FieldClass::Dynamic,
+        // Rebinding / identity / credentials / safety — restart only.
+        "turn.listen"
+        | "turn.external_ip"
+        | "turn.realm"
+        | "turn.transport"
+        | "turn.relay.min_port"
+        | "turn.relay.max_port"
+        | "turn.relay.quota.allow_unlimited_bandwidth"
+        | "production"
+        | "health.listen"
+        | "management.listen"
+        | "cluster.node_id"
+        | "cluster.backend.uri"
+        | "cluster.backend.user"
+        | "cluster.backend.password" => FieldClass::RestartRequired,
+        _ => FieldClass::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod runtime_update_tests {
+    use super::*;
+
+    fn ctx() -> RuntimeValidationCtx {
+        RuntimeValidationCtx {
+            min_port: 49152,
+            max_port: 65535,
+            production: false,
+            allow_unlimited_bandwidth: false,
+        }
+    }
+
+    fn snap() -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            version: 3,
+            limits: DynamicLimits {
+                max_bytes_per_sec_per_allocation: 1_000_000,
+                max_per_user: 100,
+                max_allocations: 10_000,
+            },
+        }
+    }
+
+    #[test]
+    fn version_mismatch_is_rejected_and_changes_nothing() {
+        let s = snap();
+        let patch = DynamicLimitsPatch {
+            max_per_user: Some(50),
+            ..Default::default()
+        };
+        let err = s.apply(&patch, 2, &ctx()).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigUpdateError::VersionMismatch {
+                expected: 2,
+                actual: 3
+            }
+        );
+    }
+
+    #[test]
+    fn happy_path_bumps_version_and_applies() {
+        let s = snap();
+        let patch = DynamicLimitsPatch {
+            max_per_user: Some(50),
+            max_bytes_per_sec_per_allocation: Some(2_000_000),
+            ..Default::default()
+        };
+        let applied = s.apply(&patch, 3, &ctx()).unwrap();
+        assert!(applied.changed);
+        assert_eq!(applied.snapshot.version, 4);
+        assert_eq!(applied.snapshot.limits.max_per_user, 50);
+        assert_eq!(
+            applied.snapshot.limits.max_bytes_per_sec_per_allocation,
+            2_000_000
+        );
+        // Untouched field preserved.
+        assert_eq!(applied.snapshot.limits.max_allocations, 10_000);
+    }
+
+    #[test]
+    fn version_counter_overflow_is_refused_without_change() {
+        let mut s = snap();
+        s.version = u64::MAX;
+        // A real, validating change at the u64 boundary must refuse rather than
+        // wrap/saturate: no snapshot is produced, so nothing is published.
+        let patch = DynamicLimitsPatch {
+            max_per_user: Some(50),
+            ..Default::default()
+        };
+        let err = s.apply(&patch, u64::MAX, &ctx()).unwrap_err();
+        assert_eq!(err, ConfigUpdateError::VersionOverflow);
+    }
+
+    #[test]
+    fn empty_or_equal_patch_is_noop_without_version_bump() {
+        let s = snap();
+        let applied = s.apply(&DynamicLimitsPatch::default(), 3, &ctx()).unwrap();
+        assert!(!applied.changed);
+        assert_eq!(applied.snapshot.version, 3);
+        // A patch that re-sets the same values is also a no-op.
+        let same = DynamicLimitsPatch {
+            max_per_user: Some(100),
+            ..Default::default()
+        };
+        let applied = s.apply(&same, 3, &ctx()).unwrap();
+        assert!(!applied.changed);
+        assert_eq!(applied.snapshot.version, 3);
+    }
+
+    #[test]
+    fn lowering_max_per_user_below_usage_still_validates() {
+        // Validation does not know live usage; a lower cap is valid here and the
+        // store blocks new reservations until usage falls (no active teardown).
+        let s = snap();
+        let patch = DynamicLimitsPatch {
+            max_per_user: Some(1),
+            ..Default::default()
+        };
+        let applied = s.apply(&patch, 3, &ctx()).unwrap();
+        assert!(applied.changed);
+        assert_eq!(applied.snapshot.limits.max_per_user, 1);
+    }
+
+    #[test]
+    fn max_allocations_above_usable_ports_fails_validation() {
+        let s = snap();
+        let patch = DynamicLimitsPatch {
+            // usable ports for [49152, 65535] = 16384
+            max_allocations: Some(20_000),
+            ..Default::default()
+        };
+        let err = s.apply(&patch, 3, &ctx()).unwrap_err();
+        match err {
+            ConfigUpdateError::ValidationFailed(errs) => {
+                assert!(errs.iter().any(|e| e.contains("max_allocations")));
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+        // Snapshot untouched: still the original.
+        assert_eq!(s.limits.max_allocations, 10_000);
+    }
+
+    #[test]
+    fn production_unlimited_bandwidth_fails_without_optin() {
+        let s = snap();
+        let prod = RuntimeValidationCtx {
+            production: true,
+            ..ctx()
+        };
+        let patch = DynamicLimitsPatch {
+            max_bytes_per_sec_per_allocation: Some(0),
+            ..Default::default()
+        };
+        let err = s.apply(&patch, 3, &prod).unwrap_err();
+        assert!(matches!(err, ConfigUpdateError::ValidationFailed(_)));
+    }
+
+    #[test]
+    fn field_classification() {
+        assert_eq!(
+            classify_config_key("turn.relay.max_allocations"),
+            FieldClass::Dynamic
+        );
+        assert_eq!(
+            classify_config_key("turn.relay.quota.max_per_user"),
+            FieldClass::Dynamic
+        );
+        assert_eq!(
+            classify_config_key("turn.listen"),
+            FieldClass::RestartRequired
+        );
+        assert_eq!(
+            classify_config_key("production"),
+            FieldClass::RestartRequired
+        );
+        assert_eq!(
+            classify_config_key("turn.relay.min_port"),
+            FieldClass::RestartRequired
+        );
+        assert_eq!(classify_config_key("nonsense.key"), FieldClass::Unknown);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1562,6 +2394,27 @@ mod tests {
 
         restore_turna_production(saved_turna_production);
         result.unwrap();
+    }
+
+    #[test]
+    fn max_allocations_above_usable_ports_is_rejected() {
+        // Default relay range 49152..=65535 => 16384 usable ports.
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.relay.max_allocations = 50_000; // > 16384 usable
+        let over = cfg.validate();
+        cfg.turn.relay.max_allocations = 16_384; // == usable -> ok
+        let at_ceiling = cfg.validate();
+        cfg.turn.relay.max_allocations = 8_192; // conservative -> ok (may warn)
+        let conservative = cfg.validate();
+
+        restore_turna_production(saved);
+        assert!(over.is_err(), "cap above usable relay ports must fail");
+        at_ceiling.unwrap();
+        conservative.unwrap();
     }
 
     #[test]
@@ -2229,11 +3082,11 @@ mod b2_bandwidth_optin_tests {
         // production=true in the file, so is_production() is true regardless of
         // the process-global TURNA_PRODUCTION env — no env lock needed.
 
-        // Default quota (max_bytes_per_sec = 0) in prod, no opt-in → rejected.
+        // Default quota (max_bytes_per_sec_per_allocation = 0) in prod, no opt-in → rejected.
         let err = TurnaConfig::from_str(&prod_base("")).expect_err("unlimited bw must fail");
         let msg = err.to_string().to_lowercase();
         assert!(
-            msg.contains("bandwidth") || msg.contains("max_bytes_per_sec"),
+            msg.contains("bandwidth") || msg.contains("max_bytes_per_sec_per_allocation"),
             "expected a bandwidth error, got: {err}"
         );
 
@@ -2245,8 +3098,80 @@ mod b2_bandwidth_optin_tests {
 
         // A real cap → accepted.
         TurnaConfig::from_str(&prod_base(
-            "[turn.relay.quota]\nmax_bytes_per_sec = 1000000\n\n",
+            "[turn.relay.quota]\nmax_bytes_per_sec_per_allocation = 1000000\n\n",
         ))
         .expect("a concrete cap must validate");
+    }
+
+    #[test]
+    fn unknown_backend_type_is_rejected() {
+        let toml = "[cluster.backend]\ntype = \"tarantol\"\n";
+        let err = TurnaConfig::from_str(toml)
+            .expect_err("unknown backend type must fail validation")
+            .to_string();
+        assert!(
+            err.contains("not a known backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cluster_mode_with_memory_backend_is_rejected() {
+        let toml = "[turn]\nexternal_ip = \"1.2.3.4\"\n\n\
+                    [cluster]\ncluster_mode = true\nnode_id = \"n1\"\n\
+                    cluster_name = \"turna\"\ncluster_secret = \"s3cr3t-not-empty\"\n\n\
+                    [cluster.backend]\ntype = \"memory\"\n";
+        let err = TurnaConfig::from_str(toml)
+            .expect_err("cluster_mode + memory must fail")
+            .to_string();
+        assert!(
+            err.contains("requires a shared state backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn command_log_config_defaults_and_invariants() {
+        // Defaults enable GC and pass validation.
+        let d = CommandLogConfig::default();
+        assert!(d.gc_enabled());
+        assert!(d.validate().is_ok());
+
+        // Idempotency retention must outlive failed commands.
+        let bad = CommandLogConfig {
+            retain_idempotency_secs: CommandLogConfig::default().retain_failed_secs - 1,
+            ..CommandLogConfig::default()
+        };
+        assert!(bad.validate().is_err());
+
+        // ...and it must outlive the LONGEST terminal window, not just failed.
+        // done = 60d while idempotency = 30d must be rejected (a long-retained
+        // done command would outlive its idempotency guard otherwise).
+        let day = 24 * 3600;
+        let bad_done = CommandLogConfig {
+            retain_done_secs: 60 * day,
+            retain_failed_secs: 30 * day,
+            retain_idempotency_secs: 30 * day,
+            ..CommandLogConfig::default()
+        };
+        assert!(
+            bad_done.validate().is_err(),
+            "idempotency (30d) < done (60d) must be rejected"
+        );
+        // Raising idempotency to cover the longest window fixes it.
+        let ok = CommandLogConfig {
+            retain_idempotency_secs: 60 * day,
+            ..bad_done
+        };
+        assert!(ok.validate().is_ok());
+
+        // Disabling GC (interval 0) skips the batch/idempotency checks.
+        let off = CommandLogConfig {
+            sweep_interval_secs: 0,
+            batch_size: 0,
+            ..CommandLogConfig::default()
+        };
+        assert!(!off.gc_enabled());
+        assert!(off.validate().is_ok());
     }
 }

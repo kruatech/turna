@@ -250,6 +250,17 @@ impl HistogramRegistry {
             ),
         );
 
+        histograms.insert(
+            "turna_runtime_config_apply_duration_seconds".into(),
+            Histogram::new(
+                "turna_runtime_config_apply_duration_seconds",
+                "Runtime configuration and user-limit apply latency",
+                vec![
+                    0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0,
+                ],
+            ),
+        );
+
         Self { histograms }
     }
 

@@ -203,6 +203,66 @@ groups:
             Either legitimate demand exceeds capacity or sessions are not being
             reaped.
 
+
+  # ── Durable runtime management ──────────────────────────────────────────────
+  - name: turna.runtime_management
+    rules:
+      - alert: TurnaRuntimeConfigMismatch
+        expr: turna_config_desired_observed_mismatch > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna desired/observed runtime config mismatch on {{ $labels.instance }}"
+          description: >-
+            A durable desired config has not reached observed state. Inspect the
+            node-scoped GetConfig response, command consumer, and Tarantool.
+
+      - alert: TurnaRuntimeConfigStuck
+        expr: turna_config_oldest_unapplied_ms > 300000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna runtime config unapplied for 5m+ on {{ $labels.instance }}"
+          description: >-
+            The oldest desired runtime configuration has remained unapplied for
+            more than five minutes. Check node heartbeat/incarnation fencing and
+            backend connectivity.
+
+      - alert: TurnaRuntimeConfigFailures
+        expr: increase(turna_config_update_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna runtime config update failure on {{ $labels.instance }}"
+          description: >-
+            A runtime config apply or durable confirmation failed. Check the
+            terminal result and rollback counter before retrying.
+
+      - alert: TurnaUserLimitFailures
+        expr: increase(turna_user_limits_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna user-limit update failure on {{ $labels.instance }}"
+          description: >-
+            A scoped user-limit update failed. Inspect the typed terminal result
+            and use the current observed version for a new intent.
+
+      - alert: TurnaCommandLogMigrationErrors
+        expr: increase(turna_command_log_migration_errors_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna command-log migration error on {{ $labels.instance }}"
+          description: >-
+            A bounded migration batch failed. Restore Tarantool connectivity;
+            migration resumes from its durable cursor.
+
   # ── Media quality (RTP observability) ───────────────────────────────────────
   - name: turna.media_quality
     rules:

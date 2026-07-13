@@ -94,6 +94,74 @@ jobs:
           push-to-registry: true
 
   # ---------------------------------------------------------------------------
+  # Admin image (UI + bridge) -> GHCR as <repo>-admin. Mirrors the `docker` job:
+  # multi-arch, keyless cosign signing by digest, SLSA provenance + SBOM.
+  # ---------------------------------------------------------------------------
+  docker-admin:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ${{ github.repository }}-admin
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: imagetags
+        run: |
+          REF="${GITHUB_REF_NAME}"
+          REPO="${REGISTRY}/${IMAGE_NAME}"
+          tags="${REPO}:${REF}"
+          case "$REF" in
+            *-*) ;;
+            *)  tags="${tags}"$'\n'"${REPO}:latest" ;;
+          esac
+          { echo "tags<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/Dockerfile.admin
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.imagetags.outputs.tags }}
+
+      - name: Sign image (keyless, by digest)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+
+      - name: Attest build provenance (GitHub, pushed to registry)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # ---------------------------------------------------------------------------
   # Standalone linux/amd64 binaries -> tar.gz + SHA256 + SBOM + provenance.
   # The container image above covers arm64 users; cross-compiling standalone
   # arm64 binaries is left as a follow-up.
@@ -163,7 +231,7 @@ jobs:
   # Create the GitHub Release once both builds succeed.
   # ---------------------------------------------------------------------------
   release:
-    needs: [docker, binaries]
+    needs: [docker, docker-admin, binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the GitHub Release and upload assets

@@ -1,7 +1,7 @@
 //! turna-admin — admin panel bridge.
 //!
-//! Stage 1 (read-only): GET /api/status /metrics /health /ready /cluster
-//! Stage 2 (mutate):    POST /api/manage → gRPC to control-plane
+//! Read-only monitoring: GET /api/status /metrics /health /ready /cluster
+//! Management bridge:   POST /api/manage → gRPC to control-plane
 //!
 //! TLS modes for --grpc-addr:
 //!   https://turna.krutilin.pro:5350  → TLS, system roots (Let's Encrypt)
@@ -218,12 +218,8 @@ async fn api_manage(
     }
 }
 
-async fn api_actions_not_implemented() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error": "not_implemented", "stage": 2})),
-    )
-        .into_response()
+async fn local_healthz() -> StatusCode {
+    StatusCode::OK
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -288,7 +284,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "plaintext"
     };
-    info!(grpc_addr = %cfg.grpc_addr, tls = tls_desc, "gRPC channel ready");
+    info!(grpc_addr = %cfg.grpc_addr, tls = tls_desc, "lazy gRPC channel configured");
 
     if cfg.auth_token.is_some() {
         info!("operator auth: X-Admin-Token required for mutations");
@@ -310,6 +306,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let index = Path::new(&cfg.static_dir).join("index.html");
+    if !index.is_file() {
+        anyhow::bail!(
+            "admin static assets are missing: expected {}",
+            index.display()
+        );
+    }
     let static_service = ServeDir::new(&cfg.static_dir).fallback(ServeFile::new(index));
 
     let api = Router::new()
@@ -318,13 +320,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(api_health))
         .route("/ready", get(api_ready))
         .route("/cluster", get(api_cluster))
-        .route("/manage", post(api_manage))
-        .route(
-            "/actions/*rest",
-            post(api_actions_not_implemented).get(api_actions_not_implemented),
-        );
+        .route("/manage", post(api_manage));
 
     let app = Router::new()
+        .route("/healthz", get(local_healthz))
         .nest("/api", api)
         .fallback_service(static_service)
         .layer(TraceLayer::new_for_http())

@@ -1,5 +1,11 @@
 # turna — verification status before GA (v0.3.0-rc.1)
 
+
+> **Historical evidence plus current boundary:** the measurements below describe
+> the cited RC commits. The `Unreleased` S4/S5, persistence, admin, and Helm
+> changes have not been run in this editing pass. They require the final command
+> and live-scenario set before this document can be used to approve GA.
+
 A map of readiness: what is verified, by what method, with what result — and,
 honestly, what is NOT verified. References the detailed reports under docs/.
 Purpose: a basis for the RC → GA decision.
@@ -130,3 +136,13 @@ Remaining to GA is mostly external / process, not code:
 Summary: the codebase and its verification are at a mature RC level. What remains
 is closed by time, real traffic, and external auditors — not by writing more
 code. The documentation honestly reflects the verified boundary.
+
+## 5. Unreleased GA implementation gates
+
+The exact release commit must additionally prove: node-targeted config update;
+stale expected-version conflict; idempotent retry after response loss and after
+command GC; runtime and user-limit restart restore; concurrent Allocate at
+user limit 1; rollback on later reservation failure; bandwidth/lifetime updates;
+legacy bounded/resumable Tarantool migration; admin token and retry behavior;
+immediate gossip leaving/rejoin; standalone Helm deployment; and release
+rollback. Until recorded, GA status is not confirmed.

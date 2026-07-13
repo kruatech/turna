@@ -60,11 +60,22 @@ pub struct Metrics {
     pub is_draining: AtomicBool,
     /// 2.4 readiness: traffic path usable (set once listeners are up).
     pub readiness: AtomicU8,
+    /// P0.5 derived-readiness input: in-memory state has diverged from the
+    /// backend (write drops seen, not yet reconciled). Combined with `is_draining`
+    /// by `refresh_readiness`, so an undrain cannot mask an active divergence.
+    pub backend_diverged: AtomicBool,
     /// 2.4 per-backend readiness (observability). With fail-fast startup these
     /// are all-or-nothing at boot; `Degraded` is reserved for future
     /// non-fatal backend failures.
     pub transport_readiness: AtomicU8,
     pub dtls_readiness: AtomicU8,
+    /// #6/#4.5: management-plane readiness sub-signal (0=starting, 1=ready,
+    /// 2=degraded, 3=draining), DISTINCT from the dataplane `readiness` flag so a
+    /// bounded/resumable command-log migration gates the management plane without
+    /// holding the TURN dataplane not-ready. Ready only once the mandatory
+    /// migration phases complete; a non-management node leaves it Ready (nothing
+    /// to gate). Exposed as `turna_management_readiness`.
+    pub management_readiness: AtomicU8,
     pub packets_received: AtomicU64,
     pub packets_sent: AtomicU64,
     pub bytes_received: AtomicU64,
@@ -164,6 +175,43 @@ pub struct Metrics {
     /// Updated by the gossip topology callback in main.rs.
     pub cluster_nodes: AtomicU64,
 
+    // ── Command-log migration and GC (control-plane) ──────────────────────────
+    /// Cumulative command rows deleted by GC.
+    pub command_log_gc_deleted_commands_total: AtomicU64,
+    /// Cumulative idempotency records deleted by GC.
+    pub command_log_gc_deleted_idempotency_total: AtomicU64,
+    /// Cumulative failed GC sweeps.
+    pub command_log_gc_errors_total: AtomicU64,
+    /// Terminal command rows still present after the last sweep (gauge).
+    pub command_log_terminal_remaining: AtomicU64,
+    /// Age (ms) since enqueue (`created_at_ms`) of the oldest not-yet-terminal
+    /// command at the last sweep (gauge). Same semantics in both backends.
+    pub command_log_oldest_unfinished_ms: AtomicU64,
+    /// Idempotency lookup failures observed while resolving post-GC replay.
+    pub command_log_idempotency_lookup_errors_total: AtomicU64,
+    /// Legacy command rows normalized by the bounded resumable migration.
+    pub command_log_migration_processed_total: AtomicU64,
+    /// Backend/procedure failures while advancing command-log migration.
+    pub command_log_migration_errors_total: AtomicU64,
+    /// Whether the command-log migration has reached its completion marker.
+    pub command_log_migration_completed: AtomicU64,
+
+    // ── Runtime management (S4/S5) ────────────────────────────────────────────
+    pub management_commands_accepted_total: AtomicU64,
+    pub config_update_applied_total: AtomicU64,
+    pub config_update_noop_total: AtomicU64,
+    pub config_update_conflicts_total: AtomicU64,
+    pub config_update_failures_total: AtomicU64,
+    pub config_update_rollback_total: AtomicU64,
+    pub config_observed_version: AtomicU64,
+    pub config_desired_observed_mismatch: AtomicU64,
+    pub config_oldest_unapplied_ms: AtomicU64,
+    pub user_limits_applied_total: AtomicU64,
+    pub user_limits_noop_total: AtomicU64,
+    pub user_limits_conflicts_total: AtomicU64,
+    pub user_limits_failures_total: AtomicU64,
+    pub user_limits_over_limit_subjects: AtomicU64,
+
     // ── Auth reason codes ──────────────────────────────────────────────────────
     // Reason-coded auth failures (each is also counted in `auth_failures`),
     // keyed by the turna_auth::AuthError variant the validator returned.
@@ -246,8 +294,10 @@ impl Metrics {
         Self {
             is_draining: AtomicBool::new(false),
             readiness: AtomicU8::new(Readiness::Starting as u8),
+            backend_diverged: AtomicBool::new(false),
             transport_readiness: AtomicU8::new(Readiness::Starting as u8),
             dtls_readiness: AtomicU8::new(Readiness::Starting as u8),
+            management_readiness: AtomicU8::new(Readiness::Starting as u8),
             packets_received: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
@@ -294,6 +344,29 @@ impl Metrics {
             // Cluster
             cluster_redirects: AtomicU64::new(0),
             cluster_nodes: AtomicU64::new(0),
+            command_log_gc_deleted_commands_total: AtomicU64::new(0),
+            command_log_gc_deleted_idempotency_total: AtomicU64::new(0),
+            command_log_gc_errors_total: AtomicU64::new(0),
+            command_log_terminal_remaining: AtomicU64::new(0),
+            command_log_oldest_unfinished_ms: AtomicU64::new(0),
+            command_log_idempotency_lookup_errors_total: AtomicU64::new(0),
+            command_log_migration_processed_total: AtomicU64::new(0),
+            command_log_migration_errors_total: AtomicU64::new(0),
+            command_log_migration_completed: AtomicU64::new(0),
+            management_commands_accepted_total: AtomicU64::new(0),
+            config_update_applied_total: AtomicU64::new(0),
+            config_update_noop_total: AtomicU64::new(0),
+            config_update_conflicts_total: AtomicU64::new(0),
+            config_update_failures_total: AtomicU64::new(0),
+            config_update_rollback_total: AtomicU64::new(0),
+            config_observed_version: AtomicU64::new(0),
+            config_desired_observed_mismatch: AtomicU64::new(0),
+            config_oldest_unapplied_ms: AtomicU64::new(0),
+            user_limits_applied_total: AtomicU64::new(0),
+            user_limits_noop_total: AtomicU64::new(0),
+            user_limits_conflicts_total: AtomicU64::new(0),
+            user_limits_failures_total: AtomicU64::new(0),
+            user_limits_over_limit_subjects: AtomicU64::new(0),
             auth_fail_missing_credentials: AtomicU64::new(0),
             auth_fail_invalid_credentials: AtomicU64::new(0),
             auth_fail_expired: AtomicU64::new(0),
@@ -366,12 +439,44 @@ impl Metrics {
         self.dtls_readiness.store(r as u8, Ordering::SeqCst);
     }
 
+    /// #6/#4.5: set management-plane readiness (see the field docs). Distinct
+    /// from the dataplane `readiness` flag; does not affect `/ready` for the TURN
+    /// dataplane.
+    pub fn set_management_readiness(&self, r: Readiness) {
+        self.management_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
     pub fn readiness(&self) -> Readiness {
         Readiness::from_u8(self.readiness.load(Ordering::SeqCst))
     }
 
     pub fn is_ready(&self) -> bool {
         self.readiness() == Readiness::Ready
+    }
+
+    /// P0.5 derived-readiness input: mark/clear in-memory↔backend divergence.
+    pub fn set_backend_diverged(&self, val: bool) {
+        self.backend_diverged.store(val, Ordering::SeqCst);
+    }
+
+    pub fn backend_diverged(&self) -> bool {
+        self.backend_diverged.load(Ordering::SeqCst)
+    }
+
+    /// P0.5 derived readiness: recompute process readiness from its inputs rather
+    /// than assigning it imperatively. Drain (operator intent) wins, then an active
+    /// backend divergence (Degraded), else Ready. Never yields `Starting`, so call
+    /// it only after boot has brought the traffic path up; boot itself still sets
+    /// `Starting`/`Ready` explicitly.
+    pub fn refresh_readiness(&self) {
+        let r = if self.is_draining() {
+            Readiness::Draining
+        } else if self.backend_diverged() {
+            Readiness::Degraded
+        } else {
+            Readiness::Ready
+        };
+        self.readiness.store(r as u8, Ordering::SeqCst);
     }
 
     /// Record one allocation for a tenant (multi-tenancy observability).
@@ -426,7 +531,106 @@ impl Metrics {
         )
     }
 
-    /// Render the experimental-transport (QUIC/WebTransport + DTLS) counters,
+    /// Command-log and runtime-management counters/gauges. Labels are avoided
+    /// so arbitrary node/user identities cannot create unbounded cardinality.
+    fn render_command_log_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_command_log_gc_deleted_commands_total Command rows deleted by GC\n\
+             # TYPE turna_command_log_gc_deleted_commands_total counter\n\
+             turna_command_log_gc_deleted_commands_total {}\n\
+             # HELP turna_command_log_gc_deleted_idempotency_total Idempotency records deleted by GC\n\
+             # TYPE turna_command_log_gc_deleted_idempotency_total counter\n\
+             turna_command_log_gc_deleted_idempotency_total {}\n\
+             # HELP turna_command_log_gc_errors_total Failed command-log GC sweeps\n\
+             # TYPE turna_command_log_gc_errors_total counter\n\
+             turna_command_log_gc_errors_total {}\n\
+             # HELP turna_command_log_terminal_remaining Terminal command rows present after the last sweep\n\
+             # TYPE turna_command_log_terminal_remaining gauge\n\
+             turna_command_log_terminal_remaining {}\n\
+             # HELP turna_command_log_oldest_unfinished_ms Age of the oldest non-terminal command\n\
+             # TYPE turna_command_log_oldest_unfinished_ms gauge\n\
+             turna_command_log_oldest_unfinished_ms {}\n\
+             # HELP turna_command_log_idempotency_lookup_errors_total Idempotency lookup errors\n\
+             # TYPE turna_command_log_idempotency_lookup_errors_total counter\n\
+             turna_command_log_idempotency_lookup_errors_total {}\n\
+             # HELP turna_command_log_migration_processed_total Legacy command rows normalized by bounded migration\n\
+             # TYPE turna_command_log_migration_processed_total counter\n\
+             turna_command_log_migration_processed_total {}\n\
+             # HELP turna_command_log_migration_errors_total Command-log migration backend errors\n\
+             # TYPE turna_command_log_migration_errors_total counter\n\
+             turna_command_log_migration_errors_total {}\n\
+             # HELP turna_command_log_migration_completed Command-log migration completion marker\n\
+             # TYPE turna_command_log_migration_completed gauge\n\
+             turna_command_log_migration_completed {}\n\
+             # HELP turna_management_commands_accepted_total Durable management commands accepted\n\
+             # TYPE turna_management_commands_accepted_total counter\n\
+             turna_management_commands_accepted_total {}\n\
+             # HELP turna_config_update_applied_total Runtime config updates applied\n\
+             # TYPE turna_config_update_applied_total counter\n\
+             turna_config_update_applied_total {}\n\
+             # HELP turna_config_update_noop_total Runtime config no-op updates\n\
+             # TYPE turna_config_update_noop_total counter\n\
+             turna_config_update_noop_total {}\n\
+             # HELP turna_config_update_conflicts_total Runtime config version conflicts\n\
+             # TYPE turna_config_update_conflicts_total counter\n\
+             turna_config_update_conflicts_total {}\n\
+             # HELP turna_config_update_failures_total Runtime config update failures\n\
+             # TYPE turna_config_update_failures_total counter\n\
+             turna_config_update_failures_total {}\n\
+             # HELP turna_config_update_rollback_total Runtime config rollbacks\n\
+             # TYPE turna_config_update_rollback_total counter\n\
+             turna_config_update_rollback_total {}\n\
+             # HELP turna_config_observed_version Current local observed config version\n\
+             # TYPE turna_config_observed_version gauge\n\
+             turna_config_observed_version {}\n\
+             # HELP turna_config_desired_observed_mismatch Desired/observed mismatch count\n\
+             # TYPE turna_config_desired_observed_mismatch gauge\n\
+             turna_config_desired_observed_mismatch {}\n\
+             # HELP turna_config_oldest_unapplied_ms Age of oldest unapplied desired config\n\
+             # TYPE turna_config_oldest_unapplied_ms gauge\n\
+             turna_config_oldest_unapplied_ms {}\n\
+             # HELP turna_user_limits_applied_total User-limit updates applied\n\
+             # TYPE turna_user_limits_applied_total counter\n\
+             turna_user_limits_applied_total {}\n\
+             # HELP turna_user_limits_noop_total User-limit no-op updates\n\
+             # TYPE turna_user_limits_noop_total counter\n\
+             turna_user_limits_noop_total {}\n\
+             # HELP turna_user_limits_conflicts_total User-limit version conflicts\n\
+             # TYPE turna_user_limits_conflicts_total counter\n\
+             turna_user_limits_conflicts_total {}\n\
+             # HELP turna_user_limits_failures_total User-limit update failures\n\
+             # TYPE turna_user_limits_failures_total counter\n\
+             turna_user_limits_failures_total {}\n\
+             # HELP turna_user_limits_over_limit_subjects Subjects currently above their allocation limit\n\
+             # TYPE turna_user_limits_over_limit_subjects gauge\n\
+             turna_user_limits_over_limit_subjects {}\n",
+            l(&self.command_log_gc_deleted_commands_total),
+            l(&self.command_log_gc_deleted_idempotency_total),
+            l(&self.command_log_gc_errors_total),
+            l(&self.command_log_terminal_remaining),
+            l(&self.command_log_oldest_unfinished_ms),
+            l(&self.command_log_idempotency_lookup_errors_total),
+            l(&self.command_log_migration_processed_total),
+            l(&self.command_log_migration_errors_total),
+            l(&self.command_log_migration_completed),
+            l(&self.management_commands_accepted_total),
+            l(&self.config_update_applied_total),
+            l(&self.config_update_noop_total),
+            l(&self.config_update_conflicts_total),
+            l(&self.config_update_failures_total),
+            l(&self.config_update_rollback_total),
+            l(&self.config_observed_version),
+            l(&self.config_desired_observed_mismatch),
+            l(&self.config_oldest_unapplied_ms),
+            l(&self.user_limits_applied_total),
+            l(&self.user_limits_noop_total),
+            l(&self.user_limits_conflicts_total),
+            l(&self.user_limits_failures_total),
+            l(&self.user_limits_over_limit_subjects),
+        )
+    }
+
     /// mirrored from the transport layer by the node's periodic copy task. All
     /// zero unless the corresponding transport is enabled and built in.
     fn render_transport_metrics(&self) -> String {
@@ -566,7 +770,10 @@ impl Metrics {
              turna_transport_readiness {}\n\
              # HELP turna_dtls_readiness DTLS listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if DTLS disabled)\n\
              # TYPE turna_dtls_readiness gauge\n\
-             turna_dtls_readiness {}\n",
+             turna_dtls_readiness {}\n\
+             # HELP turna_management_readiness Management-plane readiness incl. command-log migration (0=starting,1=ready,2=degraded,3=draining)\n\
+             # TYPE turna_management_readiness gauge\n\
+             turna_management_readiness {}\n",
             l(&self.quic_active),
             l(&self.quic_sessions_total),
             l(&self.quic_closed_total),
@@ -612,6 +819,7 @@ impl Metrics {
             self.readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.transport_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
         )
     }
 }
@@ -1081,6 +1289,7 @@ pub async fn serve_with_cluster_routes(
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
                     body.push_str(&m.render_transport_metrics());
+                    body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());
                     if let Some(provider) = &relay_routes {
                         body.push_str(&render_relay_route_metrics(&provider()));
@@ -1198,5 +1407,39 @@ mod metrics_format_regression {
             );
         }
         assert!(body.contains("turna_auth_failures_by_reason_total{reason=\"integrity_failed\"}"));
+    }
+
+    #[test]
+    fn derived_readiness_undrain_does_not_clobber_divergence() {
+        // P0.5 / review L: with derived readiness, an undrain must not force Ready
+        // while a backend divergence is still active.
+        let m = Metrics::new();
+        // Post-boot baseline.
+        m.set_readiness(Readiness::Ready);
+
+        // A divergence appears (writer drops seen).
+        m.set_backend_diverged(true);
+        m.refresh_readiness();
+        assert_eq!(m.readiness(), Readiness::Degraded);
+
+        // Operator drains — drain (intent) wins over divergence.
+        m.set_draining(true);
+        m.refresh_readiness();
+        assert_eq!(m.readiness(), Readiness::Draining);
+
+        // Operator undrains while still diverged — must fall back to Degraded,
+        // NOT Ready (the old imperative path could clobber this).
+        m.set_draining(false);
+        m.refresh_readiness();
+        assert_eq!(
+            m.readiness(),
+            Readiness::Degraded,
+            "undrain must not mask an active divergence"
+        );
+
+        // Reconcile confirms consistency — only now Ready.
+        m.set_backend_diverged(false);
+        m.refresh_readiness();
+        assert_eq!(m.readiness(), Readiness::Ready);
     }
 }

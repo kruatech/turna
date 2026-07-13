@@ -8,6 +8,7 @@ edition.workspace = true
 default = []
 io-uring = ["turna-transport/io-uring"]
 tls = ["turna-transport/tls"]
+sctp = ["turna-transport/sctp"]
 
 [dependencies]
 libc = "0.2"

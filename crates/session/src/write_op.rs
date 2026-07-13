@@ -58,6 +58,8 @@ pub enum WriteOp {
         client_addr: SocketAddr,
         relay_addr: SocketAddr,
         username: String,
+        /// Authenticated namespace; persisted for S5 restore and failover.
+        realm: String,
         created_at_ms: u64,
         expires_at_ms: u64,
         /// RFC 8016 stable allocation identity, persisted so a MOBILITY-TICKET
@@ -107,6 +109,14 @@ pub enum WriteOp {
         peer_addr: SocketAddr,
         expires_at_ms: u64,
     },
+
+    /// A reconcile ordering barrier (P0.1). Not a durable side-effect: it
+    /// carries a monotonic `generation` that the writer publishes to its
+    /// reconcile-ack *after* flushing every op enqueued before it to the
+    /// backend. Because it travels the same FIFO channel as the data ops, it
+    /// lets a reconcile pass await real backend catch-up rather than mere queue
+    /// acceptance. The writer intercepts it before any per-port coalescing.
+    Barrier { generation: u64 },
 }
 
 impl WriteOp {
@@ -121,6 +131,9 @@ impl WriteOp {
             | WriteOp::ReKey { relay_port, .. }
             | WriteOp::Permission { relay_port, .. }
             | WriteOp::Channel { relay_port, .. } => *relay_port,
+            // A barrier owns no relay port; it is intercepted before coalescing,
+            // so this sentinel is never actually observed by the batcher.
+            WriteOp::Barrier { .. } => 0,
         }
     }
 }

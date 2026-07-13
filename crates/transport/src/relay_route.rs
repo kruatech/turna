@@ -403,12 +403,10 @@ mod tests {
                         // so route_send returns SelfOwned, never Forward. Guard anyway:
                         w1_reforwards_c.fetch_add(1, Ordering::Relaxed);
                     }
-                    match classify_owned_command(owned.get(&relay_port), &allocation_id, generation)
+                    if let OwnedSendOutcome::Send =
+                        classify_owned_command(owned.get(&relay_port), &allocation_id, generation)
                     {
-                        OwnedSendOutcome::Send => {
-                            w1_sends_c.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {}
+                        w1_sends_c.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }

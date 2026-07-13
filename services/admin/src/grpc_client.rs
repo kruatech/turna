@@ -18,8 +18,9 @@ pub mod proto {
 }
 use proto::{
     turna_management_client::TurnaManagementClient, AddUserRequest, DeleteAllocationRequest,
-    GetServerStatsRequest, ListAllocationsRequest, RemoveUserRequest, SetDrainingRequest,
-    SetUserLimitsRequest,
+    GetConfigRequest, GetServerStatsRequest, LimitMode, ListAllocationsRequest, RemoveUserRequest,
+    SetDrainingRequest, SetUserLimitsRequest, UInt32Limit, UInt64Limit, UpdateConfigRequest,
+    UserLimitScope, UserLimitTarget, UserLimitsPatch,
 };
 
 /// Optional mTLS material (all three paths required together).
@@ -68,20 +69,103 @@ pub async fn build_channel(addr: &str, tls: Option<&AdminTlsConfig>) -> Result<C
                 ClientTlsConfig::new()
             }
         };
-        endpoint
-            .tls_config(tls_cfg)?
-            .connect()
-            .await
-            .context("connect to control-plane with TLS")?
+        endpoint.tls_config(tls_cfg)?.connect_lazy()
     } else {
-        // plaintext
-        endpoint
-            .connect()
-            .await
-            .context("connect to control-plane (plaintext)")?
+        // Lazy plaintext channel: the admin container can start and serve its
+        // own health/static assets while the control-plane is temporarily down.
+        // Individual management requests still fail explicitly at dispatch.
+        endpoint.connect_lazy()
     };
 
     Ok(channel)
+}
+
+fn required_str<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    params[key]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing {key}"))
+}
+
+fn limit_mode(value: &serde_json::Value) -> Result<i32> {
+    let mode = match value["mode"].as_str().unwrap_or("inherit") {
+        "inherit" => LimitMode::Inherit,
+        "value" => LimitMode::Value,
+        "unlimited" => LimitMode::Unlimited,
+        "disabled" => LimitMode::Disabled,
+        other => bail!("invalid limit mode {other:?}"),
+    };
+    Ok(mode as i32)
+}
+
+fn optional_u32(params: &serde_json::Value, key: &str) -> Result<Option<u32>> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("{key} must be an unsigned integer"))?;
+    let parsed = u32::try_from(raw).map_err(|_| anyhow::anyhow!("{key} exceeds u32::MAX"))?;
+    Ok(Some(parsed))
+}
+
+fn required_u64(params: &serde_json::Value, key: &str) -> Result<u64> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid {key}"))
+}
+
+fn u32_limit(params: &serde_json::Value, key: &str) -> Result<Option<UInt32Limit>> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let mode = limit_mode(value)?;
+    let raw = value
+        .get("value")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let parsed = u32::try_from(raw).map_err(|_| anyhow::anyhow!("{key}.value exceeds u32::MAX"))?;
+    Ok(Some(UInt32Limit {
+        mode,
+        value: parsed,
+    }))
+}
+
+fn u64_limit(params: &serde_json::Value, key: &str) -> Result<Option<UInt64Limit>> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let mode = limit_mode(value)?;
+    let parsed = value
+        .get("value")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Ok(Some(UInt64Limit {
+        mode,
+        value: parsed,
+    }))
+}
+
+fn snapshot_json(snapshot: Option<proto::RuntimeConfigSnapshot>) -> serde_json::Value {
+    match snapshot {
+        Some(value) => serde_json::json!({
+            "version": value.version,
+            "max_allocations": value.max_allocations,
+            "max_allocations_per_user": value.max_allocations_per_user,
+            "max_bytes_per_sec_per_allocation": value.max_bytes_per_sec_per_allocation,
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// Dispatch a JSON command to the correct gRPC RPC.
@@ -105,15 +189,32 @@ pub async fn dispatch(
             }))
         }
         "node.drain" => {
+            // The command routes to a specific node via the command log, so a
+            // node_id is required (an empty one is rejected server-side). An
+            // optional idempotency_key lets a retried drain dedup (P0.3).
+            let node_id = params["node_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing node_id — which node to drain"))?;
             let r = c
-                .set_draining(SetDrainingRequest { draining: true })
+                .set_draining(SetDrainingRequest {
+                    draining: true,
+                    node_id: node_id.into(),
+                    idempotency_key: params["idempotency_key"].as_str().unwrap_or("").into(),
+                })
                 .await?
                 .into_inner();
             Ok(serde_json::json!({ "ok": r.success, "active_allocations": r.active_allocations }))
         }
         "node.undrain" => {
+            let node_id = params["node_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing node_id — which node to undrain"))?;
             let r = c
-                .set_draining(SetDrainingRequest { draining: false })
+                .set_draining(SetDrainingRequest {
+                    draining: false,
+                    node_id: node_id.into(),
+                    idempotency_key: params["idempotency_key"].as_str().unwrap_or("").into(),
+                })
                 .await?
                 .into_inner();
             Ok(serde_json::json!({ "ok": r.success, "active_allocations": r.active_allocations }))
@@ -198,6 +299,7 @@ pub async fn dispatch(
                         .as_str()
                         .unwrap_or("killed via turna-admin")
                         .into(),
+                    idempotency_key: params["idempotency_key"].as_str().unwrap_or("").into(),
                 })
                 .await?
                 .into_inner();
@@ -234,19 +336,57 @@ pub async fn dispatch(
             Ok(serde_json::json!({ "ok": r.success, "allocations_deleted": r.allocations_deleted }))
         }
         "users.set_limits" => {
+            let scope = match params["scope"].as_str().unwrap_or("user") {
+                "global" => UserLimitScope::Global,
+                "tenant" => UserLimitScope::Tenant,
+                "user" => UserLimitScope::User,
+                other => bail!("invalid user-limit scope {other:?}"),
+            };
             let r = c
                 .set_user_limits(SetUserLimitsRequest {
-                    username: params["username"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("missing username"))?
-                        .into(),
-                    max_allocations: params["max_allocations"].as_u64().unwrap_or(0) as u32,
-                    max_bandwidth_bps: params["max_bandwidth_bps"].as_u64().unwrap_or(0),
-                    max_lifetime: params["max_lifetime"].as_u64().unwrap_or(0) as u32,
+                    node_id: required_str(params, "node_id")?.into(),
+                    target: Some(UserLimitTarget {
+                        scope: scope as i32,
+                        tenant: params["tenant"].as_str().unwrap_or("").into(),
+                        realm: params["realm"].as_str().unwrap_or("").into(),
+                        username: params["username"].as_str().unwrap_or("").into(),
+                    }),
+                    idempotency_key: required_str(params, "idempotency_key")?.into(),
+                    expected_version: required_u64(params, "expected_version")?,
+                    patch: Some(UserLimitsPatch {
+                        max_allocations: u32_limit(params, "max_allocations")?,
+                        max_bytes_per_sec_per_allocation: u64_limit(
+                            params,
+                            "max_bytes_per_sec_per_allocation",
+                        )?,
+                        max_lifetime_secs: u32_limit(params, "max_lifetime_secs")?,
+                    }),
+                    reason: params["reason"].as_str().unwrap_or("").into(),
                 })
                 .await?
                 .into_inner();
-            Ok(serde_json::json!({ "ok": r.success }))
+            let effective = r.effective.map(|value| {
+                serde_json::json!({
+                    "max_allocations": value.max_allocations,
+                    "max_bytes_per_sec_per_allocation": value.max_bytes_per_sec_per_allocation,
+                    "max_lifetime_secs": value.max_lifetime_secs,
+                    "allocations_disabled": value.allocations_disabled,
+                    "bandwidth_disabled": value.bandwidth_disabled,
+                    "lifetime_disabled": value.lifetime_disabled,
+                    "inherited_fields": value.inherited_fields,
+                    "capped_fields": value.capped_fields,
+                })
+            });
+            Ok(serde_json::json!({
+                "request_id": r.request_id,
+                "previous_version": r.previous_version,
+                "observed_version": r.observed_version,
+                "effective": effective,
+                "max_user_allocations_in_scope": r.max_user_allocations_in_scope,
+                "max_user_allocations_above_limit": r.max_user_allocations_above_limit,
+                "terminal_status": r.terminal_status,
+                "error": r.error,
+            }))
         }
         "server.stats" => {
             let r = c
@@ -263,29 +403,56 @@ pub async fn dispatch(
             }))
         }
         "config.get" => {
-            let r = c.get_config(proto::GetConfigRequest {}).await?.into_inner();
+            let r = c
+                .get_config(GetConfigRequest {
+                    node_id: required_str(params, "node_id")?.into(),
+                })
+                .await?
+                .into_inner();
             Ok(serde_json::json!({
-                "realm": r.realm, "min_port": r.min_port, "max_port": r.max_port,
-                "default_lifetime": r.default_lifetime, "max_lifetime": r.max_lifetime,
-                "max_allocations_per_user": r.max_allocations_per_user,
-                "max_bandwidth_per_user_bps": r.max_bandwidth_per_user_bps,
-                "draining": r.draining, "external_ipv4": r.external_ipv4,
-                "external_ipv6": r.external_ipv6,
+                "node_id": r.node_id,
+                "desired_version": r.desired_version,
+                "observed_version": r.observed_version,
+                "observed": snapshot_json(r.observed),
+                "pending_desired": snapshot_json(r.pending_desired),
+                "status": r.status,
+                "last_apply_error": r.last_apply_error,
+                "updated_at_ms": r.updated_at_ms,
             }))
         }
         "config.update" => {
             let r = c
-                .update_config(proto::UpdateConfigRequest {
-                    max_lifetime: params["max_lifetime"].as_u64().map(|v| v as u32),
-                    max_allocations_per_user: params["max_allocations_per_user"]
-                        .as_u64()
-                        .map(|v| v as u32),
-                    max_bandwidth_per_user_bps: params["max_bandwidth_per_user_bps"].as_u64(),
-                    draining: params["draining"].as_bool(),
+                .update_config(UpdateConfigRequest {
+                    node_id: required_str(params, "node_id")?.into(),
+                    idempotency_key: required_str(params, "idempotency_key")?.into(),
+                    expected_version: required_u64(params, "expected_version")?,
+                    max_allocations: optional_u32(params, "max_allocations")?,
+                    max_allocations_per_user: optional_u32(params, "max_allocations_per_user")?,
+                    max_bytes_per_sec_per_allocation: params
+                        .get("max_bytes_per_sec_per_allocation")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            value.as_u64().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "max_bytes_per_sec_per_allocation must be an unsigned integer"
+                                )
+                            })
+                        })
+                        .transpose()?,
+                    reason: params["reason"].as_str().unwrap_or("").into(),
                 })
                 .await?
                 .into_inner();
-            Ok(serde_json::json!({ "ok": r.success, "warnings": r.warnings }))
+            Ok(serde_json::json!({
+                "request_id": r.request_id,
+                "previous_version": r.previous_version,
+                "observed_version": r.observed_version,
+                "changed": r.changed,
+                "applied": snapshot_json(r.applied),
+                "terminal_status": r.terminal_status,
+                "error": r.error,
+                "rolled_back": r.rolled_back,
+            }))
         }
         "top_talkers" => {
             let r = c

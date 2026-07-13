@@ -3,7 +3,7 @@ name = "turna-admin"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Admin panel bridge for turna — read-only monitoring (stage 1) + gRPC mutate (stage 2)."
+description = "Admin panel bridge for turna monitoring and authenticated gRPC management."
 
 [[bin]]
 name = "turna-admin"
@@ -19,7 +19,7 @@ tower-http  = { version = "0.6", features = ["fs", "trace"] }
 # HTTP upstream client (read-only: /status /metrics /health /ready /cluster)
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# gRPC client to control-plane (stage 2)
+# gRPC client to the control plane
 tonic       = { version = "0.11", features = ["tls", "tls-roots"] }
 prost       = "0.12"
 

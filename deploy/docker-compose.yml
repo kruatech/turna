@@ -19,9 +19,12 @@ services:
       - "3478:3478/tcp"
       - "5349:5349/tcp"
       - "9090:9090/tcp"
-      # Relay ports for local/dev tests. Keep this range in sync with
-      # deploy/turn.toml [turn.relay] when you narrow it for testing.
-      - "49152-50152:49152-50152/udp"
+      # Relay ports. This published range MUST equal [turn.relay]
+      # min_port..max_port in deploy/turn.toml (the config this compose
+      # mounts): an allocation handed out on an unpublished port succeeds at
+      # Allocate but its relay traffic is silently dropped (P0 #13). Narrow
+      # BOTH together for a smaller dev window.
+      - "49152-65535:49152-65535/udp"
     environment:
       RUST_LOG: "info,turna=debug"
       TURNA_WORKERS: "0" # 0 = auto-detect

@@ -335,6 +335,7 @@ mod tests {
     fn live_hb(node_id: &str) -> NodeHeartbeat {
         NodeHeartbeat {
             node_id: node_id.into(),
+            incarnation: "test-incarnation".into(),
             addr: "10.0.0.1:3478".into(),
             active_allocations: 0,
             total_bandwidth_bps: 0,

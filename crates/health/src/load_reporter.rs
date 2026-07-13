@@ -18,7 +18,7 @@ use tracing::{debug, info};
 pub struct LoadReporterConfig {
     pub collect_interval: Duration,
     pub max_allocations: u32,
-    pub max_bandwidth_bps: u64,
+    pub max_aggregate_bandwidth_bps: u64,
     pub relay_port_range: (u16, u16),
 }
 
@@ -27,7 +27,7 @@ impl Default for LoadReporterConfig {
         Self {
             collect_interval: Duration::from_secs(5),
             max_allocations: 50_000,
-            max_bandwidth_bps: 10_000_000_000,
+            max_aggregate_bandwidth_bps: 10_000_000_000,
             relay_port_range: (49152, 65535),
         }
     }
@@ -44,7 +44,7 @@ pub struct NodeLoad {
     pub max_allocations: u32,
     pub allocation_percent: f64,
     pub bandwidth_bps: u64,
-    pub max_bandwidth_bps: u64,
+    pub max_aggregate_bandwidth_bps: u64,
     pub bandwidth_percent: f64,
     pub ports_used: u32,
     pub ports_total: u32,
@@ -127,7 +127,7 @@ impl LoadReporter {
             max_allocations: config.max_allocations,
             allocation_percent: 0.0,
             bandwidth_bps: 0,
-            max_bandwidth_bps: config.max_bandwidth_bps,
+            max_aggregate_bandwidth_bps: config.max_aggregate_bandwidth_bps,
             bandwidth_percent: 0.0,
             ports_used: 0,
             ports_total,
@@ -174,8 +174,8 @@ impl LoadReporter {
                 0.0
             };
 
-            let bw_pct = if self.config.max_bandwidth_bps > 0 {
-                bw_bps as f64 / self.config.max_bandwidth_bps as f64 * 100.0
+            let bw_pct = if self.config.max_aggregate_bandwidth_bps > 0 {
+                bw_bps as f64 / self.config.max_aggregate_bandwidth_bps as f64 * 100.0
             } else {
                 0.0
             };
@@ -194,7 +194,7 @@ impl LoadReporter {
                 max_allocations: self.config.max_allocations,
                 allocation_percent: alloc_pct,
                 bandwidth_bps: bw_bps,
-                max_bandwidth_bps: self.config.max_bandwidth_bps,
+                max_aggregate_bandwidth_bps: self.config.max_aggregate_bandwidth_bps,
                 bandwidth_percent: bw_pct,
                 ports_used: ports,
                 ports_total,

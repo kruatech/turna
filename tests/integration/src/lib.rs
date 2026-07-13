@@ -152,6 +152,7 @@ fn boot_node() -> Result<(SocketAddr, std::process::Child), String> {
          [turn.relay]\n\
          min_port = 49152\n\
          max_port = 49500\n\
+         max_allocations = 256\n\
          [health]\n\
          listen = \"127.0.0.1:{health_port}\"\n"
     );

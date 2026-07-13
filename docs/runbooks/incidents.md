@@ -104,3 +104,25 @@ auth, malformed STUN, forbidden peers, over-quota) — the alert flags *volume*.
 The gRPC control plane force-killed streams.
 - Check: control-plane logs; client behaviour.
 - Do: usually a misbehaving control client; investigate the caller.
+
+
+## Runtime management
+
+### TurnaRuntimeConfigMismatch (`turna_config_desired_observed_mismatch > 0`)
+A desired runtime snapshot has not reached observed state.
+- Check `GetConfig(node_id)` for desired/observed versions, status, and last error.
+- Check Tarantool connectivity and node command-consumer logs.
+- Do not restart into bootstrap defaults: startup intentionally remains not ready
+  when durable state cannot be loaded.
+
+### TurnaRuntimeConfigStuck (`turna_config_oldest_unapplied_ms > 300000`)
+A desired config has remained unapplied for more than five minutes.
+- Verify the target node heartbeat/incarnation is live and the command is not
+  fenced to an old process.
+- Retry only with the same idempotency key when recovering a lost response; a
+  new operator intent must use a new key and current observed version.
+
+### TurnaCommandLogMigrationErrors
+`increase(turna_command_log_migration_errors_total[10m]) > 0` means a bounded
+migration CALL failed. Restore Tarantool connectivity and let the control plane
+resume from the durable cursor; do not run an unbounded manual full-log scan.

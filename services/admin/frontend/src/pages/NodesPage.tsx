@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { Card } from '../ui/Card'
 import { Badge } from '../ui/Badge'
 import { MiniChart } from '../ui/MiniChart'
@@ -19,7 +19,7 @@ function readinessInfo(v: number | undefined): { kind: Status; label: string } {
   }
 }
 
-export function NodesPage({ status, metrics, history, frozen }: PanelProps) {
+export function NodesPage({ status, metrics, history, frozen, clusterNodes = [] }: PanelProps) {
   const { t, lang } = useI18n()
   const [draining, setDraining]   = useState(false)
   const [toast, setToast]         = useState<{ msg: string; ok: boolean } | null>(null)
@@ -29,31 +29,62 @@ export function NodesPage({ status, metrics, history, frozen }: PanelProps) {
     setTimeout(() => setToast(null), 2500)
   }
 
+  // High-assurance idempotency: one stable key per drain/undrain INTENT, reused
+  // across retries (a network-timeout retry must dedup, not create a second
+  // command) and cleared on success so the next toggle gets a fresh key.
+  // Required when the backend runs with TURNA_REQUIRE_IDEMPOTENCY_KEY=true.
+  const drainKey = useRef<string>('')
+  const undrainKey = useRef<string>('')
+  const newKey = () =>
+    (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+  // node.drain / node.undrain target a node by id; resolve "this" node from the
+  // cluster list (is_self, or the sole node), falling back to a node_id the
+  // status endpoint may carry. An empty id is rejected server-side, so the
+  // actions no-op with an error toast until one is known.
+  const selfNode = clusterNodes.find(n => n.is_self)
+    ?? (clusterNodes.length === 1 ? clusterNodes[0] : undefined)
+  // `status` may carry a node_id the typed `NodeStatus` doesn't declare; read it
+  // via one narrow cast to an unknown-valued field, then narrow by typeof (avoids
+  // an over-aggressive `status as { node_id: string }` cast TS rejects).
+  const statusMaybe = status as { node_id?: unknown } | null | undefined
+  const statusNodeId =
+    typeof statusMaybe?.node_id === 'string' ? statusMaybe.node_id : undefined
+  const selfNodeId = selfNode?.node_id ?? statusNodeId
+
   const doDrain = useCallback(async () => {
+    if (!selfNodeId) { showToast(t('nodes.actionError'), false); return }
     if (!confirm(t('nodes.drainConfirm'))) return
+    if (!drainKey.current) drainKey.current = newKey()
     setDraining(true)
     try {
-      await api.manage.nodeDrain()
+      await api.manage.nodeDrain(selfNodeId, drainKey.current)
       showToast(t('nodes.drainSuccess'), true)
-    } catch { showToast(t('nodes.actionError'), false) }
+      drainKey.current = '' // intent complete
+    } catch { showToast(t('nodes.actionError'), false) } // keep key for retry
     finally { setDraining(false) }
-  }, [t])
+  }, [t, selfNodeId])
 
   const doUndrain = useCallback(async () => {
+    if (!selfNodeId) { showToast(t('nodes.actionError'), false); return }
     if (!confirm(t('nodes.undrainConfirm'))) return
+    if (!undrainKey.current) undrainKey.current = newKey()
     setDraining(true)
     try {
-      await api.manage.nodeUndrain()
+      await api.manage.nodeUndrain(selfNodeId, undrainKey.current)
       showToast(t('nodes.undrainSuccess'), true)
-    } catch { showToast(t('nodes.actionError'), false) }
+      undrainKey.current = '' // intent complete
+    } catch { showToast(t('nodes.actionError'), false) } // keep key for retry
     finally { setDraining(false) }
-  }, [t])
+  }, [t, selfNodeId])
 
   if (!status) return <div className="flex items-center justify-center h-48 text-[--muted]">{t('ov.waiting')}</div>
 
   const r            = readinessInfo(metric(metrics, 'turna_backend_readiness'))
-  const clusterNodes = metricOr(metrics, 'turna_cluster_nodes', 0)
-  const isCluster    = clusterNodes > 1
+  const clusterNodeCount = metricOr(metrics, 'turna_cluster_nodes', 0)
+  const isCluster        = clusterNodeCount > 1
   const bps          = rateSeries(history, s => s.bytes_sent + s.bytes_received)
   const activ        = statusSeries(history, s => s.active_allocations)
   const authH        = rateSeries(history, s => s.auth_failures)
@@ -85,7 +116,7 @@ export function NodesPage({ status, metrics, history, frozen }: PanelProps) {
             <div>
               <div className="text-xl font-bold text-[--ink]">turna-node</div>
               <div className="font-mono text-xs text-[--muted] mt-0.5">
-                {isCluster ? `${t('nodes.clusterNodes')}: ${clusterNodes}` : t('nodes.standalone')}
+                {isCluster ? `${t('nodes.clusterNodes')}: ${clusterNodeCount}` : t('nodes.standalone')}
               </div>
             </div>
           </div>
@@ -95,7 +126,7 @@ export function NodesPage({ status, metrics, history, frozen }: PanelProps) {
             <Badge kind={r.kind} label={r.label} />
             {isCluster && (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-400/10 px-2.5 py-1 text-xs font-medium font-mono text-sky-400 ring-1 ring-sky-400/25">
-                {clusterNodes} {t('nodes.clusterNodes').toLowerCase()}
+                {clusterNodeCount} {t('nodes.clusterNodes').toLowerCase()}
               </span>
             )}
 
@@ -126,7 +157,7 @@ export function NodesPage({ status, metrics, history, frozen }: PanelProps) {
           <Kv label={t('nodes.uptime')}       value={formatDuration(status.uptime_secs, lang)} />
           <Kv label={t('nodes.status')}       value={status.status} />
           <Kv label={t('nodes.draining')}     value={status.draining ? '✓' : t('nodes.notDraining')} />
-          <Kv label={t('nodes.clusterNodes')} value={String(clusterNodes)} />
+          <Kv label={t('nodes.clusterNodes')} value={String(clusterNodeCount)} />
         </div>
       </div>
 
