@@ -22,9 +22,9 @@ dependencies = [
 
 [[package]]
 name = "bytes"
-version = "1.11.1"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
@@ -249,6 +249,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -303,19 +314,20 @@ dependencies = [
 
 [[package]]
 name = "turna-proto-stun"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "crc",
  "hmac",
  "rand",
  "sha1",
+ "sha2",
  "thiserror",
 ]
 
 [[package]]
 name = "turna-proto-turn"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
  "turna-proto-stun",
