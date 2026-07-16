@@ -4402,7 +4402,7 @@ dependencies = [
 
 [[package]]
 name = "turna-auth"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -4423,7 +4423,7 @@ dependencies = [
 
 [[package]]
 name = "turna-benchmark"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "rand 0.8.6",
  "tokio",
@@ -4433,7 +4433,7 @@ dependencies = [
 
 [[package]]
 name = "turna-cluster"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "hmac",
  "serde",
@@ -4446,7 +4446,7 @@ dependencies = [
 
 [[package]]
 name = "turna-common"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "turna-config"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4467,7 +4467,7 @@ dependencies = [
 
 [[package]]
 name = "turna-control"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -4491,7 +4491,7 @@ dependencies = [
 
 [[package]]
 name = "turna-control-plane"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -4505,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "turna-crypto"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -4518,7 +4518,7 @@ dependencies = [
 
 [[package]]
 name = "turna-diff-test"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "clap",
  "serde",
@@ -4532,14 +4532,14 @@ dependencies = [
 
 [[package]]
 name = "turna-garbage-gen"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "turna-health"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4550,7 +4550,7 @@ dependencies = [
 
 [[package]]
 name = "turna-integration-tests"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -4568,7 +4568,7 @@ dependencies = [
 
 [[package]]
 name = "turna-load-test"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "clap",
  "hmac",
@@ -4583,7 +4583,7 @@ dependencies = [
 
 [[package]]
 name = "turna-management"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -4595,7 +4595,7 @@ dependencies = [
 
 [[package]]
 name = "turna-node"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "hostname",
  "parking_lot",
@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "turna-observability"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "hostname",
  "opentelemetry",
@@ -4632,21 +4632,21 @@ dependencies = [
 
 [[package]]
 name = "turna-packet"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "turna-proto-rtp"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "turna-proto-stun"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "crc",
@@ -4661,7 +4661,7 @@ dependencies = [
 
 [[package]]
 name = "turna-proto-turn"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.18",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "turna-qos"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "dashmap",
  "loom",
@@ -4681,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "turna-relay"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -4706,7 +4706,7 @@ dependencies = [
 
 [[package]]
 name = "turna-rtp-analyzer"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "dashmap",
  "tracing",
@@ -4715,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "turna-session"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "dashmap",
@@ -4728,7 +4728,7 @@ dependencies = [
 
 [[package]]
 name = "turna-soak"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "tokio",
@@ -4741,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "turna-state-backend"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "dashmap",
@@ -4756,7 +4756,7 @@ dependencies = [
 
 [[package]]
 name = "turna-transport"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4786,7 +4786,7 @@ dependencies = [
 
 [[package]]
 name = "turnactl"
-version = "0.3.0-rc.2"
+version = "0.3.0"
 dependencies = [
  "prost 0.14.4",
  "serde",
