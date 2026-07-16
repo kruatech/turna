@@ -20,17 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      # CI runs on stable. NOTE: `toolchain: stable` overrides rust-toolchain.toml
-      # (pinned 1.95.0), so the pinned channel is the local/reproducible-build
-      # toolchain and is NOT what CI uses. MSRV against 1.95.0 is not enforced
-      # here — add a dedicated job if that guarantee is required.
+      # Use the repository's pinned release toolchain for deterministic fmt,
+      # Clippy, build and test results. A floating `stable` changed rustfmt/lint
+      # behaviour independently of the source revision and broke otherwise
+      # reproducible CI.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   msrv:
     name: msrv (pinned 1.95.0)
@@ -58,19 +58,26 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --workspace
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libclang-dev pkg-config protobuf-compiler
+      - run: cargo build --workspace --locked
       - name: cargo test workspace
         env:
           TURNA_TEST_REQUIRE_SERVER: "1"
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   integration-hermetic:
     name: integration tests (hermetic turna-node)
@@ -79,7 +86,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Build the node binary explicitly: the hermetic integration harness looks
       # for target/<profile>/turna-node and then starts it on ephemeral ports.
@@ -96,7 +103,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # `--all-features` enables the Linux-only AF_XDP dependency graph.
       # libxdp-sys/libbpf-sys need these native build inputs even for
@@ -106,7 +113,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang llvm libelf-dev zlib1g-dev pkg-config make
+            clang llvm libelf-dev linux-libc-dev zlib1g-dev pkg-config make
       - run: cargo check --workspace --all-targets --all-features --locked
 
   feature-matrix:
@@ -161,14 +168,14 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install AF_XDP native build dependencies
         if: runner.os == 'Linux' && contains(matrix.features, 'af-xdp')
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang llvm libelf-dev zlib1g-dev pkg-config make
+            clang llvm libelf-dev linux-libc-dev zlib1g-dev pkg-config make
       - name: cargo check selected feature
         run: cargo check -p ${{ matrix.package }} --all-targets --features ${{ matrix.features }} --locked
 
@@ -179,7 +186,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
@@ -312,7 +319,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Loom exhaustively explores thread interleavings for the lock-free
       # primitives. Gated behind --cfg loom so it is never part of a normal
@@ -330,7 +337,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: stable
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Provision Tarantool with the turna schema + stored functions, then run
       # the backend failover/CAS integration tests against it. The tests skip
@@ -374,7 +381,7 @@ jobs:
   # docker-compose, and the Helm values — the exact class of drift that let
   # allocations succeed while their relay traffic was silently dropped (P0 #13).
   deploy-consistency:
-    name: deploy consistency (relay range)
+    name: deploy consistency (release + relay range)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

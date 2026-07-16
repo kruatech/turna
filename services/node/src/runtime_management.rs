@@ -23,10 +23,10 @@ use turna_session::{
     RuntimeLimits, UserLimitsOverride,
 };
 use turna_state_backend::{
-    AppliedOperation, Backend, EffectiveUserLimits, LimitMode, LimitU32, LimitU64,
-    ObservationOutcome, PendingCommand, RuntimeConfigSnapshot, SetUserLimitsCommand,
-    SetUserLimitsResult, UpdateConfigCommand, UpdateConfigResult, UserLimitScope, UserLimitTarget,
-    UserLimitsPatch, command_payload_hash, now_ms,
+    command_payload_hash, now_ms, AppliedOperation, Backend, EffectiveUserLimits, LimitMode,
+    LimitU32, LimitU64, ObservationOutcome, PendingCommand, RuntimeConfigSnapshot,
+    SetUserLimitsCommand, SetUserLimitsResult, UpdateConfigCommand, UpdateConfigResult,
+    UserLimitScope, UserLimitTarget, UserLimitsPatch,
 };
 
 const COMMAND_SCHEMA_VERSION: u32 = 1;
@@ -872,28 +872,27 @@ impl RuntimeManagement {
         }
 
         let previous_cache = self.store.user_limits_snapshot();
-        let next_cache =
-            match snapshot_with_patch(&self.store, &command.target, &candidate) {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = self
-                        .backend
-                        .confirm_user_limits_observed(
-                            &self.node_id,
-                            &subject_key,
-                            desired_version,
-                            &self.incarnation,
-                            &previous_patch,
-                            ObservationOutcome {
-                                status: "failed",
-                                error: &error,
-                            },
-                            None,
-                        )
-                        .await;
-                    return limits_failure(previous_version, previous_version, error);
-                }
-            };
+        let next_cache = match snapshot_with_patch(&self.store, &command.target, &candidate) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self
+                    .backend
+                    .confirm_user_limits_observed(
+                        &self.node_id,
+                        &subject_key,
+                        desired_version,
+                        &self.incarnation,
+                        &previous_patch,
+                        ObservationOutcome {
+                            status: "failed",
+                            error: &error,
+                        },
+                        None,
+                    )
+                    .await;
+                return limits_failure(previous_version, previous_version, error);
+            }
+        };
         if let Err(error) = self.store.publish_user_limits(next_cache) {
             self.metrics
                 .user_limits_failures_total
@@ -1344,7 +1343,10 @@ fn merge_patch(current: &UserLimitsPatch, patch: &UserLimitsPatch) -> UserLimits
 
     UserLimitsPatch {
         max_allocations: merge_u32(&current.max_allocations, &patch.max_allocations),
-        max_bytes_per_sec_per_allocation: merge_u64(&current.max_bytes_per_sec_per_allocation, &patch.max_bytes_per_sec_per_allocation),
+        max_bytes_per_sec_per_allocation: merge_u64(
+            &current.max_bytes_per_sec_per_allocation,
+            &patch.max_bytes_per_sec_per_allocation,
+        ),
         max_lifetime_secs: merge_u32(&current.max_lifetime_secs, &patch.max_lifetime_secs),
     }
 }
@@ -1364,13 +1366,12 @@ fn session_override(patch: &UserLimitsPatch) -> UserLimitsOverride {
             mode: session_mode(value.mode),
             value: value.value,
         }),
-        max_bytes_per_sec_per_allocation: patch
-            .max_bytes_per_sec_per_allocation
-            .as_ref()
-            .map(|value| SessionLimitU64 {
+        max_bytes_per_sec_per_allocation: patch.max_bytes_per_sec_per_allocation.as_ref().map(
+            |value| SessionLimitU64 {
                 mode: session_mode(value.mode),
                 value: value.value,
-            }),
+            },
+        ),
         max_lifetime_secs: patch
             .max_lifetime_secs
             .as_ref()
@@ -2091,7 +2092,10 @@ mod tests {
         // A no_op (same values, expected_version = 1). Enqueue creates the
         // canonical idempotency record; apply records the outcome but we simulate
         // a LOST completion (complete_command is never called).
-        let noop = UpdateConfigCommand { expected_version: 1, ..base_update() };
+        let noop = UpdateConfigCommand {
+            expected_version: 1,
+            ..base_update()
+        };
         let noop_cmd = pending("update_config", "inc-1", &noop);
         backend.enqueue_command(&noop_cmd).await.unwrap();
         let (_, raw1) = manager.apply_update_config(&noop_cmd).await;
@@ -2117,7 +2121,11 @@ mod tests {
             "no_op",
             "replay after state change must return the recorded no_op"
         );
-        assert_eq!(store.runtime_snapshot().version, 2, "replay must not mutate");
+        assert_eq!(
+            store.runtime_snapshot().version,
+            2,
+            "replay must not mutate"
+        );
     }
 
     #[tokio::test]
@@ -2172,7 +2180,10 @@ mod tests {
         manager.restore(&bootstrap()).await.unwrap();
 
         // A permanently invalid command (unsupported payload schema) → failed.
-        let bad = UpdateConfigCommand { schema_version: 999, ..base_update() };
+        let bad = UpdateConfigCommand {
+            schema_version: 999,
+            ..base_update()
+        };
         let bad_cmd = pending("update_config", "inc-1", &bad);
         backend.enqueue_command(&bad_cmd).await.unwrap();
         let (_, raw1) = manager.apply_update_config(&bad_cmd).await;
@@ -2184,7 +2195,10 @@ mod tests {
             .await
             .unwrap()
             .expect("idempotency record exists");
-        assert!(!rec.final_status.is_empty(), "failed outcome recorded durably");
+        assert!(
+            !rec.final_status.is_empty(),
+            "failed outcome recorded durably"
+        );
         assert!(rec.result.contains("failed"));
 
         // Replay returns the same failed outcome.
@@ -2201,7 +2215,10 @@ mod tests {
         init_v1(&manager, &backend).await; // version -> 1
 
         // A canonical record exists for the key (enqueued with payload P1).
-        let p1 = UpdateConfigCommand { expected_version: 1, ..base_update() };
+        let p1 = UpdateConfigCommand {
+            expected_version: 1,
+            ..base_update()
+        };
         let c1 = pending("update_config", "inc-1", &p1);
         backend.enqueue_command(&c1).await.unwrap();
 
@@ -2234,7 +2251,10 @@ mod tests {
         // A command with a canonical record that yields a non-applied outcome:
         // stale expected_version (0 vs current 1) → business `conflict`, so it
         // must be journaled via record_command_outcome before completing.
-        let stale = UpdateConfigCommand { expected_version: 0, ..base_update() };
+        let stale = UpdateConfigCommand {
+            expected_version: 0,
+            ..base_update()
+        };
         let c = pending("update_config", "inc-1", &stale);
         backend.enqueue_command(&c).await.unwrap();
 
