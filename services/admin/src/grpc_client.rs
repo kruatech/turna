@@ -5,8 +5,9 @@
 //!   2. `https://` address + --tls-ca/cert/key → mTLS (custom CA + client cert)
 //!   3. `http://`  address                     → plaintext (loopback dev only)
 //!
-//! tonic's `tls-roots` feature bundles webpki-roots, so Let's Encrypt certs
-//! are accepted without any extra configuration.
+//! tonic 0.14: system roots are opt-in — the `tls-native-roots` feature plus
+//! `ClientTlsConfig::with_native_roots()` load the OS trust store, so Let's
+//! Encrypt certs are accepted (runtime image ships ca-certificates).
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -66,7 +67,7 @@ pub async fn build_channel(addr: &str, tls: Option<&AdminTlsConfig>) -> Result<C
                     addr,
                     "gRPC TLS with system roots (Let's Encrypt compatible)"
                 );
-                ClientTlsConfig::new()
+                ClientTlsConfig::new().with_native_roots()
             }
         };
         endpoint.tls_config(tls_cfg)?.connect_lazy()

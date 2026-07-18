@@ -8,8 +8,15 @@ targets = [
 ]
 
 [advisories]
-# Блокируем уязвимые зависимости
-ignore = []
+# Блокируем уязвимые зависимости.
+# Записи в ignore — осознанный техдолг: транзитивные зависимости старых
+# стеков (tonic 0.11 / webrtc / rustls 0.22-эпоха), закрываются только
+# апгрейдом этих стеков. Убирать записи по мере апгрейдов.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin timing attack): transitive via webrtc-dtls; no fixed rsa release, closes with webrtc stack upgrade" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained: transitive via old rustls stack; closes with tonic/rustls upgrade" },
+    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch fmt::Pointer deref: we never Debug/Pointer-format Atomic/Shared; closes with crossbeam upgrade" },
+]
 
 [licenses]
 # Разрешённые лицензии — только permissive и weak-copyleft
@@ -24,6 +31,8 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "BSL-1.0",
+    # webpki-roots / webpki-root-certs: Mozilla CA store data, permissive data license
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

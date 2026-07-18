@@ -6,8 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto = "../../crates/control/proto/management.proto";
     let include = "../../crates/control/proto";
     println!("cargo:rerun-if-changed={proto}");
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(false) // admin is client-only
-        .compile(&[proto], &[include])?;
+        .build_client(true)
+        .compile_protos(&[proto], &[include])?;
     Ok(())
 }

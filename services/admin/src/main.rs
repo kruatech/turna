@@ -222,6 +222,19 @@ async fn local_healthz() -> StatusCode {
     StatusCode::OK
 }
 
+/// Resolve on SIGTERM (docker stop / k8s pod termination) or Ctrl-C.
+/// Without this the binary runs as container PID 1, ignores SIGTERM and gets
+/// SIGKILLed after the stop grace period (exit 137).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = term.recv() => {},
+    }
+    info!("shutdown signal received, draining connections");
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -331,6 +344,8 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = cfg.listen.parse()?;
     info!(%addr, turna_addr=%turna_addr, grpc_addr=%cfg.grpc_addr, "turna-admin listening");
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
