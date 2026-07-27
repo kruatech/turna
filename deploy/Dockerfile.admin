@@ -17,7 +17,7 @@
 # =============================================================================
 # Stage 1: Frontend (Vite/React) -> static dist/
 # =============================================================================
-FROM node:22-bookworm-slim AS frontend
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS frontend
 WORKDIR /fe
 # Install against the lockfile first for cache reuse, then build.
 COPY services/admin/frontend/package.json services/admin/frontend/package-lock.json ./
@@ -29,7 +29,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Rust build (turna-admin)
 # =============================================================================
-FROM rust:1.95.0-bookworm AS builder
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cmake \
@@ -45,7 +45,7 @@ RUN cargo build --locked --release --bin turna-admin
 # =============================================================================
 # Stage 3: Runtime
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 # Same pinned non-root UID/GID convention as deploy/Dockerfile.
 ARG TURNA_UID=65532

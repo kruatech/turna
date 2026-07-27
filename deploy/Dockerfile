@@ -13,7 +13,7 @@
 # =============================================================================
 # Stage 1: Build
 # =============================================================================
-FROM rust:1.95.0-bookworm AS builder
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cmake \
@@ -34,7 +34,7 @@ RUN cargo build --locked --release \
 # =============================================================================
 # Stage 2: Runtime
 # =============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 # Pinned non-root UID/GID so the Helm chart can set
 # runAsUser/runAsGroup/fsGroup to a known value (65532, the conventional

@@ -1,0 +1,18 @@
+# OSV-Scanner exceptions for the Rust workspace (applies to ./Cargo.lock).
+#
+# Kept in sync with the [advisories].ignore list in deny.toml. cargo-deny drives
+# CI; OSSF Scorecard's Vulnerabilities check reads only this file.
+#
+# Scope: an osv-scanner.toml applies to manifests in its own directory only and
+# does not propagate to child directories.
+#
+# Only advisories with no upstream remediation path remain here. Anything that
+# could be fixed by an upgrade has been fixed instead of ignored.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0141"
+reason = "bincode unmaintained: no upstream path exists. Transitive via webrtc-dtls, and every published webrtc-dtls release through 0.12.0 depends on bincode ^1. The advisory sets patched = [] with no unaffected range, so bincode 2.x/3.x would not clear it either. Recheck when webrtc-rs changes serializer."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste unmaintained: no upstream path exists. Transitive via rtnetlink -> netlink-packet-core; rtnetlink 0.21.0 is the latest release and netlink-packet-core 0.8.1 (also latest) still declares paste ^1 as a non-optional dependency. Recheck when netlink-packet-core migrates to pastey."
