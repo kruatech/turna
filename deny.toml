@@ -14,7 +14,9 @@ targets = [
 # апгрейдом этих стеков. Убирать записи по мере апгрейдов.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin timing attack): transitive via webrtc-dtls; no fixed rsa release, closes with webrtc stack upgrade" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained: transitive via old rustls stack; closes with tonic/rustls upgrade" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained: transitive via wtransport 0.6 (only under --all-features / web-transport); upstream has no safe upgrade, closes with the wtransport stack upgrade" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained: transitive only, no workspace crate depends on it directly; remove after the owning dependency is upgraded" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: transitive via rtnetlink 0.21 -> netlink-packet-core 0.8; upstream states no safe upgrade, rtnetlink majors are pinned in .github/dependabot.yml" },
     { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch fmt::Pointer deref: we never Debug/Pointer-format Atomic/Shared; closes with crossbeam upgrade" },
 ]
 
