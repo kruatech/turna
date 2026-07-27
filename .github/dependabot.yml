@@ -7,6 +7,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Default is 5. Five action bumps were open at once (setup-helm,
+    # cargo-deny-action, setup-node, attest-build-provenance, action-gh-release),
+    # which saturated the queue and silently starved checkout / cache /
+    # upload-artifact / download-artifact -- they drifted several majors behind
+    # while no PR was ever raised. Matches the cargo entry's limit.
+    open-pull-requests-limit: 10
     commit-message:
       prefix: ci
 
