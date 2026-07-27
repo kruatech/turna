@@ -42,9 +42,9 @@ tokio-rustls = { version = "0.26", optional = true }
 quinn = { version = "0.11", optional = true }
 # WebTransport (feature: web-transport). NOTE: wtransport bundles its own quinn
 # + rustls; verify the chosen version aligns with quinn 0.11 / rustls 0.23 above
-# (wtransport 0.6.x targets quinn 0.11). If it re-exports a conflicting quinn,
+# (wtransport 0.7.x targets quinn 0.11). If it re-exports a conflicting quinn,
 # prefer wtransport's re-export and drop the standalone quinn dep for this build.
-wtransport = { version = "0.6", optional = true }
+wtransport = { version = "0.7", optional = true }
 
 # TURN over DTLS (feature: dtls). Pure-Rust, cross-platform DTLS 1.2 — NOT
 # Linux-only, so it belongs in the main [dependencies] table (a previous version

@@ -13,11 +13,8 @@ targets = [
 # стеков (tonic 0.11 / webrtc / rustls 0.22-эпоха), закрываются только
 # апгрейдом этих стеков. Убирать записи по мере апгрейдов.
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin timing attack): transitive via webrtc-dtls; no fixed rsa release, closes with webrtc stack upgrade" },
-    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained: transitive via wtransport 0.6 (only under --all-features / web-transport); upstream has no safe upgrade, closes with the wtransport stack upgrade" },
-    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained: transitive only, no workspace crate depends on it directly; remove after the owning dependency is upgraded" },
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: transitive via rtnetlink 0.21 -> netlink-packet-core 0.8; upstream states no safe upgrade, rtnetlink majors are pinned in .github/dependabot.yml" },
-    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch fmt::Pointer deref: we never Debug/Pointer-format Atomic/Shared; closes with crossbeam upgrade" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained: no upstream path exists. Transitive via webrtc-dtls, and every published webrtc-dtls release through 0.12.0 depends on bincode ^1. The advisory sets patched = [] with no unaffected range, so bincode 2.x/3.x would not clear it either. Recheck when webrtc-rs changes serializer." },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: no upstream path exists. Transitive via rtnetlink -> netlink-packet-core; rtnetlink 0.21.0 is the latest release and netlink-packet-core 0.8.1 (also latest) still declares paste ^1 as a non-optional dependency. Recheck when netlink-packet-core migrates to pastey." },
 ]
 
 [licenses]

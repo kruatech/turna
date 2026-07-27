@@ -1,0 +1,64 @@
+name: CodeQL
+
+# Closes the OSSF Scorecard "SAST" check (alert #10). Scorecard looks for
+# `github/codeql-action` in a workflow or a known SAST app on recent PRs; it does
+# not recognise cargo-deny / miri / cargo-fuzz, which is why ci.yml alone scored 0.
+#
+# Two languages are analysed:
+#   rust                  -> the workspace crates + services
+#   javascript-typescript -> services/admin/frontend (Vite/React admin UI)
+#
+# build-mode: none is mandatory for Rust — the CodeQL Rust extractor does not
+# support `manual` and fails hard with:
+#   "A fatal error occurred: Rust does not support the manual build mode."
+# For javascript-typescript `none` is likewise the supported mode.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly re-scan so new CodeQL queries land on unchanged code too.
+    - cron: '27 5 * * 1'
+
+# Least privilege at workflow level; the analyze job widens only what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # Required to upload the SARIF results to the code scanning API.
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, javascript-typescript]
+    steps:
+      # SHA-pinned to match the repo's pinned-actions policy (same pin as ci.yml).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # SHA-pinned. Resolve/update with:
+      #   git ls-remote https://github.com/github/codeql-action refs/tags/v3.37.3
+      # Note: the floating `v3` tag lags behind the newest patch tag, so pin the
+      # exact semver tag's commit rather than whatever `v3` currently points at.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f081e69141f6ea0aa740920b0c7012cd81a4fbe6 # v3.37.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@f081e69141f6ea0aa740920b0c7012cd81a4fbe6 # v3.37.3
+        with:
+          category: "/language:${{ matrix.language }}"

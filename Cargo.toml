@@ -80,7 +80,14 @@ rand = "0.8"
 base64 = "0.22"
 
 # auth
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# aws_lc_rs instead of rust_crypto: the rust_crypto feature pulls rsa as a
+# bundle member (with hmac/sha2/ed25519-dalek/p256/p384) and offers no
+# HMAC-only gate, which dragged RUSTSEC-2023-0071 (rsa Marvin timing attack,
+# no fixed release) into the graph even though turna-auth only ever uses
+# HS256. The two backends are mutually exclusive (src/crypto/mod.rs cfg
+# gates) and aws_lc_rs implements HS256, so this removes rsa, ed25519-dalek,
+# p256 and p384 outright. Requires cmake + a C compiler at build time.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 argon2 = "0.5"
 uuid = { version = "1", features = ["v4"] }
 
