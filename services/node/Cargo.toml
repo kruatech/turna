@@ -36,4 +36,4 @@ turna-proto-turn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # PR A (task 2.4): system resource metrics in heartbeat.
-sysinfo = "0.30"
+sysinfo = "0.39"
