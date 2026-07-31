@@ -5,7 +5,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 thiserror.workspace = true
 tracing.workspace = true
