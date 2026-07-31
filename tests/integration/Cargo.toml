@@ -17,7 +17,7 @@ hmac.workspace        = true
 sha1.workspace        = true
 md5.workspace         = true
 turna-proto-stun.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 # F-5 #2 hermetic harness: PR_SET_PDEATHSIG so a spawned node never orphans.
 libc = "0.2"
 turna-common = { path = "../../crates/common" }
