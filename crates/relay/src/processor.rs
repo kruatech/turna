@@ -536,6 +536,63 @@ impl PacketProcessor {
         self.process_impl(raw, src, true)
     }
 
+    /// Release the allocation owned by `client` because its **control
+    /// connection** went away (a TURNS/TCP connection closed, or a DTLS/QUIC
+    /// session ended).
+    ///
+    /// For the connection-oriented transports the allocation's 5-tuple ceases
+    /// to exist the moment the connection does, so leaving it to expire by TTL
+    /// held the relay port (and its fd) for up to a full lifetime and let a
+    /// later client reusing the same source port inherit the 437 conflict.
+    ///
+    /// Implemented as a zero-lifetime refresh — the same teardown the client
+    /// would trigger with `Refresh(lifetime=0)` — so allocation accounting and
+    /// port release follow exactly one code path. Returns the actions the
+    /// caller must dispatch (`CloseRelay` for the relay socket), empty if this
+    /// address had no allocation.
+    ///
+    /// This is sync, so it does NOT touch the RFC 6062 peer connections
+    /// (`TcpRelayManager::cleanup_allocation` is async): the TURNS bridge does
+    /// that itself right after calling this.
+    pub fn release_for_closed_connection(&self, client: SocketAddr) -> Vec<Action> {
+        let relay_port = self.store.get(&client).map(|a| a.relay_addr.port());
+        let Some(port) = relay_port else {
+            return Vec::new();
+        };
+        if self.store.refresh(&client, 0).is_err() {
+            return Vec::new();
+        }
+        self.metrics
+            .active_allocations
+            .fetch_sub(1, Ordering::Relaxed);
+        tracing::debug!(
+            %client,
+            relay_port = port,
+            "allocation released: control connection closed"
+        );
+        vec![Action::CloseRelay { port }]
+    }
+
+    /// Owned-buffer ingress for the encrypted session transports (DTLS records,
+    /// QUIC datagrams, WebTransport stream messages).
+    ///
+    /// These transports decrypt into an owned `Vec<u8>` and deliver it through a
+    /// channel, so there is no kernel-registered recv buffer to send from. They
+    /// therefore MUST NOT use [`process_slice`], which emits
+    /// [`Action::ForwardZeroCopy`] (offset/len into the caller's slice) for the
+    /// ChannelData hot path: `RelayEgress::dispatch` cannot resolve an
+    /// offset/len back into bytes, so every client→peer media packet was being
+    /// dropped. This entry point takes the buffer by value and always goes
+    /// through the owning [`process`] pipeline, which emits
+    /// [`Action::Forward`] with real `Bytes`.
+    ///
+    /// `ingress_tcp` is false: RFC 6062 TCP allocations require a TCP/TLS
+    /// control connection with a second connection for ConnectionBind, which
+    /// these transports do not provide.
+    pub fn process_owned(&self, raw: Vec<u8>, src: SocketAddr) -> Vec<Action> {
+        self.process_impl(Bytes::from(raw), src, false)
+    }
+
     fn process_impl(&self, raw: Bytes, src: SocketAddr, ingress_tcp: bool) -> Vec<Action> {
         self.metrics
             .packets_received

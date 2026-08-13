@@ -1338,6 +1338,14 @@ pub struct TlsConfig {
     pub read_timeout_secs: u64,
     /// Max concurrent TURNS connections.
     pub max_connections: usize,
+    /// Max concurrent TURNS connections from one source IP (anti
+    /// slot-exhaustion, mirrors `[turn.dtls].max_sessions_per_ip`).
+    /// 0 = unlimited.
+    pub max_connections_per_ip: usize,
+    /// Re-read `cert_path`/`key_path` every N seconds and pick up a rotated
+    /// certificate without a restart (new connections use the new material;
+    /// established ones keep their session). 0 disables reloading.
+    pub cert_reload_secs: u64,
     /// Advertise ALPN (`stun.turn`).
     pub enable_alpn: bool,
 }
@@ -1353,6 +1361,8 @@ impl Default for TlsConfig {
             handshake_timeout_secs: 5,
             read_timeout_secs: 300,
             max_connections: 10_000,
+            max_connections_per_ip: 0,
+            cert_reload_secs: 30,
             enable_alpn: true,
         }
     }
@@ -1388,6 +1398,26 @@ pub struct QuicConfigSection {
     pub keep_alive_secs: u64,
     /// ALPN protocols for the raw-QUIC path (WebTransport forces `h3`).
     pub alpn: Vec<String>,
+    /// Max concurrent QUIC/WebTransport sessions. 0 = unlimited.
+    /// Mirrors `[turn.dtls].max_sessions`.
+    pub max_sessions: usize,
+    /// Max concurrent sessions from one source IP (anti slot-exhaustion).
+    /// 0 = unlimited. Mirrors `[turn.dtls].max_sessions_per_ip`.
+    pub max_sessions_per_ip: usize,
+    /// Re-read `cert_path`/`key_path` every N seconds and hot-reload the
+    /// listener's certificate without dropping live sessions. WebTransport path
+    /// only (`web_transport = true`); the raw-QUIC endpoint has no reload hook.
+    /// 0 disables reloading.
+    pub cert_reload_secs: u64,
+    /// Max new handshakes per second from one source IP (`0` = unlimited).
+    /// Unlike `max_sessions_per_ip`, which bounds *concurrent* sessions, this
+    /// bounds the *rate* — a source that opens and drops sessions in a loop
+    /// stays under a concurrency cap while still burning CPU on handshakes.
+    pub max_handshakes_per_sec_per_ip: u32,
+    /// Burst allowance for `max_handshakes_per_sec_per_ip`. Ignored when the
+    /// rate limit is disabled. Defaults to twice the rate so a page load that
+    /// opens several sessions at once is not penalised.
+    pub handshake_burst_per_ip: u32,
 }
 
 impl Default for QuicConfigSection {
@@ -1405,6 +1435,11 @@ impl Default for QuicConfigSection {
             idle_timeout_secs: 30,
             keep_alive_secs: 10,
             alpn: vec!["stun.turn".to_string()],
+            max_sessions: 10_000,
+            max_sessions_per_ip: 0,
+            cert_reload_secs: 30,
+            max_handshakes_per_sec_per_ip: 0,
+            handshake_burst_per_ip: 0,
         }
     }
 }
@@ -2452,6 +2487,113 @@ mod tests {
         assert!(!cfg.turn.quic.enable_datagrams, "explicit override applied");
         // Untouched fields fall back to defaults.
         assert_eq!(cfg.turn.quic.max_bi_streams, 256);
+        // Session caps: bounded by default, per-IP opt-in. A config written
+        // before these keys existed must keep parsing and get these values.
+        assert_eq!(q.max_sessions, 10_000);
+        assert_eq!(q.max_sessions_per_ip, 0, "per-IP cap is opt-in");
+        assert_eq!(cfg.turn.quic.max_sessions, 10_000);
+        assert_eq!(cfg.turn.quic.max_sessions_per_ip, 0);
+    }
+
+    #[test]
+    fn quic_session_caps_parse() {
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+
+            [turn.quic]
+            enabled = true
+            max_sessions = 500
+            max_sessions_per_ip = 4
+            max_handshakes_per_sec_per_ip = 20
+            handshake_burst_per_ip = 50
+            cert_reload_secs = 0
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("quic caps parse");
+        assert_eq!(cfg.turn.quic.max_sessions, 500);
+        assert_eq!(cfg.turn.quic.max_sessions_per_ip, 4);
+        assert_eq!(cfg.turn.quic.max_handshakes_per_sec_per_ip, 20);
+        assert_eq!(cfg.turn.quic.handshake_burst_per_ip, 50);
+        assert_eq!(cfg.turn.quic.cert_reload_secs, 0);
+    }
+
+    #[test]
+    fn quic_rate_limit_is_off_by_default() {
+        // Both rate knobs default to 0 (disabled), so an existing deployment sees
+        // no behaviour change from their introduction.
+        let q = QuicConfigSection::default();
+        assert_eq!(q.max_handshakes_per_sec_per_ip, 0);
+        assert_eq!(q.handshake_burst_per_ip, 0);
+        assert_eq!(q.cert_reload_secs, 30);
+    }
+
+    #[test]
+    fn tls_section_defaults_and_parse() {
+        // TURNS lives in the ROOT `[tls]` section (not under `[turn]`).
+        let t = TlsConfig::default();
+        assert!(!t.enabled, "TURNS is opt-in");
+        assert_eq!(t.listen.port(), 5349, "IANA TURNS port");
+        assert_eq!(t.max_connections, 10_000);
+        assert_eq!(t.max_connections_per_ip, 0, "per-IP cap is opt-in");
+        assert_eq!(t.cert_reload_secs, 30, "certificate hot-reload on by default");
+        assert!(t.enable_alpn);
+
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+
+            [tls]
+            enabled = true
+            listen = "0.0.0.0:5349"
+            cert_path = "/etc/turna/tls/cert.pem"
+            key_path = "/etc/turna/tls/key.pem"
+            max_connections = 200
+            max_connections_per_ip = 8
+            cert_reload_secs = 0
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("tls section parses");
+        assert!(cfg.tls.enabled);
+        assert_eq!(cfg.tls.max_connections, 200);
+        assert_eq!(cfg.tls.max_connections_per_ip, 8);
+        assert_eq!(cfg.tls.cert_reload_secs, 0, "0 disables hot-reload");
+        // Untouched fields fall back to defaults.
+        assert_eq!(cfg.tls.handshake_timeout_secs, 5);
+        assert_eq!(cfg.tls.max_frame_size, 64 * 1024);
+    }
+
+    #[test]
+    fn tls_section_rejects_unknown_key() {
+        // deny_unknown_fields: a typo must fail loudly rather than be ignored
+        // (an ignored `max_connections_per_ips` would silently leave the cap off).
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+
+            [tls]
+            enabled = true
+            max_connections_per_ips = 8
+        "#;
+        assert!(
+            toml::from_str::<TurnaConfig>(toml).is_err(),
+            "unknown [tls] key must be rejected"
+        );
+    }
+
+    #[test]
+    fn transport_sections_omitted_entirely_still_parse() {
+        // Backward compatibility: a config predating the new keys (and the new
+        // sections altogether) must parse and land on safe defaults.
+        let toml = r#"
+            [turn]
+            listen = "0.0.0.0:3478"
+            realm = "turna"
+        "#;
+        let cfg: TurnaConfig = toml::from_str(toml).expect("minimal config parses");
+        assert!(!cfg.tls.enabled);
+        assert!(!cfg.turn.quic.enabled);
+        assert!(!cfg.turn.dtls.enabled);
+        assert_eq!(cfg.tls.cert_reload_secs, 30);
+        assert_eq!(cfg.turn.quic.max_sessions, 10_000);
     }
 
     #[test]
@@ -2542,6 +2684,8 @@ mod tests {
         assert!(cfg.turn.dtls.enabled);
         assert_eq!(cfg.turn.dtls.mtu, 1100);
         assert_eq!(cfg.turn.dtls.max_sessions, 10_000);
+        assert_eq!(cfg.turn.dtls.max_sessions_per_ip, 0, "per-IP cap is opt-in");
+        assert_eq!(cfg.turn.dtls.outbound_queue_capacity, 1024);
     }
 
     #[test]

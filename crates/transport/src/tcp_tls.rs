@@ -81,6 +81,10 @@ pub struct TlsTransportConfig {
     pub handshake_timeout: Duration,
     pub read_timeout: Duration,
     pub max_connections: usize,
+    /// Max concurrent connections from a single source IP. 0 = unlimited.
+    pub max_connections_per_ip: usize,
+    /// Interval for the mtime-based certificate reload. 0 disables it.
+    pub cert_reload_interval: Duration,
     pub enable_alpn: bool,
 }
 
@@ -94,6 +98,8 @@ impl Default for TlsTransportConfig {
             handshake_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(300),
             max_connections: 10_000,
+            max_connections_per_ip: 0,
+            cert_reload_interval: Duration::from_secs(30),
             enable_alpn: true,
         }
     }
@@ -178,6 +184,95 @@ impl TcpFrameCodec {
             buf.put_u8(0);
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+//
+// The TURNS listener previously exported nothing at all (DTLS and QUIC both
+// had counters), so there was no way to alert on handshake failures, connection
+// caps being hit, or framing errors. Same shape as `DtlsStats`: cheap atomics
+// here in the leaf transport crate, mirrored into the Prometheus `Metrics` by
+// the bridge (which can see `turna-health`).
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct TlsStats {
+    /// Connections currently established (post-handshake, pre-close).
+    pub active: std::sync::atomic::AtomicUsize,
+    /// Connections accepted (TCP accept succeeded) since start.
+    pub accepted: std::sync::atomic::AtomicU64,
+    /// Connections closed for any reason.
+    pub closed: std::sync::atomic::AtomicU64,
+    /// TLS handshakes that failed (bad client cert/version/cipher, RST, ...).
+    pub handshake_failures: std::sync::atomic::AtomicU64,
+    /// TLS handshakes that exceeded `handshake_timeout`.
+    pub handshake_timeouts: std::sync::atomic::AtomicU64,
+    /// Connections refused because `max_connections` was reached.
+    pub rejected_over_cap: std::sync::atomic::AtomicU64,
+    /// Connections refused because the source IP hit `max_connections_per_ip`.
+    pub rejected_per_ip: std::sync::atomic::AtomicU64,
+    /// Connections closed by the per-connection idle read timeout.
+    pub idle_timeouts: std::sync::atomic::AtomicU64,
+    /// Connections closed because the peer sent invalid TURN-over-TCP framing
+    /// or an over-sized frame.
+    pub framing_errors: std::sync::atomic::AtomicU64,
+    /// `accept()` errors that did NOT stop the listener (EMFILE, ECONNABORTED).
+    pub accept_errors: std::sync::atomic::AtomicU64,
+    /// Decrypted bytes read from clients.
+    pub bytes_rx: std::sync::atomic::AtomicU64,
+    /// Bytes written to clients (pre-encryption).
+    pub bytes_tx: std::sync::atomic::AtomicU64,
+    /// Successful certificate hot-reloads.
+    pub cert_reloads: std::sync::atomic::AtomicU64,
+    /// Failed certificate hot-reloads (old material kept in service).
+    pub cert_reload_failures: std::sync::atomic::AtomicU64,
+    /// True once the TCP listener is bound; cleared on drain/exit.
+    pub listening: std::sync::atomic::AtomicBool,
+}
+
+/// Point-in-time copy of [`TlsStats`] (named struct so adding a counter cannot
+/// shift a positional mirror).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TlsStatsSnapshot {
+    pub active: usize,
+    pub accepted: u64,
+    pub closed: u64,
+    pub handshake_failures: u64,
+    pub handshake_timeouts: u64,
+    pub rejected_over_cap: u64,
+    pub rejected_per_ip: u64,
+    pub idle_timeouts: u64,
+    pub framing_errors: u64,
+    pub accept_errors: u64,
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    pub cert_reloads: u64,
+    pub cert_reload_failures: u64,
+    pub listening: bool,
+}
+
+impl TlsStats {
+    pub fn snapshot(&self) -> TlsStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        TlsStatsSnapshot {
+            active: self.active.load(Relaxed),
+            accepted: self.accepted.load(Relaxed),
+            closed: self.closed.load(Relaxed),
+            handshake_failures: self.handshake_failures.load(Relaxed),
+            handshake_timeouts: self.handshake_timeouts.load(Relaxed),
+            rejected_over_cap: self.rejected_over_cap.load(Relaxed),
+            rejected_per_ip: self.rejected_per_ip.load(Relaxed),
+            idle_timeouts: self.idle_timeouts.load(Relaxed),
+            framing_errors: self.framing_errors.load(Relaxed),
+            accept_errors: self.accept_errors.load(Relaxed),
+            bytes_rx: self.bytes_rx.load(Relaxed),
+            bytes_tx: self.bytes_tx.load(Relaxed),
+            cert_reloads: self.cert_reloads.load(Relaxed),
+            cert_reload_failures: self.cert_reload_failures.load(Relaxed),
+            listening: self.listening.load(Relaxed),
+        }
     }
 }
 
@@ -340,15 +435,80 @@ impl TlsTransportServer {
     /// (sent after a validated ConnectionBind) makes the owning connection write
     /// the success response, stop framing, and hand its raw stream (plus any
     /// unread bytes) to `detach_out_tx` for raw relaying.
+    ///
+    /// Kept for compatibility: no shutdown signal (runs until the listener
+    /// errors) and throw-away stats. New callers should use [`run_full`].
     pub async fn run_with_detach(
+        self,
+        event_tx: mpsc::Sender<TcpTransportEvent>,
+        send_rx: mpsc::Receiver<TcpSendCommand>,
+        detach_req_rx: mpsc::Receiver<DetachRequest>,
+        detach_out_tx: mpsc::Sender<DetachedConn>,
+    ) -> Result<()> {
+        let (_never_tx, never_shutdown) = tokio::sync::watch::channel(false);
+        self.run_full(
+            event_tx,
+            send_rx,
+            detach_req_rx,
+            detach_out_tx,
+            Arc::new(TlsStats::default()),
+            never_shutdown,
+        )
+        .await
+    }
+
+    /// Full listener: RFC 6062 detach, shared [`TlsStats`], and a cooperative
+    /// shutdown signal.
+    ///
+    /// Shutdown (parity with the DTLS listener's DTL-4): once `shutdown` flips,
+    /// the accept loop stops taking new connections and established ones are
+    /// asked to close, instead of the whole task being `abort()`ed mid-write.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_full(
         self,
         event_tx: mpsc::Sender<TcpTransportEvent>,
         mut send_rx: mpsc::Receiver<TcpSendCommand>,
         mut detach_req_rx: mpsc::Receiver<DetachRequest>,
         detach_out_tx: mpsc::Sender<DetachedConn>,
+        stats: Arc<TlsStats>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
-        info!(addr = %self.config.listen_addr, max = self.config.max_connections, "TURNS listening");
+        info!(
+            addr = %self.config.listen_addr,
+            max = self.config.max_connections,
+            max_per_ip = self.config.max_connections_per_ip,
+            "TURNS listening"
+        );
+        stats.listening.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Certificate hot-reload. `CertReloader` existed but was wired to
+        // nothing: the acceptor was built once in `new()`, so a rotated cert
+        // (ACME renewal) needed a process restart. Each accepted connection now
+        // takes the current `ServerConfig` out of this watch channel, so a
+        // reload applies to new connections without touching established ones.
+        let cert_rx: Option<tokio::sync::watch::Receiver<Arc<ServerConfig>>> =
+            if self.config.cert_reload_interval.is_zero() {
+                info!("TURNS certificate hot-reload disabled (cert_reload_interval = 0)");
+                None
+            } else {
+                match CertReloader::new(&self.config, self.config.cert_reload_interval)
+                    .spawn(stats.clone())
+                    .await
+                {
+                    Ok(rx) => Some(rx),
+                    Err(e) => {
+                        // Non-fatal: `new()` already validated this material, so
+                        // keep serving with the static acceptor.
+                        error!(%e, "TURNS certificate hot-reload unavailable; using static cert");
+                        None
+                    }
+                }
+            };
+
+        // Per-source-IP connection counts for `max_connections_per_ip`.
+        let per_ip: Arc<tokio::sync::RwLock<HashMap<std::net::IpAddr, u32>>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         let conns: Arc<tokio::sync::RwLock<HashMap<TcpConnectionId, mpsc::Sender<ConnCtl>>>> =
             Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -404,30 +564,119 @@ impl TlsTransportServer {
             }
         });
 
+        // Consecutive accept failures, for the EMFILE backoff below.
+        let mut accept_failures: u32 = 0;
+
         loop {
-            let (stream, peer) = listener.accept().await?;
+            if *shutdown.borrow() {
+                break;
+            }
+            let accepted = tokio::select! {
+                _ = shutdown.changed() => break,
+                r = listener.accept() => r,
+            };
+            let (stream, peer) = match accepted {
+                Ok(pair) => {
+                    accept_failures = 0;
+                    pair
+                }
+                Err(e) => {
+                    // Previously `accept().await?` returned, killing the whole
+                    // TURNS listener on the first transient error — a single
+                    // EMFILE (fd exhaustion) or ECONNABORTED took TURNS down
+                    // until the process restarted. Log, count, back off on
+                    // repeats, and keep listening.
+                    stats
+                        .accept_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    accept_failures = accept_failures.saturating_add(1);
+                    let backoff = std::cmp::min(1000, 10u64 * u64::from(accept_failures));
+                    warn!(
+                        %e,
+                        consecutive = accept_failures,
+                        backoff_ms = backoff,
+                        "TURNS accept failed; listener staying up"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    continue;
+                }
+            };
             {
                 let c = conns.read().await;
                 if c.len() >= self.config.max_connections {
-                    warn!(%peer, "connection limit reached");
+                    stats
+                        .rejected_over_cap
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(%peer, max = self.config.max_connections, "connection limit reached");
                     continue;
                 }
+            }
+
+            // Per-source-IP cap (parity with the DTLS listener's DTL-9): without
+            // it a single source could hold every one of `max_connections`.
+            let max_per_ip = self.config.max_connections_per_ip;
+            if max_per_ip != 0 {
+                let ip = peer.ip();
+                let mut m = per_ip.write().await;
+                if *m.get(&ip).unwrap_or(&0) as usize >= max_per_ip {
+                    drop(m);
+                    stats
+                        .rejected_per_ip
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(%peer, max_per_ip, "TURNS connection refused: per-IP cap reached");
+                    continue;
+                }
+                *m.entry(ip).or_insert(0) += 1;
+            } else {
+                *per_ip.write().await.entry(peer.ip()).or_insert(0) += 1;
             }
 
             let conn_id = TcpConnectionId::next(&self.conn_counter);
             let (conn_tx, conn_rx) = mpsc::channel::<ConnCtl>(256);
             conns.write().await.insert(conn_id, conn_tx);
+            stats
+                .accepted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let tls = self.tls_acceptor.clone();
+            // Current certificate material: the reloader's latest, else the
+            // acceptor built at construction time.
+            let tls = match cert_rx.as_ref() {
+                Some(rx) => TlsAcceptor::from(rx.borrow().clone()),
+                None => self.tls_acceptor.clone(),
+            };
             let etx = event_tx.clone();
             let cfg = self.config.clone();
             let conns = conns.clone();
             let dout = detach_out_tx.clone();
+            let st = stats.clone();
+            let pip = per_ip.clone();
+            let conn_shutdown = shutdown.clone();
 
             tokio::spawn(async move {
-                let outcome =
-                    handle_conn(conn_id, stream, peer, tls, &cfg, etx.clone(), conn_rx, dout).await;
+                let outcome = handle_conn(
+                    conn_id,
+                    stream,
+                    peer,
+                    tls,
+                    &cfg,
+                    etx.clone(),
+                    conn_rx,
+                    dout,
+                    st.clone(),
+                    conn_shutdown,
+                )
+                .await;
                 conns.write().await.remove(&conn_id);
+                {
+                    let mut m = pip.write().await;
+                    if let Some(n) = m.get_mut(&peer.ip()) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            m.remove(&peer.ip());
+                        }
+                    }
+                }
+                st.closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match outcome {
                     Ok(HandleOutcome::Detached) => { /* moved to raw relay; not a close */ }
                     Ok(HandleOutcome::Closed(reason)) => {
@@ -451,6 +700,26 @@ impl TlsTransportServer {
                 }
             });
         }
+
+        stats
+            .listening
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        info!("TURNS listener draining: shutdown signalled, no new connections");
+        Ok(())
+    }
+}
+
+/// Decrements `TlsStats::active` on every exit path of `handle_conn`
+/// (including `?` and the RFC 6062 detach), so the gauge cannot drift upward.
+struct ActiveGuard {
+    stats: Arc<TlsStats>,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.stats
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -465,11 +734,27 @@ async fn handle_conn(
     etx: mpsc::Sender<TcpTransportEvent>,
     mut ctl_rx: mpsc::Receiver<ConnCtl>,
     detach_out_tx: mpsc::Sender<DetachedConn>,
+    stats: Arc<TlsStats>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<HandleOutcome> {
-    let tls_stream = timeout(cfg.handshake_timeout, tls.accept(stream))
-        .await
-        .map_err(|_| TlsError::HandshakeTimeout(cfg.handshake_timeout))?
-        .map_err(|e| TlsError::Io(io::Error::other(e)))?;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let tls_stream = match timeout(cfg.handshake_timeout, tls.accept(stream)).await {
+        Err(_) => {
+            stats.handshake_timeouts.fetch_add(1, Relaxed);
+            return Err(TlsError::HandshakeTimeout(cfg.handshake_timeout));
+        }
+        Ok(Err(e)) => {
+            stats.handshake_failures.fetch_add(1, Relaxed);
+            return Err(TlsError::Io(io::Error::other(e)));
+        }
+        Ok(Ok(s)) => s,
+    };
+    stats.active.fetch_add(1, Relaxed);
+    // Every exit below goes through `finish`, so `active` cannot leak.
+    let _guard = ActiveGuard {
+        stats: stats.clone(),
+    };
 
     let _ = etx
         .send(TcpTransportEvent::ConnectionOpened {
@@ -484,35 +769,68 @@ async fn handle_conn(
 
     loop {
         tokio::select! {
+            // Cooperative drain: stop serving this connection when the process
+            // is shutting down instead of being aborted mid-write. An `Err`
+            // means the watch sender is gone (the server is going away), which
+            // is treated as shutdown — otherwise `changed()` would return
+            // immediately forever and spin this loop.
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    let _ = wr.shutdown().await;
+                    return Ok(HandleOutcome::Closed("server draining".into()));
+                }
+            }
             res = timeout(cfg.read_timeout, rd.read_buf(&mut buf)) => {
                 match res {
                     Ok(Ok(0)) => return Ok(HandleOutcome::Closed("clean close".into())),
-                    Ok(Ok(_)) => {
-                        while let Some(frame) = codec.decode(&mut buf)? {
-                            etx.send(TcpTransportEvent::PacketReceived { conn_id: id, peer_addr: peer, data: frame })
-                                .await.map_err(|_| TlsError::Closed)?;
+                    Ok(Ok(n)) => {
+                        stats.bytes_rx.fetch_add(n as u64, Relaxed);
+                        loop {
+                            match codec.decode(&mut buf) {
+                                Ok(Some(frame)) => {
+                                    etx.send(TcpTransportEvent::PacketReceived { conn_id: id, peer_addr: peer, data: frame })
+                                        .await.map_err(|_| TlsError::Closed)?;
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    // Invalid framing / over-sized frame: the
+                                    // stream can no longer be resynchronised, so
+                                    // the connection still dies — but count it so
+                                    // a client sending garbage is visible instead
+                                    // of looking like a normal disconnect.
+                                    stats.framing_errors.fetch_add(1, Relaxed);
+                                    return Err(e);
+                                }
+                            }
                         }
                     }
                     Ok(Err(e)) => return Err(TlsError::Io(e)),
-                    Err(_) => return Ok(HandleOutcome::Closed("idle timeout".into())),
+                    Err(_) => {
+                        stats.idle_timeouts.fetch_add(1, Relaxed);
+                        return Ok(HandleOutcome::Closed("idle timeout".into()));
+                    }
                 }
             }
             Some(ctl) = ctl_rx.recv() => {
                 match ctl {
                     ConnCtl::Send(data) => {
-                        let mut out = BytesMut::with_capacity(2 + data.len());
+                        // `data` is already a complete self-framed message; encode
+                        // only appends ChannelData padding (no length prefix).
+                        let mut out = BytesMut::with_capacity(data.len() + 3);
                         codec.encode(&data, &mut out)?;
                         wr.write_all(&out).await?;
                         wr.flush().await?;
+                        stats.bytes_tx.fetch_add(out.len() as u64, Relaxed);
                     }
                     ConnCtl::Detach { connection_id, success } => {
                         // RFC 6062 4.4: write the ConnectionBind success, then the
                         // connection stops being a framed control connection and
                         // becomes a raw data connection.
-                        let mut out = BytesMut::with_capacity(2 + success.len());
+                        let mut out = BytesMut::with_capacity(success.len() + 3);
                         codec.encode(&success, &mut out)?;
                         wr.write_all(&out).await?;
                         wr.flush().await?;
+                        stats.bytes_tx.fetch_add(out.len() as u64, Relaxed);
                         let stream = rd.unsplit(wr);
                         let prebuffer = std::mem::take(&mut buf);
                         if detach_out_tx
@@ -625,7 +943,14 @@ impl CertReloader {
         }
     }
 
-    pub async fn spawn(self) -> Result<tokio::sync::watch::Receiver<Arc<ServerConfig>>> {
+    /// Spawn the watcher and return a channel carrying the newest
+    /// `ServerConfig`. The listener reads this per accepted connection, so a
+    /// rotated certificate applies without a restart.
+    pub async fn spawn(
+        self,
+        stats: Arc<TlsStats>,
+    ) -> Result<tokio::sync::watch::Receiver<Arc<ServerConfig>>> {
+        use std::sync::atomic::Ordering::Relaxed;
         let initial = self.reload()?;
         let (tx, rx) = tokio::sync::watch::channel(Arc::new(initial));
         tokio::spawn(async move {
@@ -641,9 +966,15 @@ impl CertReloader {
                             let _ = tx.send(Arc::new(c));
                             cert_mt = new_cert;
                             key_mt = new_key;
+                            stats.cert_reloads.fetch_add(1, Relaxed);
                             info!("TLS cert reloaded");
                         }
-                        Err(e) => error!(%e, "cert reload failed"),
+                        Err(e) => {
+                            // Keep serving the previous material rather than
+                            // dropping TLS because of a half-written PEM.
+                            stats.cert_reload_failures.fetch_add(1, Relaxed);
+                            error!(%e, "cert reload failed; keeping previous certificate");
+                        }
                     }
                 }
             }

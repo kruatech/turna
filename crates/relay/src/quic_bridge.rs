@@ -37,9 +37,29 @@ pub struct StreamFramer {
     buf: Vec<u8>,
 }
 
+/// Hard ceiling on buffered stream bytes. One logical message is at most
+/// `20 + u16::MAX` (STUN) so anything beyond this means the stream is
+/// desynchronised or hostile; the buffer is dropped rather than grown.
+const MAX_FRAMER_BUFFER: usize = 128 * 1024;
+
 impl StreamFramer {
+    /// Bytes currently buffered awaiting a complete message (test/observability).
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Append freshly-received stream bytes.
     pub fn push(&mut self, data: &[u8]) {
+        if self.buf.len().saturating_add(data.len()) > MAX_FRAMER_BUFFER {
+            tracing::warn!(
+                buffered = self.buf.len(),
+                incoming = data.len(),
+                limit = MAX_FRAMER_BUFFER,
+                "QUIC stream framer buffer limit exceeded; discarding buffer (desynchronised stream)"
+            );
+            self.buf.clear();
+            return;
+        }
         self.buf.extend_from_slice(data);
     }
 
@@ -83,6 +103,10 @@ impl StreamFramer {
 struct SessionCtx {
     remote: SocketAddr,
     framer: StreamFramer,
+    /// Bidi stream the session's most recent control message arrived on, so a
+    /// response goes back on that stream rather than whichever one the client
+    /// happened to open first.
+    last_stream: Option<u64>,
 }
 
 /// Bridges `QuicEvent`s into the processor. Tracks per-session remote address
@@ -90,6 +114,10 @@ struct SessionCtx {
 pub struct QuicBridge {
     processor: Arc<PacketProcessor>,
     sessions: HashMap<String, SessionCtx>,
+    /// Reverse index of `sessions` (remote address → session id). Every outbound
+    /// packet needs this lookup, and scanning the session map for each one was
+    /// O(sessions) on the egress hot path.
+    by_addr: HashMap<SocketAddr, String>,
 }
 
 impl QuicBridge {
@@ -97,18 +125,32 @@ impl QuicBridge {
         Self {
             processor,
             sessions: HashMap::new(),
+            by_addr: HashMap::new(),
         }
     }
 
-    /// Resolve which live session an outbound `Action`'s target belongs to
-    /// (reverse of the session → remote map), so a response routes back over
-    /// the originating WebTransport session. Returns `None` if no session has
-    /// that remote (e.g. the client disconnected).
+    /// Resolve which live session an outbound `Action`'s target belongs to, so a
+    /// response routes back over the originating session. Returns `None` if no
+    /// session has that remote (e.g. the client disconnected).
     pub fn session_for_addr(&self, addr: SocketAddr) -> Option<String> {
-        self.sessions
-            .iter()
-            .find(|(_, ctx)| ctx.remote == addr)
-            .map(|(id, _)| id.clone())
+        self.by_addr.get(&addr).cloned()
+    }
+
+    /// Bidi stream to answer a control response on for this session (the one its
+    /// most recent request arrived on), or `None` for a datagram-only session.
+    pub fn control_stream_for(&self, session_id: &str) -> Option<u64> {
+        self.sessions.get(session_id).and_then(|c| c.last_stream)
+    }
+
+    /// Re-key a session after a QUIC connection migration (the client's address
+    /// changed but the connection survived).
+    pub fn migrate(&mut self, session_id: &str, old_addr: SocketAddr, new_addr: SocketAddr) {
+        if let Some(ctx) = self.sessions.get_mut(session_id) {
+            ctx.remote = new_addr;
+        }
+        self.by_addr.remove(&old_addr);
+        self.by_addr
+            .insert(new_addr, session_id.to_string());
     }
 
     /// Feed one `QuicEvent`. Returns the `Action`s the caller must deliver back
@@ -118,35 +160,57 @@ impl QuicBridge {
         let processor = self.processor.clone();
         match ev {
             QuicEvent::NewSession(s) => {
+                self.by_addr
+                    .insert(s.remote_addr, s.session_id.clone());
                 self.sessions.insert(
                     s.session_id.clone(),
                     SessionCtx {
                         remote: s.remote_addr,
                         framer: StreamFramer::default(),
+                        last_stream: None,
                     },
                 );
                 Vec::new()
             }
             QuicEvent::SessionClosed { session_id, .. } => {
-                self.sessions.remove(&session_id);
+                if let Some(ctx) = self.sessions.remove(&session_id) {
+                    // Only drop the reverse entry if it still points at us: a
+                    // migrated session may have handed the old address on.
+                    if self.by_addr.get(&ctx.remote).map(|s| s.as_str()) == Some(session_id.as_str())
+                    {
+                        self.by_addr.remove(&ctx.remote);
+                    }
+                }
                 Vec::new()
             }
             QuicEvent::Datagram { session_id, data } => match self.sessions.get(&session_id) {
-                Some(ctx) => processor.process_slice(&data, ctx.remote),
+                // `process_owned`, NOT `process_slice`: the latter emits
+                // `ForwardZeroCopy { offset, len }` for ChannelData, which the
+                // QUIC egress cannot resolve back into bytes — every
+                // client→peer media datagram was silently dropped.
+                Some(ctx) => processor.process_owned(data, ctx.remote),
                 None => Vec::new(),
             },
             QuicEvent::StreamData {
-                session_id, data, ..
+                session_id,
+                data,
+                stream_id,
             } => {
                 let mut out = Vec::new();
                 if let Some(ctx) = self.sessions.get_mut(&session_id) {
+                    // Remember which stream to answer on.
+                    ctx.last_stream = Some(stream_id);
                     ctx.framer.push(&data);
                     while let Some(msg) = ctx.framer.next_message() {
-                        out.extend(processor.process_slice(&msg, ctx.remote));
+                        // Owned message from the framer — see the `Datagram`
+                        // arm for why `process_slice` must not be used here.
+                        out.extend(processor.process_owned(msg, ctx.remote));
                     }
                 }
                 out
             }
+            // Migration is applied by the caller via `migrate()` (it also has to
+            // re-key the shared client_sinks registry), so nothing to do here.
             QuicEvent::BiStreamOpened { .. } | QuicEvent::ConnectionMigrated { .. } => Vec::new(),
         }
     }
@@ -218,6 +282,42 @@ mod tests {
             Some(next),
             "next message starts after the pad"
         );
+    }
+
+    #[test]
+    fn framer_buffer_is_bounded() {
+        // A stream that never yields a complete message must not grow the buffer
+        // without limit. One logical message is at most 20 + u16::MAX, so hitting
+        // MAX_FRAMER_BUFFER means the stream is desynchronised: drop the buffer.
+        let mut f = StreamFramer::default();
+        // A STUN header claiming a body far larger than any single push, so
+        // `next_message` keeps returning None while bytes accumulate.
+        let mut header = vec![0u8; 20];
+        header[0] = 0x00;
+        header[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        f.push(&header);
+        assert!(f.next_message().is_none(), "incomplete message");
+
+        // Push well past the cap in chunks.
+        let chunk = vec![0u8; 32 * 1024];
+        for _ in 0..8 {
+            f.push(&chunk);
+        }
+        assert!(
+            f.buffered() <= MAX_FRAMER_BUFFER,
+            "framer buffer must stay bounded, was {}",
+            f.buffered()
+        );
+    }
+
+    #[test]
+    fn framer_recovers_after_buffer_reset() {
+        // After a reset the framer must still parse a fresh, well-formed message.
+        let mut f = StreamFramer::default();
+        f.push(&vec![0u8; MAX_FRAMER_BUFFER + 1]);
+        let good = stun_msg(0);
+        f.push(&good);
+        assert_eq!(f.next_message(), Some(good));
     }
 
     #[test]

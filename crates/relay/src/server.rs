@@ -523,10 +523,20 @@ impl RelayServer {
             let tcp_relay = self.tcp_relay.clone();
             let listener_metrics = self.processor.metrics().clone();
             let listener_shutdown = shutdown.clone();
+            // Cooperative drain for the TURNS listener: it stops accepting and
+            // winds established connections down itself, so the `abort()` at the
+            // end of `run` is only a backstop.
+            let bridge_shutdown = shutdown.clone();
             tls_handle = Some(tokio::spawn(async move {
-                let res =
-                    crate::tls_bridge::run_tls_bridge(tls_cfg, proc, relay_tx, sinks, tcp_relay)
-                        .await;
+                let res = crate::tls_bridge::run_tls_bridge(
+                    tls_cfg,
+                    proc,
+                    relay_tx,
+                    sinks,
+                    tcp_relay,
+                    bridge_shutdown,
+                )
+                .await;
                 if !*listener_shutdown.borrow() {
                     match res {
                         Ok(()) => error!("TURNS bridge exited unexpectedly"),

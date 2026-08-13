@@ -24,6 +24,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// Maximum plaintext a single DTLS 1.2 record can carry: 2^14 bytes
+/// (RFC 6347 §4.1 inherits RFC 5246 §6.2.1). The per-session receive buffer is
+/// sized to at least this so a large client record is never truncated.
+pub const MAX_DTLS_PLAINTEXT: usize = 16 * 1024;
+
 /// DTLS listener parameters (mapped from the `[turn.dtls]` config section).
 #[derive(Clone)]
 pub struct DtlsConfig {
@@ -95,23 +100,51 @@ pub struct DtlsStats {
     pub outbound_dropped: std::sync::atomic::AtomicU64,
     /// DTL-9: sessions refused because the source IP hit max_sessions_per_ip.
     pub rejected_per_ip: std::sync::atomic::AtomicU64,
+    /// Outbound datagrams dropped because they exceeded the configured record
+    /// MTU. A DTLS record cannot be fragmented at the record layer, so sending
+    /// one anyway would rely on IP fragmentation (commonly dropped on the
+    /// public Internet) — the datagram is dropped and counted instead.
+    pub outbound_oversize: std::sync::atomic::AtomicU64,
+    /// True once the UDP listener is bound and accepting handshakes; cleared on
+    /// drain/exit. Mirrored into `turna_dtls_readiness` by the node.
+    pub listening: std::sync::atomic::AtomicBool,
+}
+
+/// Point-in-time copy of [`DtlsStats`]. A named struct rather than a tuple so
+/// adding a counter cannot silently shift the node's metric mirror.
+#[cfg(feature = "dtls")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DtlsStatsSnapshot {
+    pub active: usize,
+    pub accepted: u64,
+    pub rejected_over_cap: u64,
+    pub closed: u64,
+    pub idle_timeouts: u64,
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    pub outbound_dropped: u64,
+    pub rejected_per_ip: u64,
+    pub outbound_oversize: u64,
+    pub listening: bool,
 }
 
 #[cfg(feature = "dtls")]
 impl DtlsStats {
-    pub fn snapshot(&self) -> (usize, u64, u64, u64, u64, u64, u64, u64, u64) {
+    pub fn snapshot(&self) -> DtlsStatsSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
-        (
-            self.active.load(Relaxed),
-            self.accepted.load(Relaxed),
-            self.rejected_over_cap.load(Relaxed),
-            self.closed.load(Relaxed),
-            self.idle_timeouts.load(Relaxed),
-            self.bytes_rx.load(Relaxed),
-            self.bytes_tx.load(Relaxed),
-            self.outbound_dropped.load(Relaxed),
-            self.rejected_per_ip.load(Relaxed),
-        )
+        DtlsStatsSnapshot {
+            active: self.active.load(Relaxed),
+            accepted: self.accepted.load(Relaxed),
+            rejected_over_cap: self.rejected_over_cap.load(Relaxed),
+            closed: self.closed.load(Relaxed),
+            idle_timeouts: self.idle_timeouts.load(Relaxed),
+            bytes_rx: self.bytes_rx.load(Relaxed),
+            bytes_tx: self.bytes_tx.load(Relaxed),
+            outbound_dropped: self.outbound_dropped.load(Relaxed),
+            rejected_per_ip: self.rejected_per_ip.load(Relaxed),
+            outbound_oversize: self.outbound_oversize.load(Relaxed),
+            listening: self.listening.load(Relaxed),
+        }
     }
 }
 
@@ -210,6 +243,9 @@ impl DtlsServer {
             .await
             .map_err(|e| DtlsError::Other(format!("listen: {e}")))?;
         tracing::info!(addr = %self.config.listen_addr, "DTLS endpoint listening");
+        // The socket is bound and cookie exchange is live — only now is it
+        // honest to report the DTLS listener ready.
+        stats.listening.store(true, Relaxed);
 
         spawn_stats_logger(stats.clone());
 
@@ -276,6 +312,7 @@ impl DtlsServer {
             });
         }
 
+        stats.listening.store(false, Relaxed);
         tracing::info!("DTLS listener draining: shutdown signalled, no new handshakes");
         Ok(())
     }
@@ -289,18 +326,19 @@ fn spawn_stats_logger(stats: std::sync::Arc<DtlsStats>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let (active, accepted, rejected, closed, idle, rx, tx, dropped, rejected_ip) =
-                stats.snapshot();
+            let s = stats.snapshot();
             tracing::info!(
-                active,
-                accepted,
-                rejected_over_cap = rejected,
-                closed,
-                idle_timeouts = idle,
-                bytes_rx = rx,
-                bytes_tx = tx,
-                outbound_dropped = dropped,
-                rejected_per_ip = rejected_ip,
+                active = s.active,
+                accepted = s.accepted,
+                rejected_over_cap = s.rejected_over_cap,
+                closed = s.closed,
+                idle_timeouts = s.idle_timeouts,
+                bytes_rx = s.bytes_rx,
+                bytes_tx = s.bytes_tx,
+                outbound_dropped = s.outbound_dropped,
+                rejected_per_ip = s.rejected_per_ip,
+                outbound_oversize = s.outbound_oversize,
+                listening = s.listening,
                 "DTLS stats"
             );
         }
@@ -342,8 +380,12 @@ async fn handle_dtls_session(
         })
         .await;
 
-    // Receive buffer: at least an Ethernet-ish MTU so a full record fits.
-    let mut buf = vec![0u8; mtu.max(2048)];
+    // Receive buffer: a DTLS 1.2 record carries up to 2^14 bytes of plaintext
+    // (RFC 6347 §4.1 → RFC 5246 §6.2.1), independent of the *send*-side MTU we
+    // impose on ourselves. Sizing this at `mtu.max(2048)` truncated or errored
+    // out any larger client record (e.g. a Send indication with a big payload)
+    // and killed the session.
+    let mut buf = vec![0u8; mtu.max(MAX_DTLS_PLAINTEXT)];
 
     // Resettable idle deadline.
     let idle = tokio::time::sleep(idle_timeout);
@@ -378,15 +420,21 @@ async fn handle_dtls_session(
             out = out_rx.recv() => match out {
                 // conn.send encrypts the TURN response into this DTLS session.
                 Some(msg) => {
-                    // A single DTLS record cannot be fragmented across the
-                    // record layer; oversized app data would be IP-fragmented
-                    // (or rejected). TURN control responses are tiny; relayed
-                    // ChannelData is bounded by negotiated MTU upstream.
+                    // A single DTLS record cannot be fragmented at the record
+                    // layer, so an oversized datagram would depend on IP
+                    // fragmentation — widely dropped on the public Internet, and
+                    // a silent one-way media failure for the client. Drop and
+                    // count it instead of pretending it was delivered. TURN
+                    // control responses are tiny; relayed ChannelData larger
+                    // than the configured MTU means the operator's `mtu` is
+                    // below the media path MTU in use, which the counter surfaces.
                     if msg.data.len() > mtu {
+                        stats.outbound_oversize.fetch_add(1, Relaxed);
                         tracing::warn!(
                             %remote, len = msg.data.len(), mtu,
-                            "DTLS outbound exceeds MTU; sending anyway (may IP-fragment)"
+                            "DTLS outbound exceeds record MTU; dropped (raise [turn.dtls].mtu)"
                         );
+                        continue;
                     }
                     match conn.send(&msg.data).await {
                         Ok(_) => {

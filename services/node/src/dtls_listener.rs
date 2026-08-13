@@ -106,18 +106,66 @@ pub fn spawn_dtls(
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            // Report Degraded until the first tick observes a bound listener, so
+            // `turna_dtls_readiness` cannot sit at "starting" forever (it never
+            // used to be written at all).
             loop {
                 tick.tick().await;
                 let s = stats.snapshot();
-                metrics.dtls_active.store(s.0 as u64, Relaxed);
-                metrics.dtls_sessions_total.store(s.1, Relaxed);
-                metrics.dtls_rejected_over_cap.store(s.2, Relaxed);
-                metrics.dtls_closed_total.store(s.3, Relaxed);
-                metrics.dtls_idle_timeouts.store(s.4, Relaxed);
-                metrics.dtls_bytes_rx.store(s.5, Relaxed);
-                metrics.dtls_bytes_tx.store(s.6, Relaxed);
-                metrics.dtls_outbound_dropped.store(s.7, Relaxed);
-                metrics.dtls_rejected_per_ip.store(s.8, Relaxed);
+                metrics.dtls_active.store(s.active as u64, Relaxed);
+                metrics.dtls_sessions_total.store(s.accepted, Relaxed);
+                metrics.dtls_rejected_over_cap.store(s.rejected_over_cap, Relaxed);
+                metrics.dtls_closed_total.store(s.closed, Relaxed);
+                metrics.dtls_idle_timeouts.store(s.idle_timeouts, Relaxed);
+                metrics.dtls_bytes_rx.store(s.bytes_rx, Relaxed);
+                metrics.dtls_bytes_tx.store(s.bytes_tx, Relaxed);
+                metrics.dtls_outbound_dropped.store(s.outbound_dropped, Relaxed);
+                metrics.dtls_rejected_per_ip.store(s.rejected_per_ip, Relaxed);
+                metrics
+                    .dtls_outbound_oversize
+                    .store(s.outbound_oversize, Relaxed);
+                metrics.set_dtls_readiness(if s.listening {
+                    turna_health::Readiness::Ready
+                } else {
+                    turna_health::Readiness::Degraded
+                });
+            }
+        });
+    }
+
+    // DTLS has no certificate hot-reload: webrtc-dtls takes its `Config` at
+    // `listen()`, and swapping material would mean rebinding the UDP socket and
+    // dropping every live session. The operator trap is that rotating the cert
+    // (ACME renewal) then does *nothing* with no signal at all — the listener
+    // keeps serving the old certificate until the process restarts. Watch the
+    // files and say so loudly; TURNS (tcp_tls) does reload, DTLS cannot.
+    if !cfg.cert_path.as_os_str().is_empty() && !cfg.key_path.as_os_str().is_empty() {
+        let cert_path = cfg.cert_path.clone();
+        let key_path = cfg.key_path.clone();
+        tokio::spawn(async move {
+            let mtime = |p: &std::path::Path| {
+                std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
+            };
+            let mut cert_mt = mtime(&cert_path);
+            let mut key_mt = mtime(&key_path);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let new_cert = mtime(&cert_path);
+                let new_key = mtime(&key_path);
+                if new_cert != cert_mt || new_key != key_mt {
+                    cert_mt = new_cert;
+                    key_mt = new_key;
+                    tracing::warn!(
+                        cert = %cert_path.display(),
+                        key = %key_path.display(),
+                        "DTLS certificate material changed on disk but DTLS cannot \
+                         hot-reload it (webrtc-dtls fixes its config at listen time). \
+                         The listener is still serving the OLD certificate — restart \
+                         the node to pick up the new one."
+                    );
+                }
             }
         });
     }
@@ -183,11 +231,25 @@ pub fn spawn_dtls(
                     // the client_sink (dropping the sender ends the pump task).
                     if let Ok(addr) = session_id.parse::<std::net::SocketAddr>() {
                         client_sinks.remove(&addr);
+                        // The DTLS session *is* the client's 5-tuple: once it is
+                        // gone the allocation can never be refreshed or used
+                        // again, so release it now instead of holding its relay
+                        // port for the rest of the lifetime.
+                        for action in processor.release_for_closed_connection(addr) {
+                            let _ = egress.dispatch(action).await;
+                        }
                     }
                     tracing::debug!(session = %session_id, "DTLS session closed (egress unregistered)");
                 }
                 DtlsEvent::Datagram { remote, data, .. } => {
-                    for action in processor.process_slice(&data, remote) {
+                    // `process_owned`, NOT `process_slice`: the latter emits
+                    // `ForwardZeroCopy { offset, len }` for ChannelData, and
+                    // `RelayEgress::dispatch` cannot turn an offset/len back
+                    // into bytes — so every client→peer media record was
+                    // silently dropped (and tripped a debug_assert in debug
+                    // builds). The decrypted record is already owned here, so
+                    // handing it over by value costs nothing.
+                    for action in processor.process_owned(data, remote) {
                         // Relay-plane actions (RegisterRelay/Forward/CloseRelay)
                         // go into the shared relay egress; a control Send comes
                         // back here for delivery over this DTLS session.
@@ -240,14 +302,40 @@ fn validate_dtls(cfg: &turna_config::DtlsSection) -> Result<(), Vec<String>> {
         problems.push("listen port must be non-zero".to_string());
     }
 
-    // cert/key must exist and be regular files (best-effort; the listener would
-    // otherwise fail later with a less obvious error).
-    for (label, path) in [("cert_path", &cfg.cert_path), ("key_path", &cfg.key_path)] {
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => problems.push(format!("{label} is not a regular file: {}", path.display())),
-            Err(e) => problems.push(format!("{label} unreadable ({}): {e}", path.display())),
+    // Both paths empty = explicit opt-in to the ephemeral self-signed cert that
+    // `dtls::load_certificate` generates (dev/test only). Previously this branch
+    // was unreachable: the defaults are non-empty paths and this loop required
+    // the files to exist, so the documented fallback could never be selected.
+    // A partially-configured pair is still an error.
+    let cert_empty = cfg.cert_path.as_os_str().is_empty();
+    let key_empty = cfg.key_path.as_os_str().is_empty();
+    match (cert_empty, key_empty) {
+        (true, true) => {
+            tracing::warn!(
+                "[turn.dtls] cert_path/key_path are empty: using an ephemeral \
+                 self-signed certificate. Do not do this in production."
+            );
         }
+        (false, false) => {
+            // cert/key must exist and be regular files (best-effort; the listener
+            // would otherwise fail later with a less obvious error).
+            for (label, path) in [("cert_path", &cfg.cert_path), ("key_path", &cfg.key_path)] {
+                match std::fs::metadata(path) {
+                    Ok(m) if m.is_file() => {}
+                    Ok(_) => {
+                        problems.push(format!("{label} is not a regular file: {}", path.display()))
+                    }
+                    Err(e) => {
+                        problems.push(format!("{label} unreadable ({}): {e}", path.display()))
+                    }
+                }
+            }
+        }
+        _ => problems.push(
+            "cert_path and key_path must both be set, or both be empty \
+             (empty = ephemeral self-signed, dev only)"
+                .to_string(),
+        ),
     }
 
     // idle_timeout == 0 would close every session immediately (sleep(0) fires
@@ -269,6 +357,119 @@ fn validate_dtls(cfg: &turna_config::DtlsSection) -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(problems)
+    }
+}
+
+#[cfg(all(test, feature = "dtls"))]
+mod tests {
+    use super::validate_dtls;
+    use turna_config::DtlsSection;
+
+    fn base() -> DtlsSection {
+        // Defaults are sane except that cert_path/key_path point at files that do
+        // not exist in a test environment; each case sets what it needs.
+        DtlsSection {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn both_cert_paths_empty_is_the_dev_self_signed_opt_in() {
+        // Previously unreachable: the defaults are non-empty paths and validation
+        // demanded the files exist, so `load_certificate`'s documented ephemeral
+        // self-signed fallback could never be selected from config.
+        let cfg = DtlsSection {
+            cert_path: "".into(),
+            key_path: "".into(),
+            ..base()
+        };
+        assert!(
+            validate_dtls(&cfg).is_ok(),
+            "empty cert+key must be accepted as the dev self-signed opt-in"
+        );
+    }
+
+    #[test]
+    fn half_configured_cert_pair_is_rejected() {
+        let only_cert = DtlsSection {
+            cert_path: "/nonexistent/cert.pem".into(),
+            key_path: "".into(),
+            ..base()
+        };
+        let problems = validate_dtls(&only_cert).expect_err("half-set pair must fail");
+        assert!(
+            problems.iter().any(|p| p.contains("both")),
+            "error should explain the both-or-neither rule, got {problems:?}"
+        );
+
+        let only_key = DtlsSection {
+            cert_path: "".into(),
+            key_path: "/nonexistent/key.pem".into(),
+            ..base()
+        };
+        assert!(validate_dtls(&only_key).is_err());
+    }
+
+    #[test]
+    fn missing_cert_files_are_rejected() {
+        let cfg = DtlsSection {
+            cert_path: "/nonexistent/cert.pem".into(),
+            key_path: "/nonexistent/key.pem".into(),
+            ..base()
+        };
+        let problems = validate_dtls(&cfg).expect_err("unreadable cert/key must fail");
+        assert_eq!(problems.len(), 2, "one problem per unreadable file: {problems:?}");
+    }
+
+    #[test]
+    fn zero_idle_timeout_is_rejected() {
+        // sleep(0) fires immediately, closing every session as soon as it opens.
+        let cfg = DtlsSection {
+            cert_path: "".into(),
+            key_path: "".into(),
+            idle_timeout_secs: 0,
+            ..base()
+        };
+        assert!(validate_dtls(&cfg).is_err());
+    }
+
+    #[test]
+    fn mtu_bounds_are_enforced() {
+        let too_small = DtlsSection {
+            cert_path: "".into(),
+            key_path: "".into(),
+            mtu: 500,
+            ..base()
+        };
+        assert!(validate_dtls(&too_small).is_err(), "below the IPv4 576 floor");
+
+        let too_large = DtlsSection {
+            cert_path: "".into(),
+            key_path: "".into(),
+            mtu: 70_000,
+            ..base()
+        };
+        assert!(validate_dtls(&too_large).is_err(), "above a UDP datagram");
+
+        let ok = DtlsSection {
+            cert_path: "".into(),
+            key_path: "".into(),
+            mtu: 1200,
+            ..base()
+        };
+        assert!(validate_dtls(&ok).is_ok());
+    }
+
+    #[test]
+    fn zero_listen_port_is_rejected() {
+        let cfg = DtlsSection {
+            cert_path: "".into(),
+            key_path: "".into(),
+            listen: "0.0.0.0:0".parse().unwrap(),
+            ..base()
+        };
+        assert!(validate_dtls(&cfg).is_err());
     }
 }
 

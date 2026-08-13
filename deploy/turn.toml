@@ -34,11 +34,15 @@ listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
 # XOR-RELAYED-ADDRESS attribute.
 external_ip = "${TURNA_EXTERNAL_IP:-}"
 realm       = "${TURNA_REALM:-turna}"
-# Transport backend: auto | io_uring | tokio.
-# - auto (default): use io_uring when usable at runtime, else tokio.
-# - io_uring: force io_uring (Linux + io-uring build; not production-ready yet).
-# - tokio: force epoll + recvmmsg/sendmmsg.
-transport   = "auto"
+# Transport backend: tokio | io_uring | af_xdp | auto.
+# - tokio (set below): epoll + recvmmsg/sendmmsg. The supported production path.
+# - io_uring: Linux + `--features io-uring`. Experimental.
+# - af_xdp: Linux + `--features af-xdp` + CAP_NET_RAW. Experimental; `listen`
+#   must be a concrete IP, not 0.0.0.0.
+# - auto: pick io_uring when usable at runtime, else tokio. Convenient for dev,
+#   but docs/PRODUCTION_READINESS.md R1 advises against it in production —
+#   a kernel/build capability change would silently move your datapath.
+transport   = "tokio"
 
 [turn.auth]
 # Time-limited credentials, coturn-compatible (lt-cred-mech).
@@ -199,3 +203,141 @@ tls_mode = "${TURNA_GRPC_TLS_MODE:-disabled}"
 tls_cert = "${TURNA_GRPC_TLS_CERT:-}"
 tls_key  = "${TURNA_GRPC_TLS_KEY:-}"
 tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
+
+# =============================================================================
+# [tls] — TURNS: TURN over TLS-over-TCP (RFC 5766/8656), port 5349/tcp
+# =============================================================================
+# For clients on networks that block UDP. Requires a binary built with
+# `--features tls`. Also the control transport RFC 6062 TCP allocations need:
+# [turn.tcp_relay] does nothing unless this listener is enabled.
+#
+# Maturity: beta — see docs/feature-support.md.
+#
+# NOTE: this is a ROOT-level section ([tls]), not [turn.tls].
+#
+# [tls]
+# enabled = false
+# listen  = "0.0.0.0:5349"
+# # PEM certificate chain and private key, loaded BY PATH at startup.
+# cert_path = "/etc/turna/tls/cert.pem"
+# key_path  = "/etc/turna/tls/key.pem"
+# # Max framed STUN/ChannelData message, bytes.
+# max_frame_size = 65536
+# handshake_timeout_secs = 5
+# # Per-connection idle read timeout.
+# read_timeout_secs = 300
+# # Global connection cap.
+# max_connections = 10000
+# # Per-source-IP connection cap; 0 = unlimited. Without it one source can
+# # occupy every slot of max_connections.
+# max_connections_per_ip = 0
+# # Re-read cert_path/key_path every N seconds and pick up a rotated
+# # certificate without a restart (new connections get the new material;
+# # established ones keep their session). 0 disables reloading.
+# cert_reload_secs = 30
+# # Advertise ALPN "stun.turn".
+# enable_alpn = true
+
+# =============================================================================
+# [turn.tcp_relay] — RFC 6062 TCP relay allocations
+# =============================================================================
+# The client relays TCP (not UDP) to peers via CONNECT / CONNECTION-BIND.
+# Requires [tls] enabled: RFC 6062 §4.1 mandates a TCP/TLS control connection,
+# and a TCP-transport Allocate arriving over UDP/DTLS/QUIC is refused with 400.
+#
+# [turn.tcp_relay]
+# enabled = false
+# # Outbound connect timeout to the peer (failure/timeout answers 447).
+# connect_timeout_secs = 30
+# # Reap a peer connection that is connected but never ConnectionBind-ed.
+# idle_timeout_secs = 30
+# max_per_allocation = 10
+# max_total = 50000
+# # Per-direction relay buffer, bytes.
+# buffer_size = 16384
+
+# =============================================================================
+# [turn.dtls] — TURN over DTLS (RFC 7350), port 5349/udp
+# =============================================================================
+# Requires `--features dtls`. Coexists with [tls] on 5349 (different protocol).
+# Maturity: beta.
+#
+# The key MUST be PKCS#8 ECDSA P-256 — the stack negotiates ECDHE-ECDSA only,
+# so an RSA key loads but every handshake then fails:
+#   openssl ecparam -name prime256v1 -genkey -noout -out key.pem
+#   openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pk8.pem
+#
+# Enabling this section on a binary built WITHOUT `--features dtls` is a
+# startup error, not a warning.
+#
+# [turn.dtls]
+# enabled = false
+# listen  = "0.0.0.0:5349"
+# # Both empty = ephemeral self-signed certificate (DEV ONLY). Setting only one
+# # of the two is a configuration error. A configured-but-unloadable cert
+# # aborts startup rather than silently downgrading to self-signed.
+# cert_path = "/etc/turna/tls/cert.pem"
+# key_path  = "/etc/turna/tls/key.pem"
+# # Post-handshake session cap; 0 = unlimited.
+# max_sessions = 10000
+# # Per-source-IP session cap (anti slot-exhaustion); 0 = unlimited.
+# max_sessions_per_ip = 0
+# # Per-session idle timeout. Must be > 0.
+# idle_timeout_secs = 300
+# # Application record MTU, 576..65535. An outbound datagram larger than this
+# # is DROPPED and counted (turna_dtls_outbound_oversize_total) rather than
+# # relying on IP fragmentation. Raise it if you see that counter climb.
+# mtu = 1200
+# # Bounded per-session egress queue; when full the NEWEST datagram is dropped
+# # (turna_dtls_outbound_dropped_total) instead of blocking the relay path.
+# outbound_queue_capacity = 1024
+#
+# NOTE: DTLS cannot hot-reload its certificate (the stack fixes its config at
+# listen time). Rotating the files logs a warning and needs a node restart.
+
+# =============================================================================
+# [turn.quic] — QUIC / WebTransport listener
+# =============================================================================
+# Requires `--features quic` (raw QUIC) or `--features web-transport` (browser
+# HTTP/3 CONNECT, implies quic). Maturity: EXPERIMENTAL.
+#
+# Enabling this without the matching feature is a startup error. With
+# web_transport = true you need `--features web-transport` specifically.
+#
+# IMPORTANT: on the WebTransport (H3) path only listen/cert/key/keep_alive are
+# applied — max_bi_streams, max_uni_streams, enable_datagrams,
+# max_datagram_size, idle_timeout_secs and alpn have NO effect there (the
+# listener warns about this at startup). Use web_transport = false if you need
+# those limits enforced. See docs/design/quic-webtransport.md §7.
+#
+# [turn.quic]
+# enabled = false
+# # true = WebTransport over HTTP/3 (browsers); false = raw QUIC datapath.
+# web_transport = true
+# listen = "0.0.0.0:5350"
+# cert_path = "/etc/turna/tls/cert.pem"
+# key_path  = "/etc/turna/tls/key.pem"
+# max_bi_streams = 256
+# max_uni_streams = 256
+# enable_datagrams = true
+# max_datagram_size = 1200
+# idle_timeout_secs = 30
+# keep_alive_secs = 10
+# alpn = ["stun.turn"]
+# # Session caps, same semantics as [turn.dtls]; 0 = unlimited.
+# max_sessions = 10000
+# max_sessions_per_ip = 0
+# # Per-source-IP handshake RATE limit; 0 = unlimited. max_sessions_per_ip only
+# # bounds concurrent sessions, so a source that opens and drops sessions in a
+# # loop never trips it while still costing a handshake each time. Off by
+# # default; set it on any internet-facing listener.
+# max_handshakes_per_sec_per_ip = 0
+# # Burst allowance; 0 = twice the rate.
+# handshake_burst_per_ip = 0
+# # Certificate hot-reload poll, seconds. WebTransport path only (raw QUIC has
+# # no reload hook and needs a restart). 0 disables.
+# cert_reload_secs = 30
+#
+# NOTE: the default listen port 5350/udp collides numerically with
+# [management].listen 5350/tcp. Different protocols, so the binds do not
+# conflict, but pick another port if that ambiguity bothers your tooling.
