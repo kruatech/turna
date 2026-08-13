@@ -58,16 +58,31 @@ openssl req -new -x509 -key key.pem -out cert.pem -days 365 -subj "/CN=turn.loca
   is dropped (`turna_dtls_outbound_dropped_total`) instead of blocking the relay
   return path. The registry sender is a bounded `mpsc::Sender`; both bridge send
   sites use `try_send` with drop-newest semantics.
+- **Per-IP session cap (DTL-9).** `max_sessions_per_ip`
+  (`turna_dtls_rejected_per_ip_total`); 0 = unlimited.
+- **Receive buffer ≥ one DTLS plaintext fragment.** Sized to
+  `max(mtu, 16 KiB)`: a DTLS 1.2 record carries up to 2^14 bytes of plaintext, so
+  a smaller buffer truncated large client records and killed the session.
+- **Outbound MTU enforced.** A datagram larger than `mtu` is dropped and counted
+  (`turna_dtls_outbound_oversize_total`) rather than sent and left to IP
+  fragmentation, which is widely dropped and produces silent one-way media.
+- **Allocation released on session close.** The DTLS session is the client's
+  5-tuple, so its allocation and relay port are freed immediately instead of at
+  TTL expiry.
+- **Readiness.** `turna_dtls_readiness` is derived from whether the UDP listener
+  is bound (0=starting, 1=ready, 2=degraded).
 
 ## Metrics
 
 `turna_dtls_active_sessions`, `turna_dtls_sessions_total`,
-`turna_dtls_rejected_over_cap_total`, `turna_dtls_closed_total`,
-`turna_dtls_idle_timeouts_total`, `turna_dtls_bytes_rx_total`,
-`turna_dtls_bytes_tx_total`, `turna_dtls_outbound_dropped_total`.
+`turna_dtls_rejected_over_cap_total`, `turna_dtls_rejected_per_ip_total`,
+`turna_dtls_closed_total`, `turna_dtls_idle_timeouts_total`,
+`turna_dtls_bytes_rx_total`, `turna_dtls_bytes_tx_total`,
+`turna_dtls_outbound_dropped_total`, `turna_dtls_outbound_oversize_total`,
+`turna_dtls_readiness`.
 
-Not yet exposed (require DTL-9 DoS limits and/or hooks below `accept()`):
-handshake failures/timeouts, per-IP rejection counters.
+Not yet exposed (requires hooks below `webrtc-dtls`' `accept()`): handshake
+failures and timeouts — a failed handshake never surfaces to this layer.
 
 ## Testing
 
@@ -81,7 +96,25 @@ cargo test -p turna-integration-tests --features dtls -- --ignored dtls
 
 Requires a live server built and configured with the `dtls` feature.
 
+## Certificate handling
+
+`cert_path`/`key_path` must be a PKCS#8 ECDSA P-256 pair. Setting **both** to the
+empty string is an explicit opt-in to an ephemeral self-signed certificate for
+dev/test (the listener logs a warning); setting only one is a configuration
+error. A configured-but-unloadable certificate fails startup rather than silently
+downgrading.
+
 ## Not done / follow-ups
 
-- DTL-9: per-IP and handshake-rate DoS limits (+ their metrics).
-- Pre-handshake amplification review of the listener buffer.
+- Handshake-rate DoS limits and pre-handshake amplification review of the
+  listener buffer: the handshake runs inside `webrtc-dtls`, so throttling needs
+  hooks below `accept()` (or a UDP demultiplexer in front of the listener).
+- **No certificate hot-reload.** `webrtc-dtls` takes its `Config` at `listen()`,
+  so swapping material would mean rebinding the socket and dropping every live
+  session. A rotated certificate currently needs a process restart. The node does
+  watch `cert_path`/`key_path` and logs a loud warning when they change, so a
+  silent "renewed but not served" state is at least visible; TURNS
+  (`crates/transport/src/tcp_tls.rs`) does reload without a restart.
+- DTLS 1.2 only (the stack does not implement RFC 9147 DTLS 1.3), and no
+  Connection ID (RFC 9146) — a client whose address changes gets a new session
+  and must re-allocate.

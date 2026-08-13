@@ -20,10 +20,27 @@ These are the areas we want to harden, in rough priority order:
 1. **Stabilize the core path.** The tokio UDP datapath, TURN allocation
    lifecycle, long-term/shared-secret and JWT auth, config validation, and
    graceful drain are the supported surface; keep them well-tested and stable.
-2. **Mature the experimental transports.** `io-uring`, `af-xdp`, `dtls`,
-   `quic`, and `web-transport` are behind Cargo features and not yet
-   runtime-verified for production. Move them toward "supported" one at a time,
-   with soak and integration coverage.
+2. **Mature the alternative transports.** All are behind Cargo features. They
+   are no longer one undifferentiated bucket:
+   - `tls` (TURNS, incl. RFC 6062 TCP relay) and `dtls` are **beta** — the
+     hardening is in source (per-IP and global limits, metrics, per-listener
+     readiness, cooperative drain, fail-fast startup, allocation release on
+     connection close). The remaining work is *evidence*: run
+     [docs/verification/encrypted-transports.md](docs/verification/encrypted-transports.md)
+     and record it, then they can be called supported.
+   - `quic` / `web-transport` are **experimental** with known functional gaps —
+     most `[turn.quic]` limits are not applied on the WebTransport path, there is
+     no per-stream reply routing there, and QUIC connection migration is not
+     detected. See
+     [docs/design/quic-webtransport.md](docs/design/quic-webtransport.md) §7.
+   - `io-uring` and `af-xdp` remain **experimental** and hardware/kernel
+     dependent; see [docs/roadmap/af-xdp-phase2.md](docs/roadmap/af-xdp-phase2.md).
+
+   Cross-cutting gaps that block *all* of the encrypted transports from
+   "supported": no certificate hot-reload for DTLS or QUIC (TURNS has it), no
+   pre-handshake rate limiting anywhere, and no integration test covering
+   bidirectional media on any encrypted transport — only a STUN Binding test on
+   DTLS today.
 3. **Control plane completeness.** Runtime user management (AddUser/RemoveUser
    over the control-plane gRPC, backed by Tarantool) is implemented; the
    remaining work is rounding out the rest of the gRPC management surface and

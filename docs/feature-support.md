@@ -15,17 +15,20 @@ expectations rather than imply everything is production-grade.
 | Long-term credentials (RFC 5389/5766)      | stable                  | HMAC-SHA1; realm/nonce. |
 | Shared-secret auth                         | stable                  | HMAC; secret via env/Secret. |
 | Connection migration / mobility (RFC 8016) | stable                  | ReKey + migration epoch, persisted across failover. |
-| TLS over TCP (`tls`)                        | experimental            | Feature-gated. |
-| DTLS (`dtls`)                               | experimental            | Feature-gated. |
-| QUIC (`quic`)                               | experimental            | Feature-gated; pulls `wtransport`. |
-| WebTransport (`web-transport`)             | experimental            | Feature-gated. |
+| TLS over TCP (`tls`)                        | beta                    | Feature-gated. Metrics, per-IP cap, cert hot-reload, cooperative drain, accept-error resilience in place; not yet soak-tested. |
+| TURN over TCP relay (RFC 6062)             | beta                    | Requires `[tls]` (the control connection must be TCP/TLS). |
+| DTLS (`dtls`)                               | beta                    | Feature-gated. Fail-fast, session + per-IP caps, idle reaper, bounded egress, drain, metrics. Missing: pre-handshake rate limiting, cert hot-reload. |
+| QUIC (`quic`)                               | experimental            | Feature-gated. Raw-QUIC datapath: per-stream control replies, session caps, drain. Config fully applied on this path. |
+| WebTransport (`web-transport`)             | experimental            | Feature-gated. Browser H3 path; several `[turn.quic]` knobs are NOT applied (see docs/design/quic-webtransport.md) and per-stream reply routing is unavailable. |
 | io_uring data path (`io-uring`)            | experimental, Linux-only | Compile-gated; hardware-dependent. |
 | AF_XDP data path (`af-xdp`)                | experimental, Linux-only | Kernel-bypass; requires NIC/kernel support. |
 | Runtime user CRUD (`AddUser`/`RemoveUser`) | supported (needs mgmt backend) | Requires the Tarantool management backend; unavailable on an in-memory backend. |
 
-Default builds use the tokio UDP data path; everything marked *experimental* is
-opt-in via Cargo features and is not yet covered by the same testing/hardening
-bar as the core path. The Linux-only data paths do not build on macOS (see the
+Default builds use the tokio UDP data path; everything marked *experimental* or
+*beta* is opt-in via Cargo features. **Beta** means the hardening work is done
+in source (limits, metrics, readiness, graceful drain, fail-fast startup) but the
+path has not yet passed a soak/interop run; **experimental** means functional
+gaps remain, not just missing test evidence. The Linux-only data paths do not build on macOS (see the
 `af-xdp`/`io-uring` notes in `CONTRIBUTING.md`).
 
 ## GA management feature matrix

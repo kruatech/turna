@@ -21,11 +21,27 @@ verified by this document** until the exact release commit passes the workspace,
 Tarantool, frontend, container, Helm, migration, restart, and live relay gates in
 [RELEASE.md](RELEASE.md).
 
-The high-performance and alternative-transport backends are **experimental**,
-gated behind Cargo features, and not yet runtime-verified for production: the
-`io-uring` and `af-xdp` datapaths, and the `dtls`, `quic`, `web-transport` and
-TLS-over-TCP (`tls`) transports. Treat them as preview until further validation
-— see [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md).
+The alternative transports are **not** on the same footing as the default path,
+and they differ from each other:
+
+- **Beta** — TLS-over-TCP (`tls`, TURNS), RFC 6062 TCP relay allocations, and
+  DTLS (`dtls`). Hardened in source: connection/session limits including per-IP
+  caps, Prometheus counters, per-listener readiness, cooperative drain,
+  fail-fast startup, and prompt allocation release when a control connection
+  closes. What they lack is *evidence* — no soak or interop run is recorded yet
+  ([docs/verification/encrypted-transports.md](docs/verification/encrypted-transports.md)
+  is the gate).
+- **Experimental** — QUIC (`quic`) and WebTransport (`web-transport`), plus the
+  `io-uring` and `af-xdp` datapaths. These still have functional gaps, not just
+  missing tests: notably several `[turn.quic]` limits do not apply on the
+  WebTransport path (the listener warns about this at startup) and QUIC
+  connection migration is not detected.
+
+Enabling a transport in config on a binary built without its Cargo feature is a
+startup error, not a warning, so a configured listener is never silently absent.
+For the authoritative per-feature state see
+[docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) and
+[docs/feature-support.md](docs/feature-support.md).
 
 ## Why turna
 
@@ -70,6 +86,8 @@ live in [bench/README.md](bench/README.md).
 | Existing allocation survives process crash    | Not guaranteed                                |
 | Existing media path migrates to another node  | Not guaranteed                                |
 | Drain waits indefinitely                       | No — bounded by `drain_grace_secs`            |
+| Allocation released when its TCP/DTLS/QUIC connection closes | Supported (not left to TTL)     |
+| Certificate rotation without restart           | TURNS only; DTLS and QUIC need a restart      |
 | Multi-node ownership/state failover            | Experimental / limited scope                  |
 | Transparent active-session (media) failover    | Out of GA scope                               |
 
@@ -82,7 +100,8 @@ RPC contract.
 
 - STUN binding and full TURN allocation lifecycle (Allocate / Refresh /
   CreatePermission / ChannelBind / Send & Data indications)
-- UDP and TCP relay transports
+- UDP relay on the default path; TCP relay (RFC 6062) behind the `tls` feature,
+  since RFC 6062 requires a TCP/TLS control connection
 - Long-term credential mechanism, JWT-based auth, rate limiting and credential
   rotation; multi-tenant realms with per-tenant relay port pools and limits
 - Pluggable state backend (in-memory, Tarantool) for clustered deployments
@@ -179,23 +198,30 @@ per-feature production maturity always check
 | STUN Binding | RFC 5389 | Supported (default tokio datapath) |
 | Message integrity, SHA-256 (`MESSAGE-INTEGRITY-SHA256`) | RFC 8489 | Supported |
 | TURN allocation lifecycle, UDP relay | RFC 5766 / RFC 8656 | Supported (default tokio datapath) |
-| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented, less exercised (preview) |
+| TURN over TCP (TCP relay allocations) | RFC 6062 | Beta (requires the `tls` listener) |
 | Session migration | RFC 8016 | Supported (tokio datapath) |
-| TLS-over-TCP transport (`tls`) | — | Experimental (preview) |
-| DTLS transport (`dtls`) | — | Experimental (preview) |
-| QUIC transport (`quic`) | — | Experimental (preview) |
-| WebTransport (`web-transport`) | — | Experimental (preview) |
-| `io_uring` datapath | — | Experimental (preview) |
-| `AF_XDP` datapath | — | Experimental (preview) |
+| TLS-over-TCP transport (`tls`) | — | Beta |
+| DTLS transport (`dtls`) | RFC 7350 | Beta |
+| QUIC transport (`quic`) | — | Experimental |
+| WebTransport (`web-transport`) | — | Experimental |
+| `io_uring` datapath | — | Experimental |
+| `AF_XDP` datapath | — | Experimental |
 
 Status legend: **Supported** — exercised on the primary path and intended for
-production use; **Preview** — gated behind a Cargo feature and not yet
-runtime-verified for production.
+production use. **Beta** — gated behind a Cargo feature, hardened in source
+(limits, metrics, readiness, graceful drain) but without recorded soak/interop
+evidence; test it with your own client stack first. **Experimental** — gated
+behind a Cargo feature with known functional gaps; not for production.
 
 ## Observability
 
 `turna-node` exposes Prometheus metrics and a health endpoint, and emits
-OpenTelemetry traces. Bind health/metrics to an internal interface only — see
+OpenTelemetry traces. Each listener has its own readiness gauge
+(`turna_transport_readiness`, `turna_tls_readiness`, `turna_dtls_readiness`,
+`turna_quic_readiness`) plus per-transport counters, so a listener that dies
+while the process survives is visible; operator response for the shipped alert
+rules is in
+[docs/runbooks/encrypted-transports.md](docs/runbooks/encrypted-transports.md). Bind health/metrics to an internal interface only — see
 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md). The management API and gRPC
 control plane can be secured with mTLS ([docs/MTLS.md](docs/MTLS.md)).
 

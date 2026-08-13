@@ -1,11 +1,10 @@
-# Prometheus alert rules for the io_uring / DTLS / AF_XDP transport backends
-# (roadmap §9.1). Load alongside the base turna alert file.
+# Prometheus alert rules for the encrypted transports (TURNS/TLS, DTLS,
+# QUIC/WebTransport) and the io_uring / AF_XDP datapaths.
+# Load alongside the base turna alert file (docs/alerts/turna.yml).
 #
-# NOTE: some referenced metrics are wired up in later steps — these rules go
-# live as the metrics land:
-#   * turna_uring_relay_capacity_exhausted_total  -> IOU-2b (metric plumbing)
-#   * turna_dtls_*                                 -> DTLS observability step
-#   * turna_afxdp_*                                -> AF_XDP metrics step
+# Every metric referenced below is emitted by render_transport_metrics() and
+# reads 0 when the corresponding listener is disabled or not compiled in, so
+# these rules are safe to load unconditionally.
 groups:
   - name: turna-io-uring
     rules:
@@ -24,20 +23,173 @@ groups:
           summary: "io_uring relay socket capacity exhausted"
           description: "Allocations are being rejected (508). Raise [turn.io_uring].relay_socket_capacity_per_worker or add workers."
 
+  # NOTE: there is deliberately no DTLS handshake-failure rule. The handshake
+  # runs inside the DTLS stack below the point the server observes it, so
+  # `turna_dtls_handshake_failures_total` does not exist — an earlier version of
+  # this file alerted on it, which could never fire.
   - name: turna-dtls
     rules:
-      - alert: TurnaDtlsHandshakeFailuresHigh
-        expr: rate(turna_dtls_handshake_failures_total[5m]) > 10
-        for: 10m
-        labels: { severity: warning }
-        annotations:
-          summary: "Elevated DTLS handshake failures"
       - alert: TurnaDtlsOutboundDrops
         expr: rate(turna_dtls_outbound_dropped_total[5m]) > 0
         for: 5m
         labels: { severity: warning }
         annotations:
           summary: "DTLS outbound queue dropping datagrams (slow client / backpressure)"
+          description: >-
+            A session's bounded egress queue is full and the newest datagram is
+            being dropped. Either the client is not draining, or
+            [turn.dtls].outbound_queue_capacity is too small for the bitrate.
+      - alert: TurnaDtlsOutboundOversize
+        expr: rate(turna_dtls_outbound_oversize_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "DTLS datagrams exceed the configured record MTU and are being dropped"
+          description: >-
+            Relayed payloads are larger than [turn.dtls].mtu, so they are dropped
+            rather than IP-fragmented. This is a silent one-way media failure for
+            the affected clients — raise mtu to match the path in use.
+      - alert: TurnaDtlsPerIpRejections
+        expr: rate(turna_dtls_rejected_per_ip_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "DTLS sessions refused by the per-IP cap"
+          description: >-
+            One source IP is hitting max_sessions_per_ip. Either a NAT/CGNAT
+            aggregating many real clients (raise the cap) or slot-exhaustion
+            abuse (leave it).
+      - alert: TurnaDtlsListenerDegraded
+        expr: turna_dtls_readiness == 2
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "DTLS listener is degraded while the process is still running"
+          description: >-
+            The DTLS socket is no longer bound but the node is alive, so /ready
+            may still be green while TURN-over-DTLS is unavailable.
+
+  - name: turna-turns-tls
+    rules:
+      - alert: TurnaTlsHandshakeFailuresHigh
+        expr: rate(turna_tls_handshake_failures_total[5m]) > 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Elevated TURNS TLS handshake failures"
+          description: >-
+            Clients are failing the TLS handshake. Common causes: an expired or
+            wrong certificate, a client that does not offer the ALPN, or internet
+            scanners hitting 5349.
+      - alert: TurnaTlsCertReloadFailing
+        expr: rate(turna_tls_cert_reload_failures_total[15m]) > 0
+        for: 15m
+        labels: { severity: critical }
+        annotations:
+          summary: "TURNS certificate reload is failing"
+          description: >-
+            A rotated certificate could not be loaded; the listener is still
+            serving the PREVIOUS material and will keep doing so. If the old
+            certificate expires, TURNS stops working. Check file permissions and
+            that the renewal writes a complete PEM pair.
+      - alert: TurnaTlsAcceptErrors
+        expr: rate(turna_tls_accept_errors_total[5m]) > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "TURNS accept() is failing (likely fd exhaustion)"
+          description: >-
+            The listener survives these errors with backoff, but new connections
+            are being lost. EMFILE is the usual cause — raise the process file
+            descriptor limit or lower max_connections.
+      - alert: TurnaTlsOverCapacityRejections
+        expr: rate(turna_tls_rejected_over_cap_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "TURNS connections refused at the max_connections cap"
+      - alert: TurnaTlsPerIpRejections
+        expr: rate(turna_tls_rejected_per_ip_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "TURNS connections refused by the per-IP cap"
+      - alert: TurnaTlsFramingErrors
+        expr: rate(turna_tls_framing_errors_total[5m]) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "TURNS clients sending invalid TURN-over-TCP framing"
+          description: >-
+            Connections are being closed on invalid or over-sized frames. Either
+            a broken client, a non-TURN protocol on 5349, or max_frame_size is
+            below what your clients send.
+      - alert: TurnaTlsListenerDegraded
+        expr: turna_tls_readiness == 2
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "TURNS listener is degraded while the process is still running"
+
+  - name: turna-quic
+    rules:
+      - alert: TurnaQuicHandshakeFailuresHigh
+        expr: rate(turna_quic_handshake_failures_total[5m]) > 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Elevated QUIC/WebTransport handshake failures"
+      - alert: TurnaQuicControlDroppedNoStream
+        expr: rate(turna_quic_control_dropped_no_stream_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "QUIC control responses dropped — no open bidi stream"
+          description: >-
+            The server had a STUN/TURN response to send but the session had no
+            bidi stream open to answer on, so the client is not getting replies.
+            Usually a client framing/stream-lifecycle problem.
+      - alert: TurnaQuicOverCapacityRejections
+        expr: rate(turna_quic_rejected_over_cap_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "QUIC sessions refused at the max_sessions cap"
+      - alert: TurnaQuicPerIpRejections
+        expr: rate(turna_quic_rejected_per_ip_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "QUIC sessions refused by the per-IP cap"
+      - alert: TurnaQuicHandshakeRateLimited
+        expr: rate(turna_quic_rejected_rate_limit_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "QUIC handshakes refused by the per-IP rate limiter"
+          description: >-
+            A source is opening sessions faster than
+            max_handshakes_per_sec_per_ip. Sustained: either abuse (leave it) or a
+            NAT aggregating many real clients (raise the rate/burst). Correlate
+            with turna_quic_sessions_total — abuse shows refusals without a rise
+            in established sessions.
+      - alert: TurnaQuicCertReloadFailing
+        expr: rate(turna_quic_cert_reload_failures_total[15m]) > 0
+        for: 15m
+        labels: { severity: critical }
+        annotations:
+          summary: "QUIC/WebTransport certificate reload is failing"
+          description: >-
+            A rotated certificate could not be loaded or was rejected by the
+            endpoint; the listener keeps serving the PREVIOUS material and will
+            keep doing so until it expires. Only the WebTransport path reloads at
+            all — with web_transport = false a rotation always needs a restart.
+      - alert: TurnaQuicListenerDegraded
+        expr: turna_quic_readiness == 2
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "QUIC/WebTransport listener is degraded while the process is still running"
 
   - name: turna-af-xdp
     rules:

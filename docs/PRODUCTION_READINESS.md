@@ -74,10 +74,10 @@ Production checklist:
 | Area | Status | Production guidance |
 |---|---|---|
 | UDP TURN/STUN over tokio | Mainline | Recommended baseline. |
-| TURNS / TLS-over-TCP | Implemented, feature-dependent | Test with your clients and certificates before relying on it. |
-| RFC 6062 TCP relay allocations | Implemented path exists | Treat as less exercised than UDP until covered by your interop tests. |
-| DTLS | Optional feature | Experimental; enable only after local load and interop tests. |
-| QUIC / WebTransport | Optional feature | Experimental; product semantics are still evolving. |
+| TURNS / TLS-over-TCP | Beta, feature-dependent | Metrics (`turna_tls_*`), `max_connections_per_ip`, certificate hot-reload and cooperative drain are in place. Test with your clients and certificates before relying on it. |
+| RFC 6062 TCP relay allocations | Beta | Requires `[tls]`; the allocation is released when the control connection closes. Cover with your own interop tests before relying on it. |
+| DTLS | Beta, optional feature | Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics. Pre-handshake rate limiting is still missing — do not expose to an untrusted internet without upstream rate limiting. |
+| QUIC / WebTransport | Optional feature | Experimental. Raw QUIC (`web_transport = false`) applies the full `[turn.quic]` config; the WebTransport (H3) path does not apply most of it. |
 | io_uring | Optional backend | Experimental; not the default production recommendation. |
 | AF_XDP | Explicit opt-in backend | Experimental Linux/NIC-specific path; never auto-selected. |
 | Cluster redirect/gossip | Implemented path | Useful for new-client distribution; secure gossip with `cluster_secret`. |
@@ -129,6 +129,33 @@ coverage is thinner than the core UDP TURN path.
 - **Severity:** Low–Medium depending on client population.
 - **Mitigation:** run explicit interop tests for every client stack you support,
   and keep UDP/tokio as the fallback path.
+
+Known residual gaps, per transport:
+
+- **DTLS:** no pre-handshake rate limiting (handshakes run inside `webrtc-dtls`
+  below the point the server can throttle), and no certificate hot-reload — a
+  rotated cert needs a restart. DTLS 1.2 only.
+- **QUIC/WebTransport:** certificate hot-reload works on the WebTransport path
+  only; with `web_transport = false` a rotation needs a restart. Conversely the
+  `[turn.quic]` transport limits (stream counts, datagram buffer, idle timeout)
+  apply on the raw path only — the listener warns at startup when they don't.
+  `alpn` is inert under WebTransport. `max_handshakes_per_sec_per_ip` is **off by
+  default**; set it on any internet-facing listener. No interop test recorded yet.
+- **All three:** no soak or interop evidence recorded yet. The gate is
+  `docs/verification/encrypted-transports.md` (build matrix, interop table,
+  behavioural checks, soak); operator response for the alerts is
+  `docs/runbooks/encrypted-transports.md`.
+
+### R9 — enabling a transport without its Cargo feature
+
+`[turn.dtls]`, `[turn.quic]` and `[turn.quic] web_transport` now fail startup if
+the binary lacks the matching feature (`dtls`, `quic`, `web-transport`), instead
+of running without the listener the operator asked for. `[tls]` follows the same
+model via the `tls` feature.
+
+- **Severity:** Low (fails closed).
+- **Mitigation:** build with the features you configure; the error message names
+  the required flag.
 
 ### R5 — Cluster gossip must be authenticated on any shared network
 
@@ -199,6 +226,15 @@ and never reaches the nodes.
 | `failover_errors_total` | Failover sweeps failing. |
 | `failover_sweep_duration_us` | Slow failover scans. |
 | `turna_relay_route_forwarded_ratio` | io_uring migration forwarding cost; should be zero on tokio. |
+| `turna_tls_handshake_failures_total` / `turna_tls_handshake_timeouts_total` | TURNS client/cert mismatch, or a scanner hitting 5349. |
+| `turna_tls_rejected_over_cap_total` / `turna_tls_rejected_per_ip_total` | TURNS connection caps being hit. |
+| `turna_tls_accept_errors_total` | fd exhaustion (EMFILE); the listener survives but is degraded. |
+| `turna_tls_cert_reload_failures_total` | a rotated certificate failed to load; the previous one is still in service. |
+| `turna_dtls_outbound_oversize_total` | relayed datagrams exceed `[turn.dtls].mtu` and are being dropped. |
+| `turna_quic_rejected_over_cap_total` / `turna_quic_rejected_per_ip_total` | QUIC session caps being hit. |
+| `turna_quic_control_dropped_no_stream_total` | QUIC control responses with no stream to answer on (client framing problem). |
+| `turna_quic_rejected_rate_limit_total` | Handshake flood being shed; check whether it is abuse or a NAT. |
+| `turna_tls_readiness` / `turna_dtls_readiness` / `turna_quic_readiness` | per-listener readiness; 2 = the listener died while the process lives. |
 
 See [OBSERVABILITY.md](OBSERVABILITY.md) and `docs/alerts/turna.yml` for the
 starter alert set.

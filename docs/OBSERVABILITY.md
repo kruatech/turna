@@ -137,8 +137,75 @@ Depending on enabled features and runtime paths, `/metrics` may also include:
 - auth-reason metrics from `render_auth_reason_metrics()`;
 - transport metrics from `render_transport_metrics()`;
 - relay-route metrics such as `turna_relay_route_forwarded_ratio` on io_uring
-  builds;
-- QUIC/WebTransport and DTLS counters when those listeners are enabled.
+  builds.
+
+### Encrypted-transport metrics
+
+`render_transport_metrics()` always emits these series; they read `0` when the
+listener is disabled or the feature is not compiled in, so a dashboard can be
+built once and stay valid.
+
+#### TURNS — TLS over TCP (`[tls]`)
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_tls_active_connections` | gauge | Established TURNS connections. |
+| `turna_tls_connections_total` | counter | Connections accepted since start. |
+| `turna_tls_closed_total` | counter | Connections closed. |
+| `turna_tls_handshake_failures_total` | counter | TLS handshakes that failed (client/cert mismatch, RST, scanners). |
+| `turna_tls_handshake_timeouts_total` | counter | Handshakes over `handshake_timeout_secs`. |
+| `turna_tls_rejected_over_cap_total` | counter | Refused at `max_connections`. |
+| `turna_tls_rejected_per_ip_total` | counter | Refused at `max_connections_per_ip`. |
+| `turna_tls_idle_timeouts_total` | counter | Closed by `read_timeout_secs`. |
+| `turna_tls_framing_errors_total` | counter | Invalid or over-sized TURN-over-TCP framing. |
+| `turna_tls_accept_errors_total` | counter | `accept()` errors survived without stopping the listener (e.g. `EMFILE`). |
+| `turna_tls_bytes_rx_total` / `turna_tls_bytes_tx_total` | counter | Decrypted bytes in / bytes written out. |
+| `turna_tls_cert_reloads_total` | counter | Successful certificate hot-reloads. |
+| `turna_tls_cert_reload_failures_total` | counter | Failed reloads; the previous certificate stays in service. |
+
+#### DTLS (`[turn.dtls]`)
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_dtls_active_sessions` | gauge | Live sessions. |
+| `turna_dtls_sessions_total` | counter | Sessions admitted. |
+| `turna_dtls_rejected_over_cap_total` | counter | Refused at `max_sessions`. |
+| `turna_dtls_rejected_per_ip_total` | counter | Refused at `max_sessions_per_ip`. |
+| `turna_dtls_closed_total` | counter | Sessions closed. |
+| `turna_dtls_idle_timeouts_total` | counter | Closed by `idle_timeout_secs`. |
+| `turna_dtls_bytes_rx_total` / `turna_dtls_bytes_tx_total` | counter | Decrypted / encrypted bytes. |
+| `turna_dtls_outbound_dropped_total` | counter | Egress queue full (drop-newest). |
+| `turna_dtls_outbound_oversize_total` | counter | Datagram exceeded `mtu` and was dropped — raise `[turn.dtls].mtu`. |
+
+There is deliberately **no** `turna_dtls_handshake_failures_total`: the handshake
+runs inside the DTLS stack below the point the server observes it, so a failed
+handshake never reaches this layer. Do not alert on it.
+
+#### QUIC / WebTransport (`[turn.quic]`)
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_quic_active_sessions` | gauge | Live sessions. |
+| `turna_quic_sessions_total` / `turna_quic_closed_total` | counter | Sessions admitted / closed. |
+| `turna_quic_datagrams_rx_total` / `turna_quic_datagrams_tx_total` | counter | Media path (unreliable datagrams). |
+| `turna_quic_streams_opened_total` | counter | Client-opened bidi streams (control path). |
+| `turna_quic_control_bytes_tx_total` | counter | Bytes written on control streams. |
+| `turna_quic_send_errors_total` | counter | Outbound send failures, including a full per-session egress queue. |
+| `turna_quic_handshake_failures_total` | counter | Connections/sessions that failed before becoming usable. |
+| `turna_quic_control_dropped_no_stream_total` | counter | Control responses with no open bidi stream to answer on (client framing problem). |
+| `turna_quic_rejected_over_cap_total` / `turna_quic_rejected_per_ip_total` | counter | Refused at `max_sessions` / `max_sessions_per_ip`. On the WebTransport path this happens **before** the handshake. |
+| `turna_quic_cert_reloads_total` | counter | Successful certificate hot-reloads (WebTransport path only). |
+| `turna_quic_cert_reload_failures_total` | counter | Failed reloads; the previous certificate stays in service. |
+| `turna_quic_rejected_rate_limit_total` | counter | Handshakes refused by the per-IP rate limiter, before any handshake work. |
+| `turna_quic_migrations_total` | counter | Observed client address changes. A steady non-zero rate is normal on mobile networks; a spike with no session growth can be address spoofing. |
+
+#### Per-listener readiness
+
+`turna_transport_readiness`, `turna_tls_readiness`, `turna_dtls_readiness` and
+`turna_quic_readiness` use the same encoding as `turna_backend_readiness`
+(`0`=starting, `1`=ready, `2`=degraded, `3`=draining). Each listener gauge
+follows whether its socket is bound, so `2` means that listener died while the
+process kept running — worth alerting on, because `/ready` may still be green.
 
 ## Starter alerts
 
@@ -162,7 +229,19 @@ rate(turna_auth_failures[5m]) > 1
 
 # Internal backpressure
 rate(turna_send_queue_dropped_total[5m]) > 0
+
+# An encrypted listener died while the process lives (/ready may still be green)
+turna_tls_readiness == 2 or turna_dtls_readiness == 2 or turna_quic_readiness == 2
+
+# TURNS certificate rotation is not being picked up
+rate(turna_tls_cert_reload_failures_total[15m]) > 0
+
+# DTLS mtu is below the media path in use — one-way media
+rate(turna_dtls_outbound_oversize_total[5m]) > 0
 ```
+
+Encrypted-transport rules live in `docs/alerts/transport-backends.yml`, with
+per-alert operator response in `docs/runbooks/encrypted-transports.md`.
 
 ## Structured logs
 
