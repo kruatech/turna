@@ -550,7 +550,11 @@ fn aead_decrypt(
     if nonce.len() != 12 {
         return Err(AuthError::InvalidCredentials);
     }
-    let nonce = Nonce::from_slice(nonce);
+    // `from_slice` is deprecated in aes-gcm 0.11 (hybrid_array) in favour of
+    // TryFrom. The length is already checked above so this cannot fail, but it is
+    // mapped rather than unwrapped: an unwrap here would be a panic reachable from
+    // an attacker-supplied token.
+    let nonce = Nonce::try_from(nonce).map_err(|_| AuthError::InvalidCredentials)?;
     let payload = Payload {
         msg: ciphertext,
         aad,
@@ -558,11 +562,11 @@ fn aead_decrypt(
     match key.len() {
         16 => Aes128Gcm::new_from_slice(key)
             .map_err(|_| AuthError::InvalidCredentials)?
-            .decrypt(nonce, payload)
+            .decrypt(&nonce, payload)
             .map_err(|_| AuthError::IntegrityFailed),
         32 => Aes256Gcm::new_from_slice(key)
             .map_err(|_| AuthError::InvalidCredentials)?
-            .decrypt(nonce, payload)
+            .decrypt(&nonce, payload)
             .map_err(|_| AuthError::IntegrityFailed),
         _ => Err(AuthError::InvalidCredentials),
     }
@@ -706,7 +710,7 @@ mod oauth_tests {
         let ct = Aes128Gcm::new_from_slice(as_rs_key)
             .unwrap()
             .encrypt(
-                Nonce::from_slice(&nonce_bytes),
+                &Nonce::from(nonce_bytes),
                 Payload {
                     msg: &block,
                     aad: server_name.as_bytes(),
