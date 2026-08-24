@@ -1,7 +1,7 @@
 //! Cryptographic primitives for TURN auth
 
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -9,7 +9,7 @@ type HmacSha1 = Hmac<Sha1>;
 /// Generate a random nonce string.
 pub fn generate_nonce() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
@@ -19,7 +19,7 @@ const NONCE_MAC_LEN: usize = 16;
 /// Generate a random 32-byte key, e.g. a per-process key for stateless nonces.
 pub fn random_key_32() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     key
 }
 

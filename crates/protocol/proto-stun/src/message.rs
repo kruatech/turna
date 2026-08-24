@@ -17,7 +17,7 @@ pub struct StunMessage {
 impl StunMessage {
     pub fn new(method: Method, class: MessageClass) -> Self {
         let mut transaction_id = [0u8; 12];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut transaction_id);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut transaction_id);
         Self {
             class,
             method,
