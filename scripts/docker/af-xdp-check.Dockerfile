@@ -30,7 +30,13 @@
 # native objects for the vendored C libraries and sharing a target dir with the
 # plain-Rust checks only causes rebuild churn.
 
-FROM rust:1
+# Pinned by digest, not by tag. `rust:1` moves whenever a new 1.x lands, so an
+# image that built yesterday can fail today for reasons unrelated to this repo —
+# and a mutable tag is also a place someone else's change enters the build, which
+# is what Scorecard flags as Pinned-Dependencies.
+# Refresh deliberately:
+#   docker pull rust:1 && docker inspect --format='{{index .RepoDigests 0}}' rust:1
+FROM rust:1@sha256:7f7a53a25a0319dd8284e279d529d45759cb384d59b14cc6806132910f45522e
 
 # libxdp-sys builds vendored libxdp + libbpf, which need clang (for BPF
 # compilation), llvm, libelf and zlib headers. pkg-config and libbpf-dev let the
