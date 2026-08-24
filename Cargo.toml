@@ -87,7 +87,7 @@ base64 = "0.23"
 # HS256. The two backends are mutually exclusive (src/crypto/mod.rs cfg
 # gates) and aws_lc_rs implements HS256, so this removes rsa, ed25519-dalek,
 # p256 and p384 outright. Requires cmake + a C compiler at build time.
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 argon2 = "0.5"
 uuid = { version = "1", features = ["v4"] }
 
