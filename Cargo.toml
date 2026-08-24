@@ -88,7 +88,12 @@ base64 = "0.23"
 # gates) and aws_lc_rs implements HS256, so this removes rsa, ed25519-dalek,
 # p256 and p384 outright. Requires cmake + a C compiler at build time.
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
-argon2 = "0.5"
+# `getrandom` is what puts OsRng in scope. rand_core 0.6 gates it behind that
+# feature, password-hash forwards it, and until the rand 0.10 update it happened
+# to be switched on transitively by the old rand — so the import worked by
+# accident. Requesting it here says out loud what the code depends on.
+argon2 = { version = "0.5", features = ["password-hash"] }
+password-hash = { version = "0.5", features = ["getrandom"] }
 uuid = { version = "1", features = ["v4"] }
 
 # наблюдаемость

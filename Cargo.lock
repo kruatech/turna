@@ -4153,6 +4153,7 @@ dependencies = [
  "dashmap",
  "hmac",
  "jsonwebtoken",
+ "password-hash",
  "serde",
  "serde_json",
  "sha1",
