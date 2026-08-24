@@ -304,17 +304,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      # Miri takes hours on its abstract machine, and it only ever runs two crates —
+      # both pure parsing. A change that touches neither cannot alter what it would
+      # find, so documentation, scripts and Dockerfiles skip it rather than paying
+      # for a result that is decided in advance.
+      #
+      # Deliberately generous: the whole workspace manifest and lockfile count, since
+      # a dependency bump can change what those crates compile to.
+      - name: does this change reach the crates Miri covers?
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          BASE="origin/${{ github.base_ref }}"
+          git fetch --no-tags --depth=50 origin "${{ github.base_ref }}" >/dev/null 2>&1 || true
+          CHANGED=$(git diff --name-only "$BASE...HEAD" || echo "")
+          if [ -z "$CHANGED" ]; then
+            echo "could not diff against $BASE — running Miri rather than guessing"
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if echo "$CHANGED" | grep -qE '^(crates/protocol/proto-stun/|crates/packet/|Cargo\.lock$|Cargo\.toml$|\.github/workflows/ci\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "skipped: nothing under the crates Miri covers changed"
+          fi
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        if: steps.scope.outputs.run == 'true'
         with:
           toolchain: nightly
           components: miri
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: steps.scope.outputs.run == 'true'
       # Miri executes tests on its abstract machine and flags UB and data races
       # in unsafe code. It runs only on crates whose unsafe is pure-memory
       # (parsing / packet manipulation). The transport datapath's unsafe is
       # syscall-bound (mmap/io_uring/AF_XDP) and cannot run under Miri — it is
       # covered by the hardware soak/bench instead.
       - name: cargo miri test
+        if: steps.scope.outputs.run == 'true'
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
