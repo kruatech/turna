@@ -779,4 +779,92 @@ mod tests {
         let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         assert_eq!(declared, len - 20);
     }
+
+    // The three tests below exist because `cargo mutants` showed these getters could
+    // be replaced by `None` — or have their type check replaced by `true` — with every
+    // test still passing. A getter nothing asserts on is a getter that can silently
+    // start returning the wrong attribute, and two of these sit in the authentication
+    // path.
+
+    #[test]
+    fn requested_address_family_is_read_back() {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        assert_eq!(
+            msg.get_requested_address_family(),
+            None,
+            "absent attribute must read as None"
+        );
+
+        msg.add(Attribute::RequestedAddressFamily(
+            attribute::AddressFamily::Ipv6,
+        ));
+        assert_eq!(
+            msg.get_requested_address_family(),
+            Some(attribute::AddressFamily::Ipv6),
+            "IPv6 must not be reported as IPv4 or as absent — the relayed family \
+             depends on this"
+        );
+
+        let mut v4 = StunMessage::new(Method::Allocate, MessageClass::Request);
+        v4.add(Attribute::RequestedAddressFamily(
+            attribute::AddressFamily::Ipv4,
+        ));
+        assert_eq!(
+            v4.get_requested_address_family(),
+            Some(attribute::AddressFamily::Ipv4)
+        );
+    }
+
+    #[test]
+    fn message_integrity_sha256_is_found_by_type_not_by_position() {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        assert_eq!(msg.get_message_integrity_sha256(), None);
+
+        // A decoy of the same length, added first. Without it the getter could match
+        // on anything at all and still return the right bytes, because there would be
+        // only one Unknown attribute to find.
+        msg.add(Attribute::Unknown {
+            attr_type: attribute::ATTR_PASSWORD_ALGORITHMS,
+            value: vec![0xAAu8; 32],
+        });
+        msg.add(Attribute::Unknown {
+            attr_type: attribute::ATTR_MESSAGE_INTEGRITY_SHA256,
+            value: vec![0xBBu8; 32],
+        });
+
+        assert_eq!(
+            msg.get_message_integrity_sha256(),
+            Some([0xBBu8; 32].as_slice()),
+            "matched the first unknown attribute instead of the SHA-256 tag"
+        );
+    }
+
+    #[test]
+    fn password_algorithm_reads_the_declared_value() {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        assert_eq!(msg.get_password_algorithm(), None);
+
+        // Decoy first, for the same reason as above.
+        msg.add(Attribute::Unknown {
+            attr_type: attribute::ATTR_PASSWORD_ALGORITHMS,
+            value: vec![0x00, 0x01, 0x00, 0x00],
+        });
+        // 0x0002 = SHA-256 (RFC 8489 §18.5). Deliberately not 0 or 1: a mutant
+        // returning either of those constants has to fail here.
+        msg.add(Attribute::Unknown {
+            attr_type: attribute::ATTR_PASSWORD_ALGORITHM,
+            value: vec![0x00, 0x02, 0x00, 0x00],
+        });
+
+        assert_eq!(msg.get_password_algorithm(), Some(2));
+
+        // A value too short to hold the algorithm field is not a zero algorithm, it
+        // is no algorithm.
+        let mut short = StunMessage::new(Method::Allocate, MessageClass::Request);
+        short.add(Attribute::Unknown {
+            attr_type: attribute::ATTR_PASSWORD_ALGORITHM,
+            value: vec![0x00],
+        });
+        assert_eq!(short.get_password_algorithm(), None);
+    }
 }
