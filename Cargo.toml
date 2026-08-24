@@ -77,7 +77,7 @@ sha2 = "0.10"
 md5 = "0.8"
 crc = "3"
 rand = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 
 # auth
 # aws_lc_rs instead of rust_crypto: the rust_crypto feature pulls rsa as a
