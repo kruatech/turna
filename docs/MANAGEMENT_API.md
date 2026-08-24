@@ -9,7 +9,7 @@ restate the contract.
 > verification** (not yet confirmed by a stand/soak run). No claim of
 > "production verified" is made from static implementation alone.
 >
-> Version note: this document tracks release `0.3.0`
+> Version note: this document tracks release `0.3.1`
 > (`[workspace.package].version`). The wire contract is taken from
 > `crates/control/proto/management.proto`.
 

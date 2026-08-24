@@ -64,7 +64,7 @@ RUN chown -R turna:turna /app
 
 # OCI metadata. VERSION is passed by the release workflow (--build-arg VERSION);
 # the default tracks the current chart/appVersion.
-ARG VERSION=0.3.0
+ARG VERSION=0.3.1
 LABEL org.opencontainers.image.title="turna-admin" \
       org.opencontainers.image.description="Turna admin UI + control-plane HTTP/gRPC bridge" \
       org.opencontainers.image.source="https://github.com/kruatech/turna" \
