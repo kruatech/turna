@@ -212,10 +212,7 @@ pub async fn tcp_relay_check(
     let txid: [u8; 12] = pkt[8..20].try_into().expect("txid");
     let resp = ctl.request(&pkt).await?;
     if !is_success(&resp) {
-        return Err(format!(
-            "TCP Allocate rejected: {:?}",
-            error_code(&resp)
-        ));
+        return Err(format!("TCP Allocate rejected: {:?}", error_code(&resp)));
     }
     let relayed = get_relayed_addr(&resp, &txid).ok_or("TCP Allocate without a relayed address")?;
     log.push(format!("TCP Allocate ok, relayed address {relayed}"));
@@ -288,9 +285,7 @@ pub async fn tcp_relay_check(
         }
         // A server that binds without a challenge is unusual but not wrong here; the
         // authenticated attempt below still has to succeed.
-        None if is_success(&resp) => {
-            log.push("data connection bound without a challenge".into())
-        }
+        None if is_success(&resp) => log.push("data connection bound without a challenge".into()),
         other => {
             return Err(format!(
                 "unauthenticated ConnectionBind answered {other:?}; expected a 401 \

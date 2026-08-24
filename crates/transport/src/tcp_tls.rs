@@ -989,10 +989,8 @@ fn client_cert_verifier(
         return Err(TlsError::ClientCaEmpty(ca_path.into()));
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider,
-    );
+    let builder =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
     let builder = if require {
         builder
     } else {
@@ -1009,7 +1007,8 @@ fn ring_server_config(
     client_auth: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Result<ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let base = ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?;
+    let base =
+        ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?;
     let cfg = match client_auth {
         Some(v) => base.with_client_cert_verifier(v),
         None => base.with_no_client_auth(),

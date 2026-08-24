@@ -360,8 +360,8 @@ mod tests {
         assert!(is_forbidden_peer(ip("224.0.0.1"))); // multicast
         assert!(is_forbidden_peer(ip("fe80::1"))); // link-local v6
         assert!(is_forbidden_peer(ip("fec0::1"))); // deprecated site-local
-        // v4-embedding transition ranges: without these, every v4 rule is
-        // bypassable by asking for the v6 spelling of the same target.
+                                                   // v4-embedding transition ranges: without these, every v4 rule is
+                                                   // bypassable by asking for the v6 spelling of the same target.
         assert!(
             is_forbidden_peer(ip("64:ff9b::a9fe:a9fe")),
             "NAT64 form of 169.254.169.254 must be denied"

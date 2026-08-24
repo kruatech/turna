@@ -213,8 +213,7 @@ impl DtlsSession {
                 error_code(&resp)
             ));
         }
-        let relayed =
-            get_relayed_addr(&resp, &txid).ok_or("Allocate without a relayed address")?;
+        let relayed = get_relayed_addr(&resp, &txid).ok_or("Allocate without a relayed address")?;
         Ok((sess, relayed))
     }
 
@@ -224,7 +223,10 @@ impl DtlsSession {
         if is_success(&resp) {
             Ok(())
         } else {
-            Err(format!("CreatePermission rejected: {:?}", error_code(&resp)))
+            Err(format!(
+                "CreatePermission rejected: {:?}",
+                error_code(&resp)
+            ))
         }
     }
 
@@ -305,7 +307,9 @@ pub async fn dtls_check(
     })?;
     let channel: u16 = 0x4000;
     sess.channel_bind(channel, peer_addr).await?;
-    log.push(format!("CreatePermission and ChannelBind ok for {peer_addr}"));
+    log.push(format!(
+        "CreatePermission and ChannelBind ok for {peer_addr}"
+    ));
 
     const N: usize = 20;
     for i in 0..N {
@@ -399,15 +403,14 @@ pub async fn run_dtls_load(
         let barrier = barrier.clone();
         let creds = creds.clone();
         handles.push(tokio::spawn(async move {
-            let peer_sock =
-                match UdpSocket::bind(crate::turn_client::peer_bind_addr(false)).await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        stats.errs.fetch_add(1, Ordering::Relaxed);
-                        barrier.wait().await;
-                        return;
-                    }
-                };
+            let peer_sock = match UdpSocket::bind(crate::turn_client::peer_bind_addr(false)).await {
+                Ok(s) => s,
+                Err(_) => {
+                    stats.errs.fetch_add(1, Ordering::Relaxed);
+                    barrier.wait().await;
+                    return;
+                }
+            };
             let peer_addr = match peer_sock.local_addr() {
                 Ok(a) => a,
                 Err(_) => {
@@ -464,8 +467,7 @@ pub async fn run_dtls_load(
             });
 
             let body = vec![0u8; payload];
-            let mut tick =
-                tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
+            let mut tick = tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             let mut next_refresh = Instant::now() + Duration::from_secs(240);
             while stats.is_running() {

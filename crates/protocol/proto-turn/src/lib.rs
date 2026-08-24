@@ -225,7 +225,10 @@ mod tests {
             let t = u16::from_be_bytes([wire[off], wire[off + 1]]);
             let l = u16::from_be_bytes([wire[off + 2], wire[off + 3]]) as usize;
             let vstart = off + 4;
-            assert!(vstart + l <= wire.len(), "attribute {t:#06x} runs past the message");
+            assert!(
+                vstart + l <= wire.len(),
+                "attribute {t:#06x} runs past the message"
+            );
             types.push(t);
             if t == 0x8023 {
                 alt_value = Some(&wire[vstart..vstart + l]);
@@ -250,7 +253,12 @@ mod tests {
         // 0x00, family, port, address — NOT xor-mapped. Getting this wrong is the
         // other way a client fails to find the alternate.
         let v = alt_value.expect("value captured above");
-        assert_eq!(v.len(), 8, "IPv4 MAPPED-ADDRESS is 8 bytes, got {}", v.len());
+        assert_eq!(
+            v.len(),
+            8,
+            "IPv4 MAPPED-ADDRESS is 8 bytes, got {}",
+            v.len()
+        );
         assert_eq!(v[0], 0x00, "leading byte must be zero");
         assert_eq!(v[1], 0x01, "family must be 0x01 for IPv4");
         assert_eq!(
@@ -258,7 +266,11 @@ mod tests {
             3478,
             "port must be the plain port, unxored"
         );
-        assert_eq!(&v[4..8], &[203, 0, 113, 7], "address must be plain, unxored");
+        assert_eq!(
+            &v[4..8],
+            &[203, 0, 113, 7],
+            "address must be plain, unxored"
+        );
     }
 
     /// The error code itself, on the wire, for the same reason.

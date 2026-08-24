@@ -32,14 +32,14 @@ mod turn_client;
 ))]
 mod stream_common;
 // RFC 6062 runs over TURNS, so this needs the TLS stack like the others.
-#[cfg(feature = "tls")]
-mod tcp_relay_client;
+#[cfg(feature = "dtls")]
+mod dtls_client;
 #[cfg(feature = "quic")]
 mod quic_client;
 #[cfg(feature = "tls")]
+mod tcp_relay_client;
+#[cfg(feature = "tls")]
 mod tls_client;
-#[cfg(feature = "dtls")]
-mod dtls_client;
 #[cfg(feature = "web-transport")]
 mod wt_client;
 use turn_client::{Creds, FAMILY_V4, FAMILY_V6};
@@ -1114,7 +1114,9 @@ async fn main() {
                 for s in steps {
                     println!("  ok   {s}");
                 }
-                println!("\ndtls-check: OK — DTLS carries a full allocation and relays media both ways.");
+                println!(
+                    "\ndtls-check: OK — DTLS carries a full allocation and relays media both ways."
+                );
                 std::process::exit(0);
             }
             Err(e) => {
@@ -1200,7 +1202,9 @@ async fn main() {
                 for s in steps {
                     println!("  ok   {s}");
                 }
-                println!("\ntls-check: OK — TURNS carries a full allocation and relays media both ways.");
+                println!(
+                    "\ntls-check: OK — TURNS carries a full allocation and relays media both ways."
+                );
                 std::process::exit(0);
             }
             Err(e) => {
@@ -1257,14 +1261,7 @@ async fn main() {
     // latency to report, so it exits here rather than being forced through the
     // stats/JSON path that the three load modes share.
     if let Mode::Conformance { v6_peer, v4_peer } = &cli.mode {
-        let rc = run_conformance(
-            cli.server,
-            &creds,
-            cli.rtt_timeout_ms,
-            v6_peer,
-            v4_peer,
-        )
-        .await;
+        let rc = run_conformance(cli.server, &creds, cli.rtt_timeout_ms, v6_peer, v4_peer).await;
         std::process::exit(rc);
     }
 
@@ -1518,7 +1515,11 @@ async fn run_conformance(
             probe(
                 "Allocate, no REQUESTED-ADDRESS-FAMILY",
                 &format!("ok, relayed {fam}"),
-                if s.relayed.is_ipv4() { "as expected" } else { "UNEXPECTED: default must be IPv4" },
+                if s.relayed.is_ipv4() {
+                    "as expected"
+                } else {
+                    "UNEXPECTED: default must be IPv4"
+                },
             );
             if !s.relayed.is_ipv4() {
                 failures += 1;
@@ -1526,7 +1527,11 @@ async fn run_conformance(
             Some(s)
         }
         Err(e) => {
-            probe("Allocate, no REQUESTED-ADDRESS-FAMILY", &format!("{} ({})", e.0, code_str(e.1)), "FAIL: the baseline path is broken");
+            probe(
+                "Allocate, no REQUESTED-ADDRESS-FAMILY",
+                &format!("{} ({})", e.0, code_str(e.1)),
+                "FAIL: the baseline path is broken",
+            );
             failures += 1;
             None
         }
@@ -1536,48 +1541,69 @@ async fn run_conformance(
     match turn_client::allocate_family(server, creds, rtt, Some(FAMILY_V4)).await {
         Ok(mut s) => {
             let ok = s.relayed.is_ipv4();
-            probe("Allocate, RAF = IPv4", "ok", if ok { "as expected" } else { "UNEXPECTED family" });
+            probe(
+                "Allocate, RAF = IPv4",
+                "ok",
+                if ok {
+                    "as expected"
+                } else {
+                    "UNEXPECTED family"
+                },
+            );
             if !ok {
                 failures += 1;
             }
             s.release().await;
         }
         Err(e) => {
-            probe("Allocate, RAF = IPv4", &code_str(e.1), "FAIL: explicit IPv4 must behave like absent");
+            probe(
+                "Allocate, RAF = IPv4",
+                &code_str(e.1),
+                "FAIL: explicit IPv4 must behave like absent",
+            );
             failures += 1;
         }
     }
 
     // ── 3. IPv6: both outcomes legitimate, depending on external_ip6 ──
-    let mut v6_session = match turn_client::allocate_family(server, creds, rtt, Some(FAMILY_V6)).await {
-        Ok(s) => {
-            let ok = s.relayed.is_ipv6();
-            probe(
-                "Allocate, RAF = IPv6",
-                &format!("ok, relayed {}", if ok { "IPv6" } else { "IPv4" }),
-                if ok {
-                    "IPv6 relaying is ENABLED (external_ip6 is set)"
+    let mut v6_session =
+        match turn_client::allocate_family(server, creds, rtt, Some(FAMILY_V6)).await {
+            Ok(s) => {
+                let ok = s.relayed.is_ipv6();
+                probe(
+                    "Allocate, RAF = IPv6",
+                    &format!("ok, relayed {}", if ok { "IPv6" } else { "IPv4" }),
+                    if ok {
+                        "IPv6 relaying is ENABLED (external_ip6 is set)"
+                    } else {
+                        "FAIL: accepted an IPv6 request but relayed IPv4"
+                    },
+                );
+                if !ok {
+                    failures += 1;
+                    None
                 } else {
-                    "FAIL: accepted an IPv6 request but relayed IPv4"
-                },
-            );
-            if !ok {
+                    Some(s)
+                }
+            }
+            Err(e) if e.1 == Some(440) => {
+                probe(
+                    "Allocate, RAF = IPv6",
+                    "440",
+                    "IPv6 relaying is DISABLED (external_ip6 unset) — correct refusal",
+                );
+                None
+            }
+            Err(e) => {
+                probe(
+                    "Allocate, RAF = IPv6",
+                    &code_str(e.1),
+                    "FAIL: expected success or 440",
+                );
                 failures += 1;
                 None
-            } else {
-                Some(s)
             }
-        }
-        Err(e) if e.1 == Some(440) => {
-            probe("Allocate, RAF = IPv6", "440", "IPv6 relaying is DISABLED (external_ip6 unset) — correct refusal");
-            None
-        }
-        Err(e) => {
-            probe("Allocate, RAF = IPv6", &code_str(e.1), "FAIL: expected success or 440");
-            failures += 1;
-            None
-        }
-    };
+        };
 
     // ── 4. ADDITIONAL-ADDRESS-FAMILY (RFC 8656 §7.2). Not implemented, and the
     //       attribute is comprehension-optional, so being ignored is RFC-legal —
@@ -1605,38 +1631,70 @@ async fn run_conformance(
     // feature lands. Until then it is ignored, and recording that is the point.
     let both = turn_client::probe_additional_address_family(server, rtt, FAMILY_V6, true).await;
     match both {
-        Some(400) => probe("RAF + ADDITIONAL-ADDRESS-FAMILY", "400", "as the RFC requires"),
+        Some(400) => probe(
+            "RAF + ADDITIONAL-ADDRESS-FAMILY",
+            "400",
+            "as the RFC requires",
+        ),
         Some(401) | Some(turn_client::PROBE_SUCCESS) => probe(
             "RAF + ADDITIONAL-ADDRESS-FAMILY",
             "accepted",
             "expected while AAF is unimplemented; must become 400 with the feature",
         ),
-        c => probe("RAF + ADDITIONAL-ADDRESS-FAMILY", &code_str(c), "unexpected"),
+        c => probe(
+            "RAF + ADDITIONAL-ADDRESS-FAMILY",
+            &code_str(c),
+            "unexpected",
+        ),
     }
 
     // ── 5. family mismatch: RFC 6156 §4.2 -> 443 ──
     if let Some(s) = v4_session.as_mut() {
         match s.create_permission_code(v6_peer).await {
-            Err(Some(443)) => probe("v6 peer on a v4 allocation", "443", "as expected (RFC 6156 §4.2)"),
+            Err(Some(443)) => probe(
+                "v6 peer on a v4 allocation",
+                "443",
+                "as expected (RFC 6156 §4.2)",
+            ),
             Err(c) => {
-                probe("v6 peer on a v4 allocation", &code_str(c), "FAIL: expected 443");
+                probe(
+                    "v6 peer on a v4 allocation",
+                    &code_str(c),
+                    "FAIL: expected 443",
+                );
                 failures += 1;
             }
             Ok(()) => {
-                probe("v6 peer on a v4 allocation", "success", "FAIL: a cross-family permission was installed");
+                probe(
+                    "v6 peer on a v4 allocation",
+                    "success",
+                    "FAIL: a cross-family permission was installed",
+                );
                 failures += 1;
             }
         }
     }
     if let Some(s) = v6_session.as_mut() {
         match s.create_permission_code(v4_peer).await {
-            Err(Some(443)) => probe("v4 peer on a v6 allocation", "443", "as expected (RFC 6156 §4.2)"),
+            Err(Some(443)) => probe(
+                "v4 peer on a v6 allocation",
+                "443",
+                "as expected (RFC 6156 §4.2)",
+            ),
             Err(c) => {
-                probe("v4 peer on a v6 allocation", &code_str(c), "FAIL: expected 443");
+                probe(
+                    "v4 peer on a v6 allocation",
+                    &code_str(c),
+                    "FAIL: expected 443",
+                );
                 failures += 1;
             }
             Ok(()) => {
-                probe("v4 peer on a v6 allocation", "success", "FAIL: a cross-family permission was installed");
+                probe(
+                    "v4 peer on a v6 allocation",
+                    "success",
+                    "FAIL: a cross-family permission was installed",
+                );
                 failures += 1;
             }
         }
@@ -1658,13 +1716,25 @@ async fn run_conformance(
         for (addr, what) in bypass {
             let peer: std::net::SocketAddr = format!("[{addr}]:9999").parse().expect("literal");
             match s.create_permission_code(peer).await {
-                Err(Some(403)) => probe(&format!("peer filter: {what}"), "403", "denied, as it must be"),
+                Err(Some(403)) => probe(
+                    &format!("peer filter: {what}"),
+                    "403",
+                    "denied, as it must be",
+                ),
                 Err(c) => {
-                    probe(&format!("peer filter: {what}"), &code_str(c), "FAIL: expected 403 Forbidden");
+                    probe(
+                        &format!("peer filter: {what}"),
+                        &code_str(c),
+                        "FAIL: expected 403 Forbidden",
+                    );
                     failures += 1;
                 }
                 Ok(()) => {
-                    probe(&format!("peer filter: {what}"), "success", "FAIL: this smuggles an IPv4 target past the v4 deny rules");
+                    probe(
+                        &format!("peer filter: {what}"),
+                        "success",
+                        "FAIL: this smuggles an IPv4 target past the v4 deny rules",
+                    );
                     failures += 1;
                 }
             }
@@ -1791,4 +1861,3 @@ mod tests {
         assert_eq!(snap.lat_min_us, 0, "latency histogram cleared");
     }
 }
-

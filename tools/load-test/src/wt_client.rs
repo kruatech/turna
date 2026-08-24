@@ -82,9 +82,7 @@ impl WtStream {
             // kind — but it is worth naming, because every other transport here
             // returns a bare count and the loops otherwise look identical.
             match tokio::time::timeout(left, self.recv.read(&mut chunk)).await {
-                Ok(Ok(None)) | Ok(Ok(Some(0))) => {
-                    return Err("stream closed by the server".into())
-                }
+                Ok(Ok(None)) | Ok(Ok(Some(0))) => return Err("stream closed by the server".into()),
                 Ok(Ok(Some(n))) => self.buf.extend_from_slice(&chunk[..n]),
                 Ok(Err(e)) => return Err(format!("stream read: {e}")),
                 Err(_) => {
@@ -135,7 +133,9 @@ impl WtSession {
             .open_bi()
             .await
             .map_err(|e| format!("open_bi (reserve): {e}"))?;
-        let (send, recv) = opening.await.map_err(|e| format!("open_bi (accept): {e}"))?;
+        let (send, recv) = opening
+            .await
+            .map_err(|e| format!("open_bi (accept): {e}"))?;
         let mut ctl = WtStream {
             send,
             recv,
@@ -277,7 +277,9 @@ pub async fn webtransport_check(
     })?;
     let channel: u16 = 0x4000;
     sess.channel_bind(channel, peer_addr).await?;
-    log.push(format!("CreatePermission and ChannelBind ok for {peer_addr}"));
+    log.push(format!(
+        "CreatePermission and ChannelBind ok for {peer_addr}"
+    ));
 
     const N: usize = 20;
     for i in 0..N {
@@ -381,15 +383,18 @@ pub async fn run_wt_load(
         let creds = creds.clone();
         let url = url.clone();
         handles.push(tokio::spawn(async move {
-            let peer_sock =
-                match tokio::net::UdpSocket::bind(crate::turn_client::peer_bind_addr(false)).await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        stats.errs.fetch_add(1, Ordering::Relaxed);
-                        barrier.wait().await;
-                        return;
-                    }
-                };
+            let peer_sock = match tokio::net::UdpSocket::bind(crate::turn_client::peer_bind_addr(
+                false,
+            ))
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    stats.errs.fetch_add(1, Ordering::Relaxed);
+                    barrier.wait().await;
+                    return;
+                }
+            };
             let peer_addr = match peer_sock.local_addr() {
                 Ok(a) => a,
                 Err(_) => {
@@ -442,8 +447,7 @@ pub async fn run_wt_load(
             });
 
             let body = vec![0u8; payload];
-            let mut tick =
-                tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
+            let mut tick = tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             // Inside the 300 s permission deadline, the shortest of the three.
             let mut next_refresh = Instant::now() + Duration::from_secs(240);

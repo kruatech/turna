@@ -16,78 +16,77 @@ mod verifier {
     use std::sync::Arc;
 
     /// Accepts every server certificate presented. Test-only.
-#[derive(Debug)]
-pub struct AcceptAnyServerCert(pub Arc<rustls::crypto::CryptoProvider>);
+    #[derive(Debug)]
+    pub struct AcceptAnyServerCert(pub Arc<rustls::crypto::CryptoProvider>);
 
-impl AcceptAnyServerCert {
-    /// Shared provider for the rustls builders, which take an `Arc`.
-    ///
-    /// Only the TLS and QUIC clients construct a rustls config; DTLS installs a
-    /// process default instead (`owned_provider`), so without this gate a
-    /// `--features dtls` build carries it unused.
-    #[cfg(any(feature = "tls", feature = "quic"))]
-    pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-        Arc::new(rustls::crypto::ring::default_provider())
+    impl AcceptAnyServerCert {
+        /// Shared provider for the rustls builders, which take an `Arc`.
+        ///
+        /// Only the TLS and QUIC clients construct a rustls config; DTLS installs a
+        /// process default instead (`owned_provider`), so without this gate a
+        /// `--features dtls` build carries it unused.
+        #[cfg(any(feature = "tls", feature = "quic"))]
+        pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+            Arc::new(rustls::crypto::ring::default_provider())
+        }
+
+        /// An **owned** provider, for `CryptoProvider::install_default`, which consumes
+        /// one by value. Libraries that build their own crypto — `webrtc-dtls` among
+        /// them — look up the process-wide default instead of accepting a provider, so
+        /// something has to install it.
+        ///
+        /// Gated rather than `#[allow(dead_code)]`: only the DTLS client needs it, and the
+        /// gate says so. A blanket allow would hide the next genuinely unused item here.
+        #[cfg(feature = "dtls")]
+        pub fn owned_provider() -> rustls::crypto::CryptoProvider {
+            rustls::crypto::ring::default_provider()
+        }
     }
 
-    /// An **owned** provider, for `CryptoProvider::install_default`, which consumes
-    /// one by value. Libraries that build their own crypto — `webrtc-dtls` among
-    /// them — look up the process-wide default instead of accepting a provider, so
-    /// something has to install it.
-    ///
-    /// Gated rather than `#[allow(dead_code)]`: only the DTLS client needs it, and the
-    /// gate says so. A blanket allow would hide the next genuinely unused item here.
-    #[cfg(feature = "dtls")]
-    pub fn owned_provider() -> rustls::crypto::CryptoProvider {
-        rustls::crypto::ring::default_provider()
-    }
-}
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
 
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
 
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
 
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
     }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 }
 
 #[cfg(any(feature = "tls", feature = "quic", feature = "dtls"))]

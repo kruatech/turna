@@ -80,7 +80,6 @@ impl ControlStream {
             Err(_) => Err("timeout waiting for a response on the control stream".to_string()),
         }
     }
-
 }
 
 /// An established raw-QUIC session carrying TURN.
@@ -118,10 +117,7 @@ impl QuicSession {
             .await
             .map_err(|e| format!("QUIC handshake to {server} failed: {e}"))?;
 
-        let (send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| format!("open_bi: {e}"))?;
+        let (send, recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
         let mut ctl = ControlStream {
             send,
             recv,
@@ -262,15 +258,18 @@ pub async fn run_quic_load(
         let server_name = server_name.clone();
         let alpn = alpn.clone();
         handles.push(tokio::spawn(async move {
-            let peer_sock =
-                match tokio::net::UdpSocket::bind(crate::turn_client::peer_bind_addr(false)).await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        stats.errs.fetch_add(1, Ordering::Relaxed);
-                        barrier.wait().await;
-                        return;
-                    }
-                };
+            let peer_sock = match tokio::net::UdpSocket::bind(crate::turn_client::peer_bind_addr(
+                false,
+            ))
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => {
+                    stats.errs.fetch_add(1, Ordering::Relaxed);
+                    barrier.wait().await;
+                    return;
+                }
+            };
             let peer_addr = match peer_sock.local_addr() {
                 Ok(a) => a,
                 Err(_) => {
@@ -323,8 +322,7 @@ pub async fn run_quic_load(
             });
 
             let body = vec![0u8; payload];
-            let mut tick =
-                tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
+            let mut tick = tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             let mut next_refresh = Instant::now() + Duration::from_secs(240);
             while stats.is_running() {
@@ -538,7 +536,9 @@ pub async fn quic_allocate_check(
     if !is_success(&resp) {
         return Err(format!("ChannelBind rejected: {:?}", error_code(&resp)));
     }
-    log.push(format!("ChannelBind ok for {peer_addr} on channel {channel:#06x}"));
+    log.push(format!(
+        "ChannelBind ok for {peer_addr} on channel {channel:#06x}"
+    ));
 
     // client → relay → peer
     const N: usize = 20;
@@ -581,7 +581,8 @@ pub async fn quic_allocate_check(
     ));
 
     // peer → relay → client, which must come back as ChannelData on the same stream
-    peer_sock.send_to(b"echo-from-peer", relayed)
+    peer_sock
+        .send_to(b"echo-from-peer", relayed)
         .await
         .map_err(|e| format!("peer send: {e}"))?;
 

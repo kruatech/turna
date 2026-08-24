@@ -334,7 +334,9 @@ pub async fn tls_probe(
     })?;
     let channel: u16 = 0x4000;
     sess.channel_bind(channel, peer_addr).await?;
-    log.push(format!("CreatePermission and ChannelBind ok for {peer_addr}"));
+    log.push(format!(
+        "CreatePermission and ChannelBind ok for {peer_addr}"
+    ));
 
     const N: usize = 20;
     for i in 0..N {
@@ -511,8 +513,11 @@ pub async fn run_tls_load(
             let recv_task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
                 loop {
-                    match tokio::time::timeout(Duration::from_secs(1), peer_sock.recv_from(&mut buf))
-                        .await
+                    match tokio::time::timeout(
+                        Duration::from_secs(1),
+                        peer_sock.recv_from(&mut buf),
+                    )
+                    .await
                     {
                         Ok(Ok((n, _))) => {
                             recv_stats.recv.fetch_add(1, Ordering::Relaxed);

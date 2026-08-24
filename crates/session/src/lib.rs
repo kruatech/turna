@@ -497,9 +497,7 @@ fn bind_relay_socket(family: RelayFamily, port: u16) -> std::io::Result<std::net
                 Some(socket2::Protocol::UDP),
             )?;
             sock.set_only_v6(true)?;
-            sock.bind(
-                &std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into(),
-            )?;
+            sock.bind(&std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
             Ok(sock.into())
         }
         #[cfg(not(unix))]
