@@ -29,7 +29,7 @@ RUN npm run build
 # =============================================================================
 # Stage 2: Rust build (turna-admin)
 # =============================================================================
-FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+FROM rust:1.98.0-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cmake \
