@@ -85,12 +85,12 @@ fn build_heartbeat(
 /// Creates a fresh `System` each tick — lightweight enough at 5s interval.
 fn sample_resources() -> (f32, f32) {
     let sys = System::new_with_specifics(
-        RefreshKind::new()
-            .with_cpu(CpuRefreshKind::new().with_cpu_usage())
-            .with_memory(MemoryRefreshKind::new().with_ram()),
+        RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+            .with_memory(MemoryRefreshKind::nothing().with_ram()),
     );
 
-    let cpu_pct = sys.global_cpu_info().cpu_usage();
+    let cpu_pct = sys.global_cpu_usage();
     let mem_pct = if sys.total_memory() > 0 {
         (sys.used_memory() as f32 / sys.total_memory() as f32) * 100.0
     } else {
