@@ -59,7 +59,7 @@ RUN mkdir -p /etc/turna/tls /etc/turna/ebpf /var/run/turna \
 
 # OCI image metadata. VERSION is passed by the release workflow
 # (--build-arg VERSION=<tag>); the default tracks the current chart/appVersion.
-ARG VERSION=0.3.0
+ARG VERSION=0.3.1
 LABEL org.opencontainers.image.title="turna" \
       org.opencontainers.image.description="High-performance TURN/STUN server in Rust" \
       org.opencontainers.image.source="https://github.com/kruatech/turna" \
