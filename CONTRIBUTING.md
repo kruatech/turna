@@ -65,6 +65,23 @@ Fuzz targets (nightly) live under `fuzz/`:
 cd fuzz && cargo +nightly fuzz build
 ```
 
+### Tests come with the change
+
+New functionality is expected to arrive with tests, and a fix is expected to
+arrive with a test that fails without it. Reviews ask for this.
+
+Assert on observable behaviour rather than on the constant or the call you just
+wrote. `ATTR_ALTERNATE_SERVER` held the wrong value across three releases while a
+unit test asserted that the constant equalled itself; the test that caught it
+checks the bytes on the wire. Where a getter or an encoder is involved, include a
+decoy — a second attribute of the same shape — so a test cannot pass by matching
+whatever happens to be first.
+
+Mutation testing runs on a schedule (`cargo mutants`) and reports code a test
+executes without detecting a change to it. A surviving mutant is a real gap, not
+a false positive: it means the behaviour could be replaced and nothing would
+notice.
+
 ## Commit and PR conventions
 
 - Keep commits focused; write a clear message explaining the *why*.
