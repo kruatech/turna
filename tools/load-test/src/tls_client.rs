@@ -73,19 +73,22 @@ fn load_client_auth(
     ),
     String,
 > {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(cert_path).map_err(|e| format!("open {cert_path}: {e}"))?,
-    ))
-    .collect::<std::result::Result<_, _>>()
-    .map_err(|e| format!("parse {cert_path}: {e}"))?;
+    // `rustls-pki-types` rather than `rustls-pemfile`: the latter was archived in
+    // August 2025 (RUSTSEC-2025-0134) and its final release is a thin wrapper around
+    // exactly this code. rustls already pulls pki-types in, so this removes a
+    // dependency rather than adding one.
+    use rustls::pki_types::pem::PemObject;
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_file_iter(cert_path)
+            .map_err(|e| format!("read {cert_path}: {e}"))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| format!("parse {cert_path}: {e}"))?;
     if certs.is_empty() {
         return Err(format!("{cert_path} contains no certificate"));
     }
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::fs::File::open(key_path).map_err(|e| format!("open {key_path}: {e}"))?,
-    ))
-    .map_err(|e| format!("parse {key_path}: {e}"))?
-    .ok_or_else(|| format!("{key_path} contains no private key"))?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key_path)
+        .map_err(|e| format!("read {key_path}: {e}"))?;
     Ok((certs, key))
 }
 
