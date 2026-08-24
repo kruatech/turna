@@ -19,6 +19,9 @@ tokio.workspace    = true
 # User auth
 jsonwebtoken.workspace = true
 argon2.workspace       = true
+# Declared explicitly so its `getrandom` feature is actually enabled: features
+# only activate for dependencies a crate names, and OsRng lives behind that one.
+password-hash.workspace = true
 uuid.workspace         = true
 # Workspace crates
 turna-crypto.workspace    = true
