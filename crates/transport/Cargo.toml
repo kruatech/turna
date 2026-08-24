@@ -15,7 +15,7 @@ web-transport = ["quic", "dep:wtransport"]
 # ring/mmap datapath should adopt xsk-rs (see docs/design/af-xdp-datapath.md).
 af-xdp = ["dep:xsk-rs", "dep:rtnetlink", "dep:netlink-packet-route", "dep:futures-util", "dep:libxdp-sys", "dep:libbpf-sys"]
 # TURN over DTLS (RFC 7350), pure-Rust DTLS 1.2 via webrtc-dtls.
-dtls = ["dep:webrtc-dtls", "dep:webrtc-util", "dep:rustls"]
+dtls = ["dep:webrtc-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
 # TURN-over-SCTP client control transport (experimental). Reuses the tcp_tls
 # frame codec + shared stream-event types, so it depends on the `tls` feature.
 # socket2 (cfg(unix)) and libc are already non-optional deps; SCTP needs the
@@ -44,7 +44,7 @@ quinn = { version = "0.11", optional = true }
 # + rustls; verify the chosen version aligns with quinn 0.11 / rustls 0.23 above
 # (wtransport 0.7.x targets quinn 0.11). If it re-exports a conflicting quinn,
 # prefer wtransport's re-export and drop the standalone quinn dep for this build.
-wtransport = { version = "0.7", optional = true }
+wtransport = { version = "0.7", features = ["quinn"], optional = true }
 
 # TURN over DTLS (feature: dtls). Pure-Rust, cross-platform DTLS 1.2 — NOT
 # Linux-only, so it belongs in the main [dependencies] table (a previous version
@@ -53,6 +53,11 @@ wtransport = { version = "0.7", optional = true }
 # behind the `pem` feature) verified against 0.10.0 source.
 webrtc-dtls = { version = "0.10", features = ["pem"], optional = true }
 webrtc-util = { version = "0.9", optional = true }
+# Needed only to implement `webrtc_util::conn::Conn` for the owned DTLS
+# demultiplexer (crates/transport/src/dtls_demux.rs): the trait is declared with
+# #[async_trait], so an impl needs the same macro. webrtc-dtls already pulls this
+# crate transitively — declaring it makes the macro reachable here.
+async-trait = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }

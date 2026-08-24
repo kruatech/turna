@@ -12,6 +12,7 @@ data:
     [turn]
     listen = "0.0.0.0:{{ .Values.turn.listenPort }}"
     external_ip = {{ .Values.turn.externalIP | quote }}
+    external_ip6 = {{ .Values.turn.externalIP6 | default "" | quote }}
     realm = {{ .Values.turn.realm | quote }}
     transport = {{ .Values.turn.transport | quote }}
 

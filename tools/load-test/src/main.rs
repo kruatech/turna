@@ -17,7 +17,32 @@ use tokio::net::UdpSocket;
 use tokio::sync::Barrier;
 
 mod turn_client;
-use turn_client::Creds;
+// Framing and the test certificate verifier, shared by the stream transports.
+// Gated together with them: the TCP relay client used to keep the framer alive
+// without any feature, then moved under `tls` itself, leaving the module dead in a
+// featureless build.
+// Two independent pieces live here with different users: the certificate verifier
+// (tls, quic, dtls) and the stream framer (tls, quic, web-transport). The module gate
+// is the union; each piece carries its own inside.
+#[cfg(any(
+    feature = "tls",
+    feature = "quic",
+    feature = "dtls",
+    feature = "web-transport"
+))]
+mod stream_common;
+// RFC 6062 runs over TURNS, so this needs the TLS stack like the others.
+#[cfg(feature = "dtls")]
+mod dtls_client;
+#[cfg(feature = "quic")]
+mod quic_client;
+#[cfg(feature = "tls")]
+mod tcp_relay_client;
+#[cfg(feature = "tls")]
+mod tls_client;
+#[cfg(feature = "web-transport")]
+mod wt_client;
+use turn_client::{Creds, FAMILY_V4, FAMILY_V6};
 
 const STUN_MAGIC: u32 = 0x2112A442;
 
@@ -60,6 +85,15 @@ struct Cli {
     /// Per-request response timeout in milliseconds.
     #[arg(long, default_value = "2000")]
     rtt_timeout_ms: u64,
+    /// Local IP to bind every socket on. Default: loopback.
+    ///
+    /// Needed whenever the server is not on loopback — the AF_XDP lab, for one, puts
+    /// the node on `10.123.0.1` across a veth pair, so the client must send from
+    /// `10.123.0.2`. `0.0.0.0` is not a substitute: `local_addr()` would return
+    /// `0.0.0.0` and that is the address that goes into CreatePermission, where it
+    /// means nothing.
+    #[arg(long)]
+    bind_ip: Option<String>,
 }
 
 #[derive(Subcommand, Clone)]
@@ -79,6 +113,193 @@ enum Mode {
         pps: u64,
         #[arg(long, default_value = "160")]
         payload: usize,
+        /// Relayed address family: `v4` (default) or `v6`.
+        ///
+        /// `v6` sends REQUESTED-ADDRESS-FAMILY = IPv6 on Allocate and binds the peer
+        /// socket on `[::1]`, so the whole path — v6 relay socket, v6 peer
+        /// permission, v6 channel — is exercised. The server must have
+        /// `[turn] external_ip6` set, or the Allocate is refused with 440.
+        ///
+        /// This is the only way to put load on IPv6 relaying: a browser cannot send
+        /// the attribute, and the `conformance` mode only checks the control plane.
+        #[arg(long, default_value = "v4")]
+        family: String,
+    },
+    /// TURN over WebTransport (HTTP/3): session, control stream, allocation and
+    /// relayed media both ways.
+    ///
+    /// Requires `--features web-transport` here and `[turn.quic] enabled = true`
+    /// with `web_transport = true` on the server.
+    ///
+    /// Not a substitute for a browser: this client and the server share the
+    /// `wtransport` library and one reading of the spec, so a shared misreading
+    /// stays invisible. It catches server-side faults ahead of a browser test.
+    /// Sustained load over WebTransport. What an endurance run needs — `wt-check` is
+    /// one session for a few seconds.
+    #[cfg(feature = "web-transport")]
+    Wt {
+        #[arg(long, default_value = "https://localhost:3479/")]
+        url: String,
+        #[arg(short = 'c', long, default_value = "20")]
+        concurrency: usize,
+        #[arg(long, default_value = "25")]
+        pps: u64,
+        #[arg(long, default_value = "160")]
+        payload: usize,
+    },
+    #[cfg(feature = "web-transport")]
+    WtCheck {
+        /// Full URL, e.g. `https://localhost:3479/turn`. WebTransport is an HTTP/3
+        /// CONNECT, so it needs a URL rather than a host:port.
+        #[arg(long, default_value = "https://localhost:3479/")]
+        url: String,
+    },
+    /// Sustained load over DTLS.
+    #[cfg(feature = "dtls")]
+    Dtls {
+        #[arg(short = 'c', long, default_value = "20")]
+        concurrency: usize,
+        #[arg(long, default_value = "25")]
+        pps: u64,
+        #[arg(long, default_value = "160")]
+        payload: usize,
+    },
+    /// Sustained load over raw QUIC.
+    #[cfg(feature = "quic")]
+    Quic {
+        #[arg(short = 'c', long, default_value = "20")]
+        concurrency: usize,
+        #[arg(long, default_value = "25")]
+        pps: u64,
+        #[arg(long, default_value = "160")]
+        payload: usize,
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+        #[arg(long, default_value = "stun.turn")]
+        alpn: String,
+    },
+    /// TURN over DTLS: handshake, allocation, and relayed media both ways.
+    ///
+    /// Requires `--features dtls` here and `[turn.dtls] enabled = true` on the
+    /// server. Point `--server` at the DTLS port, not 3478.
+    ///
+    /// Run it against both server paths: `[turn.dtls] demux = false` (the default,
+    /// `webrtc_dtls::listen()`) and `demux = true` (the owned demultiplexer). They
+    /// accept handshakes differently, so one result does not stand for the other.
+    #[cfg(feature = "dtls")]
+    DtlsCheck,
+    /// RFC 6062 TCP relay: Allocate(TCP) → CreatePermission → Connect →
+    /// ConnectionBind, then data in both directions.
+    ///
+    /// Requires `[turn.tcp_relay] enabled = true` and `production = false` — the
+    /// feature is refused in production precisely for want of this evidence.
+    #[cfg(feature = "tls")]
+    TcpRelayCheck {
+        /// SNI presented in the TURNS handshake. RFC 6062 runs over TURNS here —
+        /// turna has no plain-TCP TURN listener — so `--server` must be the TURNS
+        /// port, not 3478.
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+        /// Send the first application bytes in the SAME write as ConnectionBind.
+        ///
+        /// This is the case RFC 6062 §5.4 permits and the one the server's detach
+        /// prebuffer exists to handle: a server that stops parsing STUN and starts a
+        /// fresh read loses whatever shared the segment. Run it both ways — the
+        /// non-pipelined form passing tells you little on its own.
+        #[arg(long)]
+        pipelined: bool,
+    },
+    /// TURN over TLS (TURNS): one session end to end, including relayed media in
+    /// both directions.
+    ///
+    /// Requires `--features tls` here and `[tls] enabled = true` on the server.
+    /// Point `--server` at the TURNS port (5349 by convention), not 3478.
+    #[cfg(feature = "tls")]
+    TlsCheck {
+        /// SNI presented in the handshake. Any syntactically valid name works — the
+        /// certificate is not verified.
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+        /// ALPN to offer. Empty offers none, which is what tests `alpn_required`.
+        #[arg(long, default_value = "stun.turn")]
+        alpn: String,
+        /// PEM chain to present for client authentication (mTLS).
+        ///
+        /// Needs a **private** CA: public issuers hand out server certificates only.
+        /// The server side is `[tls] client_ca` plus `require_client_cert`. Omit both
+        /// flags to test the negative case — with `require_client_cert = true` a
+        /// client without a certificate must be refused.
+        #[arg(long)]
+        client_cert: Option<String>,
+        /// Private key for `--client-cert`.
+        #[arg(long)]
+        client_key: Option<String>,
+    },
+    /// Sustained load over TURNS. This is the mode a TURNS soak needs: the UDP
+    /// modes cannot place any load on the TLS path.
+    #[cfg(feature = "tls")]
+    Tls {
+        #[arg(short = 'c', long, default_value = "100")]
+        concurrency: usize,
+        /// Pump ChannelData over long-lived sessions instead of churning
+        /// allocations. Allocation churn measures the handshake + Allocate cost;
+        /// channel-data measures the relay under sustained traffic. Both matter and
+        /// they stress different things.
+        #[arg(long)]
+        channel_data: bool,
+        #[arg(long, default_value = "50")]
+        pps: u64,
+        #[arg(long, default_value = "160")]
+        payload: usize,
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+        #[arg(long, default_value = "stun.turn")]
+        alpn: String,
+        /// PEM chain to present for client authentication (mTLS); see `tls-check`.
+        #[arg(long)]
+        client_cert: Option<String>,
+        /// Private key for `--client-cert`.
+        #[arg(long)]
+        client_key: Option<String>,
+    },
+    /// TURN over raw QUIC: full authenticated Allocate + CreatePermission on a
+    /// bidi control stream. Requires `--features quic` on this tool and
+    /// `[turn.quic] enabled = true` with `web_transport = false` on the server.
+    ///
+    /// This is the interop evidence `[turn.quic]` has never had. It accepts any
+    /// server certificate — a verification client, not a library.
+    #[cfg(feature = "quic")]
+    QuicCheck {
+        /// SNI presented in the handshake; any value works with a self-signed cert.
+        #[arg(long, default_value = "localhost")]
+        server_name: String,
+        /// Must match `[turn.quic].alpn`.
+        #[arg(long, default_value = "stun.turn")]
+        alpn: String,
+        /// Peer used for the CreatePermission step.
+        #[arg(long, default_value = "192.0.2.10:9999")]
+        peer: String,
+    },
+    /// Address-family and peer-filter conformance probes. Seconds, not minutes,
+    /// and no browser — this is what can be checked on a dev machine before
+    /// committing to a stand.
+    ///
+    /// It reports what the server actually answered rather than asserting one
+    /// expected outcome, because several answers are legitimate: an IPv6 Allocate
+    /// is `440` when `[turn] external_ip6` is unset and succeeds when it is set,
+    /// and both are correct behaviour for their configuration.
+    Conformance {
+        /// IPv6 peer for the family-mismatch probe. Must be **globally routable**:
+        /// `is_forbidden_peer` is checked before the family test, so a loopback or
+        /// link-local address answers 403 and the probe never reaches the 443 it is
+        /// looking for. (This defaulted to `[::1]` and produced exactly that
+        /// misleading result.) No traffic is sent to it — only a permission is
+        /// attempted.
+        #[arg(long, default_value = "[2606:4700::1111]:9999")]
+        v6_peer: String,
+        /// IPv4 peer used for the family-mismatch probe.
+        #[arg(long, default_value = "192.0.2.10:9999")]
+        v4_peer: String,
     },
 }
 
@@ -88,6 +309,25 @@ impl Mode {
             Mode::Binding { .. } => "binding",
             Mode::Allocate { .. } => "allocate",
             Mode::ChannelData { .. } => "channeldata",
+            Mode::Conformance { .. } => "conformance",
+            #[cfg(feature = "quic")]
+            Mode::QuicCheck { .. } => "quic-check",
+            #[cfg(feature = "tls")]
+            Mode::TcpRelayCheck { .. } => "tcp-relay-check",
+            #[cfg(feature = "dtls")]
+            Mode::DtlsCheck => "dtls-check",
+            #[cfg(feature = "dtls")]
+            Mode::Dtls { .. } => "dtls",
+            #[cfg(feature = "quic")]
+            Mode::Quic { .. } => "quic",
+            #[cfg(feature = "web-transport")]
+            Mode::WtCheck { .. } => "wt-check",
+            #[cfg(feature = "web-transport")]
+            Mode::Wt { .. } => "wt",
+            #[cfg(feature = "tls")]
+            Mode::TlsCheck { .. } => "tls-check",
+            #[cfg(feature = "tls")]
+            Mode::Tls { .. } => "tls",
         }
     }
 }
@@ -625,6 +865,7 @@ async fn run_channeldata(
     json: bool,
     creds: Creds,
     rtt_ms: u64,
+    v6: bool,
 ) -> Arc<Stats> {
     let stats = Arc::new(Stats::new());
     let barrier = Arc::new(Barrier::new(channels + 1));
@@ -638,8 +879,11 @@ async fn run_channeldata(
         let creds = creds.clone();
         let epoch = epoch.clone();
         handles.push(tokio::spawn(async move {
-            // Local peer socket: the relay's other side.
-            let peer = match UdpSocket::bind("127.0.0.1:0").await {
+            // Local peer socket: the relay's other side. It must match the
+            // relayed family — RFC 6156 §4.2 refuses a cross-family peer with 443,
+            // so a v4 peer on a v6 allocation would fail at CreatePermission.
+            let bind_addr = turn_client::peer_bind_addr(v6);
+            let peer = match UdpSocket::bind(bind_addr).await {
                 Ok(s) => s,
                 Err(_) => {
                     stats.errs.fetch_add(1, Ordering::Relaxed);
@@ -649,9 +893,26 @@ async fn run_channeldata(
             };
             let peer_addr = peer.local_addr().unwrap();
 
-            let mut sess = match turn_client::allocate(server, &creds, rtt_ms).await {
+            let family = if v6 {
+                Some(turn_client::FAMILY_V6)
+            } else {
+                None
+            };
+            let mut sess = match turn_client::allocate_family(server, &creds, rtt_ms, family).await
+            {
                 Ok(s) => s,
-                Err(_) => {
+                Err(e) => {
+                    // 440 here means the server has no `[turn] external_ip6`, which is
+                    // a configuration answer rather than a fault — but the phase still
+                    // has nothing to measure, so it is counted as an error and the
+                    // reason is printed once.
+                    if v6 && e.1 == Some(440) && i == 0 {
+                        eprintln!(
+                            "IPv6 Allocate refused with 440: the server has no \
+                             [turn] external_ip6 configured, so there is no IPv6 relay \
+                             to test against."
+                        );
+                    }
                     stats.errs.fetch_add(1, Ordering::Relaxed);
                     barrier.wait().await;
                     return;
@@ -710,8 +971,17 @@ async fn run_channeldata(
             let mut seq: u64 = 0;
             let mut tick = tokio::time::interval(Duration::from_nanos(1_000_000_000 / pps.max(1)));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+            // Inside the 300 s permission deadline, the shortest of the three.
+            let mut next_refresh = Instant::now() + Duration::from_secs(240);
             while stats.is_running() {
                 tick.tick().await;
+                if Instant::now() >= next_refresh {
+                    if sess.refresh(ch, peer_addr).await.is_err() {
+                        stats.errs.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    next_refresh = Instant::now() + Duration::from_secs(240);
+                }
                 seq += 1;
                 body[0..8].copy_from_slice(&seq.to_be_bytes());
                 let now_ns = epoch.elapsed().as_nanos() as u64;
@@ -777,6 +1047,19 @@ fn progress_reporter(stats: &Arc<Stats>, json: bool) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Set before any client runs: `peer_bind_addr` reads it for every socket.
+    if let Some(ref ip) = cli.bind_ip {
+        match ip.parse::<std::net::IpAddr>() {
+            Ok(addr) => {
+                let _ = turn_client::BIND_IP.set(addr);
+            }
+            Err(e) => {
+                eprintln!("--bind-ip {ip:?} is not an IP address: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     let dur = Duration::from_secs(cli.duration);
     let wu = Duration::from_secs(cli.warmup);
     let mode_name = cli.mode.name();
@@ -801,6 +1084,187 @@ async fn main() {
         }
     };
 
+    #[cfg(feature = "web-transport")]
+    if let Mode::WtCheck { url } = &cli.mode {
+        println!("TURN over WebTransport against {url}\n");
+        match wt_client::webtransport_check(url, &creds, cli.rtt_timeout_ms).await {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                println!(
+                    "\nwt-check: OK — the H3 path carries a full allocation and relays media."
+                );
+                println!("Not a browser test: same library on both sides (see the module docs).");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("  FAIL {e}");
+                println!("\nwt-check: FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(feature = "dtls")]
+    if matches!(cli.mode, Mode::DtlsCheck) {
+        println!("TURN over DTLS against {}\n", cli.server);
+        match dtls_client::dtls_check(cli.server, &creds, cli.rtt_timeout_ms).await {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                println!(
+                    "\ndtls-check: OK — DTLS carries a full allocation and relays media both ways."
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("  FAIL {e}");
+                println!("\ndtls-check: FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    if let Mode::TcpRelayCheck {
+        server_name,
+        pipelined,
+    } = &cli.mode
+    {
+        println!(
+            "RFC 6062 TCP relay against {} ({})\n",
+            cli.server,
+            if *pipelined {
+                "payload pipelined with ConnectionBind"
+            } else {
+                "payload sent after ConnectionBind"
+            }
+        );
+        match tcp_relay_client::tcp_relay_check(
+            cli.server,
+            server_name,
+            &creds,
+            cli.rtt_timeout_ms,
+            *pipelined,
+        )
+        .await
+        {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                println!("\ntcp-relay-check: OK");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("  FAIL {e}");
+                println!("\ntcp-relay-check: FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    if let Mode::TlsCheck {
+        server_name,
+        alpn,
+        client_cert,
+        client_key,
+    } = &cli.mode
+    {
+        let alpns: Vec<String> = if alpn.is_empty() {
+            Vec::new()
+        } else {
+            vec![alpn.clone()]
+        };
+        println!("TURN over TLS against {}\n", cli.server);
+        let auth = match (client_cert.as_deref(), client_key.as_deref()) {
+            (Some(c), Some(k)) => Some((c, k)),
+            (None, None) => None,
+            _ => {
+                eprintln!("--client-cert and --client-key must be given together");
+                std::process::exit(2);
+            }
+        };
+        match tls_client::tls_probe(
+            cli.server,
+            server_name,
+            &alpns,
+            &creds,
+            cli.rtt_timeout_ms,
+            auth,
+        )
+        .await
+        {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                println!(
+                    "\ntls-check: OK — TURNS carries a full allocation and relays media both ways."
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("  FAIL {e}");
+                println!("\ntls-check: FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(feature = "quic")]
+    if let Mode::QuicCheck {
+        server_name,
+        alpn,
+        peer,
+    } = &cli.mode
+    {
+        let peer: std::net::SocketAddr = match peer.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("bad --peer: {e}");
+                std::process::exit(2);
+            }
+        };
+        println!("TURN over raw QUIC against {}\n", cli.server);
+        match quic_client::quic_allocate_check(
+            cli.server,
+            server_name,
+            alpn,
+            &creds,
+            cli.rtt_timeout_ms,
+            peer,
+        )
+        .await
+        {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                println!("\nquic-check: OK — the QUIC ingress carries a full TURN allocation.");
+                println!("Control plane only: relayed media over QUIC is not exercised here");
+                println!("(docs/verification/interop-plan.md, Tier 2).");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                println!("  FAIL {e}");
+                println!("\nquic-check: FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Conformance is a probe sequence, not a load run: it has no throughput or
+    // latency to report, so it exits here rather than being forced through the
+    // stats/JSON path that the three load modes share.
+    if let Mode::Conformance { v6_peer, v4_peer } = &cli.mode {
+        let rc = run_conformance(cli.server, &creds, cli.rtt_timeout_ms, v6_peer, v4_peer).await;
+        std::process::exit(rc);
+    }
+
     let stats = match cli.mode {
         Mode::Binding { concurrency } => {
             if !cli.json {
@@ -823,13 +1287,154 @@ async fn main() {
             )
             .await
         }
-        Mode::ChannelData {
-            channels,
+        Mode::Conformance { .. } => unreachable!("handled above"),
+        #[cfg(feature = "quic")]
+        Mode::QuicCheck { .. } => unreachable!("handled above"),
+        #[cfg(feature = "tls")]
+        Mode::TcpRelayCheck { .. } => unreachable!("handled above"),
+        #[cfg(feature = "dtls")]
+        Mode::DtlsCheck => unreachable!("handled above"),
+        #[cfg(feature = "dtls")]
+        Mode::Dtls {
+            concurrency,
             pps,
             payload,
         } => {
             if !cli.json {
-                eprintln!("Mode: ChannelData relay (n={channels}, {pps} pps/ch, {payload} B)");
+                eprintln!("Mode: DTLS load (c={concurrency}, {pps} pps/session, {payload} B)");
+            }
+            dtls_client::run_dtls_load(
+                cli.server,
+                concurrency,
+                pps,
+                payload,
+                dur,
+                wu,
+                cli.json,
+                creds,
+                cli.rtt_timeout_ms,
+            )
+            .await
+        }
+        #[cfg(feature = "quic")]
+        Mode::Quic {
+            concurrency,
+            pps,
+            payload,
+            ref server_name,
+            ref alpn,
+        } => {
+            if !cli.json {
+                eprintln!("Mode: QUIC load (c={concurrency}, {pps} pps/session, {payload} B)");
+            }
+            quic_client::run_quic_load(
+                cli.server,
+                server_name.clone(),
+                alpn.clone(),
+                concurrency,
+                pps,
+                payload,
+                dur,
+                wu,
+                cli.json,
+                creds,
+                cli.rtt_timeout_ms,
+            )
+            .await
+        }
+        #[cfg(feature = "web-transport")]
+        Mode::WtCheck { .. } => unreachable!("handled above"),
+        #[cfg(feature = "web-transport")]
+        Mode::Wt {
+            ref url,
+            concurrency,
+            pps,
+            payload,
+        } => {
+            if !cli.json {
+                eprintln!(
+                    "Mode: WebTransport load (c={concurrency}, {pps} pps/session, {payload} B)"
+                );
+            }
+            wt_client::run_wt_load(
+                url.clone(),
+                concurrency,
+                pps,
+                payload,
+                dur,
+                wu,
+                cli.json,
+                creds,
+                cli.rtt_timeout_ms,
+            )
+            .await
+        }
+        #[cfg(feature = "tls")]
+        Mode::TlsCheck { .. } => unreachable!("handled above"),
+        #[cfg(feature = "tls")]
+        Mode::Tls {
+            concurrency,
+            channel_data,
+            pps,
+            payload,
+            ref server_name,
+            ref alpn,
+            ref client_cert,
+            ref client_key,
+        } => {
+            let alpns: Vec<String> = if alpn.is_empty() {
+                Vec::new()
+            } else {
+                vec![alpn.clone()]
+            };
+            if !cli.json {
+                eprintln!(
+                    "Mode: TURNS load (c={concurrency}, {})",
+                    if channel_data {
+                        format!("channel-data {pps} pps/session, {payload} B")
+                    } else {
+                        "allocation churn".to_string()
+                    }
+                );
+            }
+            tls_client::run_tls_load(
+                cli.server,
+                server_name.clone(),
+                alpns,
+                client_cert.clone(),
+                client_key.clone(),
+                concurrency,
+                channel_data,
+                pps,
+                payload,
+                dur,
+                wu,
+                cli.json,
+                creds,
+                cli.rtt_timeout_ms,
+            )
+            .await
+        }
+        Mode::ChannelData {
+            channels,
+            pps,
+            payload,
+            ref family,
+        } => {
+            let v6 = match family.as_str() {
+                "v4" => false,
+                "v6" => true,
+                other => {
+                    eprintln!("--family must be v4 or v6, got {other:?}");
+                    std::process::exit(2);
+                }
+            };
+            if !cli.json {
+                eprintln!(
+                    "Mode: ChannelData relay (n={channels}, {pps} pps/ch, {payload} B, \
+                     relayed family {})",
+                    if v6 { "IPv6" } else { "IPv4" }
+                );
             }
             run_channeldata(
                 cli.server,
@@ -841,6 +1446,7 @@ async fn main() {
                 cli.json,
                 creds,
                 cli.rtt_timeout_ms,
+                v6,
             )
             .await
         }
@@ -851,6 +1457,307 @@ async fn main() {
         snap.print_json();
     } else {
         snap.print_report();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conformance probes (address family + peer filter)
+// ---------------------------------------------------------------------------
+
+/// Print one probe result. `verdict` is the interpretation, not just the raw
+/// answer — a reader should not have to know the RFC to see whether a line is
+/// good news.
+fn probe(name: &str, answer: &str, verdict: &str) {
+    println!("  {name:<44} {answer:<28} {verdict}");
+}
+
+fn code_str(c: Option<u16>) -> String {
+    match c {
+        Some(c) => format!("{c}"),
+        None => "no response".to_string(),
+    }
+}
+
+/// Address-family and peer-filter conformance. Returns a process exit code.
+///
+/// Deliberately reports rather than asserts where more than one answer is
+/// correct: an IPv6 Allocate is `440` with `[turn] external_ip6` unset and
+/// succeeds when it is set. Only genuinely wrong answers fail the run.
+async fn run_conformance(
+    server: std::net::SocketAddr,
+    creds: &Creds,
+    rtt: u64,
+    v6_peer: &str,
+    v4_peer: &str,
+) -> i32 {
+    let v6_peer: std::net::SocketAddr = match v6_peer.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("bad --v6-peer: {e}");
+            return 2;
+        }
+    };
+    let v4_peer: std::net::SocketAddr = match v4_peer.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("bad --v4-peer: {e}");
+            return 2;
+        }
+    };
+
+    let mut failures = 0;
+    println!("conformance probes against {server}\n");
+
+    // ── 1. baseline: no family requested ──
+    let mut v4_session = match turn_client::allocate_family(server, creds, rtt, None).await {
+        Ok(s) => {
+            let fam = if s.relayed.is_ipv4() { "IPv4" } else { "IPv6" };
+            probe(
+                "Allocate, no REQUESTED-ADDRESS-FAMILY",
+                &format!("ok, relayed {fam}"),
+                if s.relayed.is_ipv4() {
+                    "as expected"
+                } else {
+                    "UNEXPECTED: default must be IPv4"
+                },
+            );
+            if !s.relayed.is_ipv4() {
+                failures += 1;
+            }
+            Some(s)
+        }
+        Err(e) => {
+            probe(
+                "Allocate, no REQUESTED-ADDRESS-FAMILY",
+                &format!("{} ({})", e.0, code_str(e.1)),
+                "FAIL: the baseline path is broken",
+            );
+            failures += 1;
+            None
+        }
+    };
+
+    // ── 2. explicit IPv4 must be indistinguishable from absent ──
+    match turn_client::allocate_family(server, creds, rtt, Some(FAMILY_V4)).await {
+        Ok(mut s) => {
+            let ok = s.relayed.is_ipv4();
+            probe(
+                "Allocate, RAF = IPv4",
+                "ok",
+                if ok {
+                    "as expected"
+                } else {
+                    "UNEXPECTED family"
+                },
+            );
+            if !ok {
+                failures += 1;
+            }
+            s.release().await;
+        }
+        Err(e) => {
+            probe(
+                "Allocate, RAF = IPv4",
+                &code_str(e.1),
+                "FAIL: explicit IPv4 must behave like absent",
+            );
+            failures += 1;
+        }
+    }
+
+    // ── 3. IPv6: both outcomes legitimate, depending on external_ip6 ──
+    let mut v6_session =
+        match turn_client::allocate_family(server, creds, rtt, Some(FAMILY_V6)).await {
+            Ok(s) => {
+                let ok = s.relayed.is_ipv6();
+                probe(
+                    "Allocate, RAF = IPv6",
+                    &format!("ok, relayed {}", if ok { "IPv6" } else { "IPv4" }),
+                    if ok {
+                        "IPv6 relaying is ENABLED (external_ip6 is set)"
+                    } else {
+                        "FAIL: accepted an IPv6 request but relayed IPv4"
+                    },
+                );
+                if !ok {
+                    failures += 1;
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            Err(e) if e.1 == Some(440) => {
+                probe(
+                    "Allocate, RAF = IPv6",
+                    "440",
+                    "IPv6 relaying is DISABLED (external_ip6 unset) — correct refusal",
+                );
+                None
+            }
+            Err(e) => {
+                probe(
+                    "Allocate, RAF = IPv6",
+                    &code_str(e.1),
+                    "FAIL: expected success or 440",
+                );
+                failures += 1;
+                None
+            }
+        };
+
+    // ── 4. ADDITIONAL-ADDRESS-FAMILY (RFC 8656 §7.2). Not implemented, and the
+    //       attribute is comprehension-optional, so being ignored is RFC-legal —
+    //       the probe records which of the three possible behaviours this build
+    //       has, so the doc claim and the wire agree. ──
+    let aaf = turn_client::probe_additional_address_family(server, rtt, FAMILY_V6, false).await;
+    match aaf {
+        Some(401) | Some(turn_client::PROBE_SUCCESS) => probe(
+            "ADDITIONAL-ADDRESS-FAMILY = IPv6",
+            "ignored",
+            "not implemented; ignoring is RFC-legal for a comprehension-optional attribute",
+        ),
+        Some(400) => probe(
+            "ADDITIONAL-ADDRESS-FAMILY = IPv6",
+            "400",
+            "the attribute is being validated — docs say it is not implemented, so one of them is wrong",
+        ),
+        c => probe(
+            "ADDITIONAL-ADDRESS-FAMILY = IPv6",
+            &code_str(c),
+            "unexpected; investigate before trusting the family docs",
+        ),
+    }
+    // The illegal combination: both family attributes at once must be 400 once the
+    // feature lands. Until then it is ignored, and recording that is the point.
+    let both = turn_client::probe_additional_address_family(server, rtt, FAMILY_V6, true).await;
+    match both {
+        Some(400) => probe(
+            "RAF + ADDITIONAL-ADDRESS-FAMILY",
+            "400",
+            "as the RFC requires",
+        ),
+        Some(401) | Some(turn_client::PROBE_SUCCESS) => probe(
+            "RAF + ADDITIONAL-ADDRESS-FAMILY",
+            "accepted",
+            "expected while AAF is unimplemented; must become 400 with the feature",
+        ),
+        c => probe(
+            "RAF + ADDITIONAL-ADDRESS-FAMILY",
+            &code_str(c),
+            "unexpected",
+        ),
+    }
+
+    // ── 5. family mismatch: RFC 6156 §4.2 -> 443 ──
+    if let Some(s) = v4_session.as_mut() {
+        match s.create_permission_code(v6_peer).await {
+            Err(Some(443)) => probe(
+                "v6 peer on a v4 allocation",
+                "443",
+                "as expected (RFC 6156 §4.2)",
+            ),
+            Err(c) => {
+                probe(
+                    "v6 peer on a v4 allocation",
+                    &code_str(c),
+                    "FAIL: expected 443",
+                );
+                failures += 1;
+            }
+            Ok(()) => {
+                probe(
+                    "v6 peer on a v4 allocation",
+                    "success",
+                    "FAIL: a cross-family permission was installed",
+                );
+                failures += 1;
+            }
+        }
+    }
+    if let Some(s) = v6_session.as_mut() {
+        match s.create_permission_code(v4_peer).await {
+            Err(Some(443)) => probe(
+                "v4 peer on a v6 allocation",
+                "443",
+                "as expected (RFC 6156 §4.2)",
+            ),
+            Err(c) => {
+                probe(
+                    "v4 peer on a v6 allocation",
+                    &code_str(c),
+                    "FAIL: expected 443",
+                );
+                failures += 1;
+            }
+            Ok(()) => {
+                probe(
+                    "v4 peer on a v6 allocation",
+                    "success",
+                    "FAIL: a cross-family permission was installed",
+                );
+                failures += 1;
+            }
+        }
+    }
+
+    // ── 6. peer filter: the v4-embedding v6 transition prefixes must be 403.
+    //       This is the SSRF check — each of these smuggles an arbitrary IPv4
+    //       address inside a v6 literal, so without them every v4 deny rule is
+    //       bypassable. Run on the v4 allocation: `is_forbidden_peer` is checked
+    //       before the family test, so a forbidden peer answers 403 even though
+    //       it is also cross-family. ──
+    let bypass: [(&str, &str); 4] = [
+        ("64:ff9b::a9fe:a9fe", "NAT64 form of 169.254.169.254"),
+        ("2002:c000:0204::1", "6to4"),
+        ("2001::1", "Teredo"),
+        ("::203.0.113.1", "IPv4-compatible"),
+    ];
+    if let Some(s) = v4_session.as_mut() {
+        for (addr, what) in bypass {
+            let peer: std::net::SocketAddr = format!("[{addr}]:9999").parse().expect("literal");
+            match s.create_permission_code(peer).await {
+                Err(Some(403)) => probe(
+                    &format!("peer filter: {what}"),
+                    "403",
+                    "denied, as it must be",
+                ),
+                Err(c) => {
+                    probe(
+                        &format!("peer filter: {what}"),
+                        &code_str(c),
+                        "FAIL: expected 403 Forbidden",
+                    );
+                    failures += 1;
+                }
+                Ok(()) => {
+                    probe(
+                        &format!("peer filter: {what}"),
+                        "success",
+                        "FAIL: this smuggles an IPv4 target past the v4 deny rules",
+                    );
+                    failures += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(s) = v4_session.as_mut() {
+        s.release().await;
+    }
+    if let Some(s) = v6_session.as_mut() {
+        s.release().await;
+    }
+
+    println!();
+    if failures == 0 {
+        println!("conformance: OK — every probe answered as the RFC and the config require.");
+        println!("This covers address-family handling and the peer filter. It does not cover");
+        println!("relayed media: an allocation that answers correctly can still fail to pass");
+        println!("packets (see docs/verification/interop-plan.md, Tier 2).");
+        0
+    } else {
+        println!("conformance: FAIL — {failures} probe(s) wrong. Details above.");
+        1
     }
 }
 

@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use turna_transport::tcp_tls::{
-    DetachRequest, DetachedConn, TcpSendCommand, TcpTransportEvent, TlsTransportConfig,
+    DetachRequest, DetachedConn, TcpSendCommand, TcpTransportEvent, TlsStats, TlsTransportConfig,
     TlsTransportServer,
 };
 
@@ -51,8 +51,14 @@ pub(crate) async fn run_tls_bridge(
     relay_tx: mpsc::Sender<OutMsg>,
     client_sinks: ClientSinks,
     tcp_relay: Option<Arc<TcpRelayManager>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> BridgeResult {
     let server = TlsTransportServer::new(cfg)?;
+
+    // Shared counters for the TURNS listener, mirrored into the Prometheus
+    // metrics below. Before this the TLS transport exported nothing at all.
+    let stats = Arc::new(TlsStats::default());
+    spawn_tls_metrics_mirror(stats.clone(), processor.metrics().clone());
 
     // Events from the TLS server (opened / packet / closed).
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
@@ -63,9 +69,18 @@ pub(crate) async fn run_tls_bridge(
     let (detach_req_tx, detach_req_rx) = mpsc::channel::<DetachRequest>(256);
     let (detach_out_tx, mut detach_out_rx) = mpsc::channel::<DetachedConn>(256);
 
+    let server_stats = stats.clone();
+    let server_shutdown = shutdown.clone();
     tokio::spawn(async move {
         if let Err(e) = server
-            .run_with_detach(event_tx, tls_send_rx, detach_req_rx, detach_out_tx)
+            .run_full(
+                event_tx,
+                tls_send_rx,
+                detach_req_rx,
+                detach_out_tx,
+                server_stats,
+                server_shutdown,
+            )
             .await
         {
             error!(error = %e, "TURNS server stopped");
@@ -167,7 +182,12 @@ pub(crate) async fn run_tls_bridge(
                         }
                     }
                 }
-                for action in processor.process(raw, peer_addr) {
+                // TCP/TLS control-connection ingress: `process_tcp_control` sets
+                // `ingress_tcp`, without which `handle_allocate` rejects every
+                // RFC 6062 TCP allocation with 400 (§4.1 requires a TCP/TLS
+                // control connection) — making the whole CONNECT /
+                // ConnectionBind / detach path below unreachable.
+                for action in processor.process_tcp_control(raw, peer_addr) {
                     match action {
                         Action::Send { data, target } => {
                             if target == peer_addr {
@@ -299,14 +319,15 @@ pub(crate) async fn run_tls_bridge(
                         Action::ForwardZeroCopy { .. } => {
                             // Emitted only by `process_slice` on borrowed-slice
                             // ingress (io_uring / AF_XDP). The TLS bridge uses
-                            // `process()`, which emits `Forward { data }`, and the
-                            // original recv buffer is moved into `process()`, so the
-                            // payload cannot be reconstructed from offset/len here.
-                            // Unreachable on this path; drop defensively (a hit
-                            // would be a logic error) rather than panic.
+                            // `process_tcp_control()`, which emits
+                            // `Forward { data }`, and the original recv buffer is
+                            // moved into it, so the payload cannot be
+                            // reconstructed from offset/len here. Unreachable on
+                            // this path; drop defensively (a hit would be a logic
+                            // error) rather than panic.
                             tracing::warn!(
                                 %peer_addr,
-                                "TURNS bridge: unexpected ForwardZeroCopy on process() path; dropping"
+                                "TURNS bridge: unexpected ForwardZeroCopy on owning-process path; dropping"
                             );
                         }
                         Action::None => {}
@@ -321,16 +342,80 @@ pub(crate) async fn run_tls_bridge(
             } => {
                 client_sinks.remove(&peer_addr);
                 debug!(%peer_addr, %conn_id, %reason, "TURNS connection closed");
-                // The client's allocation is left to expire by TTL. A prompt
-                // release would need a store hook keyed by client address; see
-                // the §2c follow-up.
-                let _ = conn_id;
+                // §2c: release the allocation now instead of waiting for the TTL.
+                // For TURN over TCP the control connection *is* the allocation's
+                // 5-tuple, so once it closes the allocation can never be
+                // refreshed or used again — holding it (and its relay port/fd)
+                // for the rest of the lifetime only blocks capacity and makes a
+                // reconnecting client collide with 437 Allocation Mismatch.
+                for action in processor.release_for_closed_connection(peer_addr) {
+                    if let Action::CloseRelay { port } = action {
+                        let _ = relay_tx.send(OutMsg::CloseRelay { port }).await;
+                        if let Some(h) = tcp_listeners.remove(&port) {
+                            h.abort();
+                        }
+                        // RFC 6062: drop any pending/bound peer connections that
+                        // belonged to this (TCP) allocation.
+                        if let Some(mgr) = &tcp_relay {
+                            mgr.cleanup_allocation(AllocationId(port as u64)).await;
+                        }
+                    }
+                }
             }
         }
     }
 
     warn!("TURNS bridge event stream ended");
     Ok(())
+}
+
+/// Copy `TlsStats` into the shared Prometheus `Metrics` every few seconds and
+/// derive `turna_tls_readiness` from the listener's bound state. The transport
+/// crate is leaf-level and cannot depend on `turna-health`, so — exactly like
+/// the DTLS/QUIC listeners do in the node — the copy lives on this side.
+fn spawn_tls_metrics_mirror(stats: Arc<TlsStats>, metrics: Arc<turna_health::Metrics>) {
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let s = stats.snapshot();
+            metrics.tls_active.store(s.active as u64, Relaxed);
+            metrics.tls_conns_total.store(s.accepted, Relaxed);
+            metrics.tls_closed_total.store(s.closed, Relaxed);
+            metrics
+                .tls_handshake_failures
+                .store(s.handshake_failures, Relaxed);
+            metrics
+                .tls_handshake_timeouts
+                .store(s.handshake_timeouts, Relaxed);
+            metrics
+                .tls_rejected_over_cap
+                .store(s.rejected_over_cap, Relaxed);
+            metrics
+                .tls_rejected_per_ip
+                .store(s.rejected_per_ip, Relaxed);
+            metrics.tls_idle_timeouts.store(s.idle_timeouts, Relaxed);
+            metrics.tls_framing_errors.store(s.framing_errors, Relaxed);
+            metrics.tls_accept_errors.store(s.accept_errors, Relaxed);
+            metrics.tls_bytes_rx.store(s.bytes_rx, Relaxed);
+            metrics.tls_bytes_tx.store(s.bytes_tx, Relaxed);
+            metrics.tls_cert_reloads.store(s.cert_reloads, Relaxed);
+            metrics
+                .tls_cert_reload_failures
+                .store(s.cert_reload_failures, Relaxed);
+            metrics
+                .tls_rejected_rate_limit
+                .store(s.rejected_rate_limit, Relaxed);
+            metrics.tls_alpn_rejected.store(s.alpn_rejected, Relaxed);
+            metrics.set_tls_readiness(if s.listening {
+                turna_health::Readiness::Ready
+            } else {
+                turna_health::Readiness::Degraded
+            });
+        }
+    });
 }
 
 /// Handle one RFC 6062 CONNECT request on a client's TLS control connection:

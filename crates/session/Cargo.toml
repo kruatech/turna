@@ -14,6 +14,13 @@ rand.workspace = true
 # PR1 (allocation-store persistence): mpsc channel for write-behind WriteOp events.
 # Inherits `features = ["full"]` from the workspace — `sync` is what we actually need.
 tokio.workspace = true
+# IPV6_V6ONLY on relay sockets bound for an IPv6 allocation. std cannot set it
+# (the option must be applied between socket() and bind()), and without it a v6
+# wildcard bind also takes v4 traffic on the same port on Linux. Same declaration
+# style as turna-transport: cfg(unix) only, since the option is POSIX.
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+
 [dev-dependencies]
 # Tests use #[tokio::test]; workspace `full` already covers `macros` + `rt`.
 tokio.workspace = true

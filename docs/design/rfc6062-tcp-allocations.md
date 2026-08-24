@@ -1,8 +1,11 @@
 # Design: RFC 6062 TCP Allocations (Audit-3 F1)
 
-Status: **design / not yet implemented**. This document scopes the work, flags a
-hard architectural prerequisite, and lays out a chunked implementation plan so
-F1 can be landed safely rather than as one large change.
+Status: **implemented (beta).** This document keeps the original scoping and
+plan for the rationale; §7 records what actually landed. The "hard prerequisite"
+of §2 — no TCP client transport — has since been resolved: `crates/transport/src/
+tcp_tls.rs` provides the TLS-over-TCP control transport, and `crates/relay/src/
+tls_bridge.rs` + `crates/relay/src/tcp_relay.rs` implement the RFC 6062 flow on
+top of it. Read §2 as history, not as current state.
 
 ## 1. What RFC 6062 adds
 
@@ -148,3 +151,40 @@ path is the **TCP control transport** that does not exist yet. Recommend:
   groundwork, then build chunk 2 (TCP transport) as a dedicated effort.
 - Until then, F1 stays in design; the other audit findings (C1, H1, M1, L1, O1,
   Q1–Q5, F2, F4) are already closed.
+
+## 7. What landed (current state)
+
+Implementation: `crates/transport/src/tcp_tls.rs` (TLS control transport +
+`DetachedConn` role transition), `crates/relay/src/tls_bridge.rs` (CONNECT /
+ConnectionBind handling, peer-initiated accept loop), `crates/relay/src/
+tcp_relay.rs` (`TcpRelayManager` state machine + byte relay),
+`crates/relay/src/processor.rs` (`handle_allocate_tcp`, `connect_decision`,
+`connection_bind_decision`).
+
+- **Allocate with `REQUESTED-TRANSPORT = 6`** binds a TCP listener instead of a
+  UDP relay socket and emits `Action::RegisterTcpListener`. It is rejected with
+  400 unless it arrives over the TCP/TLS control transport (`ingress_tcp`) — the
+  UDP, DTLS and QUIC paths all refuse it.
+- **CONNECT** is validated synchronously (auth, allocation, permission) and the
+  outbound dial happens in the bridge; failures answer 447.
+- **ConnectionAttempt** is pushed to the client's control connection when a peer
+  dials the relayed listener; an undeliverable indication releases the pending
+  peer connection instead of leaking it.
+- **ConnectionBind** atomically claims the pending peer connection with an
+  ownership check against the credentials that opened it (a `CONNECTION-ID` is a
+  guessable sequential value, so this prevents hijacking), then the transport
+  writes the success response and detaches the connection into raw relay mode,
+  handing over any bytes already buffered past the ConnectionBind frame.
+- **Teardown**: idle reaper for pending/claimed connections, rollback if the
+  detach hand-off cannot be delivered, and full `cleanup_allocation` when the
+  control connection closes.
+
+### Still missing
+
+- **Plain TCP (non-TLS) control transport.** RFC 6062 permits TCP or
+  TLS-over-TCP; only TURNS is implemented, so `[turn.tcp_relay]` requires
+  `[tls]` to be enabled.
+- **Pre-bind peer-data buffering limit** (§5.3 open question) is implicit in the
+  socket buffer rather than an explicit policy bound.
+- **No integration test** for the full allocate → connect → bind → relay
+  round-trip (chunk 7 of §4).

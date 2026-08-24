@@ -13,6 +13,7 @@ pub mod hugepages;
 pub mod migration;
 pub mod probe;
 pub mod quic;
+pub mod ratelimit;
 pub mod select;
 pub mod tokio_transport;
 
@@ -88,3 +89,5 @@ pub mod gso;
 pub mod numa;
 
 pub mod dtls;
+#[cfg(feature = "dtls")]
+pub(crate) mod dtls_demux;

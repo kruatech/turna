@@ -144,6 +144,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Same fail-fast for QUIC. `quic_listener::spawn_quic` is a no-op stub on a
+    // build without the `quic` feature (it only logs), so `[turn.quic] enabled`
+    // would otherwise leave the listener silently unstarted. WebTransport needs
+    // the additional `web-transport` feature; `web_transport = true` is the
+    // config default, so a `--features quic`-only build must say so explicitly
+    // rather than fall back to raw QUIC the operator did not ask for.
+    if config.quic.enabled && !turna_transport::quic::QUIC_AVAILABLE {
+        return Err(
+            "[turn.quic] is enabled in the configuration, but this binary \
+                    was built without QUIC support; rebuild with `--features quic` \
+                    (or `--features web-transport` for the browser H3 path) \
+                    or disable [turn.quic]"
+                .into(),
+        );
+    }
+    if config.quic.enabled
+        && config.quic.web_transport
+        && !turna_transport::quic::WEB_TRANSPORT_AVAILABLE
+    {
+        return Err(
+            "[turn.quic] web_transport = true, but this binary was built \
+                    without WebTransport support; rebuild with \
+                    `--features web-transport`, or set \
+                    [turn.quic] web_transport = false to serve raw QUIC only"
+                .into(),
+        );
+    }
+
     let external_ip: std::net::IpAddr = if config.external_ip.is_empty() {
         let ip = config.listen.ip();
         if ip.is_unspecified() {
@@ -309,7 +337,14 @@ fn build_tls_transport_config(
         handshake_timeout: std::time::Duration::from_secs(c.handshake_timeout_secs),
         read_timeout: std::time::Duration::from_secs(c.read_timeout_secs),
         max_connections: c.max_connections,
+        max_connections_per_ip: c.max_connections_per_ip,
+        cert_reload_interval: std::time::Duration::from_secs(c.cert_reload_secs),
         enable_alpn: c.enable_alpn,
+        max_handshakes_per_sec_per_ip: c.max_handshakes_per_sec_per_ip,
+        handshake_burst_per_ip: c.handshake_burst_per_ip,
+        alpn_required: c.alpn_required,
+        client_ca_path: c.client_ca.clone(),
+        require_client_cert: c.require_client_cert,
     }
 }
 
@@ -529,6 +564,33 @@ fn apply_command(
     }
 }
 
+/// RFC 6156 IPv6 relayed transport: resolve `[turn] external_ip6` into the address
+/// to advertise for IPv6-family allocations, or `None` to keep IPv4-only relaying
+/// (where an explicit IPv6 Allocate answers 440).
+///
+/// `validate()` already rejected a non-IPv6 literal, so a parse failure here can
+/// only mean the key was left empty — but it is reported rather than swallowed,
+/// because silently relaying IPv4-only after an operator set the key would be the
+/// worst outcome.
+fn resolve_external_ip6(cfg: &TurnConfig) -> Option<std::net::Ipv6Addr> {
+    if cfg.external_ip6.is_empty() {
+        return None;
+    }
+    match cfg.external_ip6.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => {
+            info!(%v6, "IPv6 relayed transport enabled (RFC 6156)");
+            Some(v6)
+        }
+        Err(e) => {
+            warn!(
+                value = %cfg.external_ip6, %e,
+                "turn.external_ip6 is not a valid IPv6 address; IPv6 relaying stays disabled"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tokio(
     config: TurnConfig,
@@ -545,6 +607,7 @@ fn run_tokio(
     // `tls_cfg` is only consumed when the `tls` feature is enabled.
     #[cfg(not(feature = "tls"))]
     let _ = &tls_cfg;
+    let external_ip6 = resolve_external_ip6(&config);
     let num_threads = std::env::var("TURNA_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1581,13 +1644,16 @@ fn run_tokio(
             // AF_XDP ring datapath (Linux + af-xdp feature). Opt-in backend;
             // handles the main TURN socket via the xsk-rs datapath.
             turna_transport::TransportBackend::AfXdp => {
-                let processor = Arc::new(turna_relay::PacketProcessor::new_with_cluster(
-                    store,
-                    auth,
-                    external_ip,
-                    metrics.clone(),
-                    cluster_routing.clone(),
-                ));
+                let processor = Arc::new(
+                    turna_relay::PacketProcessor::new_with_cluster(
+                        store,
+                        auth,
+                        external_ip,
+                        metrics.clone(),
+                        cluster_routing.clone(),
+                    )
+                    .with_external_ip6(external_ip6),
+                );
                 let af_cfg = config.af_xdp.clone();
                 let listen = config.listen;
                 let af_shutdown = shutdown_rx.clone();
@@ -1633,7 +1699,8 @@ fn run_tokio(
                     cluster_routing.clone(),
                     migration,
                     tcp_relay,
-                );
+                )
+                .with_external_ip6(external_ip6);
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
                     info!(listen = %tls_cfg.listen, cert = %tls_cfg.cert_path.display(), "TURNS (TLS) enabled");
@@ -1668,6 +1735,7 @@ fn run_tokio(
                             server.client_sinks(),
                             metrics.clone(),
                             egress.clone(),
+                            shutdown_rx.clone(),
                         );
                     }
                     if config.dtls.enabled {
@@ -1719,6 +1787,14 @@ fn run_tokio(
                         });
                     info!(num_workers, "io_uring multi-worker pool");
 
+                    // Same gap the tokio path had: `turna_transport_readiness` is
+                    // exported and documented as the primary UDP datapath's
+                    // readiness, but nothing set it here either — a soak on this
+                    // backend read `0` (starting) for its whole run while serving
+                    // traffic. Found by comparing the two soak verdicts: tokio said
+                    // "ready throughout", io_uring said "values seen: [0.0]".
+                    metrics.set_transport_readiness(turna_health::Readiness::Ready);
+
                     // QUIC/DTLS coexist with the io_uring datapath: they run as
                     // independent tokio transports (separate ports) served by a
                     // dedicated PacketProcessor sharing the same store/auth, plus
@@ -1726,13 +1802,16 @@ fn run_tokio(
                     // io_uring workers own the main :3478 socket; QUIC/DTLS
                     // clients are reached via the egress' client_sinks.
                     if config.quic.enabled || config.dtls.enabled {
-                        let qd_processor = Arc::new(turna_relay::PacketProcessor::new_with_cluster(
-                            store.clone(),
-                            auth.clone(),
-                            external_ip,
-                            metrics.clone(),
-                            cluster_routing.clone(),
-                        ));
+                        let qd_processor = Arc::new(
+                            turna_relay::PacketProcessor::new_with_cluster(
+                                store.clone(),
+                                auth.clone(),
+                                external_ip,
+                                metrics.clone(),
+                                cluster_routing.clone(),
+                            )
+                            .with_external_ip6(external_ip6),
+                        );
                         let qd_sinks = turna_relay::new_client_sinks();
                         // Ephemeral fallback socket (bound off :3478 so it never
                         // joins the io_uring reuseport group); QUIC/DTLS clients
@@ -1753,6 +1832,7 @@ fn run_tokio(
                                 qd_sinks.clone(),
                                 metrics.clone(),
                                 egress.clone(),
+                                shutdown_rx.clone(),
                             );
                         }
                         if config.dtls.enabled {
@@ -2097,6 +2177,7 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("[turn]");
     println!("listen      = \"{}\"", t.listen);
     println!("external_ip = \"{}\"", t.external_ip);
+    println!("external_ip6 = \"{}\"", t.external_ip6);
     println!("realm       = \"{}\"", t.realm);
     println!();
     println!("[turn.auth]");

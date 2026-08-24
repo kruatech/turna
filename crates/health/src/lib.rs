@@ -69,6 +69,13 @@ pub struct Metrics {
     /// non-fatal backend failures.
     pub transport_readiness: AtomicU8,
     pub dtls_readiness: AtomicU8,
+    pub tls_readiness: AtomicU8,
+    pub quic_readiness: AtomicU8,
+    /// AF_XDP datapath readiness, same encoding as the others. AF_XDP was the only
+    /// datapath still sharing the process-level `backend_readiness`, which meant a
+    /// dead XSK socket was indistinguishable from a dead tokio datapath — and on a
+    /// kernel-bypass path that is exactly the failure worth naming.
+    pub afxdp_readiness: AtomicU8,
     /// #6/#4.5: management-plane readiness sub-signal (0=starting, 1=ready,
     /// 2=degraded, 3=draining), DISTINCT from the dataplane `readiness` flag so a
     /// bounded/resumable command-log migration gates the management plane without
@@ -242,6 +249,39 @@ pub struct Metrics {
     pub dtls_bytes_tx: AtomicU64,
     pub dtls_outbound_dropped: AtomicU64,
     pub dtls_rejected_per_ip: AtomicU64,
+    pub dtls_outbound_oversize: AtomicU64,
+    pub dtls_accept_timeouts: AtomicU64,
+    pub dtls_handshake_failures: AtomicU64,
+    pub dtls_inbound_dropped: AtomicU64,
+    pub dtls_rejected_rate_limit: AtomicU64,
+    pub dtls_cert_reloads: AtomicU64,
+    pub dtls_cert_reload_failures: AtomicU64,
+    pub quic_handshake_failures: AtomicU64,
+    pub quic_control_dropped_no_stream: AtomicU64,
+    pub quic_rejected_over_cap: AtomicU64,
+    pub quic_rejected_per_ip: AtomicU64,
+    pub quic_cert_reloads: AtomicU64,
+    pub quic_cert_reload_failures: AtomicU64,
+    pub quic_rejected_rate_limit: AtomicU64,
+    pub quic_migrations: AtomicU64,
+    // TURNS (TLS-over-TCP). Mirrored from `turna_transport::tcp_tls::TlsStats`
+    // by the TURNS bridge; all zero when the listener is disabled or not built.
+    pub tls_active: AtomicU64,
+    pub tls_conns_total: AtomicU64,
+    pub tls_closed_total: AtomicU64,
+    pub tls_handshake_failures: AtomicU64,
+    pub tls_handshake_timeouts: AtomicU64,
+    pub tls_rejected_over_cap: AtomicU64,
+    pub tls_rejected_per_ip: AtomicU64,
+    pub tls_idle_timeouts: AtomicU64,
+    pub tls_framing_errors: AtomicU64,
+    pub tls_accept_errors: AtomicU64,
+    pub tls_bytes_rx: AtomicU64,
+    pub tls_bytes_tx: AtomicU64,
+    pub tls_cert_reloads: AtomicU64,
+    pub tls_cert_reload_failures: AtomicU64,
+    pub tls_rejected_rate_limit: AtomicU64,
+    pub tls_alpn_rejected: AtomicU64,
 
     // ── io_uring worker-pool ring utilisation (Linux io-uring backend) ───────
     // Summed across workers by a periodic copy task in the node's io_uring arm.
@@ -297,6 +337,9 @@ impl Metrics {
             backend_diverged: AtomicBool::new(false),
             transport_readiness: AtomicU8::new(Readiness::Starting as u8),
             dtls_readiness: AtomicU8::new(Readiness::Starting as u8),
+            tls_readiness: AtomicU8::new(Readiness::Starting as u8),
+            quic_readiness: AtomicU8::new(Readiness::Starting as u8),
+            afxdp_readiness: AtomicU8::new(Readiness::Starting as u8),
             management_readiness: AtomicU8::new(Readiness::Starting as u8),
             packets_received: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
@@ -389,6 +432,37 @@ impl Metrics {
             dtls_bytes_tx: AtomicU64::new(0),
             dtls_outbound_dropped: AtomicU64::new(0),
             dtls_rejected_per_ip: AtomicU64::new(0),
+            dtls_outbound_oversize: AtomicU64::new(0),
+            dtls_accept_timeouts: AtomicU64::new(0),
+            dtls_handshake_failures: AtomicU64::new(0),
+            dtls_inbound_dropped: AtomicU64::new(0),
+            dtls_rejected_rate_limit: AtomicU64::new(0),
+            dtls_cert_reloads: AtomicU64::new(0),
+            dtls_cert_reload_failures: AtomicU64::new(0),
+            quic_handshake_failures: AtomicU64::new(0),
+            quic_control_dropped_no_stream: AtomicU64::new(0),
+            quic_rejected_over_cap: AtomicU64::new(0),
+            quic_rejected_per_ip: AtomicU64::new(0),
+            quic_cert_reloads: AtomicU64::new(0),
+            quic_cert_reload_failures: AtomicU64::new(0),
+            quic_rejected_rate_limit: AtomicU64::new(0),
+            quic_migrations: AtomicU64::new(0),
+            tls_active: AtomicU64::new(0),
+            tls_conns_total: AtomicU64::new(0),
+            tls_closed_total: AtomicU64::new(0),
+            tls_handshake_failures: AtomicU64::new(0),
+            tls_handshake_timeouts: AtomicU64::new(0),
+            tls_rejected_over_cap: AtomicU64::new(0),
+            tls_rejected_per_ip: AtomicU64::new(0),
+            tls_idle_timeouts: AtomicU64::new(0),
+            tls_framing_errors: AtomicU64::new(0),
+            tls_accept_errors: AtomicU64::new(0),
+            tls_bytes_rx: AtomicU64::new(0),
+            tls_bytes_tx: AtomicU64::new(0),
+            tls_cert_reloads: AtomicU64::new(0),
+            tls_cert_reload_failures: AtomicU64::new(0),
+            tls_rejected_rate_limit: AtomicU64::new(0),
+            tls_alpn_rejected: AtomicU64::new(0),
             uring_workers: AtomicU64::new(0),
             uring_cqe_drained_total: AtomicU64::new(0),
             uring_cqe_batches_total: AtomicU64::new(0),
@@ -437,6 +511,18 @@ impl Metrics {
 
     pub fn set_dtls_readiness(&self, r: Readiness) {
         self.dtls_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_tls_readiness(&self, r: Readiness) {
+        self.tls_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_quic_readiness(&self, r: Readiness) {
+        self.quic_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_afxdp_readiness(&self, r: Readiness) {
+        self.afxdp_readiness.store(r as u8, Ordering::SeqCst);
     }
 
     /// #6/#4.5: set management-plane readiness (see the field docs). Distinct
@@ -762,6 +848,99 @@ impl Metrics {
              # HELP turna_afxdp_neighbor_cache_entries Resolved next-hop MAC entries currently cached\n\
              # TYPE turna_afxdp_neighbor_cache_entries gauge\n\
              turna_afxdp_neighbor_cache_entries {}\n\
+             # HELP turna_dtls_outbound_oversize_total Outbound DTLS datagrams dropped for exceeding the configured record MTU\n\
+             # TYPE turna_dtls_outbound_oversize_total counter\n\
+             turna_dtls_outbound_oversize_total {}\n\
+             # HELP turna_dtls_accept_timeouts_total DTLS handshakes abandoned because accept() exceeded accept_timeout_secs (liveness guard for webrtc-rs/webrtc#614)\n\
+             # TYPE turna_dtls_accept_timeouts_total counter\n\
+             turna_dtls_accept_timeouts_total {}\n\
+             # HELP turna_dtls_handshake_failures_total DTLS handshakes that failed (demux path only; not observable on the stock listener)\n\
+             # TYPE turna_dtls_handshake_failures_total counter\n\
+             turna_dtls_handshake_failures_total {}\n\
+             # HELP turna_dtls_inbound_dropped_total Inbound DTLS datagrams dropped because a peer queue was full (demux path)\n\
+             # TYPE turna_dtls_inbound_dropped_total counter\n\
+             turna_dtls_inbound_dropped_total {}\n\
+             # HELP turna_dtls_rejected_rate_limit_total DTLS handshakes refused by the per-IP rate limiter before any DTLS state existed (demux path)\n\
+             # TYPE turna_dtls_rejected_rate_limit_total counter\n\
+             turna_dtls_rejected_rate_limit_total {}\n\
+             # HELP turna_dtls_cert_reloads_total Successful DTLS certificate hot-reloads (demux path)\n\
+             # TYPE turna_dtls_cert_reloads_total counter\n\
+             turna_dtls_cert_reloads_total {}\n\
+             # HELP turna_dtls_cert_reload_failures_total Failed DTLS certificate hot-reloads; the previous certificate stays in service\n\
+             # TYPE turna_dtls_cert_reload_failures_total counter\n\
+             turna_dtls_cert_reload_failures_total {}\n\
+             # HELP turna_quic_handshake_failures_total QUIC/WebTransport sessions that failed before becoming usable\n\
+             # TYPE turna_quic_handshake_failures_total counter\n\
+             turna_quic_handshake_failures_total {}\n\
+             # HELP turna_quic_control_dropped_no_stream_total QUIC control responses dropped because the session had no open bidi stream\n\
+             # TYPE turna_quic_control_dropped_no_stream_total counter\n\
+             turna_quic_control_dropped_no_stream_total {}\n\
+             # HELP turna_quic_rejected_over_cap_total QUIC sessions refused at the max_sessions cap\n\
+             # TYPE turna_quic_rejected_over_cap_total counter\n\
+             turna_quic_rejected_over_cap_total {}\n\
+             # HELP turna_quic_rejected_per_ip_total QUIC sessions refused at max_sessions_per_ip\n\
+             # TYPE turna_quic_rejected_per_ip_total counter\n\
+             turna_quic_rejected_per_ip_total {}\n\
+             # HELP turna_quic_cert_reloads_total Successful QUIC/WebTransport certificate hot-reloads\n\
+             # TYPE turna_quic_cert_reloads_total counter\n\
+             turna_quic_cert_reloads_total {}\n\
+             # HELP turna_quic_cert_reload_failures_total Failed QUIC/WebTransport certificate hot-reloads (previous certificate kept)\n\
+             # TYPE turna_quic_cert_reload_failures_total counter\n\
+             turna_quic_cert_reload_failures_total {}\n\
+             # HELP turna_quic_rejected_rate_limit_total QUIC/WebTransport handshakes refused by the per-IP rate limiter\n\
+             # TYPE turna_quic_rejected_rate_limit_total counter\n\
+             turna_quic_rejected_rate_limit_total {}\n\
+             # HELP turna_quic_migrations_total Observed QUIC client address changes (connection migration)\n\
+             # TYPE turna_quic_migrations_total counter\n\
+             turna_quic_migrations_total {}\n\
+             # HELP turna_tls_active_connections Active TURNS (TLS-over-TCP) connections\n\
+             # TYPE turna_tls_active_connections gauge\n\
+             turna_tls_active_connections {}\n\
+             # HELP turna_tls_connections_total TURNS connections accepted since start\n\
+             # TYPE turna_tls_connections_total counter\n\
+             turna_tls_connections_total {}\n\
+             # HELP turna_tls_closed_total TURNS connections closed since start\n\
+             # TYPE turna_tls_closed_total counter\n\
+             turna_tls_closed_total {}\n\
+             # HELP turna_tls_handshake_failures_total TURNS TLS handshakes that failed\n\
+             # TYPE turna_tls_handshake_failures_total counter\n\
+             turna_tls_handshake_failures_total {}\n\
+             # HELP turna_tls_handshake_timeouts_total TURNS TLS handshakes that exceeded handshake_timeout_secs\n\
+             # TYPE turna_tls_handshake_timeouts_total counter\n\
+             turna_tls_handshake_timeouts_total {}\n\
+             # HELP turna_tls_rejected_over_cap_total TURNS connections refused at the max_connections cap\n\
+             # TYPE turna_tls_rejected_over_cap_total counter\n\
+             turna_tls_rejected_over_cap_total {}\n\
+             # HELP turna_tls_rejected_per_ip_total TURNS connections refused at max_connections_per_ip\n\
+             # TYPE turna_tls_rejected_per_ip_total counter\n\
+             turna_tls_rejected_per_ip_total {}\n\
+             # HELP turna_tls_idle_timeouts_total TURNS connections closed by the idle read timeout\n\
+             # TYPE turna_tls_idle_timeouts_total counter\n\
+             turna_tls_idle_timeouts_total {}\n\
+             # HELP turna_tls_framing_errors_total TURNS connections closed on invalid or over-sized TURN-over-TCP framing\n\
+             # TYPE turna_tls_framing_errors_total counter\n\
+             turna_tls_framing_errors_total {}\n\
+             # HELP turna_tls_accept_errors_total TURNS accept() errors survived without stopping the listener\n\
+             # TYPE turna_tls_accept_errors_total counter\n\
+             turna_tls_accept_errors_total {}\n\
+             # HELP turna_tls_bytes_rx_total Decrypted bytes read from TURNS clients\n\
+             # TYPE turna_tls_bytes_rx_total counter\n\
+             turna_tls_bytes_rx_total {}\n\
+             # HELP turna_tls_bytes_tx_total Bytes written to TURNS clients\n\
+             # TYPE turna_tls_bytes_tx_total counter\n\
+             turna_tls_bytes_tx_total {}\n\
+             # HELP turna_tls_cert_reloads_total Successful TURNS certificate hot-reloads\n\
+             # TYPE turna_tls_cert_reloads_total counter\n\
+             turna_tls_cert_reloads_total {}\n\
+             # HELP turna_tls_cert_reload_failures_total Failed TURNS certificate hot-reloads (previous certificate kept)\n\
+             # TYPE turna_tls_cert_reload_failures_total counter\n\
+             turna_tls_cert_reload_failures_total {}\n\
+             # HELP turna_tls_rejected_rate_limit_total TURNS connections refused by the per-IP handshake rate limiter\n\
+             # TYPE turna_tls_rejected_rate_limit_total counter\n\
+             turna_tls_rejected_rate_limit_total {}\n\
+             # HELP turna_tls_alpn_rejected_total TURNS connections refused because alpn_required was set and the client negotiated no ALPN\n\
+             # TYPE turna_tls_alpn_rejected_total counter\n\
+             turna_tls_alpn_rejected_total {}\n\
              # HELP turna_backend_readiness Process readiness (0=starting,1=ready,2=degraded,3=draining)\n\
              # TYPE turna_backend_readiness gauge\n\
              turna_backend_readiness {}\n\
@@ -771,6 +950,15 @@ impl Metrics {
              # HELP turna_dtls_readiness DTLS listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if DTLS disabled)\n\
              # TYPE turna_dtls_readiness gauge\n\
              turna_dtls_readiness {}\n\
+             # HELP turna_tls_readiness TURNS listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if TURNS disabled)\n\
+             # TYPE turna_tls_readiness gauge\n\
+             turna_tls_readiness {}\n\
+             # HELP turna_quic_readiness QUIC/WebTransport listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if QUIC disabled)\n\
+             # TYPE turna_quic_readiness gauge\n\
+             turna_quic_readiness {}\n\
+             # HELP turna_afxdp_readiness AF_XDP datapath readiness (0=starting,1=ready,2=degraded,3=draining; starting if AF_XDP is not the selected backend)\n\
+             # TYPE turna_afxdp_readiness gauge\n\
+             turna_afxdp_readiness {}\n\
              # HELP turna_management_readiness Management-plane readiness incl. command-log migration (0=starting,1=ready,2=degraded,3=draining)\n\
              # TYPE turna_management_readiness gauge\n\
              turna_management_readiness {}\n",
@@ -816,9 +1004,43 @@ impl Metrics {
             l(&self.afxdp_neighbor_unresolved),
             l(&self.afxdp_tx_inflight),
             l(&self.afxdp_neighbor_cache_entries),
+            l(&self.dtls_outbound_oversize),
+            l(&self.dtls_accept_timeouts),
+            l(&self.dtls_handshake_failures),
+            l(&self.dtls_inbound_dropped),
+            l(&self.dtls_rejected_rate_limit),
+            l(&self.dtls_cert_reloads),
+            l(&self.dtls_cert_reload_failures),
+            l(&self.quic_handshake_failures),
+            l(&self.quic_control_dropped_no_stream),
+            l(&self.quic_rejected_over_cap),
+            l(&self.quic_rejected_per_ip),
+            l(&self.quic_cert_reloads),
+            l(&self.quic_cert_reload_failures),
+            l(&self.quic_rejected_rate_limit),
+            l(&self.quic_migrations),
+            l(&self.tls_active),
+            l(&self.tls_conns_total),
+            l(&self.tls_closed_total),
+            l(&self.tls_handshake_failures),
+            l(&self.tls_handshake_timeouts),
+            l(&self.tls_rejected_over_cap),
+            l(&self.tls_rejected_per_ip),
+            l(&self.tls_idle_timeouts),
+            l(&self.tls_framing_errors),
+            l(&self.tls_accept_errors),
+            l(&self.tls_bytes_rx),
+            l(&self.tls_bytes_tx),
+            l(&self.tls_cert_reloads),
+            l(&self.tls_cert_reload_failures),
+            l(&self.tls_rejected_rate_limit),
+            l(&self.tls_alpn_rejected),
             self.readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.transport_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.tls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
         )
     }

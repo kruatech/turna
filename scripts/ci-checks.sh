@@ -39,6 +39,11 @@ os_is_linux() { [ "$(uname -s)" = "Linux" ]; }
 log "rustfmt --check"
 cargo fmt --all -- --check
 
+# Documentation claims tied to code facts. Cheap, and it exists because a
+# false doc claim once hid a shipped wire bug (ALTERNATE-SERVER was 0x0003).
+log "doc-truth gate"
+bash scripts/check-doc-claims.sh
+
 log "clippy (default features, all targets)"
 cargo clippy --workspace --all-targets -- $CLIPPY_FLAGS
 

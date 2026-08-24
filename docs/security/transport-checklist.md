@@ -26,6 +26,38 @@ implemented. ✅ = in code; ⚠ = partial / follow-up; ❌ = not done.
   run with `cargo +nightly fuzz run fuzz_stun`. ⚠ Continuous fuzzing runs are
   an operational task (not yet run in CI here).
 
+## TURNS (TLS over TCP)
+
+- ✅ **Cooperative drain.** The accept loop stops on the shutdown watch and
+  established connections close themselves, instead of the listener task being
+  `abort()`ed mid-write.
+- ✅ **Accept-error resilience.** A transient `accept()` failure (EMFILE,
+  ECONNABORTED) is counted (`turna_tls_accept_errors_total`) with backoff; it no
+  longer terminates the listener until the next process restart.
+- ✅ **Connection caps.** Global `max_connections` plus per-source-IP
+  `max_connections_per_ip` (`turna_tls_rejected_over_cap_total`,
+  `turna_tls_rejected_per_ip_total`).
+- ✅ **Handshake timeout** with its own counters
+  (`turna_tls_handshake_failures_total`, `turna_tls_handshake_timeouts_total`).
+- ✅ **Per-IP handshake rate limit** (`max_handshakes_per_sec_per_ip`, token
+  bucket + burst) — the same limiter the QUIC paths use, refused before
+  `tls.accept()` so a flood costs a map lookup
+  (`turna_tls_rejected_rate_limit_total`). Off by default; enable it on any
+  internet-facing listener, since `max_connections_per_ip` bounds concurrency
+  only.
+- ⚠ **ALPN strict mode is opt-in** (`alpn_required`). rustls fails the handshake
+  when a client offers ALPN with no overlap, but a client offering none is served
+  unless this is set (`turna_tls_alpn_rejected_total`).
+- ✅ **Certificate hot-reload** by mtime (`cert_reload_secs`); a failed reload
+  keeps the previous material in service and increments
+  `turna_tls_cert_reload_failures_total`.
+- ✅ **Framing errors counted** (`turna_tls_framing_errors_total`) rather than
+  looking like a normal disconnect.
+- ✅ **Allocation released on connection close** — the control connection is the
+  allocation's 5-tuple, so its relay port is freed immediately instead of at TTL.
+- ⚠ **No client-certificate (mTLS) option** for TURNS clients; authentication is
+  the TURN long-term/JWT credential only.
+
 ## DTLS
 
 - ✅ **Handshake/anti-spoof inside webrtc-dtls.** `accept()` only yields a `Conn`
@@ -40,7 +72,68 @@ implemented. ✅ = in code; ⚠ = partial / follow-up; ❌ = not done.
 - ⚠ **Pre-handshake amplification / rate limiting.** The listener's
   pre-handshake per-address buffer is not rate-limited above `accept()`
   (handshake lives inside webrtc-dtls); pre-handshake throttling is a follow-up.
+- ✅ **Concurrent handshakes, pre-handshake admission, rate limit and certificate
+  hot-reload — behind `[turn.dtls] demux = true`.** Owning the UDP socket
+  (`crates/transport/src/dtls_demux.rs`) is what makes all four possible at once:
+  one task per handshake, session/per-IP caps applied to the *first datagram* from
+  an unknown address, `max_handshakes_per_sec_per_ip` (the same limiter TURNS and
+  QUIC use), and `cert_reload_secs`. A failed handshake also becomes observable
+  there (`turna_dtls_handshake_failures_total`) because it fails in our task
+  instead of below `accept()`. **Off by default** — it replaces the only DTLS path
+  with recorded verification, so it stays opt-in until its own interop run exists.
+- ⚠ **On the default (stock) path, handshakes are accepted serially and `accept()`
+  has no upstream timeout**
+  (webrtc-rs/webrtc#614). One peer that begins a handshake and stops parked the
+  accept loop indefinitely — a silent, one-packet outage of the whole DTLS
+  listener. `[turn.dtls].accept_timeout_secs` bounds it and counts abandonments
+  (`turna_dtls_accept_timeouts_total`), which restores liveness; it does not make
+  handshakes concurrent, so a flood still degrades new-session throughput one
+  timeout window at a time. Owning the UDP demultiplexer is the real fix and
+  would also give a place to rate-limit and to hot-reload the certificate.
 - ✅ **ECDSA cert requirement** documented (ECDHE-ECDSA suites).
+- ✅ **Receive buffer sized to a full DTLS plaintext fragment** (2^14) so a large
+  client record cannot be truncated into a session kill.
+- ✅ **Outbound MTU enforced** — a datagram over `[turn.dtls].mtu` is dropped and
+  counted (`turna_dtls_outbound_oversize_total`) instead of relying on IP
+  fragmentation.
+- ✅ **Allocation released on session close.**
+- ❌ **No certificate hot-reload** (`webrtc-dtls` takes its `Config` at
+  `listen()`); a rotated certificate requires a restart.
+
+## QUIC / WebTransport
+
+- ✅ **Session caps.** `max_sessions` and `max_sessions_per_ip`
+  (`turna_quic_rejected_over_cap_total`, `turna_quic_rejected_per_ip_total`),
+  applied post-handshake as on the DTLS path.
+- ✅ **Cooperative drain** on the shutdown watch for both the raw-QUIC and
+  WebTransport accept loops.
+- ✅ **Bounded per-session outbound queue** (`QUIC_OUTBOUND_CAP`, drop-newest,
+  `turna_quic_send_errors_total`).
+- ✅ **Bounded stream reassembly buffer** — a desynchronised or hostile bidi
+  stream cannot grow the framer without limit.
+- ✅ **Per-stream control replies** on the raw-QUIC path (a response goes back on
+  the stream its request arrived on).
+- ✅ **Pre-handshake admission control on the WebTransport path.**
+  `IncomingSession` exposes the peer address and can be refused, so the session
+  and per-IP caps are enforced before any QUIC/H3 handshake work. The raw-QUIC
+  path can only check post-handshake.
+- ✅ **Certificate hot-reload on both QUIC paths** —
+  `Endpoint::reload_config` (WebTransport) and `Endpoint::set_server_config`
+  (raw QUIC). Live sessions are untouched; a failed reload keeps the previous
+  material (`turna_quic_cert_reload_failures_total`).
+- ✅ **`[turn.quic]` transport limits apply on both paths** (stream counts,
+  datagram buffer, idle timeout) — raw QUIC owns its `quinn::ServerConfig`, and
+  the WebTransport path reaches the same knobs through
+  `ServerConfig::quic_config_mut()` now that the wtransport `quinn` dependency
+  feature is enabled. `alpn` remains inert on H3 by design (wtransport forces
+  `h3`).
+- ✅ **Per-IP handshake rate limit** (`max_handshakes_per_sec_per_ip`, token
+  bucket + burst), enforced before the handshake on both paths
+  (`turna_quic_rejected_rate_limit_total`). Off by default; enable it on any
+  internet-facing listener.
+- ✅ **Connection migration detected** by polling the peer address; the egress
+  registries and the per-IP admission slot follow the client
+  (`turna_quic_migrations_total`).
 
 ## Relaying
 
@@ -64,12 +157,36 @@ implemented. ✅ = in code; ⚠ = partial / follow-up; ❌ = not done.
 - ✅ **Graceful drain** on SIGTERM/SIGINT (lame-duck, `drain_grace_secs`); all
   backends stop accepting new work cooperatively and release resources on exit.
 - ✅ **Readiness signalling** (`/ready`, `turna_backend_readiness`, per-component
-  `turna_transport_readiness` / `turna_dtls_readiness`).
+  `turna_transport_readiness`, `turna_dtls_readiness`, `turna_tls_readiness`,
+  `turna_quic_readiness`). Each listener's gauge is now actually written — it is
+  derived from whether the listening socket is bound, so a listener that dies
+  while the process survives shows up as `2` (degraded).
 
 ## Open items (not done)
 
-- ❌ DTL-9 pre-handshake rate limiting / amplification review (needs hooks below
-  webrtc-dtls `accept()`).
+- ❌ DTL-9 pre-handshake rate limiting / amplification review for **DTLS**: the
+  handshake runs inside `webrtc-dtls` below `accept()`, so a rate limit there
+  needs a UDP demultiplexer in front of the listener. The QUIC paths now have
+  one (`max_handshakes_per_sec_per_ip`).
+- ❌ Certificate hot-reload for **DTLS** — the only transport still needing a
+  restart on rotation (`webrtc-dtls` fixes its config at `listen()`). TURNS and
+  both QUIC paths reload live.
+- ✅ **mTLS / client certificates for TURNS clients** — `[tls].client_ca` plus
+  `require_client_cert` (mandatory vs optional presentation via rustls
+  `allow_unauthenticated`, so a fleet can be migrated in stages).
+  **Verified** (`scripts/verify/mtls.sh`, 2026-08-20): a client with a valid
+  certificate is accepted; a client with **none** is refused when
+  `require_client_cert = true`; and with the flag off, a client without a certificate
+  still gets in. The refusal is the load-bearing case — a server that accepts everybody
+  looks identical to a working one if only the happy path is exercised. The certificate
+  reloader carries the CA, so a server-certificate rotation cannot silently switch
+  mTLS off — that would be the worst failure mode for this feature.
+  **No CRL/OCSP**, deliberately and consistently with the management plane
+  (`docs/MTLS.md` → Revocation): revocation is solved by the PKI, and revoking here
+  means rotating the CA.
+
 - ❌ `unsafe` audit refresh (io_uring/AF_XDP raw-syscall + mmap paths).
-- ❌ Load/soak runs and continuous fuzzing in CI.
+- ❌ Load/soak runs and continuous fuzzing in CI. The encrypted-transport plan
+  (what to run, what to record) is `docs/verification/encrypted-transports.md`;
+  §4 there lists the specific missing automated tests.
 - ❌ Differential vs coturn (§7.2) executed against a live coturn.

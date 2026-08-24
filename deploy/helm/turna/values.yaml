@@ -13,6 +13,11 @@ turn:
   healthPort: 9090
   managementPort: 5350
   externalIP: "" # Required when production=true; must belong to this node/pod
+  # RFC 6156 IPv6 relayed transport. Empty = IPv4-only relaying: an Allocate
+  # requesting IPv6 is answered 440. Set to a routable IPv6 address of this
+  # node/pod to advertise it for IPv6-family allocations. Opt-in and unverified —
+  # see docs/PRODUCTION_READINESS.md R10.
+  externalIP6: ""
   nodeId: "turna-standalone" # Stable durable-state key for the standalone node
   transport: "tokio" # GA production backend; auto/io_uring remain opt-in
   turnUrl: "turn:127.0.0.1:3478"

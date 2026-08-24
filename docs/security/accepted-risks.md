@@ -6,22 +6,26 @@ each entry is revisited at the version named under "Review by".
 
 ## RISK-001 — `rustls-pemfile` reachable only via the experimental `web-transport` feature
 
-- **Status:** accepted for `0.2.0-alpha.1` (scope narrowed in this release).
+- **Status:** **resolved** — `rustls-pemfile` is no longer in the dependency graph
+  at all, including with `--features web-transport`
+  (`cargo tree -p turna-transport --features web-transport -i rustls-pemfile`
+  reports no matching package). `wtransport 0.7.1` dropped it.
 - **Description:** `rustls-pemfile` is flagged unmaintained
   (RUSTSEC-2025-0134; the upstream repository was archived in August 2025).
 - **Why it stays:** the direct dependency was removed — `turna-transport` now
   parses PEM via `rustls-pki-types` under the `tls`/`quic` features. The only
   remaining occurrence is transitive, through `wtransport` under the
-  experimental `web-transport` feature. `wtransport 0.6.1` (the latest release)
-  still depends on `rustls-pemfile`, so no dependency bump removes it; it is
-  absent from the default and production build.
+  experimental `web-transport` feature. `wtransport 0.6.1` still depended on it, so
+  no dependency bump removed it at the time; the workspace has since moved to
+  `wtransport 0.7.1`, which does not.
 - **Compensating controls:** `cargo deny check advisories` is green because the
   default graph does not enable `web-transport`, so the crate is not in release
   builds; the PEM surface only touches operator-supplied certificate files at
   startup; the advisory is tracked here rather than ignored silently.
-- **Planned remediation:** drop when `wtransport` migrates off `rustls-pemfile`
-  upstream, or when `web-transport` is removed/replaced.
-- **Review by:** `0.2.0-beta.1`.
+- **Planned remediation:** done — `wtransport` migrated off `rustls-pemfile`
+  upstream. If `web-transport` is ever pinned back to a 0.6.x release the risk
+  returns; the `Cargo.lock` check above is what to re-run.
+- **Review by:** closed.
 
 ## RISK-002 — duplicate dependency versions (previous gRPC/HTTP generation)
 
@@ -39,6 +43,27 @@ each entry is revisited at the version named under "Review by".
   0.5/0.6, `hashbrown`, `getrandom`, plus dev-only `proptest`/`criterion`
   trees); tracked in `docs/security/dependency-dedup.md`.
 - **Review by:** closed; residuals tracked in the dedup roadmap.
+
+## RISK-003 — LGPL branch in the `af-xdp` dependency graph
+
+- **Status:** accepted, mitigated by licence election.
+- **Description:** `libxdp-sys` and the C libraries it binds (`libxdp`, `libbpf`)
+  are offered under `LGPL-2.1 OR BSD-2-Clause`. It is the only crate in the
+  workspace that brings an LGPL branch into the graph, and it arrives solely
+  through the `af-xdp` feature.
+- **Aggravating factor found 2026-08-13:** the declared SPDX string uses the
+  **deprecated** identifier `LGPL-2.1`, which cargo-deny cannot parse — it
+  degraded to a warning, so this crate's licence was effectively **not being
+  checked** at all. It only became visible once `deny.toml` moved to
+  `all-features = true`.
+- **Mitigation:** Turna elects the permissive branch, `BSD-2-Clause`, pinned
+  explicitly via `[[licenses.clarify]]` in `deny.toml` so the check is real and
+  the election is machine-readable. Recorded for audit in `docs/COMPLIANCE.md` §6.
+  `af-xdp` is absent from default and production builds and is Linux-only.
+- **Planned remediation:** none needed while the election holds. If a binary is
+  shipped with `--features af-xdp`, add the BSD-2-Clause notice for
+  `libxdp`/`libbpf` to `NOTICE`.
+- **Review by:** whenever `af-xdp` graduates from experimental.
 
 ## RISK — active-session HA remains experimental
 

@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TURN over WebTransport — browser probe</title>
+<style>
+  :root{
+    --ink:#0C1116; --panel:#131A21; --panel-2:#0F151B; --rule:#223039;
+    --text:#C9D6DF; --dim:#6C818F; --dimmer:#455663;
+    --signal:#F0A93B; --fail:#E0544B; --run:#4FB6C4; --ok:#7FBF6A;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --disp: "HelveticaNeue-CondensedBold", "Helvetica Neue", Inter, system-ui, sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--ink);color:var(--text)}
+  body{font-family:var(--mono);font-size:13px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1000px;margin:0 auto;padding:28px 20px 80px}
+  header{border-bottom:1px solid var(--rule);padding-bottom:18px;margin-bottom:22px}
+  h1{font-family:var(--disp);font-weight:700;font-size:34px;line-height:1;
+     letter-spacing:-.02em;text-transform:uppercase;margin:0 0 6px;color:#E8F1F7}
+  h1 em{font-style:normal;color:var(--signal)}
+  .sub{color:var(--dim);max-width:66ch}
+  .panel{background:var(--panel);border:1px solid var(--rule);padding:14px 16px;margin-bottom:18px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px 16px}
+  label{display:block;color:var(--dim);font-size:11px;letter-spacing:.08em;
+        text-transform:uppercase;margin-bottom:4px}
+  input,select{width:100%;background:var(--panel-2);border:1px solid var(--rule);
+    color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 9px;border-radius:0}
+  input:focus,select:focus{outline:2px solid var(--run);outline-offset:-2px}
+  .hint{color:var(--dimmer);font-size:11px;margin-top:5px}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  button{font-family:var(--disp);text-transform:uppercase;letter-spacing:.06em;
+    font-size:13px;font-weight:700;padding:9px 16px;border:1px solid var(--rule);
+    background:var(--panel-2);color:var(--text);cursor:pointer;border-radius:0}
+  button:hover:not(:disabled){border-color:var(--signal);color:var(--signal)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary{background:var(--signal);border-color:var(--signal);color:#171008}
+  .check{border:1px solid var(--rule);border-bottom:0;background:var(--panel)}
+  .check:last-of-type{border-bottom:1px solid var(--rule)}
+  .head{display:flex;align-items:baseline;gap:14px;padding:12px 16px}
+  .tag{font-family:var(--disp);font-size:12px;letter-spacing:.14em;color:var(--dim);
+       min-width:92px;text-transform:uppercase}
+  .what{flex:1;min-width:0}
+  .what b{color:#E8F1F7;font-weight:400}
+  .what span{color:var(--dim);display:block;font-size:12px}
+  .verdict{font-family:var(--disp);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+  .v-idle{color:var(--dimmer)} .v-run{color:var(--run)}
+  .v-pass{color:var(--ok)} .v-fail{color:var(--fail)} .v-skip{color:var(--dimmer)}
+  .detail{padding:0 16px 14px;color:var(--dim);font-size:12px;white-space:pre-wrap;
+          border-top:1px dashed var(--rule);margin-top:2px;padding-top:10px}
+  .detail:empty{display:none}
+  .ledger-head{display:flex;justify-content:space-between;align-items:baseline;margin:22px 0 8px}
+  .ledger-head h2{font-family:var(--disp);text-transform:uppercase;letter-spacing:.1em;
+    font-size:13px;color:var(--dim);margin:0;font-weight:700}
+  #ledger{background:var(--panel-2);border:1px solid var(--rule);height:320px;
+    overflow-y:auto;padding:10px 12px;font-size:12px;line-height:1.5}
+  #ledger .row{display:flex;gap:10px;white-space:pre-wrap;word-break:break-all;padding:1px 0}
+  #ledger .t{color:var(--dimmer);flex:0 0 62px}
+  #ledger .m{flex:1;min-width:0}
+  .k-ok .m{color:var(--ok)} .k-fail .m{color:var(--fail)}
+  .k-dim .m{color:var(--dim)} .k-sig .m{color:var(--signal)}
+  .empty{color:var(--dimmer)}
+  footer{margin-top:26px;padding-top:16px;border-top:1px solid var(--rule);
+    color:var(--dimmer);font-size:12px;max-width:78ch}
+  code{color:var(--text);background:var(--panel);padding:1px 4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>TURN over <em>WebTransport</em></h1>
+  <p class="sub">A TURN client written in browser JavaScript, speaking HTTP/3. It
+  exists to be <em>not</em> the server's code: the Rust client that verified this path
+  shares a library and one reading of the spec with the server, so anything both get
+  wrong stays invisible to it. Chrome's WebTransport stack does not.</p>
+</header>
+
+<div class="panel">
+  <div class="grid">
+    <div>
+      <label for="url">WebTransport URL</label>
+      <input id="url" value="https://turna.quinter.ru:3479/" spellcheck="false">
+      <p class="hint">HTTPS with a certificate the browser trusts. Self-signed will not
+      do — WebTransport has no exception dialogue.</p>
+    </div>
+    <div>
+      <label for="mode">Credentials</label>
+      <select id="mode">
+        <option value="rest">Shared secret (REST)</option>
+        <option value="static">Static user</option>
+      </select>
+    </div>
+    <div>
+      <label for="user">Username / user id</label>
+      <input id="user" value="probe" spellcheck="false">
+    </div>
+    <div>
+      <label for="pass">Password or secret</label>
+      <input id="pass" type="password" spellcheck="false">
+      <p class="hint">Never written to the log.</p>
+    </div>
+  </div>
+  <div class="bar">
+    <button id="run" class="primary">Run</button>
+    <button id="copy" disabled>Copy log</button>
+    <button id="download" disabled>Download log</button>
+    <span id="summary" style="color:var(--dim)"></span>
+  </div>
+</div>
+
+<div id="checks"></div>
+
+<div class="ledger-head">
+  <h2>Ledger</h2>
+  <span style="color:var(--dimmer);font-size:12px">newest last</span>
+</div>
+<div id="ledger"><span class="empty">Nothing yet.</span></div>
+
+<footer>
+  Everything here is built by hand: the STUN messages, the XOR-MAPPED-ADDRESS
+  encoding, the MESSAGE-INTEGRITY HMAC-SHA1, the ChannelData framing. That is the
+  point — an independent encoder is what makes this interop evidence rather than a
+  second run of the same code. Nothing leaves the page except traffic to the server
+  you name.
+</footer>
+
+</div>
+
+<script>
+"use strict";
+
+const CHECKS = [
+  { id:"session", tag:"Session",  title:"WebTransport session established",
+    why:"HTTP/3 CONNECT to the server. A certificate the browser does not trust fails here, with no way to override." },
+  { id:"stream",  tag:"Stream",   title:"Bidirectional control stream opens",
+    why:"TURN control messages travel on a bidi stream; the server accepts it and replies on the same one." },
+  { id:"auth",    tag:"Auth",     title:"401 challenge, then an authenticated Allocate",
+    why:"The full long-term credential exchange, with MESSAGE-INTEGRITY computed here rather than by a library shared with the server." },
+  { id:"perm",    tag:"Channel",  title:"CreatePermission and ChannelBind accepted",
+    why:"Both carry XOR-PEER-ADDRESS, which this page encodes itself — a disagreement about that encoding shows up here." },
+  { id:"media",   tag:"Media",    title:"Relayed data comes back",
+    why:"ChannelData down the stream, and the relayed reply returned as a datagram. An allocation that answers correctly can still forward nothing." },
+];
+
+const state = { results:{}, events:[], detail:{} };
+const el = id => document.getElementById(id);
+const ledger = el("ledger");
+
+function log(msg, kind){
+  const t = new Date();
+  state.events.push({ t:t.toISOString(), kind:kind||"", msg });
+  if (ledger.querySelector(".empty")) ledger.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "row" + (kind ? " k-"+kind : "");
+  row.innerHTML = '<span class="t"></span><span class="m"></span>';
+  row.children[0].textContent = t.toTimeString().slice(0,8);
+  row.children[1].textContent = msg;
+  ledger.appendChild(row);
+  ledger.scrollTop = ledger.scrollHeight;
+}
+
+function renderChecks(){
+  el("checks").innerHTML = "";
+  for (const c of CHECKS){
+    const r = state.results[c.id] || { verdict:"idle", detail:"" };
+    const box = document.createElement("div");
+    box.className = "check";
+    box.innerHTML = '<div class="head"><span class="tag"></span>' +
+      '<span class="what"><b></b><span></span></span><span class="verdict"></span></div>' +
+      '<div class="detail"></div>';
+    box.querySelector(".tag").textContent = c.tag;
+    box.querySelector(".what b").textContent = c.title;
+    box.querySelector(".what span").textContent = c.why;
+    const v = box.querySelector(".verdict");
+    v.textContent = { idle:"—", run:"running", pass:"pass", fail:"fail", skip:"skipped" }[r.verdict];
+    v.className = "verdict v-" + r.verdict;
+    box.querySelector(".detail").textContent = r.detail || "";
+    el("checks").appendChild(box);
+  }
+  const done = Object.values(state.results).filter(r => r.verdict==="pass" || r.verdict==="fail");
+  const fails = done.filter(r => r.verdict==="fail").length;
+  el("summary").textContent = done.length ? `${done.length - fails} of ${done.length} passed` : "";
+}
+function set(id, verdict, detail){
+  state.results[id] = { verdict, detail: detail||"" };
+  renderChecks();
+  if (verdict === "run") return;
+  const tag = (CHECKS.find(c => c.id===id)||{}).tag || id;
+  log(`[${tag}] ${verdict.toUpperCase()}` + (detail ? " — " + detail.replace(/\n+/g," | ") : ""),
+      verdict==="pass" ? "ok" : verdict==="fail" ? "fail" : "dim");
+}
+
+// ── STUN, encoded by hand ───────────────────────────────────────────────────
+//
+// Every byte below is assembled here rather than by a library the server also uses.
+// That is the whole justification for this page: a shared encoder cannot disagree
+// with itself, so it cannot detect a misreading of the spec.
+
+const MAGIC = 0x2112A442;
+const M_ALLOCATE = 0x0003, M_CREATE_PERM = 0x0008, M_CHANNEL_BIND = 0x0009;
+const A_MAPPED = 0x0001, A_USERNAME = 0x0006, A_MESSAGE_INTEGRITY = 0x0008,
+      A_ERROR_CODE = 0x0009, A_REALM = 0x0014, A_NONCE = 0x0015,
+      A_XOR_RELAYED = 0x0016, A_REQUESTED_TRANSPORT = 0x0019,
+      A_XOR_PEER = 0x0012, A_CHANNEL_NUMBER = 0x000C, A_LIFETIME = 0x000D;
+
+const enc = new TextEncoder();
+
+function randomTxid(){
+  const t = new Uint8Array(12);
+  crypto.getRandomValues(t);
+  return t;
+}
+
+class Msg {
+  constructor(method, txid){
+    this.method = method;
+    this.txid = txid || randomTxid();
+    this.attrs = [];
+  }
+  add(type, value){ this.attrs.push({ type, value }); return this; }
+  addString(type, s){ return this.add(type, enc.encode(s)); }
+  addRequestedTransportUdp(){ return this.add(A_REQUESTED_TRANSPORT, new Uint8Array([17,0,0,0])); }
+  addLifetime(secs){
+    const v = new Uint8Array(4); new DataView(v.buffer).setUint32(0, secs);
+    return this.add(A_LIFETIME, v);
+  }
+  addChannelNumber(ch){
+    const v = new Uint8Array(4); new DataView(v.buffer).setUint16(0, ch);
+    return this.add(A_CHANNEL_NUMBER, v);
+  }
+  // XOR-PEER-ADDRESS / XOR-RELAYED-ADDRESS (RFC 5389 §15.2): family, port XOR the
+  // top half of the magic cookie, address XOR the cookie (v4) or cookie+txid (v6).
+  addXorPeer(host, port){
+    this.add(A_XOR_PEER, xorAddrEncode(host, port, this.txid));
+    return this;
+  }
+  // Attributes are padded to 4 bytes on the wire; the padding is NOT counted in the
+  // attribute's own length but IS counted in the message length.
+  body(){
+    const parts = [];
+    for (const a of this.attrs){
+      const head = new Uint8Array(4);
+      const dv = new DataView(head.buffer);
+      dv.setUint16(0, a.type); dv.setUint16(2, a.value.length);
+      parts.push(head, a.value);
+      const pad = (4 - (a.value.length % 4)) % 4;
+      if (pad) parts.push(new Uint8Array(pad));
+    }
+    let len = 0; for (const p of parts) len += p.length;
+    const out = new Uint8Array(len);
+    let off = 0; for (const p of parts){ out.set(p, off); off += p.length; }
+    return out;
+  }
+  encode(extraLen){
+    const body = this.body();
+    const out = new Uint8Array(20 + body.length);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(0, this.method);                 // class bits 0 = request
+    dv.setUint16(2, body.length + (extraLen||0));
+    dv.setUint32(4, MAGIC);
+    out.set(this.txid, 8);
+    out.set(body, 20);
+    return out;
+  }
+  // MESSAGE-INTEGRITY (RFC 5389 §15.4): HMAC-SHA1 over the message with the header
+  // length already including the 24 bytes this attribute will occupy. Getting that
+  // ordering wrong is the classic mistake, and it fails as a 401 loop rather than
+  // anything obvious.
+  async encodeWithIntegrity(key){
+    const pre = this.encode(24);
+    const k = await crypto.subtle.importKey("raw", key, { name:"HMAC", hash:"SHA-1" }, false, ["sign"]);
+    const tag = new Uint8Array(await crypto.subtle.sign("HMAC", k, pre));
+    const out = new Uint8Array(pre.length + 24);
+    out.set(pre, 0);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(pre.length, A_MESSAGE_INTEGRITY);
+    dv.setUint16(pre.length + 2, 20);
+    out.set(tag, pre.length + 4);
+    return out;
+  }
+}
+
+function xorAddrEncode(host, port, txid){
+  const isV6 = host.includes(":");
+  const v = new Uint8Array(isV6 ? 20 : 8);
+  const dv = new DataView(v.buffer);
+  v[0] = 0; v[1] = isV6 ? 0x02 : 0x01;
+  dv.setUint16(2, port ^ (MAGIC >>> 16));
+  if (!isV6){
+    const octets = host.split(".").map(Number);
+    const cookie = [0x21,0x12,0xA4,0x42];
+    for (let i=0;i<4;i++) v[4+i] = octets[i] ^ cookie[i];
+  } else {
+    const b = v6ToBytes(host);
+    const mask = new Uint8Array(16);
+    mask.set([0x21,0x12,0xA4,0x42], 0);
+    mask.set(txid, 4);
+    for (let i=0;i<16;i++) v[4+i] = b[i] ^ mask[i];
+  }
+  return v;
+}
+
+function v6ToBytes(s){
+  const out = new Uint8Array(16);
+  const [head, tail] = s.split("::");
+  const h = head ? head.split(":").filter(Boolean) : [];
+  const t = tail ? tail.split(":").filter(Boolean) : [];
+  let i = 0;
+  for (const g of h){ const n = parseInt(g,16); out[i++] = n>>8; out[i++] = n & 0xff; }
+  let j = 16 - t.length*2;
+  for (const g of t){ const n = parseInt(g,16); out[j++] = n>>8; out[j++] = n & 0xff; }
+  return out;
+}
+
+function parseAttrs(msg){
+  const out = {};
+  const dv = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+  let off = 20;
+  while (off + 4 <= msg.length){
+    const t = dv.getUint16(off), l = dv.getUint16(off+2);
+    if (off + 4 + l > msg.length) break;
+    out[t] = msg.subarray(off+4, off+4+l);
+    off += 4 + l + ((4 - (l % 4)) % 4);
+  }
+  return out;
+}
+const isSuccess = m => (new DataView(m.buffer, m.byteOffset).getUint16(0) & 0x0110) === 0x0100;
+function errorCode(m){
+  const a = parseAttrs(m)[A_ERROR_CODE];
+  return a && a.length >= 4 ? a[2]*100 + a[3] : null;
+}
+function relayedAddr(m, txid){
+  const a = parseAttrs(m)[A_XOR_RELAYED];
+  if (!a || a.length < 8) return null;
+  const dv = new DataView(a.buffer, a.byteOffset, a.byteLength);
+  const port = dv.getUint16(2) ^ (MAGIC >>> 16);
+  if (a[1] === 0x01){
+    const cookie = [0x21,0x12,0xA4,0x42];
+    const o = []; for (let i=0;i<4;i++) o.push(a[4+i] ^ cookie[i]);
+    return { host:o.join("."), port, family:"IPv4" };
+  }
+  const mask = new Uint8Array(16);
+  mask.set([0x21,0x12,0xA4,0x42],0); mask.set(txid,4);
+  const b = []; for (let i=0;i<16;i++) b.push((a[4+i] ^ mask[i]).toString(16).padStart(2,"0"));
+  const groups = []; for (let i=0;i<16;i+=2) groups.push(b[i]+b[i+1]);
+  return { host: groups.join(":"), port, family:"IPv6" };
+}
+
+function channelDataFrame(ch, payload){
+  const pad = (4 - (payload.length % 4)) % 4;
+  const out = new Uint8Array(4 + payload.length + pad);
+  const dv = new DataView(out.buffer);
+  dv.setUint16(0, ch); dv.setUint16(2, payload.length);
+  out.set(payload, 4);
+  return out;
+}
+
+// The long-term credential key is MD5(username:realm:password) — and SubtleCrypto
+// deliberately does not implement MD5, so it is done by hand here. This is the one
+// place where "written independently" costs something real.
+function md5(bytes){
+  const s=[7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+           4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+  const K=[]; for(let i=0;i<64;i++) K[i]=Math.floor(Math.abs(Math.sin(i+1))*4294967296);
+  let a0=0x67452301,b0=0xefcdab89,c0=0x98badcfe,d0=0x10325476;
+  const ml=bytes.length*8;
+  const withPad=new Uint8Array((((bytes.length+8)>>6)+1)*64);
+  withPad.set(bytes); withPad[bytes.length]=0x80;
+  new DataView(withPad.buffer).setUint32(withPad.length-8, ml>>>0, true);
+  for(let off=0;off<withPad.length;off+=64){
+    const M=[]; const dv=new DataView(withPad.buffer,off,64);
+    for(let i=0;i<16;i++) M[i]=dv.getUint32(i*4,true);
+    let A=a0,B=b0,C=c0,D=d0;
+    for(let i=0;i<64;i++){
+      let F,g;
+      if(i<16){ F=(B&C)|(~B&D); g=i; }
+      else if(i<32){ F=(D&B)|(~D&C); g=(5*i+1)%16; }
+      else if(i<48){ F=B^C^D; g=(3*i+5)%16; }
+      else { F=C^(B|~D); g=(7*i)%16; }
+      F=(F+A+K[i]+M[g])>>>0; A=D; D=C; C=B;
+      B=(B+(((F<<s[i])|(F>>>(32-s[i])))>>>0))>>>0;
+    }
+    a0=(a0+A)>>>0; b0=(b0+B)>>>0; c0=(c0+C)>>>0; d0=(d0+D)>>>0;
+  }
+  const out=new Uint8Array(16); const dv=new DataView(out.buffer);
+  dv.setUint32(0,a0,true); dv.setUint32(4,b0,true); dv.setUint32(8,c0,true); dv.setUint32(12,d0,true);
+  return out;
+}
+
+async function credentials(){
+  const mode = el("mode").value, user = el("user").value.trim(), secret = el("pass").value;
+  if (mode === "static") return { username:user, password:secret };
+  const expiry = Math.floor(Date.now()/1000) + 600;
+  const username = `${expiry}:${user||"probe"}`;
+  const k = await crypto.subtle.importKey("raw", enc.encode(secret), { name:"HMAC", hash:"SHA-1" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(username)));
+  return { username, password: btoa(String.fromCharCode(...mac)) };
+}
+
+// ── stream framing ──────────────────────────────────────────────────────────
+// Same rule the server uses: STUN is delimited by the length in its own header;
+// ChannelData is a 4-byte header plus a payload padded to 4 bytes on a stream.
+class Framer {
+  constructor(){ this.buf = new Uint8Array(0); }
+  push(chunk){
+    const n = new Uint8Array(this.buf.length + chunk.length);
+    n.set(this.buf); n.set(chunk, this.buf.length);
+    this.buf = n;
+  }
+  next(){
+    while (this.buf.length >= 4){
+      const dv = new DataView(this.buf.buffer, this.buf.byteOffset, this.buf.byteLength);
+      const b0 = this.buf[0], len = dv.getUint16(2);
+      let wire, logical;
+      if ((b0 & 0xC0) === 0){ wire = 20 + len; logical = wire; }
+      else if (b0 >= 0x40 && b0 <= 0x7f){
+        const pad = (4 - (len % 4)) % 4; wire = 4 + len + pad; logical = 4 + len;
+      } else { this.buf = this.buf.subarray(1); continue; }
+      if (this.buf.length < wire) return null;
+      const msg = this.buf.subarray(0, logical).slice();
+      this.buf = this.buf.subarray(wire);
+      return msg;
+    }
+    return null;
+  }
+}
+
+// ── the run ─────────────────────────────────────────────────────────────────
+async function run(){
+  state.results = {}; state.events = []; state.detail = {};
+  ledger.innerHTML = ""; renderChecks();
+  log("browser: " + navigator.userAgent, "dim");
+
+  if (typeof WebTransport === "undefined"){
+    set("session","fail","This browser has no WebTransport. Chrome and Edge have it; Firefox and Safari did not at the time of writing.");
+    return;
+  }
+
+  const url = el("url").value.trim();
+  let wt, reader, writer, framer = new Framer(), dgReader;
+
+  // ── session ──
+  set("session","run");
+  try {
+    wt = new WebTransport(url);
+    await wt.ready;
+    set("session","pass", `connected to ${url}`);
+  } catch (e) {
+    set("session","fail",
+      `${e}\n\nA certificate the browser does not trust fails exactly here, and ` +
+      `WebTransport offers no exception dialogue — unlike an https:// page, you cannot ` +
+      `click through. Check that [turn.quic] has web_transport = true and that the ` +
+      `certificate matches the host in the URL.`);
+    return;
+  }
+
+  // ── stream ──
+  set("stream","run");
+  try {
+    const s = await wt.createBidirectionalStream();
+    writer = s.writable.getWriter();
+    reader = s.readable.getReader();
+    dgReader = wt.datagrams.readable.getReader();
+    set("stream","pass","bidirectional stream open");
+  } catch (e) {
+    set("stream","fail", String(e));
+    return;
+  }
+
+  const readMsg = async (ms) => {
+    const deadline = Date.now() + ms;
+    for (;;){
+      const m = framer.next();
+      if (m) return m;
+      if (Date.now() > deadline) throw new Error("timeout waiting for a reply on the stream");
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise(r => setTimeout(() => r({ value:null, done:false }), Math.max(50, deadline - Date.now())))
+      ]);
+      if (done) throw new Error("stream closed by the server");
+      if (value) framer.push(value);
+    }
+  };
+
+  // ── auth ──
+  set("auth","run");
+  let realm, nonce, key, cred;
+  try {
+    cred = await credentials();
+    const probe = new Msg(M_ALLOCATE).addRequestedTransportUdp().addLifetime(600);
+    await writer.write(probe.encode());
+    const resp = await readMsg(6000);
+    const code = errorCode(resp);
+    if (code !== 401) throw new Error(`expected a 401 challenge, got ${code === null ? "a success" : code}`);
+    const a = parseAttrs(resp);
+    realm = new TextDecoder().decode(a[A_REALM]);
+    nonce = a[A_NONCE];
+    log(`401 challenge, realm "${realm}"`, "dim");
+    key = md5(enc.encode(`${cred.username}:${realm}:${cred.password}`));
+
+    let relayed = null, lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++){
+      const m = new Msg(M_ALLOCATE).addRequestedTransportUdp().addLifetime(600)
+        .addString(A_USERNAME, cred.username).addString(A_REALM, realm).add(A_NONCE, nonce);
+      const pkt = await m.encodeWithIntegrity(key);
+      await writer.write(pkt);
+      const r = await readMsg(6000);
+      if (isSuccess(r)){ relayed = relayedAddr(r, m.txid); break; }
+      lastErr = errorCode(r);
+      if (lastErr === 438 || lastErr === 401){ nonce = parseAttrs(r)[A_NONCE]; continue; }
+      throw new Error(`authenticated Allocate rejected: ${lastErr}`);
+    }
+    if (!relayed) throw new Error(`Allocate never succeeded (last error ${lastErr})`);
+    state.detail.relayed = relayed;
+    set("auth","pass",
+      `MESSAGE-INTEGRITY accepted, relayed address ${relayed.host}:${relayed.port} (${relayed.family})\n` +
+      `The HMAC and the MD5 key were computed here — the server agreeing with them is ` +
+      `the part a shared library could not have told us.`);
+    log(`relayed ${relayed.host}:${relayed.port}`, "sig");
+  } catch (e) {
+    set("auth","fail", String(e.message || e));
+    try { await wt.close(); } catch(_){}
+    return;
+  }
+
+  // ── permission and channel ──
+  set("perm","run");
+  const channel = 0x4000;
+  try {
+    const relayed = state.detail.relayed;
+    // The peer is the relayed address itself: this page has no second socket, and a
+    // permission for the relay's own address is enough to make the server accept
+    // ChannelData for it. What it proves is the encoding of XOR-PEER-ADDRESS and the
+    // channel binding, which is what an independent implementation is for.
+    const peerHost = relayed.host, peerPort = relayed.port;
+
+    const p = new Msg(M_CREATE_PERM).addXorPeer(peerHost, peerPort)
+      .addString(A_USERNAME, cred.username).addString(A_REALM, realm).add(A_NONCE, nonce);
+    await writer.write(await p.encodeWithIntegrity(key));
+    const pr = await readMsg(6000);
+    if (!isSuccess(pr)) throw new Error(`CreatePermission rejected: ${errorCode(pr)}`);
+
+    const b = new Msg(M_CHANNEL_BIND).addChannelNumber(channel).addXorPeer(peerHost, peerPort)
+      .addString(A_USERNAME, cred.username).addString(A_REALM, realm).add(A_NONCE, nonce);
+    await writer.write(await b.encodeWithIntegrity(key));
+    const br = await readMsg(6000);
+    if (!isSuccess(br)) throw new Error(`ChannelBind rejected: ${errorCode(br)}`);
+
+    set("perm","pass", `permission and channel ${channel.toString(16)} for ${peerHost}:${peerPort}`);
+  } catch (e) {
+    set("perm","fail", String(e.message || e));
+    try { await wt.close(); } catch(_){}
+    return;
+  }
+
+  // ── media ──
+  set("media","run");
+  try {
+    const payload = enc.encode("turn-over-webtransport from a browser");
+    for (let i = 0; i < 10; i++) await writer.write(channelDataFrame(channel, payload));
+    log("10 ChannelData frames written to the stream", "dim");
+
+    // The relayed reply comes back as a datagram, not on the stream: media is
+    // unreliable by nature and a reliable stream would add retransmission and
+    // head-of-line blocking that UDP does not have. Both are accepted so a server
+    // that chooses reliable delivery is not reported as broken.
+    const got = await Promise.race([
+      dgReader.read().then(r => ({ via:"datagram", data:r.value })),
+      readMsg(6000).then(m => ({ via:"stream", data:m })),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(
+        "nothing came back within 6 s, on either a datagram or the stream. The " +
+        "allocation and the channel binding both succeeded, so the control plane " +
+        "works and the relay egress does not.")), 6000)),
+    ]);
+    const first = got.data && got.data.length ? got.data[0] : 0;
+    if (!(first >= 0x40 && first <= 0x7f)){
+      throw new Error(`expected ChannelData back, got ${got.data.length} bytes starting with 0x${first.toString(16)}`);
+    }
+    set("media","pass",
+      `relayed data returned as a WebTransport ${got.via} (${got.data.length} bytes)\n` +
+      `This is the half a control-plane check cannot reach: an allocation that answers ` +
+      `every request correctly can still forward nothing.`);
+  } catch (e) {
+    set("media","fail", String(e.message || e));
+  }
+
+  try { await wt.close(); } catch(_){}
+  const rs = CHECKS.map(c => `${c.tag}=${(state.results[c.id]||{}).verdict||"idle"}`).join("  ");
+  const failed = CHECKS.filter(c => (state.results[c.id]||{}).verdict === "fail").length;
+  log(`RESULT  ${rs}`, failed ? "fail" : "ok");
+}
+
+el("run").onclick = async () => {
+  el("run").disabled = true;
+  try { await run(); } catch (e) { log("harness error: " + (e.message||e), "fail"); }
+  el("run").disabled = false;
+  el("copy").disabled = false; el("download").disabled = false;
+};
+
+function report(){
+  return {
+    kind: "turn-over-webtransport-browser-probe",
+    generated: new Date().toISOString(),
+    browser: navigator.userAgent,
+    url: el("url").value.trim(),
+    credentialMode: el("mode").value,
+    username: el("user").value.trim(),
+    secret: "[redacted]",
+    relayed: state.detail.relayed || null,
+    checks: CHECKS.map(c => ({
+      id:c.id, title:c.title,
+      verdict:(state.results[c.id]||{}).verdict || "idle",
+      detail:(state.results[c.id]||{}).detail || "",
+    })),
+    events: state.events,
+  };
+}
+el("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText(JSON.stringify(report(), null, 2)); el("copy").textContent = "Copied"; }
+  catch(_){ el("copy").textContent = "Clipboard blocked — use Download"; }
+  setTimeout(() => { el("copy").textContent = "Copy log"; }, 2200);
+};
+el("download").onclick = () => {
+  const blob = new Blob([JSON.stringify(report(), null, 2)], { type:"application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `wt-browser-probe-${new Date().toISOString().replace(/[:.]/g,"-").slice(0,19)}.json`;
+  a.click(); URL.revokeObjectURL(a.href);
+};
+
+renderChecks();
+</script>
+</body>
+</html>

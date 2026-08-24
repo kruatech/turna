@@ -544,10 +544,14 @@ fn set_ring_size(fd: RawFd, opt: i32, size: u32) -> Result<()> {
 //
 // AF_XDP delivers and accepts *full Ethernet frames*, so the datapath must
 // parse inbound ETH/IP/UDP itself and build the headers for outbound frames.
-// This module is Phase 2 of docs/design/af-xdp-datapath.md. IPv4 only for now
-// (IPv6 is a TODO). MAC resolution for TX is the caller's responsibility (the
-// kernel neighbour table); these functions take the MACs as inputs and are
-// completely free of any socket/ring state, so they are directly unit-testable.
+// This module is Phase 2 of docs/design/af-xdp-datapath.md. Both families are
+// covered: `build_eth_ipv4_udp` / `parse_eth_ipv4_udp` and their `ipv6`
+// counterparts, plus ARP and ICMPv6 neighbour discovery. (An earlier version of
+// this comment said "IPv4 only, IPv6 is a TODO" — that was stale; what remains
+// IPv4-only is the *ring datapath* wiring above, not this frame layer.)
+// MAC resolution for TX is the caller's responsibility (the kernel neighbour
+// table); these functions take the MACs as inputs and are completely free of any
+// socket/ring state, so they are directly unit-testable.
 // ---------------------------------------------------------------------------
 pub mod frame {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
@@ -1281,6 +1285,17 @@ pub mod xsk {
     }
 
     /// One AF_XDP socket bound to a single NIC queue, with its UMEM and rings.
+    /// Descriptor slots reserved for the RX ring to overwrite.
+    ///
+    /// The listener calls `recv_batch(64)`, so 256 leaves headroom if that grows
+    /// without anyone remembering this constant. These frames are donated to the
+    /// scratch and never used for RX or TX payloads — the cost is 256 frames out of
+    /// the pool, paid once at bind.
+    ///
+    /// It bounds a batch, not the receive capacity: the frames the kernel fills come
+    /// from the fill ring, and this is only the buffer their descriptors land in.
+    const RX_BATCH_MAX: usize = 256;
+
     pub struct XskDatapath {
         umem: Umem,
         rx: RxQueue,
@@ -1292,6 +1307,20 @@ pub mod xsk {
         /// Pre-allocated buffer the completion ring overwrites with the
         /// descriptors of finished TX frames (see `reclaim_completions`).
         comp_scratch: Vec<FrameDesc>,
+        /// Pre-allocated buffer the RX ring overwrites with the descriptors of
+        /// received frames — the same pattern as `comp_scratch`, and for the same
+        /// reason.
+        ///
+        /// `recv_batch` used to take this buffer out of `free_frames` instead.
+        /// `poll_and_consume` overwrites the first `n` entries with descriptors
+        /// pointing at the frames the kernel filled from the fill ring, so the `n`
+        /// frames drained from `free_frames` had their addresses destroyed and were
+        /// never returned anywhere. Every receive batch permanently consumed `n`
+        /// frames from the pool; once it emptied, `want` was 0 and `recv_batch`
+        /// returned without even polling. RX stopped for good after exactly
+        /// pool-size frames — 2015 of them, in three lab runs at different rates,
+        /// which is what a leak looks like and what congestion never does.
+        rx_scratch: Vec<FrameDesc>,
         local_addr: SocketAddr,
         src_mac: [u8; 6],
         // TX needs the next-hop (gateway) MAC. Phase 1: configured/placeholder;
@@ -1305,6 +1334,10 @@ pub mod xsk {
         tx_produced: u64,
         /// Cumulative completions reaped from the completion ring.
         comp_consumed: u64,
+        /// Times the fill ring refused a descriptor because it was full. Non-zero
+        /// means the RX batch is larger than the ring or the kernel is behind; it is
+        /// not a leak, because the refused descriptors stay in the scratch.
+        fill_ring_full: u64,
         /// Optional Phase-2 neighbor resolution: (cache, resolve-request sender, TTL).
         neighbor: Option<(
             crate::neighbor::NeighborCache,
@@ -1478,6 +1511,12 @@ pub mod xsk {
             let scratch_n = frames.len().min(64);
             let comp_scratch: Vec<FrameDesc> = frames.drain(..scratch_n).collect();
 
+            // Same trick for RX: a fixed buffer the RX ring writes descriptors into.
+            // Its frames are donated to the scratch and never used as RX/TX frames,
+            // so nothing has to be returned when the ring overwrites them.
+            let rx_scratch_n = frames.len().min(RX_BATCH_MAX);
+            let rx_scratch: Vec<FrameDesc> = frames.drain(..rx_scratch_n).collect();
+
             // Split remaining descriptors: half seed the fill ring (kernel RX
             // targets), the rest stay free for TX. Simple even split for the draft.
             let split = frames.len() / 2;
@@ -1524,6 +1563,7 @@ pub mod xsk {
                 fill,
                 comp,
                 free_frames: frames,
+                rx_scratch,
                 comp_scratch,
                 local_addr,
                 src_mac,
@@ -1531,6 +1571,7 @@ pub mod xsk {
                 arp_replies: 0,
                 ndp_replies: 0,
                 tx_produced: 0,
+                fill_ring_full: 0,
                 comp_consumed: 0,
                 neighbor: None,
                 xdp_prog: Some(xdp_prog),
@@ -1560,6 +1601,18 @@ pub mod xsk {
 
         /// Free UMEM frames available for RX/TX (gauge source for
         /// turna_afxdp_umem_free_frames).
+        /// Descriptors the fill ring refused because it was full. Not a leak — they
+        /// stay in the RX scratch and are offered again — but a signal that the batch
+        /// outruns the ring.
+        pub fn fill_ring_full(&self) -> u64 {
+            self.fill_ring_full
+        }
+        /// Frames available for **TX**.
+        ///
+        /// Named for what it is: RX frames live in the fill ring and are not counted
+        /// here. The `turna_afxdp_umem_free_frames` gauge reads this, which is why it
+        /// sat at a healthy 2016 while the receive path was starving — it was never
+        /// watching RX.
         pub fn free_frames(&self) -> usize {
             self.free_frames.len()
         }
@@ -1630,11 +1683,15 @@ pub mod xsk {
         /// Drain up to `max` received frames: poll RX, parse ETH+IPv4+UDP, emit
         /// the TURN payloads, then return the descriptors to the fill ring.
         pub fn recv_batch(&mut self, max: usize) -> Vec<ReceivedFrame> {
-            let want = self.free_frames.len().min(max);
+            // Receive capacity is the fill ring's business, not the TX pool's. Tying
+            // it to `free_frames` also meant a busy TX path could starve RX.
+            let want = self.rx_scratch.len().min(max);
             if want == 0 {
                 return Vec::new();
             }
-            let mut rx_descs: Vec<FrameDesc> = self.free_frames.drain(..want).collect();
+            // Borrowed, not drained: the RX ring overwrites these entries and the
+            // scratch is reused on the next call.
+            let mut rx_descs = std::mem::take(&mut self.rx_scratch);
 
             // Non-blocking poll (timeout 0). Returns how many descs were filled.
             // SAFETY: `rx_descs` is a valid mutable buffer; the RX queue is owned
@@ -1675,13 +1732,26 @@ pub mod xsk {
                 }
             }
 
-            // Recycle consumed descriptors back to the kernel for more RX; any
-            // we didn't use return to the free pool.
+            // Hand the frames the kernel just filled back to the fill ring so it can
+            // receive into them again.
+            //
+            // `produce` returns how many it actually placed; a full fill ring accepts
+            // fewer than offered. Those are still ours and must not be dropped on the
+            // floor — that was the second half of the leak. They stay in the scratch
+            // and are offered again on the next batch, which is safe because the
+            // scratch is not a frame pool: its entries are placeholders the ring
+            // overwrites.
             // SAFETY: as in `bind` — these frames are ours and ring-free.
-            unsafe {
-                self.fill.produce(&rx_descs[..n]);
+            let produced = unsafe { self.fill.produce(&rx_descs[..n]) } as usize;
+            if produced < n {
+                // Not fatal, but worth seeing: it means the fill ring is smaller than
+                // the batch or the kernel is behind.
+                self.fill_ring_full += (n - produced) as u64;
             }
-            self.free_frames.extend(rx_descs.drain(n..));
+            // The scratch goes back whole. Nothing is taken from or added to
+            // `free_frames` here: RX frames live in the fill ring, TX frames in the
+            // pool, and the two no longer trade places.
+            self.rx_scratch = rx_descs;
 
             // The XDP redirect funnels ALL ingress (including ARP) into the xsk,
             // bypassing the kernel's ARP responder — so we answer ARP for our own

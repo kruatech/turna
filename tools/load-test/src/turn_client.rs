@@ -37,6 +37,20 @@ const A_REALM: u16 = 0x0014;
 const A_NONCE: u16 = 0x0015;
 const A_XOR_RELAYED_ADDRESS: u16 = 0x0016;
 const A_REQUESTED_TRANSPORT: u16 = 0x0019;
+/// RFC 6156 §4.1.1. Value is one byte of family (0x01 v4, 0x02 v6) + 3 reserved.
+const A_REQUESTED_ADDRESS_FAMILY: u16 = 0x0017;
+/// RFC 8656 §7.2 ADDITIONAL-ADDRESS-FAMILY. Comprehension-optional, so a server
+/// that does not implement it ignores it silently — which is what makes it worth
+/// probing explicitly rather than assuming.
+const A_ADDITIONAL_ADDRESS_FAMILY: u16 = 0x8000;
+
+/// Address-family codes as they appear on the wire.
+pub const FAMILY_V4: u8 = 0x01;
+pub const FAMILY_V6: u8 = 0x02;
+
+/// Sentinel returned by the probe helpers for "the server answered success". Not a
+/// STUN error code — STUN has none for success.
+pub const PROBE_SUCCESS: u16 = 0;
 
 // ---------------------------------------------------------------------------
 // Credentials
@@ -79,6 +93,40 @@ impl Creds {
 }
 
 /// RFC 5389 §15.4 long-term credential key: MD5("user:realm:pass").
+/// Local address the clients bind their sockets on, from `--bind-ip`.
+///
+/// It exists because a loopback bind cannot reach a peer on another interface. The
+/// AF_XDP lab is exactly that case: the node sits on `10.123.0.1` over a veth pair
+/// and the client has to send from `10.123.0.2`. Binding `0.0.0.0` is not a
+/// substitute — `local_addr()` would then return `0.0.0.0`, and that is the address
+/// that goes into CreatePermission, where it means nothing.
+pub static BIND_IP: std::sync::OnceLock<std::net::IpAddr> = std::sync::OnceLock::new();
+
+/// `ip:0` for a peer socket of the given family, honouring `--bind-ip`.
+///
+/// Falls back to loopback, which is what every local check wants. If `--bind-ip` was
+/// given in the other family it is ignored rather than silently producing an
+/// unreachable peer — a v4 peer on a v6 allocation is refused with 443 by design, and
+/// that refusal would look like a server fault.
+/// Local address for a **control** socket talking to `server`.
+///
+/// The family follows the server's address, not a flag. A control socket bound in the
+/// wrong family cannot send at all: the request never leaves, `allocate` fails without
+/// a response to report, and the caller sees an error with no cause — which is exactly
+/// how an IPv6 run looked before this existed. It reported 10 setup errors and zero
+/// packets while the server logged nothing, because nothing ever reached it.
+pub fn control_bind_addr(server: SocketAddr) -> String {
+    peer_bind_addr(server.is_ipv6())
+}
+
+pub fn peer_bind_addr(v6: bool) -> String {
+    match BIND_IP.get() {
+        Some(ip) if ip.is_ipv6() == v6 => format!("{}", std::net::SocketAddr::new(*ip, 0)),
+        _ if v6 => "[::1]:0".to_string(),
+        _ => "127.0.0.1:0".to_string(),
+    }
+}
+
 pub fn long_term_key(user: &str, realm: &str, pass: &str) -> [u8; 16] {
     md5::compute(format!("{user}:{realm}:{pass}")).0
 }
@@ -153,6 +201,17 @@ impl Msg {
 
     pub fn add_requested_transport_udp(&mut self) {
         self.add(A_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
+    }
+
+    /// RFC 6156 REQUESTED-ADDRESS-FAMILY.
+    pub fn add_requested_address_family(&mut self, family: u8) {
+        self.add(A_REQUESTED_ADDRESS_FAMILY, &[family, 0, 0, 0]);
+    }
+
+    /// RFC 8656 ADDITIONAL-ADDRESS-FAMILY. Only IPv6 is legal here; passing v4 is
+    /// how you check the server answers 400 rather than accepting it.
+    pub fn add_additional_address_family(&mut self, family: u8) {
+        self.add(A_ADDITIONAL_ADDRESS_FAMILY, &[family, 0, 0, 0]);
     }
     pub fn add_lifetime(&mut self, secs: u32) {
         self.add(A_LIFETIME, &secs.to_be_bytes());
@@ -328,10 +387,10 @@ pub fn channel_data_frame(ch: u16, payload: &[u8]) -> Vec<u8> {
 pub struct Session {
     pub sock: UdpSocket,
     pub server: SocketAddr,
-    /// Relay transport address the server assigned. Not read by the
-    /// current bench scenarios (they send to the server's main port);
-    /// kept for diagnostics and future scenarios.
-    #[allow(dead_code)]
+    /// Relay transport address the server assigned. The load scenarios send to
+    /// the server's main port and do not read it; the `conformance` mode does —
+    /// checking that an IPv6 Allocate actually yields an IPv6 relayed address is
+    /// the point of that probe.
     pub relayed: SocketAddr,
     realm: String,
     nonce: Vec<u8>,
@@ -372,21 +431,86 @@ pub async fn allocate(
     creds: &Creds,
     rtt_ms: u64,
 ) -> Result<Session, &'static str> {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.map_err(|_| "bind")?;
+    allocate_family(server, creds, rtt_ms, None)
+        .await
+        .map_err(|e| e.0)
+}
+
+/// Probe an unauthenticated Allocate carrying ADDITIONAL-ADDRESS-FAMILY, and
+/// report the STUN code the server answered with.
+///
+/// Unauthenticated on purpose: the attribute is parsed (or not) before
+/// authentication matters, so a `401` challenge means "the attribute did not
+/// offend the parser", while a `400` means the server implements the RFC 8656 §7.2
+/// validation. Both are informative; neither needs credentials.
+///
+/// `family` is the value placed in the attribute. RFC 8656 allows only IPv6 there,
+/// so passing `FAMILY_V4` is how you check whether the server rejects the illegal
+/// combination or silently ignores it.
+pub async fn probe_additional_address_family(
+    server: SocketAddr,
+    rtt_ms: u64,
+    family: u8,
+    with_raf: bool,
+) -> Option<u16> {
+    let sock = UdpSocket::bind(control_bind_addr(server)).await.ok()?;
+    let mut m = Msg::request(M_ALLOCATE);
+    m.add_requested_transport_udp();
+    if with_raf {
+        // RFC 8656 §7.2: mutually exclusive with ADDITIONAL-ADDRESS-FAMILY.
+        m.add_requested_address_family(FAMILY_V6);
+    }
+    m.add_additional_address_family(family);
+    m.add_lifetime(600);
+    let txid = m.txid();
+    let pkt = m.encode();
+    let resp = send_recv(&sock, server, &pkt, &txid, rtt_ms).await?;
+    if is_success(&resp) {
+        // 0 is not a STUN code; it stands for "answered success". Callers treat it
+        // the same as a 401 challenge here — both mean the attribute did not make
+        // the server reject the request.
+        return Some(PROBE_SUCCESS);
+    }
+    error_code(&resp)
+}
+
+/// An Allocate rejection, with the STUN error code when the server sent one.
+/// `allocate` collapses this to a message; the conformance checks need the code,
+/// because "refused with 440" and "timed out" mean opposite things.
+#[derive(Debug)]
+pub struct AllocError(pub &'static str, pub Option<u16>);
+
+/// Full authenticated Allocate, optionally requesting an address family
+/// (`FAMILY_V4` / `FAMILY_V6`). `None` sends no REQUESTED-ADDRESS-FAMILY at all,
+/// which is the default client behaviour and must stay indistinguishable from
+/// asking for v4.
+pub async fn allocate_family(
+    server: SocketAddr,
+    creds: &Creds,
+    rtt_ms: u64,
+    family: Option<u8>,
+) -> Result<Session, AllocError> {
+    let sock = UdpSocket::bind(control_bind_addr(server))
+        .await
+        .map_err(|_| AllocError("bind", None))?;
 
     // 1. Unauthenticated Allocate → expect 401 challenge (or success on
     //    a no-auth server).
     let mut m = Msg::request(M_ALLOCATE);
     m.add_requested_transport_udp();
+    if let Some(f) = family {
+        m.add_requested_address_family(f);
+    }
     m.add_lifetime(600);
     let txid = m.txid();
     let pkt = m.encode();
     let resp = send_recv(&sock, server, &pkt, &txid, rtt_ms)
         .await
-        .ok_or("alloc: no response to probe")?;
+        .ok_or(AllocError("alloc: no response to probe", None))?;
 
     if is_success(&resp) {
-        let relayed = get_relayed_addr(&resp, &txid).ok_or("alloc: no relayed addr")?;
+        let relayed =
+            get_relayed_addr(&resp, &txid).ok_or(AllocError("alloc: no relayed addr", None))?;
         return Ok(Session {
             sock,
             server,
@@ -400,10 +524,16 @@ pub async fn allocate(
         });
     }
     if !is_error(&resp) || error_code(&resp) != Some(401) {
-        return Err("alloc: expected 401 challenge");
+        // Not a challenge and not a success: the server refused outright. A
+        // family request that the server does not support lands here (440), and
+        // that is a legitimate answer to report rather than an error to hide.
+        return Err(AllocError(
+            "alloc: expected 401 challenge",
+            error_code(&resp),
+        ));
     }
-    let realm = get_realm(&resp).ok_or("alloc: 401 without realm")?;
-    let mut nonce = get_nonce(&resp).ok_or("alloc: 401 without nonce")?;
+    let realm = get_realm(&resp).ok_or(AllocError("alloc: 401 without realm", None))?;
+    let mut nonce = get_nonce(&resp).ok_or(AllocError("alloc: 401 without nonce", None))?;
 
     // 2. Authenticated Allocate (retry once on 438/401 with fresh nonce).
     let (user, pass) = creds.materialize();
@@ -411,6 +541,9 @@ pub async fn allocate(
     for _attempt in 0..2 {
         let mut m = Msg::request(M_ALLOCATE);
         m.add_requested_transport_udp();
+        if let Some(f) = family {
+            m.add_requested_address_family(f);
+        }
         m.add_lifetime(600);
         m.add_username(&user);
         m.add_realm(&realm);
@@ -419,9 +552,10 @@ pub async fn allocate(
         let pkt = m.encode_with_integrity(&key);
         let resp = send_recv(&sock, server, &pkt, &txid, rtt_ms)
             .await
-            .ok_or("alloc: no response to authed request")?;
+            .ok_or(AllocError("alloc: no response to authed request", None))?;
         if is_success(&resp) {
-            let relayed = get_relayed_addr(&resp, &txid).ok_or("alloc: no relayed addr")?;
+            let relayed =
+                get_relayed_addr(&resp, &txid).ok_or(AllocError("alloc: no relayed addr", None))?;
             return Ok(Session {
                 sock,
                 server,
@@ -440,12 +574,14 @@ pub async fn allocate(
                     nonce = n;
                     continue;
                 }
-                return Err("alloc: stale nonce without replacement");
+                return Err(AllocError("alloc: stale nonce without replacement", None));
             }
-            _ => return Err("alloc: authed request rejected"),
+            code => {
+                return Err(AllocError("alloc: authed request rejected", code));
+            }
         }
     }
-    Err("alloc: nonce retry exhausted")
+    Err(AllocError("alloc: nonce retry exhausted", None))
 }
 
 impl Session {
@@ -491,10 +627,57 @@ impl Session {
         Err("req: nonce retry exhausted")
     }
 
+    /// One CreatePermission, reporting the STUN error code instead of collapsing
+    /// it to a message. The conformance checks need the code: `443` (family
+    /// mismatch) and `403` (forbidden peer) are both "rejected", and telling them
+    /// apart is the whole point of the check.
+    ///
+    /// No nonce retry: these are single-shot probes on an already-authenticated
+    /// session, and retrying would blur which answer came from which request.
+    pub async fn create_permission_code(&mut self, peer: SocketAddr) -> Result<(), Option<u16>> {
+        let mut m = Msg::request(M_CREATE_PERM);
+        m.add_xor_peer(peer);
+        let pkt = if self.no_auth {
+            m.encode()
+        } else {
+            m.add_username(&self.user);
+            m.add_realm(&self.realm);
+            m.add_nonce(&self.nonce);
+            m.encode_with_integrity(&self.key)
+        };
+        let txid: [u8; 12] = pkt[8..20].try_into().expect("txid slice");
+        let resp = send_recv(&self.sock, self.server, &pkt, &txid, self.rtt_ms)
+            .await
+            .ok_or(None)?;
+        if is_success(&resp) {
+            return Ok(());
+        }
+        Err(error_code(&resp))
+    }
+
     pub async fn create_permission(&mut self, peer: SocketAddr) -> Result<(), &'static str> {
         self.auth_request(M_CREATE_PERM, move |m| m.add_xor_peer(peer))
             .await
             .map(|_| ())
+    }
+
+    /// Refresh the allocation and re-assert the permission and channel binding.
+    ///
+    /// A session that runs longer than ten minutes has to do this or it stops working
+    /// with no error at all: the allocation lasts 600 s (RFC 8656 §7.2), the permission
+    /// 300 s (§9), the channel binding 600 s (§11.2), and the server is required to
+    /// drop ChannelData once the binding is gone.
+    ///
+    /// Measured consequence, before this existed: a 1755 s phase delivered
+    /// 600/1755 ≈ 34 % of what it sent, identically on every transport, and it looked
+    /// like a capacity cliff. Rehearsals of 244 s never crossed the deadline and passed
+    /// clean, which is what made it confusing.
+    pub async fn refresh(&mut self, ch: u16, peer: SocketAddr) -> Result<(), &'static str> {
+        self.auth_request(M_REFRESH, |m| m.add_lifetime(600))
+            .await
+            .map_err(|_| "refresh failed")?;
+        self.create_permission(peer).await?;
+        self.channel_bind(ch, peer).await
     }
 
     pub async fn channel_bind(&mut self, ch: u16, peer: SocketAddr) -> Result<(), &'static str> {

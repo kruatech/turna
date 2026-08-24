@@ -240,9 +240,62 @@ fn is_special_v4(v4: Ipv4Addr) -> bool {
 }
 
 fn is_special_v6(v6: Ipv6Addr) -> bool {
+    let s = v6.segments();
+
     // Link-local unicast fe80::/10 (Ipv6Addr::is_unicast_link_local is still
     // unstable, so test the prefix directly).
-    (v6.segments()[0] & 0xffc0) == 0xfe80
+    if (s[0] & 0xffc0) == 0xfe80 {
+        return true;
+    }
+    // Deprecated site-local fec0::/10 (RFC 3879). Still routed by some stacks.
+    if (s[0] & 0xffc0) == 0xfec0 {
+        return true;
+    }
+
+    // ── v4-embedding transition ranges ──────────────────────────────────────
+    // These matter because they carry an arbitrary IPv4 address inside a v6
+    // literal. Without them, every v4 rule above (link-local 169.254.169.254,
+    // RFC 1918, the operator deny list) is bypassable simply by asking for the
+    // v6 form of the same target — which became reachable the moment IPv6
+    // relaying was added. Denying the prefixes outright is the only safe answer:
+    // resolving them to a v4 address and re-running the v4 policy would still
+    // leave the operator's own allow/deny CIDRs written in the wrong family.
+    //
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052).
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        return true;
+    }
+    // 6to4 2002::/16 (RFC 3056) — the next 32 bits are a v4 address.
+    if s[0] == 0x2002 {
+        return true;
+    }
+    // Teredo 2001::/32 (RFC 4380) — embeds a v4 server and client address.
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return true;
+    }
+    // IPv4-compatible ::/96 (deprecated, RFC 4291 §2.5.5.1), e.g. ::203.0.113.1.
+    // `to_ipv4_mapped()` does NOT normalise this form, so it would otherwise
+    // reach the datapath as a v6 peer. `::` itself is caught by is_unspecified
+    // and `::1` by is_loopback before we get here.
+    if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+        return true;
+    }
+
+    // ── non-routable / reserved ─────────────────────────────────────────────
+    // Discard-only 100::/64 (RFC 6666).
+    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+        return true;
+    }
+    // Benchmarking 2001:2::/48 (RFC 5180) and ORCHIDv2 2001:20::/28 (RFC 7343).
+    if s[0] == 0x2001 && (s[1] == 0x0002 || (s[1] & 0xfff0) == 0x0020) {
+        return true;
+    }
+    // NOT denied: documentation 2001:db8::/32 (RFC 3849). It embeds no IPv4
+    // address, so it is not a bypass of the v4 rules, and it is the canonical
+    // stand-in for "a routable public v6 address" in test suites and examples —
+    // including this crate's own `internet_facing_default_denies_private_allows_public`.
+    // Denying it would buy nothing and surprise anyone writing a test.
+    false
 }
 
 /// RFC 1918 (v4) / ULA fc00::/7 (v6).
@@ -306,6 +359,34 @@ mod tests {
         assert!(is_forbidden_peer(ip("255.255.255.255")));
         assert!(is_forbidden_peer(ip("224.0.0.1"))); // multicast
         assert!(is_forbidden_peer(ip("fe80::1"))); // link-local v6
+        assert!(is_forbidden_peer(ip("fec0::1"))); // deprecated site-local
+                                                   // v4-embedding transition ranges: without these, every v4 rule is
+                                                   // bypassable by asking for the v6 spelling of the same target.
+        assert!(
+            is_forbidden_peer(ip("64:ff9b::a9fe:a9fe")),
+            "NAT64 form of 169.254.169.254 must be denied"
+        );
+        assert!(is_forbidden_peer(ip("2002:c000:0204::1")), "6to4");
+        assert!(is_forbidden_peer(ip("2001::1")), "Teredo");
+        assert!(
+            is_forbidden_peer(ip("::203.0.113.1")),
+            "deprecated IPv4-compatible form is not normalised by to_ipv4_mapped"
+        );
+        assert!(is_forbidden_peer(ip("100::1")), "discard-only");
+        assert!(is_forbidden_peer(ip("2001:2::1")), "benchmarking");
+        assert!(is_forbidden_peer(ip("2001:20::1")), "ORCHIDv2");
+        // 2001:db8::/32 is deliberately NOT denied — see is_special_v6.
+        assert!(
+            !is_forbidden_peer(ip("2001:db8::1")),
+            "the documentation prefix must stay allowed: it embeds no IPv4 address \
+             and is the canonical example address in tests"
+        );
+        // A normal global v6 address stays allowed — the point is to deny the
+        // transition/reserved prefixes, not IPv6 itself.
+        assert!(
+            !is_forbidden_peer(ip("2606:4700::1111")),
+            "a routable global v6 peer must remain allowed"
+        );
         assert!(is_forbidden_peer(ip("::"))); // unspecified
     }
 

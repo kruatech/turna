@@ -2,6 +2,18 @@
 # Run: cargo deny check
 
 [graph]
+# Resolve the FULL feature graph, not just default features.
+#
+# Both `ignore` entries below are reachable only through optional features
+# (bincode via webrtc-dtls -> `dtls`; paste via rtnetlink -> `af-xdp`). With the
+# default graph those crates are absent, so cargo-deny reported
+# `advisory-not-detected` for both: the checks were not covering the very builds
+# the ignores exist for. cargo-deny resolves the dependency graph without
+# compiling, so enabling every feature here is safe even though
+# `cargo build --all-features` cannot work (wtransport bundles its own quinn,
+# which conflicts with the standalone quinn dep).
+all-features = true
+
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
@@ -30,8 +42,12 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "BSL-1.0",
-    # webpki-roots / webpki-root-certs: Mozilla CA store data, permissive data license
-    "CDLA-Permissive-2.0",
+    # NOTE: "CDLA-Permissive-2.0" (webpki-roots / webpki-root-certs — Mozilla CA
+    # store data) was removed: with `all-features = true` over both Linux targets
+    # nothing in the graph carries that licence any more, and cargo-deny reported
+    # it as an `unused-allowed-license`. A server does not need a client CA store.
+    # If a future client-side feature pulls webpki-roots back in, cargo-deny will
+    # fail with "license not allowed" — re-add the line then.
 ]
 confidence-threshold = 0.8
 
@@ -41,6 +57,33 @@ crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [
     { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+# libxdp-sys (feature `af-xdp` only) declares `LGPL-2.1 OR BSD-2-Clause`.
+# `LGPL-2.1` is a DEPRECATED SPDX identifier (current: LGPL-2.1-only /
+# LGPL-2.1-or-later), so cargo-deny cannot parse the expression and degrades to a
+# warning — which means this crate's licence was effectively NOT being checked.
+#
+# The expression is a disjunction and we elect the permissive branch,
+# BSD-2-Clause, which is already in `allow` above. Recorded in
+# docs/COMPLIANCE.md §7 so the election is auditable rather than implicit.
+#
+# Note this also covers the vendored C libraries (libxdp/libbpf) reached through
+# this -sys crate, which carry the same dual licence. `af-xdp` is the only feature
+# that pulls an LGPL branch into the graph at all; it is absent from default and
+# production builds.
+[[licenses.clarify]]
+crate = "libxdp-sys"
+expression = "BSD-2-Clause"
+# cargo-deny 0.19 requires this field to be present. Empty = elect the branch from
+# the crate's own declared disjunction without pinning a file hash; unlike `ring`
+# above, we are not overriding an unparseable licence, only choosing between two
+# the crate already offers.
+license-files = [
+    # Elects the permissive branch of the crate's own `LGPL-2.1 OR BSD-2-Clause`
+    # disjunction by pinning the BSD file it ships. The LGPL-2.1 file is present
+    # in the crate and deliberately NOT referenced. See docs/COMPLIANCE.md §7.
+    { path = "LICENSE-BSD-2-Clause", hash = 0x00000000 },
 ]
 
 [licenses.private]

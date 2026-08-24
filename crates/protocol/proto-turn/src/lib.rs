@@ -188,6 +188,118 @@ pub fn build_oauth_challenge(
 mod tests {
     use super::*;
 
+    /// A `300 Try Alternate` must carry ALTERNATE-SERVER as attribute type
+    /// **0x8023**, checked on the encoded bytes rather than through the enum.
+    ///
+    /// This is a wire-format regression test, and it exists because the constant was
+    /// `0x0003` — which is RFC 5780 CHANGE-REQUEST, a different attribute entirely.
+    /// Every cluster redirect and every lame-duck drain therefore shipped a `300`
+    /// whose alternate address no conforming client could find, so the redirect
+    /// silently did nothing. Nothing caught it: the enum variant was right, the
+    /// round-trip tests passed because they used the same wrong constant on both
+    /// sides, and the documentation claimed the value had already been corrected.
+    ///
+    /// Asserting the literal bytes is the point. A test written against
+    /// `ATTR_ALTERNATE_SERVER` would have passed throughout the bug.
+    #[test]
+    fn redirect_encodes_alternate_server_as_0x8023() {
+        let alt: std::net::SocketAddr = "203.0.113.7:3478".parse().unwrap();
+        let tid = [0x11u8; 12];
+        let msg = build_redirect_response(
+            Method::Allocate,
+            tid,
+            alt,
+            "198.51.100.9:50000".parse().unwrap(),
+        );
+
+        let mut buf = [0u8; 512];
+        let len = msg.encode(&mut buf).expect("redirect must encode");
+        let wire = &buf[..len];
+
+        // Walk the TLV attributes after the 20-byte STUN header and collect the
+        // types actually present on the wire.
+        let mut types = Vec::new();
+        let mut alt_value: Option<&[u8]> = None;
+        let mut off = 20usize;
+        while off + 4 <= wire.len() {
+            let t = u16::from_be_bytes([wire[off], wire[off + 1]]);
+            let l = u16::from_be_bytes([wire[off + 2], wire[off + 3]]) as usize;
+            let vstart = off + 4;
+            assert!(
+                vstart + l <= wire.len(),
+                "attribute {t:#06x} runs past the message"
+            );
+            types.push(t);
+            if t == 0x8023 {
+                alt_value = Some(&wire[vstart..vstart + l]);
+            }
+            off = vstart + l + ((4 - (l % 4)) % 4); // 4-byte alignment padding
+        }
+
+        assert!(
+            types.contains(&0x8023),
+            "no ALTERNATE-SERVER (0x8023) on the wire; attribute types present: {:#06x?}",
+            types
+        );
+        assert!(
+            !types.contains(&0x0003),
+            "0x0003 is on the wire — that is RFC 5780 CHANGE-REQUEST, not \
+             ALTERNATE-SERVER. This is the exact regression this test guards: types \
+             present {:#06x?}",
+            types
+        );
+
+        // ALTERNATE-SERVER uses the plain MAPPED-ADDRESS encoding (RFC 5389 §15.5):
+        // 0x00, family, port, address — NOT xor-mapped. Getting this wrong is the
+        // other way a client fails to find the alternate.
+        let v = alt_value.expect("value captured above");
+        assert_eq!(
+            v.len(),
+            8,
+            "IPv4 MAPPED-ADDRESS is 8 bytes, got {}",
+            v.len()
+        );
+        assert_eq!(v[0], 0x00, "leading byte must be zero");
+        assert_eq!(v[1], 0x01, "family must be 0x01 for IPv4");
+        assert_eq!(
+            u16::from_be_bytes([v[2], v[3]]),
+            3478,
+            "port must be the plain port, unxored"
+        );
+        assert_eq!(
+            &v[4..8],
+            &[203, 0, 113, 7],
+            "address must be plain, unxored"
+        );
+    }
+
+    /// The error code itself, on the wire, for the same reason.
+    #[test]
+    fn redirect_encodes_error_code_300() {
+        let msg = build_redirect_response(
+            Method::Allocate,
+            [0u8; 12],
+            "203.0.113.7:3478".parse().unwrap(),
+            "198.51.100.9:50000".parse().unwrap(),
+        );
+        let mut buf = [0u8; 512];
+        let len = msg.encode(&mut buf).expect("encode");
+        let wire = &buf[..len];
+
+        let mut off = 20usize;
+        let mut code = None;
+        while off + 4 <= wire.len() {
+            let t = u16::from_be_bytes([wire[off], wire[off + 1]]);
+            let l = u16::from_be_bytes([wire[off + 2], wire[off + 3]]) as usize;
+            if t == 0x0009 && l >= 4 {
+                // ERROR-CODE: two reserved bytes, then class and number.
+                code = Some(u16::from(wire[off + 6]) * 100 + u16::from(wire[off + 7]));
+            }
+            off += 4 + l + ((4 - (l % 4)) % 4);
+        }
+        assert_eq!(code, Some(300), "expected 300 Try Alternate on the wire");
+    }
+
     #[test]
     fn auth_challenge_advertises_password_algorithms() {
         let msg = build_auth_challenge(Method::Allocate, [0u8; 12], "realm", "nonce");
