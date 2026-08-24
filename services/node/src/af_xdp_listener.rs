@@ -119,6 +119,11 @@ pub fn run_af_xdp(
         std::collections::HashMap::new();
     let listen_port = listen.port();
 
+    // Own readiness gauge, not the process-level one: on a kernel-bypass datapath
+    // "the XSK socket died but the process is fine" is a distinct and far more
+    // likely failure than the process dying, and `/ready` will not show it.
+    metrics.set_afxdp_readiness(turna_health::Readiness::Ready);
+
     // Busy-poll RX → process → TX, backing off briefly when idle so a quiet
     // socket doesn't peg a core.
     loop {
@@ -129,6 +134,7 @@ pub fn run_af_xdp(
         // releases all resources; the operator-owned XDP program is untouched.
         if *shutdown.borrow() {
             tracing::info!("AF_XDP datapath: shutdown signalled, stopping");
+            metrics.set_afxdp_readiness(turna_health::Readiness::Draining);
             return Ok(());
         }
         let frames = dp.recv_batch(64);

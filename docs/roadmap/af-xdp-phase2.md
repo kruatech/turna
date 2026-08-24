@@ -1,4 +1,58 @@
-# AF_XDP Phase 2 — implementation plan
+# AF_XDP Phase 2 — implementation plan (COMPLETED)
+
+> **STATUS: all four items shipped and validated on hardware (IPv4 + IPv6).** See
+> `docs/roadmap/IMPLEMENTATION_STATUS.md` → "Stage 4b" for what landed. This file is
+> kept as the record of *how* it was planned, not as a task list.
+>
+> It has already caused one wrong conclusion. Read as a status document it says
+> IPv6, netlink neighbour resolution and ring metrics are outstanding — all three
+> are in the code (`build_eth_ipv6_udp`, `maybe_ndp_reply`, `crate::neighbor` with
+> rtnetlink 0.21, `turna_afxdp_tx_inflight`), and `send_to` resolves the next hop
+> per destination rather than using a single static MAC. If you are asking "what is
+> left for AF_XDP", the answer is **not code**: it is recorded evidence on the
+> target NIC, plus per-queue metric labels once multi-queue binding exists.
+> Everything below the line is the original plan text, unchanged.
+
+> **Found 2026-08-19: `zero_copy` conflates two orthogonal settings.**
+>
+> `cfg.zero_copy` drives both the XSK bind flag (`XDP_ZEROCOPY` vs `XDP_COPY`,
+> `af_xdp.rs:1451`) and the XDP attach mode (NATIVE/DRV vs SKB/generic,
+> `af_xdp.rs:1196`). Those are independent: the attach mode decides *where the
+> program runs*, zero-copy decides *whether the driver DMAs into the UMEM*.
+>
+> The consequence shows up on veth, which supports native XDP attach but not
+> zero-copy: there is no way to ask for a native attach without also asking for
+> zero-copy, which the device refuses. So the lab is stuck in SKB mode.
+>
+> Fix, when someone takes this on: separate keys — `attach_mode = "native"|"skb"` and
+> `zero_copy = true|false` — with the current single flag kept as a compatible
+> default. Not done here: it changes the meaning of an existing config key, and
+> nothing verified which combinations the target NIC actually supports.
+
+> **Found 2026-08-19: `frame_count` above 2× the ring size silently kills RX.**
+>
+> `af_xdp.rs` honours `cfg.frame_count` but pins the rings to the xsk-rs defaults
+> ("for first-light use library defaults (frame 4096, rings 2048) and honour only
+> frame_count"). The RX half of the UMEM has to fit the 2048-entry fill ring, so:
+>
+> | `frame_count` | `umem_free_frames` | RX |
+> |---|---|---|
+> | 4096 (default) | 2016 | works — 2015 frames received |
+> | 16384 | 8160 | **dead — 0 frames received, no error anywhere** |
+>
+> Nothing reports it. The socket binds, the program attaches, readiness reads 1, and
+> not a single packet arrives.
+>
+> Related: `[turn.af_xdp]` exposes `fill_ring_size`, `comp_ring_size`, `rx_ring_size`
+> and `tx_ring_size`, and **all four are ignored** — the same comment says so. A
+> config key that does nothing is worse than an absent one, because it invites exactly
+> the change that breaks RX.
+>
+> Fix, when someone takes this on: size the rings from `frame_count` (or honour the
+> four ring keys), and refuse a combination where the RX frames cannot fit the fill
+> ring instead of accepting it and going quiet.
+
+---
 
 These are the remaining AF_XDP code items. They are **not** written blind here:
 each needs the compiler + AF_XDP hardware in the loop, and writing netlink wire

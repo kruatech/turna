@@ -150,11 +150,13 @@ quic = ["dep:quinn", "dep:wtransport", "dep:rustls", "dep:rustls-pemfile"]
   stream reported id 0). The key is opaque routing state between the transport
   and the bridge, not the on-wire QUIC stream id — the real index would need the
   same gated quinn re-export as above.
-- **Certificate hot-reload.** `Endpoint::reload_config(cfg, rebind = false)`
-  swaps the material for new sessions without touching live ones, polled by
-  mtime on `[turn.quic].cert_reload_secs` (`turna_quic_cert_reloads_total`,
-  `turna_quic_cert_reload_failures_total`). The **raw-QUIC** path has no such
-  hook and still needs a restart.
+- **Certificate hot-reload on both paths**, polled by mtime on
+  `[turn.quic].cert_reload_secs` (`turna_quic_cert_reloads_total`,
+  `turna_quic_cert_reload_failures_total`). WebTransport uses
+  `Endpoint::reload_config(cfg, rebind = false)`; raw QUIC uses
+  `Endpoint::set_server_config(Some(cfg))`. Both affect new sessions only, live
+  ones are untouched. The raw path rebuilds through the same
+  `build_quic_config()` used at startup, so startup and reload cannot drift.
 - **Session descriptor is honest**: `datagrams_available` comes from
   `Connection::max_datagram_size()` and `local_addr` from
   `Endpoint::local_addr()`.
@@ -174,12 +176,16 @@ quic = ["dep:quinn", "dep:wtransport", "dep:rustls", "dep:rustls-pemfile"]
 
 ### Missing / known gaps
 
-1. **No certificate hot-reload on the raw-QUIC path** (`web_transport = false`).
-2. **`alpn` is inert on the WebTransport path** (wtransport forces `h3`).
-3. **Transport limits not applied on the WebTransport path** — see the first
-   bullet of the previous section. Enabling wtransport's quinn re-export would
-   close this and give back the real stream ids in one go.
-4. **No loopback or browser interop test yet** — §5 remains the plan.
+1. **`alpn` is inert on the WebTransport path** (wtransport forces `h3`).
+2. **No loopback or browser interop test yet** — §5 remains the plan.
+
+Closed: the transport limits *are* applied on the WebTransport path. The
+wtransport dependency now enables its `quinn` feature, which exposes
+`ServerConfig::quic_config_mut()`; `build_wt_config` installs a
+`quinn::TransportConfig` built from `[turn.quic]` exactly like the raw path. The
+same re-export would also give back the real on-wire stream ids — the opaque
+per-session counter is kept deliberately, since routing needs a stable key rather
+than the QUIC index.
 
 Note on `--all-features`: `web-transport` pulls wtransport's own bundled quinn,
 which can conflict with the standalone `quinn` dependency. Build the two QUIC

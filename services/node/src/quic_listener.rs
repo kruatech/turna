@@ -75,6 +75,12 @@ pub fn spawn_quic(
     // Mirror QuicStats into the shared Prometheus Metrics every few seconds
     // (the transport crate is leaf-level and cannot depend on turna-health, so
     // the copy lives here in the node where both crates are visible).
+    // Cloned before the mirror task below, which moves `metrics` into itself. Both
+    // are used to mark the listener degraded if it dies.
+    let dead_metrics = metrics.clone();
+    let consumer_metrics = metrics.clone();
+    let consumer_shutdown = shutdown.clone();
+
     {
         let stats = stats.clone();
         tokio::spawn(async move {
@@ -89,7 +95,9 @@ pub fn spawn_quic(
                 metrics.quic_datagrams_rx.store(s.datagrams_rx, Relaxed);
                 metrics.quic_datagrams_tx.store(s.datagrams_tx, Relaxed);
                 metrics.quic_streams_opened.store(s.streams_opened, Relaxed);
-                metrics.quic_control_bytes_tx.store(s.control_bytes_tx, Relaxed);
+                metrics
+                    .quic_control_bytes_tx
+                    .store(s.control_bytes_tx, Relaxed);
                 metrics.quic_send_errors.store(s.send_errors, Relaxed);
                 metrics
                     .quic_handshake_failures
@@ -100,7 +108,9 @@ pub fn spawn_quic(
                 metrics
                     .quic_rejected_over_cap
                     .store(s.rejected_over_cap, Relaxed);
-                metrics.quic_rejected_per_ip.store(s.rejected_per_ip, Relaxed);
+                metrics
+                    .quic_rejected_per_ip
+                    .store(s.rejected_per_ip, Relaxed);
                 metrics.quic_cert_reloads.store(s.cert_reloads, Relaxed);
                 metrics
                     .quic_cert_reload_failures
@@ -124,12 +134,22 @@ pub fn spawn_quic(
     let st = stats.clone();
     let web_transport = cfg.web_transport;
     let listener_shutdown = shutdown.clone();
+    // A listener that dies must say so. `if let Err(...)` below covers a returned
+    // error, but not a panic: the task unwinds, the closure never reaches this line,
+    // the JoinHandle is dropped, and the only trace left is the consumer noticing its
+    // channel closed — at INFO. That is how a dead QUIC listener looked in a
+    // verification run: "QUIC server starting", then an info line, and
+    // `turna_quic_readiness` sitting at 2 with nothing explaining why.
     tokio::spawn(async move {
         let result =
             run_listener(server, web_transport, event_tx, reg, st, listener_shutdown).await;
-        if let Err(e) = result {
-            tracing::error!(%e, "QUIC listener exited");
+        match result {
+            Ok(()) => tracing::info!("QUIC listener stopped"),
+            Err(e) => tracing::error!(%e, "QUIC listener exited with an error"),
         }
+        // Reached on a clean return and on an error, but NOT on a panic — hence the
+        // consumer-side check as well.
+        dead_metrics.set_quic_readiness(turna_health::Readiness::Degraded);
     });
 
     // -- consumer task: bridge events into the processor, route responses back --
@@ -267,7 +287,24 @@ pub fn spawn_quic(
                 }
             }
         }
-        tracing::info!("QUIC bridge consumer stopped (listener closed)");
+        // The consumer's channel closing means the listener is gone, whatever the
+        // reason — including a panic, which leaves no other trace. Report it as an
+        // error and mark the listener degraded so it is visible in metrics and to
+        // the alert rule, rather than only in a log line nobody greps for.
+        // Distinguish a clean stop from a disappearance. The channel closes in both
+        // cases, but only one of them is a fault — logging ERROR on every SIGTERM
+        // would teach a reader to ignore exactly the line that exists to catch a
+        // silent listener panic.
+        if *consumer_shutdown.borrow() {
+            tracing::info!("QUIC bridge consumer stopped (listener closed during drain)");
+        } else {
+            tracing::error!(
+                "QUIC listener is gone: the event channel closed while the node was not \
+                 draining. If no listener error was logged above, the listener task \
+                 panicked."
+            );
+            consumer_metrics.set_quic_readiness(turna_health::Readiness::Degraded);
+        }
     });
 }
 

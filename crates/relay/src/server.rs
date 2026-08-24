@@ -402,6 +402,28 @@ impl RelayServer {
         &self.processor
     }
 
+    /// Enable RFC 6156 IPv6 relayed transport on this server's processor.
+    ///
+    /// Reaches the processor through `Arc::get_mut`, which succeeds because this
+    /// is called immediately after construction while the refcount is still 1 (the
+    /// same pattern the QUIC listener uses for `quinn::ServerConfig::transport`).
+    /// If it ever fails, IPv6 stays off and says so rather than silently
+    /// advertising a v6 candidate the datapath will not bind.
+    pub fn with_external_ip6(mut self, ip6: Option<std::net::Ipv6Addr>) -> Self {
+        if ip6.is_none() {
+            return self;
+        }
+        match Arc::get_mut(&mut self.processor) {
+            Some(p) => p.set_external_ip6(ip6),
+            None => error!(
+                "cannot enable IPv6 relayed transport: the processor is already \
+                 shared. IPv6 stays disabled (an explicit IPv6 Allocate keeps \
+                 answering 440)."
+            ),
+        }
+        self
+    }
+
     /// Shared cross-transport client-sink registry (addr -> writer).
     /// DTLS/QUIC listeners register established client addresses here so
     /// peer->client relay data is delivered over the right transport.
@@ -414,6 +436,15 @@ impl RelayServer {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!(addr = %self.transport.local_addr()?, "relay server started (tokio)");
+
+        // `turna_transport_readiness` was exported, documented as the primary UDP
+        // backend's readiness, and listed as shipped — but `set_transport_readiness`
+        // was never called anywhere, so it read `0` (starting) for the life of every
+        // process, including one actively serving traffic. Found by a browser interop
+        // run against a healthy node. Set it here, where the datapath is actually up.
+        self.processor
+            .metrics()
+            .set_transport_readiness(turna_health::Readiness::Ready);
 
         // Per-port relay recv-task handles, so a released/expired relay can be
         // stopped (its socket closed, fd freed, port reusable).
@@ -779,6 +810,9 @@ impl RelayServer {
         }
         info!("shutdown signal received, draining...");
         self.processor.metrics().set_draining(true);
+        self.processor
+            .metrics()
+            .set_transport_readiness(turna_health::Readiness::Draining);
         self.drain().await;
         for w in &workers {
             w.abort();

@@ -23,6 +23,59 @@ groups:
           summary: "io_uring relay socket capacity exhausted"
           description: "Allocations are being rejected (508). Raise [turn.io_uring].relay_socket_capacity_per_worker or add workers."
 
+      - alert: TurnaDtlsHandshakeFailuresHigh
+        expr: rate(turna_dtls_handshake_failures_total[5m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DTLS handshakes are failing"
+          description: >-
+            Only meaningful with [turn.dtls].demux = true — on the stock listener
+            a failed handshake is not observable, so this counter stays at zero
+            there. A sustained rate means bad certificate material, no shared
+            cipher suite, or a scanner.
+
+      - alert: TurnaDtlsRateLimited
+        expr: rate(turna_dtls_rejected_rate_limit_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "DTLS handshakes refused by the per-IP rate limit"
+          description: >-
+            Expected under a flood; the refusal happens before any DTLS state is
+            created. Steady firing without an attack means the limit is below what
+            a shared NAT/CGNAT egress legitimately needs.
+
+      - alert: TurnaDtlsCertReloadFailing
+        expr: rate(turna_dtls_cert_reload_failures_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DTLS certificate reload is failing"
+          description: >-
+            The previous certificate stays in service, so this is not an outage —
+            but the rotation is not landing. Check the PEM files are complete and
+            readable.
+
+      - alert: TurnaDtlsAcceptTimeouts
+        expr: rate(turna_dtls_accept_timeouts_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DTLS handshakes are being abandoned at the accept bound"
+          description: >-
+            Each event is one handshake the listener gave up on after
+            [turn.dtls].accept_timeout_secs. This is the guard for
+            webrtc-rs/webrtc#614: without it a single peer that starts a handshake
+            and goes silent parks accept() forever and DTLS stops serving everyone
+            while the process still reads Ready. A steady rate means either a
+            deliberate flood (new-session throughput is degraded, one timeout
+            window at a time) or a bound set below real handshake latency.
+
   # NOTE: there is deliberately no DTLS handshake-failure rule. The handshake
   # runs inside the DTLS stack below the point the server observes it, so
   # `turna_dtls_handshake_failures_total` does not exist — an earlier version of
@@ -114,6 +167,31 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "TURNS connections refused by the per-IP cap"
+      - alert: TurnaTlsHandshakeRateLimited
+        expr: rate(turna_tls_rejected_rate_limit_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "TURNS handshakes refused by the per-IP rate limit"
+          description: >-
+            A source IP is exceeding [tls].max_handshakes_per_sec_per_ip. Expected
+            under a connection flood — the refusal is pre-handshake and cheap. If
+            it fires steadily without an attack, the limit is set too low for a
+            legitimate client (a NAT or CGNAT egress shares one IP).
+
+      - alert: TurnaTlsAlpnRejected
+        expr: rate(turna_tls_alpn_rejected_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TURNS connections refused for missing ALPN"
+          description: >-
+            [tls].alpn_required is set and clients are negotiating no ALPN. Either
+            the client stack does not offer ALPN (then this rejects real users —
+            unset alpn_required) or something is probing the port.
+
       - alert: TurnaTlsFramingErrors
         expr: rate(turna_tls_framing_errors_total[5m]) > 1
         for: 10m

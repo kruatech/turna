@@ -4,6 +4,24 @@ name = "turna-load-test"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# TURN-over-QUIC verification client (`quic-check` mode). Off by default: it pulls
+# quinn + rustls into a tool whose other modes need neither.
+quic = ["dep:quinn", "dep:rustls"]
+# TURN-over-TLS verification client and load driver (`tls-check`, `tls` modes).
+# This is what makes a TURNS soak possible at all — the UDP modes cannot put load
+# on the TLS path.
+# `rustls-pemfile` is only needed to load a client certificate for mTLS.
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+# TURN-over-DTLS verification client (`dtls-check`). Versions match the server's
+# so a disagreement cannot be blamed on a version skew.
+dtls = ["dep:webrtc-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
+# TURN-over-WebTransport verification client (`wt-check`). Same wtransport version
+# as the server, so a mismatch cannot be blamed on version skew — and the same
+# library on both sides is also this check's limitation, noted in the module.
+web-transport = ["dep:wtransport"]
+
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
@@ -14,3 +32,17 @@ sha1.workspace = true
 md5.workspace = true
 turna-observability.workspace = true
 clap = { version = "4", features = ["derive"] }
+# Match the versions turna-transport builds against, or client and server negotiate
+# different things and a failure becomes ambiguous.
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+webrtc-dtls = { version = "0.10", features = ["pem"], optional = true }
+webrtc-util = { version = "0.9", optional = true }
+# `dangerous-configuration` is what exposes `with_no_cert_validation()`
+# (wtransport 0.7.1 config.rs:902). This is a verification client pointed at
+# test servers with self-signed certificates; the feature name is accurate and
+# is the reason this must never be linked into anything but a test tool.
+wtransport = { version = "0.7", features = ["quinn", "dangerous-configuration"], optional = true }
+async-trait = { version = "0.1", optional = true }

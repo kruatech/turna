@@ -9,6 +9,17 @@ what each `partial` needs to become `stable`.
 "Unverified" = plausibly present but not inspected — treated as an audit item, not
 a claim. Line numbers are omitted (they drift); symbols/paths are stable enough.
 
+**Transport pass 2026-08-13**: the TLS / DTLS / QUIC-WebTransport rows below were
+re-checked against the code after the encrypted-transport hardening work; entries
+marked "Done since the audit" reflect that pass. The codec rows are unchanged.
+
+**Doc-truth gate.** This file is the register operators and auditors read, and it
+has been wrong before: the RFC 5780 entry claimed a codec that did not exist, and
+in doing so hid a real wire bug (`ATTR_ALTERNATE_SERVER` was 0x0003, i.e.
+CHANGE-REQUEST, so every `300 Try Alternate` was unreadable). `scripts/check-doc-claims.sh`
+now ties the load-bearing claims here to a grep over the code and fails CI when
+they diverge. If you change a status line below, run it.
+
 **Codec audit performed 2026-07-12** against `crates/protocol/proto-stun/src/{lib,
 header,message,attribute,method}.rs`, `crates/protocol/proto-turn/src/lib.rs`,
 `crates/crypto/src/lib.rs`, `crates/relay/src/processor.rs` (auth path in
@@ -42,20 +53,21 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 | Feature | Status | Confirmed by |
 |---|---|---|
 | STUN core (RFC 8489) | present, audited + hardened | typed attrs, 420, SHA-1/256 verify+sign, vectors+fuzz |
-| TURN UDP (RFC 8656) | present, audited (interop pending) | 7 methods, TURN attrs typed, EVEN-PORT/RESV, builder roundtrips |
+| TURN UDP (RFC 8656) | present, **interop verified** | 7 methods, TURN attrs typed, EVEN-PORT/RESV, builder roundtrips; agreement with coturn's client (`docs/interop/coturn-2026-08-23.md`) |
 | EVEN-PORT / RESERVATION-TOKEN | present | `get_even_port`, `allocate_even_and_bind` |
-| IPv6 (RFC 8656) | partial | `Attribute::RequestedAddressFamily` |
+| IPv6 (RFC 8656) | partial | relaying works per-family behind `[turn] external_ip6`; **relayed media and coturn interop verified on routable addresses**; still no `ADDITIONAL-ADDRESS-FAMILY`, and no run across different hosts |
 | Mobility (RFC 8016) | partial | `Attribute::MobilityTicket` issue+reissue |
-| DTLS (RFC 7350) | partial | `DtlsSection` (feature-gated) |
+| DTLS (RFC 7350) | present, **interop verified** | `DtlsSection` (feature-gated); allocation, media both directions on both listener paths, 20 min under load, and agreement with coturn's client (`docs/interop/coturn-2026-08-23.md`) |
 | TLS 1.3 / TURNS | present, audit needed | `[tls]` listener config |
 | ALPN (RFC 7443) | partial | referenced in config + node main |
 | TURN REST credentials | present (compat) | `AuthMode::SharedSecret` HMAC |
 | Multi-realm / tenant | present, isolation tests needed | per-tenant range + disjointness validation + realm match |
 | Peer filtering (SSRF) | present | `peer_filter` module |
 | TCP relay (RFC 6062) | **near-complete (experimental)** | Allocate(TCP)+CONNECT+ConnectionBind raw-detach over TLS + **peer-initiated relayed TCP listener + accept loop + CONNECTION-ATTEMPT indication + ConnectionBind on peer-initiated conns**; ConnectionBind ownership-bound (O#1), leak-safe detach (O#2); off by default; remaining: pipelined-client hardening + interop verification; **still refused under `production=true`** pending interop verification |
-| NAT discovery (RFC 5780) | **partial** | codec done (CHANGE-REQUEST/OTHER-ADDRESS/RESPONSE-ORIGIN); dual-IP datapath remains (#9) |
+| NAT discovery (RFC 5780) | **absent** | no codec in the tree — see the section below; the earlier "codec done" claim was wrong |
 | OAuth (RFC 7635) | **done** (stages 1–3) | codec + AuthMode::OAuth (AEAD decrypt + MI-by-mac_key; token-time = §6.2 fixed-point + clock skew) + config wiring + 401 THIRD-PARTY-AUTHORIZATION challenge + §6.1 lifetime cap incl. zero-remaining 401 + **`kid`-from-USERNAME key selection (RFC 7635 §6.1): kid-tagged keys select one AS-RS key directly; `strict_kid` opt-in rejects unknown/absent kid, default keeps trial-decrypt fallback for rotation**. Remaining: RFC 6062 TCP-allocate binding |
 | ORIGIN | **present (codec)** | `Attribute::Origin` (0x802F) parse/encode/getter |
+| QUIC / WebTransport | **both beta** — raw QUIC has correctness, relayed media and 20 min under load, but **no independent implementation can exist**: no RFC defines TURN over raw QUIC. WebTransport has browser interop (Chrome 151, real certificate, `docs/interop/webtransport-browser-2026-08-20.md`) plus 20 min under load | `quic.rs` raw-QUIC + wtransport H3 paths; per-stream control replies, session + per-IP caps, per-IP handshake rate limit, cert hot-reload and the full `[turn.quic]` transport limits on **both** paths (the wtransport `quinn` dependency feature is enabled, so `quic_config_mut()` is reachable). Remaining: `alpn` inert on H3 (wtransport forces `h3`), no interop test |
 | SCTP client transport | **wired** | codec + bridge + transport server + server.with_sctp + [turn.sctp] config + Cargo feature; needs compile pass + host kernel; **refused under `production=true`** (config gate) |
 
 ---
@@ -117,10 +129,12 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **Priority**: highest (everything rides on it) — but this is now *hardening*, not
   build-from-scratch.
 
-### TURN UDP — RFC 8656 — audited (codec), interop pending
+### TURN UDP — RFC 8656 — audited (codec), interop verified
 - **Methods** (`method.rs`): Binding 0x0001, Allocate 0x0003, Refresh 0x0004,
   Send 0x0006, Data 0x0007, CreatePermission 0x0008, ChannelBind 0x0009 — the full
-  RFC 8656 method set. No Connect/ConnectionBind (confirms 6062 TCP-relay absent).
+  RFC 8656 method set. (This bullet used to add "no Connect/ConnectionBind,
+  confirming 6062 absent"; that is stale — `Method::{Connect, ConnectionBind,
+  ConnectionAttempt}` 0x000A/0B/0C now exist, see the RFC 6062 section below.)
 - **TURN attributes typed** (`attribute.rs` + `proto-turn`): LIFETIME(u32),
   REQUESTED-TRANSPORT(u8), XOR-PEER-ADDRESS, XOR-RELAYED-ADDRESS, CHANNEL-NUMBER,
   DATA, DONT-FRAGMENT, EVEN-PORT(bool R-bit), RESERVATION-TOKEN([u8;8]),
@@ -140,12 +154,39 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   and runtime-leak proof, not protocol implementation.
 
 ### TLS 1.3 / TURNS
-- **Confirmed**: `[tls]` listener config (TURNS enable).
-- **Unverified (audit)**: version floor (reject ≤1.1), 0-RTT disabled by default,
-  cert reload without datapath restart, handshake rate limiting.
+- **Confirmed**: `[tls]` listener config; rustls `with_safe_default_protocol_versions`
+  pinned to the `ring` provider (`tls12` + 1.3, so ≤1.1 is out by construction);
+  ALPN `stun.turn` / `stun.nat-discovery` advertised when `enable_alpn`.
+- **Done since the audit**: **cert reload without datapath restart** —
+  `CertReloader` polls mtime on `[tls].cert_reload_secs` and each new connection
+  takes the current `ServerConfig`; a failed reload keeps the previous material
+  (`turna_tls_cert_reloads_total`, `turna_tls_cert_reload_failures_total`).
+  Connection caps (global + per-IP), handshake timeout with its own counters, and
+  accept-error resilience are in (`docs/security/transport-checklist.md`).
+- **Unverified (audit)**: 0-RTT / early-data policy stated explicitly; behaviour on
+  expired / unknown-CA client certs (no client auth is configured today).
+- **Done since the audit**: a handshake **rate** limit —
+  `[tls].max_handshakes_per_sec_per_ip` / `handshake_burst_per_ip`, the same
+  token bucket the QUIC paths use (`crate::ratelimit::HandshakeLimiter`, lifted
+  out of `quic.rs` so a `--features tls` build can reach it). Refused before
+  `tls.accept()`, counted as `turna_tls_rejected_rate_limit_total`. Off by
+  default, like the QUIC one.
+- **Done since the audit**: ALPN **strict** mode — `[tls].alpn_required` refuses a
+  client that negotiates no ALPN (`turna_tls_alpn_rejected_total`). rustls already
+  failed the handshake on a non-overlapping offer; the gap was the client offering
+  none at all. Default stays compatible.
 - **Required tests**: 1.3 handshake, 1.2 compat, ≤1.1 rejected, expired/unknown-CA,
-  cert reload, handshake flood bound.
-- **partial→stable**: version policy + early-data-off + reload proven; ALPN wired.
+  cert reload (covered by `docs/verification/encrypted-transports.md`), handshake
+  flood bound.
+- **Done since the audit**: interop evidence, re-recorded against the current code —
+  Chrome 151 / Firefox 153 / Safari 26.5, full allocation and bidirectional relayed
+  data, with `relayProtocol: tls` confirming the transport on the two engines that
+  report it (`docs/interop/turns-browsers-2026-08-18.md`).
+- **Done 2026-08-22/23**: 24 h under load against this code with zero relayed-frame
+  loss and no leak (`docs/soak/endurance-24h-2026-08-22.md`), a Let's Encrypt chain
+  validated by a verifying client on a public deployment, and agreement with coturn's
+  client (`docs/interop/coturn-2026-08-23.md`). TURNS is **supported**.
+- **Remaining**: version/early-data policy documented.
 - **Priority**: high (TURNS is the common browser path).
 
 ### TURN REST credentials (compatibility, NOT an RFC)
@@ -177,14 +218,81 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 
 ## partial
 
-### IPv6 — RFC 8656
+### IPv6 — RFC 8656 / RFC 6156
 - **Confirmed**: `Attribute::RequestedAddressFamily` used in Allocate.
-- **Absent/unverified**: all four client/relay/peer family combinations actually
-  relaying; `ADDITIONAL-ADDRESS-FAMILY`; IPv6-specific peer filtering (link-local,
-  ULA, v4-mapped, metadata ranges) as distinct from the v4 checks; external IPv6.
-- **Required tests**: v4→v4, v4→v6, v6→v4, v6→v6; unsupported family error;
-  v4-mapped normalization; external IPv6 peer (not loopback).
-- **partial→stable**: full transport matrix + IPv6 peer-filter classes + external test.
+- **Done since the audit**: IPv6 *relaying* itself. `[turn] external_ip6` (empty =
+  off, and then an IPv6 Allocate still answers 440) turns on a v6 relay socket:
+  `session::PortAllocator::{allocate_and_bind_family, allocate_even_and_bind_family,
+  claim_and_bind_family}` bind in `RelayFamily::{V4,V6}`, and the processor
+  advertises `external_ip6` in XOR-RELAYED-ADDRESS for v6 allocations. RFC 6156
+  §4.2 family separation is enforced: a cross-family peer is refused with **443
+  Peer Address Family Mismatch** on CreatePermission and ChannelBind, and dropped
+  (counted) on a Send indication, which has no error response. The relay port pool
+  is shared — one port number is bound in exactly one family at a time, so port
+  accounting is unchanged. Config validation rejects a v4 literal in
+  `external_ip6`.
+- **Also done**: IPv6 peer-filter classes and a family-aware DONT-FRAGMENT.
+  `peer_filter::is_special_v6` now denies, besides link-local: deprecated
+  site-local `fec0::/10`, and the **v4-embedding transition prefixes** — NAT64
+  `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/32` and the deprecated
+  IPv4-compatible `::/96`. That last group is the security-relevant one: each
+  carries an arbitrary IPv4 address inside a v6 literal, so without them every v4
+  rule (169.254.169.254, RFC 1918, the operator deny list) was bypassable by
+  asking for the v6 spelling of the same target — reachable the moment IPv6
+  relaying existed. Also denied: discard-only `100::/64`, benchmarking
+  `2001:2::/48`, ORCHIDv2 `2001:20::/28`. Deliberately **not** denied:
+  documentation `2001:db8::/32` — it embeds no IPv4 address, so it is not a bypass,
+  and it is the canonical stand-in for a public v6 address in test suites (denying
+  it broke this crate's own peer-filter test). ULA
+  `fc00::/7` remains under `deny_private`, unchanged. And `set_dont_fragment` now
+  takes the relay family and uses `IPPROTO_IPV6`/`IPV6_MTU_DISCOVER` on a v6
+  socket — the v4 option does not set DF on an `AF_INET6` socket, so a v6
+  allocation with DONT-FRAGMENT would have silently fragmented.
+- **Also done**: `IPV6_V6ONLY` is now set on v6 relay sockets (`socket2` under
+  `cfg(unix)` in `turna-session`; the option has to be applied between `socket()`
+  and `bind()`, which `std` cannot express). The family separation no longer rests
+  only on the three downstream checks.
+- **Absent — and blocked on a schema decision, not on protocol work**:
+  `ADDITIONAL-ADDRESS-FAMILY` (RFC 8656 §7.2 — one Allocate asking for both
+  families, which is what a dual-stack WebRTC client wants). The protocol side is
+  small; the state side is not. `turna_allocations` in both
+  `deploy/tarantool/init.lua` and the Rust `INIT_SCRIPT` uses **`relay_port` as the
+  primary key**, so one allocation cannot hold two relay ports without choosing
+  one of:
+  1. keep `relay_port` as the v4 port and carry the v6 port inside the `data` blob
+     — no schema change, but the v6 port loses its index, so port-collision
+     detection and `pool_states` cover only half the allocation (there is an
+     existing `rehydrate_double_port_conflict` test asserting the guarantee this
+     would weaken);
+  2. two tuples per allocation linked by `allocation_id` — keeps both ports
+     indexed, but `by_user` quota counting double-counts and refresh/remove become
+     transactional across two tuples;
+  3. change the primary key — cleanest model, needs a migration story for live
+     data.
+  Recommendation: (3) if a schema migration is acceptable in this release,
+  otherwise (1) with the halved guarantee written down explicitly rather than
+  discovered later. **Not started** — picking wrong here is expensive to unwind,
+  and `init.lua` carries an explicit "change one place, change both" coupling with
+  the Rust script. Full analysis, per-option edit lists, the test list and the
+  ordering argument: [docs/design/additional-address-family.md](design/additional-address-family.md).
+- **Absent**: IPv6 for RFC 6062 TCP relay (still 440 there — the TCP relay datapath
+  has no v6 path).
+- **Verified 2026-08-18** (`docs/interop/conformance-2026-08-18.md`): the control
+  plane, in both configurations — 440 with `external_ip6` unset, an IPv6 relayed
+  address when set, 443 in both directions on a cross-family peer, and all four
+  v4-embedding transition prefixes denied with 403.
+- **Verified 2026-08-19** (`docs/interop/relayed-media-2026-08-19.md`): relayed
+  **media** over IPv6 — 20 000 frames through a v6 allocation, zero loss, p50 0.5 ms,
+  using `channel-data --family v6` (peer on `[::1]`, since a cross-family peer is
+  refused with 443 by design).
+- **Verified 2026-08-23**: relayed media between two *routable* global v6 addresses —
+  6 010 of 6 010 frames, zero loss, peer filter in `lan` profile with no loopback
+  concession. Still outside: routing between different hosts (both addresses belong to
+  one machine).
+- **Required tests**: v4→v4, v4→v6 refused with 443, v6→v6 relaying, v6→v4 refused;
+  440 when `external_ip6` is unset; v4-mapped normalization; external IPv6 peer
+  (not loopback); EVEN-PORT on a v6 allocation.
+- **partial→stable**: the tests above recorded, plus IPv6 peer-filter classes.
 - **Priority**: high (dual-stack is table stakes for WebRTC).
 
 ### Mobility — RFC 8016
@@ -195,16 +303,63 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   #4/#16 this is at most same-cluster, likely **same-node** today), race handling.
 - **Required tests**: address change preserving relay addr + channel binds; replay
   rejected; modified/expired/wrong-realm ticket rejected; cross-node policy defined.
-- **partial→stable**: negative + e2e migration tests; cross-node behaviour documented
-  (or explicitly limited to same-node).
+- **Wiring status (checked 2026-08-18)**: `crates/relay/src/node_migration.rs`
+  (`MigrationCoordinator`, `DrainCoordinator`, `MigrationPayload`) is referenced
+  **only** by `crates/relay/src/lib.rs`'s `pub mod` line — nothing calls it. So
+  cross-node migration is not "unverified", it is **unwired**: there is no path
+  that transfers an allocation to another node. `turna_transport::migration`
+  (tickets / ReKey) *is* wired, which is the part that works.
+- **partial→stable**: negative + e2e migration tests; and a decision on
+  `node_migration.rs` — wire it (needs payload transfer over the control-plane
+  gRPC, plus fencing) or delete it, because a tested-but-uncalled module reads as
+  a feature that exists.
 - **Priority**: medium.
 
 ### DTLS — RFC 7350
 - **Confirmed**: `DtlsSection` config (feature `dtls`, `mtu`, `max_sessions`,
   outbound-drop metric) — a real listener path, not a stub.
-- **Absent/unverified**: DTLS 1.2 interop, anti-amplification (stateless cookie,
-  handshake bounds), loss/reorder/duplicate handling, ALPN over DTLS, DTLS 1.0 kept
-  legacy-only/off.
+- **Done since the audit**: per-IP session cap; receive buffer sized to a full DTLS
+  plaintext fragment (2^14 — it was 2 KiB, so a large client record killed the
+  session); outbound MTU enforced by dropping + counting
+  (`turna_dtls_outbound_oversize_total`) instead of relying on IP fragmentation;
+  allocation released on session close; cooperative drain; readiness gauge.
+  Anti-amplification is covered by the HelloVerifyRequest cookie exchange inside
+  `webrtc-dtls::listen()`.
+- **Upstream liveness bug, mitigated 2026-08-18**: `DtlsListener::accept()` runs
+  `DTLSConn::new()` — the entire handshake — inline and with no timeout
+  (webrtc-rs/webrtc#614). A peer that starts a handshake and goes silent therefore
+  parked the accept loop forever, taking the whole DTLS listener out of service
+  from a single packet, with no signal: socket bound, process healthy, readiness
+  Ready, no counter moving. The cookie exchange does not help — it defends against
+  spoofed sources, not a real peer that stops. `[turn.dtls].accept_timeout_secs`
+  (default 10) now bounds the accept and counts abandonments
+  (`turna_dtls_accept_timeouts_total`). Liveness restored; concurrency not — the
+  accepts are still serial, so a flood costs one timeout window each. Owning the
+  UDP demultiplexer is the structural fix and is the same work that would enable a
+  handshake rate limit and certificate hot-reload. All three should be done
+  together, not separately.
+- **Structural fix implemented, opt-in**: `crates/transport/src/dtls_demux.rs`
+  (`[turn.dtls] demux = true`) owns the UDP socket and runs one task per
+  handshake, which closes all four items at once — concurrency, admission control
+  *before* any DTLS state exists, `max_handshakes_per_sec_per_ip`, and
+  `cert_reload_secs`. Failed handshakes become observable there
+  (`turna_dtls_handshake_failures_total`), which the stock path cannot do. The
+  HelloVerifyRequest cookie exchange is unaffected: it lives in the server-side
+  `DTLSConn` handshake, not in the listener we replaced, and established sessions
+  still go through the shared `handle_dtls_session`, so the record pump, MTU
+  enforcement and idle reaper cannot drift between the two paths.
+  **Default off**: it displaces the only DTLS path with recorded verification
+  (`docs/dtls/`). `partial→stable` for DTLS now means an interop run on the demux
+  path, after which the default can flip.
+- **Verified 2026-08-23**: DTLS 1.2 interop against coturn's `turnutils_uclient`
+  (`docs/interop/coturn-2026-08-23.md`) — an implementation written elsewhere — plus
+  allocation and relayed media on both listener paths and 20 min under load.
+- **Absent/unverified**: in-code handshake **rate**
+  bound (the handshake runs below `accept()`, so it needs a UDP demultiplexer in
+  front — currently an ops mitigation via `iptables hashlimit`), loss/reorder/
+  duplicate handling, ALPN over DTLS, **certificate hot-reload** (the stack fixes
+  its config at `listen()`; rotation logs a warning and needs a restart), DTLS 1.3
+  (RFC 9147) and Connection ID (RFC 9146) are not in the stack at all.
 - **Required tests**: 1.2 allocation; loss/reorder in handshake; invalid cookie;
   handshake timeout; cert rotation; ALPN.
 - **partial→stable**: interop + amplification + failure tests; DTLS 1.0 gated off.
@@ -289,23 +444,27 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **Priority**: medium-high (enterprise/firewalled clients). Now a wiring job, not a
   from-scratch build.
 
-### NAT behavior discovery — RFC 5780 — partial (codec done)
-- **Codec layer — done**: `ATTR_CHANGE_REQUEST` (0x0003) +
-  `Attribute::ChangeRequest{change_ip,change_port}`; `ATTR_RESPONSE_ORIGIN` (0x802B)
-  + `Attribute::ResponseOrigin(SocketAddr)`; `ATTR_OTHER_ADDRESS` (0x802C) +
-  `Attribute::OtherAddress(SocketAddr)` (MAPPED-ADDRESS format, v4+v6); getters
-  `get_change_request/get_other_address/get_response_origin`; test
-  `tests/nat_discovery.rs`. (RESPONSE-PORT/PADDING/CACHE-TIMEOUT skipped — client
-  test knobs, low value.)
-- **Bug fixed while here**: `ATTR_ALTERNATE_SERVER` was **0x0003 (wrong — that is
-  CHANGE-REQUEST)**; corrected to the RFC 5389/8489 value **0x8023**. This changes
-  the wire value the server sends in 300 Try-Alternate redirects to the correct one
-  (coturn/pion expect 0x8023); tests reference the constant symbolically so they
-  follow the fix. Behaviour change — verify.
-- **Remaining (datapath, gated on #9)**: the behaviour-discovery *service* needs a
-  **2×IP / 2×port** topology so the server can answer from an alternate address/port
-  per CHANGE-REQUEST — conflicts with the current single-relay-IP hostNetwork model,
-  so resolve the networking model (#9) first.
+### NAT behavior discovery — RFC 5780 — ABSENT (this entry was wrong)
+- **Correction (2026-08-18).** This section previously claimed the codec was done,
+  listing `ATTR_CHANGE_REQUEST`, `Attribute::ChangeRequest`, `ATTR_RESPONSE_ORIGIN`,
+  `ATTR_OTHER_ADDRESS`, the matching getters and a test `tests/nat_discovery.rs`.
+  **None of that exists.** A repo-wide grep for `ChangeRequest`, `OtherAddress` and
+  `ResponseOrigin` over `crates/` returns nothing, and `proto-stun/tests/` has no
+  `nat_discovery.rs`. Treat RFC 5780 as not started.
+- **Bug the stale entry was hiding.** It also claimed `ATTR_ALTERNATE_SERVER` had
+  been corrected from 0x0003 to 0x8023. It had not — the constant was still
+  **0x0003**, which is CHANGE-REQUEST. Since ALTERNATE-SERVER is the payload of a
+  300 Try Alternate, every cluster redirect and every lame-duck drain redirect was
+  sending an attribute a conforming client cannot recognise as the alternate
+  address. Fixed now (`ATTR_ALTERNATE_SERVER = 0x8023`); 0x0003 is kept as
+  `ATTR_CHANGE_REQUEST_RESERVED` purely so the collision cannot come back.
+  **This is a wire-behaviour change — the redirect path needs a re-test.**
+- **Remaining (all of it)**: the codec, and then the *service*, which needs a
+  **2×IP / 2×port** topology so the server can answer from an alternate
+  address/port per CHANGE-REQUEST. That conflicts with the current
+  single-relay-IP hostNetwork model, so the networking model (#9) comes first.
+- **Priority**: low. Without the dual-address topology the codec alone buys
+  nothing, so the honest status is "not started", not "partial".
 - **Priority**: low (experimental; niche).
 
 ### OAuth third-party authorization — RFC 7635 — done (stages 1–3)
@@ -390,12 +549,22 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
     with_sctp … }` in the tokio backend, after the TURNS block.
   - Fixed `TcpConnectionId::next` visibility to `pub(crate)` so the sctp module can
     mint connection ids.
-- **Remaining**: (1) a **compile pass** — the socket layer (`socket2`+`AsyncFd`,
-  `// VERIFY` marks in `sctp.rs`) was written without a compiler. (2) **Host**: Linux
-  `sctp` kernel module loaded. (3) io_uring backend: SCTP is only wired in the tokio
-  backend path (mirrors where TURNS is wired); add to the io_uring arm if needed.
-- **Recommendation stands**: low real-world use, high attack surface, awkward in
-  containers (needs the host SCTP kernel module). Keep experimental, off by default.
+- **Remaining**: (1) **Host**: Linux `sctp` kernel module loaded. (2) io_uring
+  backend: SCTP is only wired in the tokio backend path (mirrors where TURNS is
+  wired); add to the io_uring arm if needed. (3) The control channel is
+  **plaintext** — TLS-over-SCTP is out of scope, so anything an operator would
+  protect with TURNS is unprotected here. (4) It is missing the hardening every
+  other listener received: no per-IP connection cap, no handshake rate limit, no
+  `turna_sctp_*` metrics, no readiness gauge, and no cooperative drain.
+- **Fixed 2026-08-18**: `sctp_bridge` did not release the allocation on
+  `ConnectionClosed`, so a closed association held its relay port until the TTL and
+  a reconnecting client hit 437. `tls_bridge` had that release; SCTP was missing
+  it. Now mirrored.
+- **Recommendation stands, sharpened**: low real-world use, high attack surface,
+  awkward in containers (needs the host SCTP kernel module). Position: **keep it
+  refused under `production = true` and do not invest further** — the gate already
+  makes it unshippable, so hardening it buys nothing. The only open decision is
+  deletion. Keep experimental, off by default.
 - **Priority**: lowest.
 
 ---

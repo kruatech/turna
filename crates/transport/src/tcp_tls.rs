@@ -64,6 +64,16 @@ pub enum TlsError {
     Closed,
     #[error("TLS handshake timeout ({0:?})")]
     HandshakeTimeout(Duration),
+    #[error("ALPN required but the client negotiated none")]
+    AlpnMissing,
+    #[error("client CA bundle {0} has no usable certificate")]
+    ClientCaEmpty(PathBuf),
+    #[error("client certificate verifier rejected the CA bundle: {0}")]
+    ClientCaInvalid(String),
+    #[error("require_client_cert = true needs client_ca_path")]
+    ClientCertConfig,
+    #[error("alpn_required = true needs enable_alpn = true")]
+    AlpnConfig,
 }
 
 pub type Result<T> = std::result::Result<T, TlsError>;
@@ -86,6 +96,24 @@ pub struct TlsTransportConfig {
     /// Interval for the mtime-based certificate reload. 0 disables it.
     pub cert_reload_interval: Duration,
     pub enable_alpn: bool,
+    /// Per-source-IP handshake **rate** limit (handshakes/second). 0 = unlimited.
+    /// Complements `max_connections_per_ip`, which bounds only how many
+    /// connections a source holds at once.
+    pub max_handshakes_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate.
+    pub handshake_burst_per_ip: u32,
+    /// RFC 7443 strict mode: refuse a client that negotiated no ALPN protocol.
+    /// Requires `enable_alpn`. Default false (compatible mode).
+    pub alpn_required: bool,
+    /// PEM bundle of CA certificates that may sign a TURNS **client** certificate.
+    /// Empty (the default) disables client-certificate verification entirely, which
+    /// is what a public TURN server wants.
+    pub client_ca_path: String,
+    /// With a `client_ca_path` set: refuse a client that presents no certificate.
+    /// `false` allows unauthenticated clients through TLS and leaves them to the
+    /// normal TURN long-term credential check — useful while rolling certificates
+    /// out to an existing fleet.
+    pub require_client_cert: bool,
 }
 
 impl Default for TlsTransportConfig {
@@ -101,6 +129,11 @@ impl Default for TlsTransportConfig {
             max_connections_per_ip: 0,
             cert_reload_interval: Duration::from_secs(30),
             enable_alpn: true,
+            max_handshakes_per_sec_per_ip: 0,
+            handshake_burst_per_ip: 0,
+            alpn_required: false,
+            client_ca_path: String::new(),
+            require_client_cert: false,
         }
     }
 }
@@ -228,6 +261,12 @@ pub struct TlsStats {
     pub cert_reloads: std::sync::atomic::AtomicU64,
     /// Failed certificate hot-reloads (old material kept in service).
     pub cert_reload_failures: std::sync::atomic::AtomicU64,
+    /// Connections refused by the per-IP handshake rate limiter, before any
+    /// TLS work was done.
+    pub rejected_rate_limit: std::sync::atomic::AtomicU64,
+    /// Connections closed after the handshake because `alpn_required` was set
+    /// and the client negotiated no ALPN protocol.
+    pub alpn_rejected: std::sync::atomic::AtomicU64,
     /// True once the TCP listener is bound; cleared on drain/exit.
     pub listening: std::sync::atomic::AtomicBool,
 }
@@ -250,6 +289,8 @@ pub struct TlsStatsSnapshot {
     pub bytes_tx: u64,
     pub cert_reloads: u64,
     pub cert_reload_failures: u64,
+    pub rejected_rate_limit: u64,
+    pub alpn_rejected: u64,
     pub listening: bool,
 }
 
@@ -271,6 +312,8 @@ impl TlsStats {
             bytes_tx: self.bytes_tx.load(Relaxed),
             cert_reloads: self.cert_reloads.load(Relaxed),
             cert_reload_failures: self.cert_reload_failures.load(Relaxed),
+            rejected_rate_limit: self.rejected_rate_limit.load(Relaxed),
+            alpn_rejected: self.alpn_rejected.load(Relaxed),
             listening: self.listening.load(Relaxed),
         }
     }
@@ -410,6 +453,17 @@ pub struct TlsTransportServer {
 
 impl TlsTransportServer {
     pub fn new(config: TlsTransportConfig) -> Result<Self> {
+        // Strict ALPN with nothing advertised would refuse every client, since no
+        // protocol can be negotiated. Fail at construction rather than at the
+        // first connection.
+        if config.alpn_required && !config.enable_alpn {
+            return Err(TlsError::AlpnConfig);
+        }
+        // `require_client_cert` with no CA would demand a certificate that nothing
+        // can validate, refusing every client.
+        if config.require_client_cert && config.client_ca_path.is_empty() {
+            return Err(TlsError::ClientCertConfig);
+        }
         let tls_config = build_tls_config(&config)?;
         Ok(Self {
             config,
@@ -480,7 +534,9 @@ impl TlsTransportServer {
             max_per_ip = self.config.max_connections_per_ip,
             "TURNS listening"
         );
-        stats.listening.store(true, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .listening
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Certificate hot-reload. `CertReloader` existed but was wired to
         // nothing: the acceptor was built once in `new()`, so a rotated cert
@@ -564,6 +620,24 @@ impl TlsTransportServer {
             }
         });
 
+        // Per-source-IP handshake RATE limit, shared implementation with the
+        // QUIC listeners (`crate::ratelimit`). `max_connections_per_ip` bounds
+        // concurrency only: a source that connects and drops in a loop never
+        // trips it while still making us pay for a TLS handshake each time.
+        let limiter = crate::ratelimit::HandshakeLimiter::new(
+            self.config.max_handshakes_per_sec_per_ip,
+            self.config.handshake_burst_per_ip,
+        );
+        if limiter.enabled() {
+            info!(
+                rate = self.config.max_handshakes_per_sec_per_ip,
+                burst = self.config.handshake_burst_per_ip,
+                "TURNS per-IP handshake rate limit active"
+            );
+        }
+        let mut limiter_sweep = tokio::time::interval(Duration::from_secs(30));
+        limiter_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // Consecutive accept failures, for the EMFILE backoff below.
         let mut accept_failures: u32 = 0;
 
@@ -573,6 +647,10 @@ impl TlsTransportServer {
             }
             let accepted = tokio::select! {
                 _ = shutdown.changed() => break,
+                _ = limiter_sweep.tick() => {
+                    limiter.sweep();
+                    continue;
+                }
                 r = listener.accept() => r,
             };
             let (stream, peer) = match accepted {
@@ -601,6 +679,16 @@ impl TlsTransportServer {
                     continue;
                 }
             };
+            // Refused before `tls.accept()`, so a flood costs a map lookup
+            // instead of a handshake.
+            if !limiter.allow(peer.ip()) {
+                stats
+                    .rejected_rate_limit
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(%peer, "TURNS connection refused: per-IP handshake rate limit");
+                continue;
+            }
+
             {
                 let c = conns.read().await;
                 if c.len() >= self.config.max_connections {
@@ -750,6 +838,14 @@ async fn handle_conn(
         }
         Ok(Ok(s)) => s,
     };
+    // RFC 7443 strict mode. rustls already fails the handshake when the client
+    // offers ALPN with no overlap, but a client offering NO ALPN is accepted —
+    // that is the case this refuses. Checked after the handshake because that is
+    // the earliest point the negotiated protocol is known.
+    if cfg.alpn_required && tls_stream.get_ref().1.alpn_protocol().is_none() {
+        stats.alpn_rejected.fetch_add(1, Relaxed);
+        return Err(TlsError::AlpnMissing);
+    }
     stats.active.fetch_add(1, Relaxed);
     // Every exit below goes through `finish`, so `active` cannot leak.
     let _guard = ActiveGuard {
@@ -866,21 +962,73 @@ async fn handle_conn(
 /// both `ring` and `aws-lc-rs` end up in the dependency graph via feature
 /// unification. Selecting the provider explicitly removes that ambiguity and
 /// needs no process-global `install_default()`.
+/// Build the client-certificate verifier from a CA bundle.
+///
+/// `require` selects mandatory vs optional presentation:
+/// `allow_unauthenticated()` lets a client with no certificate complete the
+/// handshake (it is then only as authenticated as its TURN long-term credentials
+/// make it), which is what makes a staged rollout possible on a live fleet.
+///
+/// **No CRL or OCSP**, deliberately, and for the same reason the management plane
+/// does not have them (`docs/MTLS.md` → Revocation): correct revocation means CRL
+/// download and caching or OCSP stapling, and it is solved better by the PKI
+/// (Vault, cloud CA) than by a bespoke path inside turna. To revoke here, rotate
+/// the CA — the procedure in `docs/MTLS.md` applies unchanged.
+fn client_cert_verifier(
+    ca_path: &Path,
+    require: bool,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    let cas = load_certs(ca_path)?;
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in cas {
+        roots
+            .add(ca)
+            .map_err(|e| TlsError::ClientCaInvalid(e.to_string()))?;
+    }
+    if roots.is_empty() {
+        return Err(TlsError::ClientCaEmpty(ca_path.into()));
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider,
+    );
+    let builder = if require {
+        builder
+    } else {
+        builder.allow_unauthenticated()
+    };
+    builder
+        .build()
+        .map_err(|e| TlsError::ClientCaInvalid(e.to_string()))
+}
+
 fn ring_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    client_auth: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Result<ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Ok(ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?)
+    let base = ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?;
+    let cfg = match client_auth {
+        Some(v) => base.with_client_cert_verifier(v),
+        None => base.with_no_client_auth(),
+    };
+    Ok(cfg.with_single_cert(certs, key)?)
 }
 
 fn build_tls_config(cfg: &TlsTransportConfig) -> Result<ServerConfig> {
     let certs = load_certs(&cfg.cert_path)?;
     let key = load_key(&cfg.key_path)?;
-    let mut tls = ring_server_config(certs, key)?;
+    let client_auth = if cfg.client_ca_path.is_empty() {
+        None
+    } else {
+        Some(client_cert_verifier(
+            Path::new(&cfg.client_ca_path),
+            cfg.require_client_cert,
+        )?)
+    };
+    let mut tls = ring_server_config(certs, key, client_auth)?;
     if cfg.enable_alpn {
         tls.alpn_protocols = vec![b"stun.turn".to_vec(), b"stun.nat-discovery".to_vec()];
     }
@@ -931,6 +1079,11 @@ pub struct CertReloader {
     key_path: PathBuf,
     interval: Duration,
     enable_alpn: bool,
+    /// Carried so a server-certificate rotation rebuilds the config *with* the
+    /// client verifier. Dropping it here would silently turn mTLS off at the first
+    /// reload, which is the worst possible failure mode for this feature.
+    client_ca_path: String,
+    require_client_cert: bool,
 }
 
 impl CertReloader {
@@ -940,6 +1093,8 @@ impl CertReloader {
             key_path: cfg.key_path.clone(),
             interval,
             enable_alpn: cfg.enable_alpn,
+            client_ca_path: cfg.client_ca_path.clone(),
+            require_client_cert: cfg.require_client_cert,
         }
     }
 
@@ -985,7 +1140,15 @@ impl CertReloader {
     fn reload(&self) -> Result<ServerConfig> {
         let certs = load_certs(&self.cert_path)?;
         let key = load_key(&self.key_path)?;
-        let mut tls = ring_server_config(certs, key)?;
+        let client_auth = if self.client_ca_path.is_empty() {
+            None
+        } else {
+            Some(client_cert_verifier(
+                Path::new(&self.client_ca_path),
+                self.require_client_cert,
+            )?)
+        };
+        let mut tls = ring_server_config(certs, key, client_auth)?;
         if self.enable_alpn {
             tls.alpn_protocols = vec![b"stun.turn".to_vec(), b"stun.nat-discovery".to_vec()];
         }

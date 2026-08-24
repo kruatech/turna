@@ -328,92 +328,16 @@ fn spawn_quic_stats_logger(stats: std::sync::Arc<QuicStats>) {
     });
 }
 
-/// Per-source-IP handshake rate limiter (token bucket).
-///
-/// `max_sessions_per_ip` bounds how many sessions a source may hold at once,
-/// which a source that opens and immediately drops sessions never trips — it
-/// stays at one concurrent session while making us pay for a QUIC/H3 handshake
-/// every time. This bounds the rate instead. Checked BEFORE the handshake on
-/// both paths, so a refused attempt costs a map lookup.
-///
-/// Entries are reclaimed lazily: a bucket that has been full (i.e. idle) for
-/// longer than the refill window is dropped on the next sweep, so the map is
-/// bounded by the number of *active* sources, not by every IP ever seen.
-#[cfg(any(feature = "quic", feature = "web-transport"))]
-pub struct HandshakeLimiter {
-    rate_per_sec: f64,
-    burst: f64,
-    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
-}
-
-#[cfg(any(feature = "quic", feature = "web-transport"))]
-impl HandshakeLimiter {
-    /// `rate == 0` disables the limiter entirely (`allow` always returns true).
-    pub fn new(rate_per_sec: u32, burst: u32) -> Self {
-        // A burst below the rate would make a legitimate client that opens a few
-        // sessions at once fail; default to twice the rate when unset.
-        let burst = if burst == 0 {
-            rate_per_sec.saturating_mul(2)
-        } else {
-            burst
-        };
-        Self {
-            rate_per_sec: f64::from(rate_per_sec),
-            burst: f64::from(burst.max(1)),
-            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.rate_per_sec > 0.0
-    }
-
-    /// Take one token for `ip`. `false` = over the limit, refuse the handshake.
-    pub fn allow(&self, ip: std::net::IpAddr) -> bool {
-        if !self.enabled() {
-            return true;
-        }
-        let now = std::time::Instant::now();
-        let mut m = match self.buckets.lock() {
-            Ok(g) => g,
-            // A poisoned lock must not deny service.
-            Err(_) => return true,
-        };
-        let entry = m.entry(ip).or_insert((self.burst, now));
-        let elapsed = now.saturating_duration_since(entry.1).as_secs_f64();
-        entry.0 = (entry.0 + elapsed * self.rate_per_sec).min(self.burst);
-        entry.1 = now;
-        if entry.0 >= 1.0 {
-            entry.0 -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Drop idle (full) buckets. Cheap; call from the listener's periodic tick.
-    pub fn sweep(&self) {
-        if !self.enabled() {
-            return;
-        }
-        let now = std::time::Instant::now();
-        if let Ok(mut m) = self.buckets.lock() {
-            let burst = self.burst;
-            let rate = self.rate_per_sec;
-            m.retain(|_, (tokens, last)| {
-                let refilled =
-                    (*tokens + now.saturating_duration_since(*last).as_secs_f64() * rate).min(burst);
-                // Keep only buckets still carrying debt.
-                refilled < burst
-            });
-        }
-    }
-}
+// The per-source-IP handshake rate limiter now lives in `crate::ratelimit`
+// so the TURNS listener (feature `tls`, no quic) can use it too. Re-exported
+// here because both QUIC paths and their docs refer to it as
+// `quic::HandshakeLimiter`.
+pub use crate::ratelimit::HandshakeLimiter;
 
 /// Last-modified time of a certificate/key file, or `None` if unreadable.
 /// Used by the WebTransport hot-reload poll; an unreadable file compares equal
 /// to itself, so a missing file does not trigger a reload storm.
-#[cfg(feature = "web-transport")]
+#[cfg(any(feature = "quic", feature = "web-transport"))]
 fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
@@ -564,14 +488,18 @@ impl QuicServer {
         Err(QuicError::NotSupported)
     }
 
-    /// Real quinn-backed QUIC server (Phase 1: endpoint + accept loop + inbound
-    /// events). WebTransport-over-HTTP/3 negotiation (the browser handshake) is
-    /// Phase 2 — see `docs/design/quic-webtransport.md`; this loop currently
-    /// surfaces raw QUIC streams/datagrams as `QuicEvent`s.
+    /// Raw-QUIC server: quinn endpoint + accept loop, surfacing streams and
+    /// datagrams as `QuicEvent`s. Selected with `[turn.quic] web_transport =
+    /// false`; the browser HTTP/3 path is [`run_web_transport`].
     ///
-    /// NOTE (draft): written against quinn 0.11 + rustls 0.23. The endpoint /
-    /// `ServerConfig` / `Incoming` / stream APIs are the version-sensitive
-    /// calls — verify with `cargo build --features quic`.
+    /// Unlike the WebTransport path, this one applies the full `[turn.quic]`
+    /// transport config (stream limits, datagram buffer, idle timeout) because it
+    /// owns the `quinn::ServerConfig` directly. Admission control is
+    /// post-handshake here (quinn's `Incoming` is refused before the handshake
+    /// only for the rate limit), whereas WebTransport can refuse on the session
+    /// request itself.
+    ///
+    /// Verified against quinn 0.11 + rustls 0.23.
     #[cfg(feature = "quic")]
     pub async fn run(
         &self,
@@ -580,8 +508,6 @@ impl QuicServer {
         stats: std::sync::Arc<QuicStats>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        use std::sync::Arc;
-
         info!(
             addr = %self.config.listen_addr,
             alpn = ?self.config.alpn,
@@ -589,45 +515,7 @@ impl QuicServer {
             "QUIC server starting"
         );
 
-        // ── rustls server config from cert/key (reuse the PEM material the
-        // `tls` transport already uses). ──
-        let certs = load_certs(&self.config.cert_path)?;
-        let key = load_key(&self.config.key_path)?;
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| QuicError::Tls(e.to_string()))?;
-        tls.alpn_protocols = self
-            .config
-            .alpn
-            .iter()
-            .map(|p| p.as_bytes().to_vec())
-            .collect();
-
-        // ── quinn server config + transport tuning. ──
-        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-            .map_err(|e| QuicError::Tls(e.to_string()))?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-        {
-            let tp = Arc::get_mut(&mut server_config.transport)
-                .expect("fresh ServerConfig has a unique transport");
-            tp.max_concurrent_bidi_streams((self.config.max_bi_streams as u32).into());
-            tp.max_concurrent_uni_streams((self.config.max_uni_streams as u32).into());
-            tp.max_idle_timeout(Some(
-                self.config
-                    .idle_timeout
-                    .try_into()
-                    .map_err(|_| QuicError::Connection("idle_timeout too large".into()))?,
-            ));
-            tp.keep_alive_interval(Some(self.config.keep_alive));
-            if self.config.enable_datagrams {
-                tp.datagram_receive_buffer_size(Some(self.config.max_datagram_size * 16));
-            } else {
-                tp.datagram_receive_buffer_size(None);
-            }
-        }
-
-        let endpoint = quinn::Endpoint::server(server_config, self.config.listen_addr)
+        let endpoint = quinn::Endpoint::server(self.build_quic_config()?, self.config.listen_addr)
             .map_err(|e| QuicError::Connection(e.to_string()))?;
         info!(addr = %self.config.listen_addr, "QUIC endpoint listening");
         stats
@@ -652,6 +540,24 @@ impl QuicServer {
         let mut sweep = tokio::time::interval(Duration::from_secs(30));
         sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Certificate hot-reload. `quinn::Endpoint::set_server_config` swaps the
+        // material for *new* connections without touching live ones, so the raw
+        // path reloads like the WebTransport one (and like TURNS) instead of
+        // needing a restart.
+        let reload_enabled = !self.config.cert_reload_interval.is_zero();
+        let mut reload_tick = tokio::time::interval(if reload_enabled {
+            self.config.cert_reload_interval
+        } else {
+            Duration::from_secs(3600)
+        });
+        reload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reload_tick.tick().await; // the first tick completes immediately
+        let mut cert_mt = file_mtime(&self.config.cert_path);
+        let mut key_mt = file_mtime(&self.config.key_path);
+        if !reload_enabled {
+            info!("QUIC certificate hot-reload disabled (cert_reload_interval = 0)");
+        }
+
         // Accept loop: one task per connection, each translating quinn events
         // into `QuicEvent`s on the shared channel. Stops on the shutdown watch
         // (previously there was no shutdown path at all, so a drain could only
@@ -664,6 +570,34 @@ impl QuicServer {
                 _ = shutdown.changed() => break,
                 _ = sweep.tick() => {
                     limiter.sweep();
+                    continue;
+                }
+                _ = reload_tick.tick() => {
+                    if reload_enabled {
+                        let nc = file_mtime(&self.config.cert_path);
+                        let nk = file_mtime(&self.config.key_path);
+                        if nc != cert_mt || nk != key_mt {
+                            cert_mt = nc;
+                            key_mt = nk;
+                            match self.build_quic_config() {
+                                Ok(cfg) => {
+                                    // Infallible on the quinn side; only building
+                                    // the config can fail.
+                                    endpoint.set_server_config(Some(cfg));
+                                    stats
+                                        .cert_reloads
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    info!("QUIC certificate reloaded");
+                                }
+                                Err(e) => {
+                                    stats
+                                        .cert_reload_failures
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    warn!(%e, "QUIC certificate reload failed; keeping previous certificate");
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 acc = endpoint.accept() => match acc {
@@ -691,16 +625,9 @@ impl QuicServer {
             let max_sessions = self.config.max_sessions;
             let max_per_ip = self.config.max_sessions_per_ip;
             tokio::spawn(async move {
-                if let Err(e) = handle_quic_connection(
-                    incoming,
-                    tx,
-                    reg,
-                    st,
-                    pip,
-                    max_sessions,
-                    max_per_ip,
-                )
-                .await
+                if let Err(e) =
+                    handle_quic_connection(incoming, tx, reg, st, pip, max_sessions, max_per_ip)
+                        .await
                 {
                     tracing::warn!(%e, "QUIC connection ended with error");
                 }
@@ -724,9 +651,12 @@ impl QuicServer {
     ///     `IncomingSession` (cheaper than the raw path's post-handshake check);
     ///   * `cert_reload_secs` via `Endpoint::reload_config`.
     ///
-    /// NOT reached: the transport limits (stream counts, datagram buffer, idle
-    /// timeout) — see the TODO in [`build_wt_config`]. The listener warns about
-    /// this at startup instead of letting the config look effective.
+    ///   * the transport limits (stream counts, datagram buffer, idle timeout)
+    ///     via `ServerConfig::quic_config_mut()`, reachable since the wtransport
+    ///     dependency enables its `quinn` re-export — so this path now enforces
+    ///     the same `[turn.quic]` limits as the raw-QUIC one.
+    ///
+    /// NOT reached: `alpn`, inert by design — wtransport negotiates "h3" itself.
     ///
     /// Certificate hot-reload uses `Endpoint::reload_config(cfg, rebind=false)`,
     /// which swaps the material for new sessions without disturbing live ones.
@@ -744,9 +674,7 @@ impl QuicServer {
 
         let endpoint = Endpoint::server(self.build_wt_config().await?)
             .map_err(|e| QuicError::Connection(e.to_string()))?;
-        let local_addr = endpoint
-            .local_addr()
-            .unwrap_or(self.config.listen_addr);
+        let local_addr = endpoint.local_addr().unwrap_or(self.config.listen_addr);
         info!(addr = %local_addr, "WebTransport endpoint listening");
         stats
             .listening
@@ -872,6 +800,66 @@ impl QuicServer {
         Ok(())
     }
 
+    /// Build the quinn `ServerConfig` for the raw-QUIC path from `[turn.quic]`.
+    /// Used at startup and on certificate hot-reload, so the two can never drift.
+    #[cfg(feature = "quic")]
+    fn build_quic_config(&self) -> Result<quinn::ServerConfig> {
+        use std::sync::Arc;
+
+        // rustls server config from cert/key (the same PEM material the `tls`
+        // transport uses).
+        //
+        // The provider is pinned explicitly rather than left to
+        // `ServerConfig::builder()`, which resolves a *process-global* default and
+        // has none when more than one provider is in the dependency graph. That is
+        // not hypothetical: with `--features "tls,quic"` both ring and aws-lc-rs are
+        // present, and this call took the listener down between "QUIC server
+        // starting" and "QUIC endpoint listening" — no error line, just a dead
+        // listener and `turna_quic_readiness` stuck at 2. `tcp_tls.rs` already pins
+        // ring for exactly this reason; raw QUIC was the one path that did not, so
+        // it worked under `--features quic` alone and failed the moment `tls` was
+        // enabled alongside it.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let certs = load_certs(&self.config.cert_path)?;
+        let key = load_key(&self.config.key_path)?;
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| QuicError::Tls(e.to_string()))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| QuicError::Tls(e.to_string()))?;
+        tls.alpn_protocols = self
+            .config
+            .alpn
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+
+        // quinn server config + transport tuning.
+        let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+            .map_err(|e| QuicError::Tls(e.to_string()))?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+        {
+            let tp = Arc::get_mut(&mut server_config.transport)
+                .expect("fresh ServerConfig has a unique transport");
+            tp.max_concurrent_bidi_streams((self.config.max_bi_streams as u32).into());
+            tp.max_concurrent_uni_streams((self.config.max_uni_streams as u32).into());
+            tp.max_idle_timeout(Some(
+                self.config
+                    .idle_timeout
+                    .try_into()
+                    .map_err(|_| QuicError::Connection("idle_timeout too large".into()))?,
+            ));
+            tp.keep_alive_interval(Some(self.config.keep_alive));
+            if self.config.enable_datagrams {
+                tp.datagram_receive_buffer_size(Some(self.config.max_datagram_size * 16));
+            } else {
+                tp.datagram_receive_buffer_size(None);
+            }
+        }
+        Ok(server_config)
+    }
+
     /// Build a wtransport `ServerConfig` from `[turn.quic]`, applying the knobs
     /// the builder does not expose through the underlying `quinn::ServerConfig`.
     /// Used both at startup and on certificate hot-reload.
@@ -883,29 +871,37 @@ impl QuicServer {
             .await
             .map_err(|e| QuicError::Tls(format!("wtransport identity: {e}")))?;
 
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_bind_address(self.config.listen_addr)
             .with_identity(identity)
             .keep_alive_interval(Some(self.config.keep_alive))
             .allow_migration(self.config.allow_migration)
             .build();
 
-        // TODO(quic-wt-limits): reaching the underlying quinn transport config
-        // (`ServerConfig::quic_config_mut()`) is not possible in this build —
-        // wtransport gates its quinn re-export, so the method is not in scope.
-        // Until that gate is enabled, these keys do not take effect on this path.
-        // Say so at startup rather than let the config look effective.
-        //
-        // What IS applied here: listen address, identity (cert/key) and
-        // keep-alive. `alpn` is inert by design — wtransport negotiates "h3".
-        warn!(
-            "WebTransport path: [turn.quic] max_bi_streams / max_uni_streams / \
-             enable_datagrams / max_datagram_size / idle_timeout_secs are NOT \
-             applied (the wtransport quinn transport config is not reachable in \
-             this build). Session caps, keep-alive and certificate reload DO \
-             apply. Use web_transport = false for the raw-QUIC path where the \
-             transport limits are enforced."
-        );
+        // [turn.quic] transport limits, applied through wtransport's quinn
+        // re-export (dependency feature "quinn"). Previously unreachable, so
+        // these keys silently did nothing on this path; now the WebTransport and
+        // raw-QUIC paths enforce the same limits. `alpn` stays inert by design —
+        // wtransport negotiates "h3".
+        {
+            let mut tp = wtransport::quinn::TransportConfig::default();
+            tp.max_concurrent_bidi_streams((self.config.max_bi_streams as u32).into());
+            tp.max_concurrent_uni_streams((self.config.max_uni_streams as u32).into());
+            tp.max_idle_timeout(Some(
+                self.config
+                    .idle_timeout
+                    .try_into()
+                    .map_err(|_| QuicError::Connection("idle_timeout too large".into()))?,
+            ));
+            tp.keep_alive_interval(Some(self.config.keep_alive));
+            if self.config.enable_datagrams {
+                tp.datagram_receive_buffer_size(Some(self.config.max_datagram_size * 16));
+            } else {
+                tp.datagram_receive_buffer_size(None);
+            }
+            config.quic_config_mut().transport = std::sync::Arc::new(tp);
+        }
+
         Ok(config)
     }
 
@@ -1238,10 +1234,9 @@ async fn handle_wt_session(
     let mut writers: std::collections::HashMap<u64, wtransport::SendStream> =
         std::collections::HashMap::new();
     let mut newest_stream: Option<u64> = None;
-    // Per-session stream counter. `wtransport::RecvStream::quic_stream()` (which
-    // would give the real quinn stream index) is not reachable in this build, and
-    // `StreamId` has no public conversion we rely on — but the id is purely an
-    // opaque routing key: the transport hands it to the bridge in `StreamData`
+    // Per-session stream counter. The real quinn stream index IS reachable now
+    // (the wtransport `quinn` dependency feature is enabled), but it is
+    // deliberately not used: the id is purely an opaque routing key: the transport hands it to the bridge in `StreamData`
     // and the bridge hands it back in `QuicOutbound.stream_id`. A monotonic
     // per-session counter is therefore sufficient AND stable, which is all the
     // routing needs. (It is NOT the on-wire QUIC stream id; do not log it as one.)
@@ -1403,57 +1398,6 @@ mod tests {
         assert!(c.enable_datagrams);
         assert_eq!(c.max_datagram_size, 1200);
         assert!(c.alpn.contains(&"h3".to_string()));
-    }
-
-    #[cfg(any(feature = "quic", feature = "web-transport"))]
-    #[test]
-    fn handshake_limiter_disabled_allows_everything() {
-        let l = HandshakeLimiter::new(0, 0);
-        assert!(!l.enabled());
-        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-        for _ in 0..1000 {
-            assert!(l.allow(ip), "a disabled limiter must never refuse");
-        }
-    }
-
-    #[cfg(any(feature = "quic", feature = "web-transport"))]
-    #[test]
-    fn handshake_limiter_spends_burst_then_refuses() {
-        // rate 1/s, burst 3: three immediate handshakes pass, the fourth does not.
-        let l = HandshakeLimiter::new(1, 3);
-        assert!(l.enabled());
-        let ip: std::net::IpAddr = "203.0.113.8".parse().unwrap();
-        assert!(l.allow(ip));
-        assert!(l.allow(ip));
-        assert!(l.allow(ip));
-        assert!(!l.allow(ip), "burst exhausted");
-    }
-
-    #[cfg(any(feature = "quic", feature = "web-transport"))]
-    #[test]
-    fn handshake_limiter_is_per_ip() {
-        let l = HandshakeLimiter::new(1, 1);
-        let a: std::net::IpAddr = "203.0.113.9".parse().unwrap();
-        let b: std::net::IpAddr = "203.0.113.10".parse().unwrap();
-        assert!(l.allow(a));
-        assert!(!l.allow(a), "a is out of tokens");
-        assert!(l.allow(b), "b must not be affected by a");
-    }
-
-    #[cfg(any(feature = "quic", feature = "web-transport"))]
-    #[test]
-    fn handshake_limiter_default_burst_is_twice_the_rate() {
-        // burst = 0 means "pick a sane default", not "no burst" — otherwise a
-        // client opening two sessions at once would be refused at rate >= 1.
-        let l = HandshakeLimiter::new(5, 0);
-        let ip: std::net::IpAddr = "203.0.113.11".parse().unwrap();
-        let mut allowed = 0;
-        for _ in 0..20 {
-            if l.allow(ip) {
-                allowed += 1;
-            }
-        }
-        assert_eq!(allowed, 10, "burst should default to 2x rate");
     }
 
     #[test]

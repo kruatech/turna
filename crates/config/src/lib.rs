@@ -204,6 +204,64 @@ impl TurnaConfig {
                     .into(),
             );
         }
+        // The demux-only DTLS knobs do nothing on the stock listener path. Set
+        // without `demux = true` they read as protection that is not there, which
+        // is worse than an explicit error at startup.
+        if self.turn.dtls.enabled && !self.turn.dtls.demux {
+            if self.turn.dtls.max_handshakes_per_sec_per_ip != 0 {
+                errors.push(
+                    "turn.dtls.max_handshakes_per_sec_per_ip requires turn.dtls.demux = true \
+                     (on the stock listener the handshake runs below accept(), so the limit \
+                     cannot be enforced)"
+                        .into(),
+                );
+            }
+            if self.turn.dtls.cert_reload_secs != 0 {
+                errors.push(
+                    "turn.dtls.cert_reload_secs requires turn.dtls.demux = true (the stock \
+                     listener fixes its certificate at bind time and can only warn that the \
+                     files changed; set demux = true or plan a restart on rotation)"
+                        .into(),
+                );
+            }
+        }
+        // RFC 6156: external_ip6 must be a real IPv6 literal if set — a v4 literal
+        // here would advertise a v4 address for a v6-family allocation, which is
+        // exactly the mismatch the 443 check exists to prevent.
+        if !self.turn.external_ip6.is_empty() {
+            match self.turn.external_ip6.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V6(_)) => {}
+                Ok(std::net::IpAddr::V4(_)) => errors.push(
+                    "turn.external_ip6 must be an IPv6 address (it is the address \
+                     advertised for IPv6-family allocations)"
+                        .into(),
+                ),
+                Err(_) => errors.push(
+                    "turn.external_ip6 is not a valid IP address; leave it empty to \
+                     keep IPv4-only relaying"
+                        .into(),
+                ),
+            }
+        }
+        // require_client_cert with no CA would demand a certificate nothing can
+        // validate, refusing every client — fail at startup, not at first connect.
+        if self.tls.enabled && self.tls.require_client_cert && self.tls.client_ca.is_empty() {
+            errors.push(
+                "tls.require_client_cert = true requires tls.client_ca (a CA bundle to \
+                 validate client certificates against)"
+                    .into(),
+            );
+        }
+        // Strict ALPN with nothing advertised refuses every client (no protocol
+        // can be negotiated), so the combination is a config error rather than a
+        // runtime surprise.
+        if self.tls.enabled && self.tls.alpn_required && !self.tls.enable_alpn {
+            errors.push(
+                "tls.alpn_required = true requires tls.enable_alpn = true (nothing \
+                 would be advertised, so every client would be refused)"
+                    .into(),
+            );
+        }
         // Experimental transports are not production-ready: RFC 6062 TCP relay is
         // partial/experimental, and TURN-over-SCTP is experimental. Refuse to
         // enable either under `production` so an unfinished datapath is never
@@ -225,7 +283,8 @@ impl TurnaConfig {
         if self.turn.auth.oauth.enabled {
             if prod {
                 errors.push(
-                    "turn.auth.oauth.enabled = true in production, but RFC 7635 OAuth                      is experimental and not supported in production"
+                    "turn.auth.oauth.enabled = true in production, but RFC 7635 OAuth \
+                     is experimental and not supported in production"
                         .into(),
                 );
             }
@@ -554,6 +613,17 @@ pub enum TransportSelection {
 pub struct TurnConfig {
     pub listen: SocketAddr,
     pub external_ip: String,
+    /// RFC 6156 IPv6 relayed transport: the IPv6 address advertised in
+    /// XOR-RELAYED-ADDRESS for allocations that asked for
+    /// `REQUESTED-ADDRESS-FAMILY = IPv6`. Empty (the default) keeps the
+    /// IPv4-only behaviour, where an explicit IPv6 Allocate is answered
+    /// `440 Address Family not Supported`.
+    ///
+    /// This is separate from `external_ip` on purpose: `external_ip` may itself be
+    /// an IPv6 literal, but that only changes what is advertised for *v4-family*
+    /// allocations. Relaying over IPv6 needs its own advertised address, and the
+    /// relay socket is bound in the requested family.
+    pub external_ip6: String,
     pub realm: String,
     /// Transport backend preference. Default `tokio` (safest); `io_uring`,
     /// `af_xdp` and `auto` are explicit opt-ins.
@@ -599,6 +669,7 @@ impl Default for TurnConfig {
         Self {
             listen: "0.0.0.0:3478".parse().unwrap(),
             external_ip: String::new(),
+            external_ip6: String::new(),
             realm: "turna".into(),
             transport: TransportSelection::default(),
             auth: AuthConfig::default(),
@@ -1348,6 +1419,31 @@ pub struct TlsConfig {
     pub cert_reload_secs: u64,
     /// Advertise ALPN (`stun.turn`).
     pub enable_alpn: bool,
+    /// Per-source-IP handshake **rate** limit, handshakes/second (0 = unlimited).
+    /// `max_connections_per_ip` caps concurrent connections only, so a source
+    /// that connects and drops in a loop never trips it while still costing a TLS
+    /// handshake each time. Mirrors `[turn.quic].max_handshakes_per_sec_per_ip`.
+    pub max_handshakes_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate, so a client
+    /// opening a few connections at once is not penalised.
+    pub handshake_burst_per_ip: u32,
+    /// PEM bundle of CAs allowed to sign a TURNS **client** certificate. Empty
+    /// (default) = no client-certificate verification, which is what a public TURN
+    /// server wants. Setting it enables mTLS on the TURNS listener only; the
+    /// management plane has its own `[grpc] tls_ca` and is unaffected.
+    ///
+    /// No CRL/OCSP, deliberately — same position as the management plane
+    /// (`docs/MTLS.md` → Revocation). Revoke by rotating the CA.
+    pub client_ca: String,
+    /// Refuse a TURNS client that presents no certificate. Requires `client_ca`.
+    /// `false` (default) lets an unauthenticated client through TLS and leaves it
+    /// to the normal long-term credential check, which is what allows a staged
+    /// rollout across an existing fleet.
+    pub require_client_cert: bool,
+    /// RFC 7443 strict mode: refuse clients that negotiate no ALPN protocol.
+    /// Requires `enable_alpn = true`. Default false = compatible mode (a client
+    /// that offers no ALPN is served).
+    pub alpn_required: bool,
 }
 
 impl Default for TlsConfig {
@@ -1364,6 +1460,11 @@ impl Default for TlsConfig {
             max_connections_per_ip: 0,
             cert_reload_secs: 30,
             enable_alpn: true,
+            max_handshakes_per_sec_per_ip: 0,
+            handshake_burst_per_ip: 0,
+            alpn_required: false,
+            client_ca: String::new(),
+            require_client_cert: false,
         }
     }
 }
@@ -1542,6 +1643,38 @@ pub struct DtlsSection {
     /// DTL-9: max concurrent DTLS sessions from one source IP (anti
     /// slot-exhaustion). 0 = unlimited.
     pub max_sessions_per_ip: usize,
+    /// Use the owned UDP demultiplexer instead of `webrtc_dtls::listen()`.
+    ///
+    /// Off by default. `listen()` runs handshakes serially inside `accept()`
+    /// (webrtc-rs/webrtc#614), which forces three compromises: admission control
+    /// can only happen *after* the crypto, there is nowhere to put a handshake
+    /// rate limit, and the certificate is fixed at bind time. The demux path
+    /// fixes all three at once — but it replaces the code path that has recorded
+    /// verification behind it, so it stays opt-in until its own interop run is on
+    /// record (`docs/verification/encrypted-transports.md`).
+    pub demux: bool,
+    /// Per-source-IP handshake **rate** limit, handshakes/second (0 = unlimited).
+    /// Requires `demux = true`; on the stock path the handshake runs below
+    /// `accept()`, so there is nowhere to enforce it.
+    pub max_handshakes_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate.
+    pub handshake_burst_per_ip: u32,
+    /// Poll `cert_path`/`key_path` every N seconds and pick up a rotated
+    /// certificate without a restart. 0 disables. Requires `demux = true`:
+    /// `listen()` fixes its config at bind time, which is why the stock path can
+    /// only warn that the files changed.
+    pub cert_reload_secs: u64,
+    /// Upper bound, in seconds, on one DTLS `accept()` — i.e. on a single
+    /// handshake. 0 disables the bound.
+    ///
+    /// This is a liveness guard, not tuning. `webrtc-dtls` runs the whole
+    /// handshake inline inside `accept()` with no timeout of its own
+    /// (webrtc-rs/webrtc#614), so a peer that starts a handshake and goes silent
+    /// parks the accept loop forever and the DTLS listener stops serving *anyone*
+    /// while the process still looks healthy. Bounding the accept restores
+    /// liveness; the cost is that a legitimately slow handshake is abandoned, so
+    /// keep this comfortably above real-world handshake latency.
+    pub accept_timeout_secs: u64,
 }
 
 impl Default for DtlsSection {
@@ -1556,6 +1689,11 @@ impl Default for DtlsSection {
             mtu: 1200,
             outbound_queue_capacity: 1024,
             max_sessions_per_ip: 0,
+            accept_timeout_secs: 10,
+            demux: false,
+            max_handshakes_per_sec_per_ip: 0,
+            handshake_burst_per_ip: 0,
+            cert_reload_secs: 0,
         }
     }
 }
@@ -2355,6 +2493,44 @@ mod runtime_update_tests {
     }
 
     #[test]
+    fn external_ip6_must_be_ipv6_or_empty() {
+        // Empty = IPv4-only relaying, the default.
+        let cfg = TurnaConfig::default();
+        assert!(
+            cfg.turn.external_ip6.is_empty(),
+            "IPv6 relaying is opt-in, so the default must be empty"
+        );
+        assert!(cfg.validate().is_ok(), "default config must validate");
+
+        // An IPv4 literal here would advertise the wrong family for a v6-family
+        // allocation, which is exactly what the 443 check exists to prevent.
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.external_ip6 = "203.0.113.10".into();
+        let err = cfg
+            .validate()
+            .expect_err("an IPv4 literal in external_ip6 must be rejected")
+            .to_string()
+            .to_lowercase();
+        assert!(err.contains("external_ip6"), "unexpected error: {err}");
+
+        // Garbage is rejected too.
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.external_ip6 = "not-an-address".into();
+        assert!(
+            cfg.validate().is_err(),
+            "garbage external_ip6 must be rejected"
+        );
+
+        // A real v6 literal validates.
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.external_ip6 = "2001:db8::1".into();
+        assert!(
+            cfg.validate().is_ok(),
+            "a valid IPv6 literal must be accepted"
+        );
+    }
+
+    #[test]
     fn production_unlimited_bandwidth_fails_without_optin() {
         let s = snap();
         let prod = RuntimeValidationCtx {
@@ -2535,8 +2711,23 @@ mod tests {
         assert_eq!(t.listen.port(), 5349, "IANA TURNS port");
         assert_eq!(t.max_connections, 10_000);
         assert_eq!(t.max_connections_per_ip, 0, "per-IP cap is opt-in");
-        assert_eq!(t.cert_reload_secs, 30, "certificate hot-reload on by default");
+        assert_eq!(
+            t.cert_reload_secs, 30,
+            "certificate hot-reload on by default"
+        );
         assert!(t.enable_alpn);
+        assert_eq!(
+            t.max_handshakes_per_sec_per_ip, 0,
+            "handshake rate limit is opt-in, like the QUIC one"
+        );
+        assert_eq!(t.handshake_burst_per_ip, 0);
+        assert!(!t.alpn_required, "ALPN strict mode is opt-in");
+        assert!(
+            t.client_ca.is_empty(),
+            "client-certificate verification is opt-in: a public TURN server must \
+             not require one"
+        );
+        assert!(!t.require_client_cert);
 
         let toml = r#"
             [turn]

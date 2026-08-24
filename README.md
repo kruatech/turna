@@ -21,21 +21,63 @@ verified by this document** until the exact release commit passes the workspace,
 Tarantool, frontend, container, Helm, migration, restart, and live relay gates in
 [RELEASE.md](RELEASE.md).
 
-The alternative transports are **not** on the same footing as the default path,
-and they differ from each other:
+## Status legend
 
-- **Beta** — TLS-over-TCP (`tls`, TURNS), RFC 6062 TCP relay allocations, and
-  DTLS (`dtls`). Hardened in source: connection/session limits including per-IP
-  caps, Prometheus counters, per-listener readiness, cooperative drain,
-  fail-fast startup, and prompt allocation release when a control connection
-  closes. What they lack is *evidence* — no soak or interop run is recorded yet
-  ([docs/verification/encrypted-transports.md](docs/verification/encrypted-transports.md)
-  is the gate).
-- **Experimental** — QUIC (`quic`) and WebTransport (`web-transport`), plus the
-  `io-uring` and `af-xdp` datapaths. These still have functional gaps, not just
-  missing tests: notably several `[turn.quic]` limits do not apply on the
-  WebTransport path (the listener warns about this at startup) and QUIC
-  connection migration is not detected.
+This is software other people install on machines we have never seen, so a status has
+to say what was verified and where — a bare "supported" would promise something no
+project in this position can deliver.
+
+- **Supported** — verified end to end, and its behaviour does not depend on the
+  kernel or the hardware underneath. UDP TURN/STUN on the tokio datapath, long-term
+  credentials and the Tarantool backend are here: three hours under load with no
+  leak, 13.7 M allocations, 441 M packets
+  ([docs/soak/endurance-2026-08-19.md](docs/soak/endurance-2026-08-19.md)).
+
+  **TURNS is here too**, on three independent pieces of evidence: interop across three
+  browser engines, a Let's Encrypt chain validated by a verifying client against a
+  public address, and 24 hours under load with zero relayed-frame loss and no leak on
+  any signal ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)).
+
+- **Beta, verified on listed configurations** — correctness is on record, but the
+  behaviour depends on your environment in a way we cannot test for you. The
+  `io-uring` datapath is the clearest case: it is verified on Linux **6.8** and
+  **6.14** — 9.6 h of relayed media at 0.006 % loss on the former, no leak on either —
+  and io_uring semantics are version-sensitive, so that is evidence about those two
+  kernels and no others. `af-xdp` is the same with a NIC driver added —
+  the lab attaches in SKB (generic) mode, which copies every frame and reproduces
+  none of the kernel-bypass behaviour the feature exists for.
+
+  Verify on your kernel and your NIC before enabling either. What is on record is in
+  [docs/interop/](docs/interop/) and [docs/soak/](docs/soak/), with the exact
+  configurations named.
+
+- **Beta, no independent implementation** — **QUIC only.** It carries a TURN
+  allocation and relays media in both directions, but the client that proved it was
+  written here, against the same reading of the spec as the server, so a shared
+  misreading stays invisible. That is correctness evidence, not interop evidence.
+
+  QUIC is alone here for a structural reason: no RFC defines TURN over raw QUIC, so
+  there is no second implementation to test against and none can be written from a
+  specification that does not exist. The path out is a draft and someone else's
+  implementation, not more testing — see
+  [docs/OPEN-DECISIONS.md](docs/OPEN-DECISIONS.md).
+
+  Everything else has left this group. TURNS: three browser engines. WebTransport: a
+  TURN client written in browser JavaScript, assembling every STUN byte and its own MD5
+  and HMAC. DTLS, UDP, IPv6 and RFC 6062: coturn's `turnutils_uclient`, another
+  language and another reading of the RFC
+  ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)).
+
+- **Refused in production** — RFC 6062 TCP relay (`[turn.tcp_relay]`),
+  TURN-over-SCTP (`[turn.sctp]`) and RFC 7635 OAuth (`[turn.auth.oauth]`). Implemented
+  and usable for testing; `production = true` makes config validation **reject** them,
+  so they cannot ship by accident. For RFC 6062 the interop that gate was waiting for
+  now exists — lifting it is a decision, recorded in
+  [docs/OPEN-DECISIONS.md](docs/OPEN-DECISIONS.md).
+
+Two known functional gaps, independent of testing: several `[turn.quic]` limits do not
+apply on the WebTransport path (the listener warns at startup), and QUIC connection
+migration is not detected.
 
 Enabling a transport in config on a binary built without its Cargo feature is a
 startup error, not a warning, so a configured listener is never silently absent.
@@ -87,7 +129,9 @@ live in [bench/README.md](bench/README.md).
 | Existing media path migrates to another node  | Not guaranteed                                |
 | Drain waits indefinitely                       | No — bounded by `drain_grace_secs`            |
 | Allocation released when its TCP/DTLS/QUIC connection closes | Supported (not left to TTL)     |
-| Certificate rotation without restart           | TURNS only; DTLS and QUIC need a restart      |
+| mTLS for TURNS clients                         | Opt-in (`[tls] client_ca`); no CRL/OCSP by design |
+| IPv6 relayed transport                         | Opt-in via `[turn] external_ip6`; 440 when unset. Relayed media and coturn interop verified on routable addresses |
+| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS only with `[turn.dtls] demux = true` |
 | Multi-node ownership/state failover            | Experimental / limited scope                  |
 | Transparent active-session (media) failover    | Out of GA scope                               |
 
@@ -100,8 +144,9 @@ RPC contract.
 
 - STUN binding and full TURN allocation lifecycle (Allocate / Refresh /
   CreatePermission / ChannelBind / Send & Data indications)
-- UDP relay on the default path; TCP relay (RFC 6062) behind the `tls` feature,
-  since RFC 6062 requires a TCP/TLS control connection
+- UDP relay on the default path (IPv4, plus IPv6 when `external_ip6` is set); TCP relay (RFC 6062)
+  behind the `tls` feature, since RFC 6062 requires a TCP/TLS control connection
+  — and refused under `production = true`
 - Long-term credential mechanism, JWT-based auth, rate limiting and credential
   rotation; multi-tenant realms with per-tenant relay port pools and limits
 - Pluggable state backend (in-memory, Tarantool) for clustered deployments
@@ -198,20 +243,32 @@ per-feature production maturity always check
 | STUN Binding | RFC 5389 | Supported (default tokio datapath) |
 | Message integrity, SHA-256 (`MESSAGE-INTEGRITY-SHA256`) | RFC 8489 | Supported |
 | TURN allocation lifecycle, UDP relay | RFC 5766 / RFC 8656 | Supported (default tokio datapath) |
-| TURN over TCP (TCP relay allocations) | RFC 6062 | Beta (requires the `tls` listener) |
-| Session migration | RFC 8016 | Supported (tokio datapath) |
-| TLS-over-TCP transport (`tls`) | — | Beta |
-| DTLS transport (`dtls`) | RFC 7350 | Beta |
-| QUIC transport (`quic`) | — | Experimental |
-| WebTransport (`web-transport`) | — | Experimental |
-| `io_uring` datapath | — | Experimental |
-| `AF_XDP` datapath | — | Experimental |
+| Relayed transport family | RFC 6156 / 8656 | IPv4 by default; IPv6 opt-in via `[turn] external_ip6` (unset → `440`). One family per allocation, cross-family peers get `443`. `ADDITIONAL-ADDRESS-FAMILY` not implemented |
+| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; **refused under `production = true`**. Requires the `tls` listener |
+| Session migration | RFC 8016 | Partial — tickets are issued and re-issued on the tokio datapath; cross-node migration is **unwired** (no allocation is transferred between nodes), treat as same-node |
+| TLS-over-TCP transport (`tls`) | — | **Supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, and 24 h under load ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)) |
+| DTLS transport (`dtls`) | RFC 7350 | Beta — both listener paths, 20 min under load, and interop against coturn's client ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)) |
+| QUIC transport (`quic`) | — | Beta — allocation, relayed media both directions and 20 min under load, but **no independent implementation exists** (no RFC defines TURN over raw QUIC), so interop cannot be obtained |
+| WebTransport (`web-transport`) | — | Beta — browser interop recorded ([docs/interop/webtransport-browser-2026-08-20.md](docs/interop/webtransport-browser-2026-08-20.md)) plus 20 min under load |
+| TURN-over-SCTP transport (`sctp`) | none — no RFC defines it | Experimental; **refused under `production = true`**. Control channel only, the relay stays UDP |
+| Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
+| NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
+| ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
+| Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |
+| `io_uring` datapath | — | Beta — endurance and relaying recorded on Linux **6.8 and 6.14** ([docs/soak/endurance-2026-08-19.md](docs/soak/endurance-2026-08-19.md), [docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)); io_uring is version-sensitive — verify on your own kernel |
+| `AF_XDP` datapath | — | Beta — correctness verified on a veth lab ([docs/interop/af-xdp-2026-08-19.md](docs/interop/af-xdp-2026-08-19.md)); validate on your NIC, the lab attaches in SKB mode |
 
 Status legend: **Supported** — exercised on the primary path and intended for
 production use. **Beta** — gated behind a Cargo feature, hardened in source
 (limits, metrics, readiness, graceful drain) but without recorded soak/interop
 evidence; test it with your own client stack first. **Experimental** — gated
-behind a Cargo feature with known functional gaps; not for production.
+behind a Cargo feature with known functional gaps; not for production. **Partial**
+— the protocol element is present but not the whole feature; the notes say what
+is missing. Anything marked *refused under `production = true`* is rejected by
+config validation in that mode, which is the authoritative signal.
+
+The full per-feature register, with what each `partial` needs to become stable,
+is [docs/protocol-gap.md](docs/protocol-gap.md).
 
 ## Observability
 
@@ -223,7 +280,10 @@ while the process survives is visible; operator response for the shipped alert
 rules is in
 [docs/runbooks/encrypted-transports.md](docs/runbooks/encrypted-transports.md). Bind health/metrics to an internal interface only — see
 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md). The management API and gRPC
-control plane can be secured with mTLS ([docs/MTLS.md](docs/MTLS.md)).
+control plane can be secured with mTLS, and TURNS clients can be required to
+present a certificate too (`[tls] client_ca` / `require_client_cert`) — see
+[docs/MTLS.md](docs/MTLS.md), which covers both planes and states the deliberate
+no-CRL/OCSP position.
 
 ## Using turna as a library
 

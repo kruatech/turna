@@ -33,6 +33,19 @@ listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
 # Tip: don't leave this blank behind NAT — clients receive this IP in the
 # XOR-RELAYED-ADDRESS attribute.
 external_ip = "${TURNA_EXTERNAL_IP:-}"
+# RFC 6156 IPv6 relayed transport. Empty = IPv4-only relaying (the default): an
+# Allocate carrying REQUESTED-ADDRESS-FAMILY = IPv6 is answered
+# "440 Address Family not Supported".
+#
+# Set this to the routable IPv6 address to advertise in XOR-RELAYED-ADDRESS for
+# IPv6-family allocations. The relay socket is then bound in the requested family,
+# and peers of the other family are refused with 443 Peer Address Family Mismatch
+# (RFC 6156 §4.2) — one allocation serves one family.
+#
+# NOTE: this is NOT the same as putting an IPv6 literal in external_ip above.
+# That only changes what is advertised for v4-family allocations.
+# NOTE: RFC 6062 TCP relay allocations stay IPv4-only regardless of this key.
+external_ip6 = "${TURNA_EXTERNAL_IP6:-}"
 realm       = "${TURNA_REALM:-turna}"
 # Transport backend: tokio | io_uring | af_xdp | auto.
 # - tokio (set below): epoll + recvmmsg/sendmmsg. The supported production path.
@@ -237,6 +250,29 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # cert_reload_secs = 30
 # # Advertise ALPN "stun.turn".
 # enable_alpn = true
+# # Per-source-IP handshake RATE limit (handshakes/sec); 0 = unlimited.
+# # max_connections_per_ip bounds CONCURRENT connections only, so a source that
+# # connects and drops in a loop never trips it while still costing a TLS
+# # handshake each time. Refused before the handshake.
+# # Counter: turna_tls_rejected_rate_limit_total.
+# max_handshakes_per_sec_per_ip = 0
+# # Burst allowance for the rate limit; 0 = twice the rate.
+# handshake_burst_per_ip = 0
+# # RFC 7443 strict ALPN: refuse a client that negotiates no ALPN at all.
+# # rustls already fails a non-overlapping ALPN offer; this covers the client
+# # that offers none. Requires enable_alpn = true (otherwise startup fails).
+# # Counter: turna_tls_alpn_rejected_total.
+# alpn_required = false
+# # mTLS for TURNS CLIENTS (not the management plane — that is [grpc] tls_ca).
+# # Empty = no client-certificate verification, correct for a public TURN server.
+# client_ca = ""
+# # Refuse clients presenting no certificate. Needs client_ca (startup error
+# # otherwise). false = unauthenticated clients still pass TLS and are then subject
+# # to the normal long-term credential check — that is what allows rolling certs out
+# # to an existing fleet without a flag day.
+# # NOTE: no CRL/OCSP in code, deliberately (docs/MTLS.md -> Revocation). Revoke by
+# # rotating the CA.
+# require_client_cert = false
 
 # =============================================================================
 # [turn.tcp_relay] — RFC 6062 TCP relay allocations
@@ -244,6 +280,10 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # The client relays TCP (not UDP) to peers via CONNECT / CONNECTION-BIND.
 # Requires [tls] enabled: RFC 6062 §4.1 mandates a TCP/TLS control connection,
 # and a TCP-transport Allocate arriving over UDP/DTLS/QUIC is refused with 400.
+#
+# REFUSED under production = true (config validation rejects enabled = true).
+# Implemented and testable with production = false; the gate lifts once interop
+# and pipelined-client hardening are done.
 #
 # [turn.tcp_relay]
 # enabled = false
@@ -292,8 +332,54 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # # (turna_dtls_outbound_dropped_total) instead of blocking the relay path.
 # outbound_queue_capacity = 1024
 #
-# NOTE: DTLS cannot hot-reload its certificate (the stack fixes its config at
-# listen time). Rotating the files logs a warning and needs a node restart.
+# # Upper bound on one DTLS accept() = one handshake; 0 disables it.
+# # LIVENESS GUARD, not tuning: webrtc-dtls runs the whole handshake inline inside
+# # accept() with no timeout (webrtc-rs/webrtc#614), so a peer that starts a
+# # handshake and goes silent parks the accept loop forever and DTLS stops serving
+# # everyone — while the socket stays bound and readiness still reads Ready.
+# # Abandoned handshakes are counted: turna_dtls_accept_timeouts_total.
+# accept_timeout_secs = 10
+#
+# # Own the UDP socket instead of using webrtc_dtls::listen(). OFF by default.
+# #
+# # listen() runs handshakes SERIALLY inside accept() (webrtc-rs/webrtc#614), which
+# # forces three compromises: session/per-IP caps can only apply AFTER the crypto,
+# # there is nowhere to enforce a handshake rate limit, and the certificate is
+# # fixed at bind time. demux = true fixes all three: one task per handshake,
+# # admission before any DTLS state exists, and live certificate reload.
+# #
+# # It replaces the code path that has recorded verification behind it
+# # (docs/dtls/), so it is opt-in until its own interop run is on record.
+# demux = false
+# # The next three require demux = true; config validation rejects them otherwise
+# # rather than let them read as protection that is not there.
+# max_handshakes_per_sec_per_ip = 0
+# handshake_burst_per_ip = 0
+# cert_reload_secs = 0
+#
+# NOTE: with demux = false (the default) DTLS cannot hot-reload its certificate —
+# the stack fixes its config at listen time. Rotating the files logs a warning and
+# needs a node restart.
+
+# =============================================================================
+# [turn.sctp] — TURN-over-SCTP (experimental, no RFC)
+# =============================================================================
+# Client CONTROL transport over an SCTP association; the relay socket to the peer
+# stays UDP. Requires `--features sctp` and the host `sctp` kernel module.
+#
+# REFUSED under production = true (config validation rejects enabled = true).
+#
+# No TURN RFC defines SCTP. The control channel is PLAINTEXT — whatever you would
+# protect with TURNS is unprotected here. Low real-world use, awkward in
+# containers; see docs/protocol-gap.md, which rates it lowest priority.
+#
+# [turn.sctp]
+# enabled = false
+# listen  = "0.0.0.0:3478"
+# max_frame_size = 65536
+# read_timeout_secs = 300
+# max_connections = 10000
+# backlog = 1024
 
 # =============================================================================
 # [turn.quic] — QUIC / WebTransport listener

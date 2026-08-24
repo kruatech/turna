@@ -219,6 +219,10 @@ fn run_worker<H: PacketHandler>(
     }
 
     let mut stats = Stats::default();
+    // Which 100k-traffic bucket has already been logged, so the periodic line
+    // fires once per bucket rather than on an exact modulo hit that a batched
+    // counter can step over.
+    let mut last_stats_bucket: u64 = 0;
 
     info!(worker_id, addr = %engine.local_addr(), "worker started");
 
@@ -330,6 +334,24 @@ fn run_worker<H: PacketHandler>(
                     sends_inflight_remaining = sends_left,
                     "worker drain complete; exiting loop"
                 );
+                // Unconditional packet summary at exit. The periodic line is gated on
+                // traffic volume, so on a short run spread across many workers it
+                // never fires — 960k packets over 32 workers is 30k each, under any
+                // sensible threshold. A diagnostic that only appears under load is no
+                // help diagnosing a run that produced no load, which is exactly the
+                // situation it was added for.
+                info!(
+                    worker_id,
+                    recv = stats.recv,
+                    sent = stats.sent,
+                    relay_recv = stats.relay_recv,
+                    relay_sent = stats.relay_sent,
+                    relay_send_failed = stats.relay_send_failed,
+                    relay_send_errno = stats.relay_send_errno,
+                    zc = stats.zc,
+                    errors = stats.errors,
+                    "worker packet totals"
+                );
                 if sends_left > 0 {
                     warn!(
                         worker_id,
@@ -345,7 +367,7 @@ fn run_worker<H: PacketHandler>(
         // Bytes-typed send queues: clones are AtomicAdd, not memcpy.
         let mut main_sends: Vec<(Bytes, SocketAddr)> = Vec::new();
         let mut relay_sends: Vec<(u16, Bytes, SocketAddr)> = Vec::new();
-        let mut zc_relay_sends: Vec<(u16, u16, usize, usize, SocketAddr)> = Vec::new();
+        let mut zc_relay_sends: Vec<ZcRelaySend> = Vec::new();
         let mut resubmit_main: Vec<(u16, u16)> = Vec::new();
         let mut resubmit_relay: Vec<(u16, u16, u16)> = Vec::new();
         let mut new_relays: Vec<(u16, String)> = Vec::new();
@@ -403,11 +425,28 @@ fn run_worker<H: PacketHandler>(
                         stats.errors += 1;
                     }
                 }
-                CompletionEvent::RelaySend { result, .. } => {
+                CompletionEvent::RelaySend {
+                    result, relay_port, ..
+                } => {
                     if result >= 0 {
                         stats.relay_sent += 1;
                     } else {
                         stats.errors += 1;
+                        stats.relay_send_failed += 1;
+                        // Log the first failure per worker with the errno. Every
+                        // packet would drown the log, and silence hid the bug — so:
+                        // once, loudly, with the number that identifies the cause.
+                        if stats.relay_send_errno == 0 {
+                            stats.relay_send_errno = -result;
+                            warn!(
+                                worker_id,
+                                relay_port,
+                                errno = -result,
+                                "relay send FAILED at completion — no relayed traffic will \
+                                 reach peers through this socket. This is logged once per \
+                                 worker; see relay_send_failed in the periodic stats line."
+                            );
+                        }
                     }
                 }
                 CompletionEvent::MainRecvError {
@@ -553,16 +592,35 @@ fn run_worker<H: PacketHandler>(
             }
         }
 
-        // Zero-copy relay sends: copy from the kernel-registered recv buffer
-        // into the send slot, then release the recv buffer.
-        // NOTE: this still double-copies (buffer → Vec → send_buf); collapsing
-        // it requires registered send buffers (tracked in ADR-0002).
-        for (buf_idx, port, offset, len, target) in &zc_relay_sends {
-            let data = engine.buffer_data(*buf_idx, offset + len)[*offset..*offset + *len].to_vec();
-            if engine.submit_relay_send(*port, &data, *target).is_err() {
+        // Relay sends that came from a registered recv buffer: copy the payload
+        // out, submit the send, then **re-arm the recv slot with the same buffer**.
+        //
+        // Re-arming — not `release_buffer` — is what mirrors the `Send` path: the
+        // buffer belongs to the slot, and `resubmit_*_recv` hands it back to the
+        // kernel for the next packet. Releasing it here and re-arming as well would
+        // hand the same buffer to both the free pool and the kernel; doing neither
+        // (the previous behaviour) leaked the slot and made the worker deaf after 64
+        // relayed packets.
+        //
+        // NOTE: this still double-copies (buffer → Vec → send_buf); collapsing it
+        // requires registered send buffers (tracked in ADR-0002). Until then the
+        // name "zero copy" flatters it.
+        for zc in &zc_relay_sends {
+            let data = engine.buffer_data(zc.buf_idx, zc.offset + zc.len)
+                [zc.offset..zc.offset + zc.len]
+                .to_vec();
+            if engine
+                .submit_relay_send(zc.relay_port, &data, zc.target)
+                .is_err()
+            {
                 stats.errors += 1;
             }
-            engine.release_buffer(*buf_idx);
+            // The payload is copied; the slot can serve the next packet.
+            if zc.is_main {
+                resubmit_main.push((zc.msghdr_idx, zc.buf_idx));
+            } else {
+                resubmit_relay.push((zc.relay_port, zc.msghdr_idx, zc.buf_idx));
+            }
         }
 
         // Re-submit recvs. Even while draining we keep the MAIN socket armed:
@@ -580,17 +638,24 @@ fn run_worker<H: PacketHandler>(
 
         let _ = engine.flush();
 
-        if stats.recv % 100_000 == 0 && stats.recv > 0 {
+        // Gated on total traffic, not on main recv alone: a worker relaying heavily
+        // while receiving little would never print, which is the case that needed
+        // printing most.
+        let traffic = stats.recv + stats.relay_recv + stats.relay_sent;
+        if traffic > 0 && traffic / 10_000 != last_stats_bucket {
+            last_stats_bucket = traffic / 10_000;
             info!(
                 worker_id,
                 recv = stats.recv,
                 sent = stats.sent,
                 relay_recv = stats.relay_recv,
                 relay_sent = stats.relay_sent,
+                relay_send_failed = stats.relay_send_failed,
+                relay_send_errno = stats.relay_send_errno,
                 zc = stats.zc,
                 errors = stats.errors,
                 bufs = engine.buffers_available(),
-                "stats"
+                "worker packet stats"
             );
         }
     }
@@ -606,7 +671,7 @@ fn process_action(
     is_main: bool,
     main_sends: &mut Vec<(Bytes, SocketAddr)>,
     relay_sends: &mut Vec<(u16, Bytes, SocketAddr)>,
-    zc_relay_sends: &mut Vec<(u16, u16, usize, usize, SocketAddr)>,
+    zc_relay_sends: &mut Vec<ZcRelaySend>,
     resubmit_main: &mut Vec<(u16, u16)>,
     new_relays: &mut Vec<(u16, String)>,
     close_relays: &mut Vec<u16>,
@@ -641,13 +706,28 @@ fn process_action(
             relay_port,
         } => {
             stats.zc += 1;
-            zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
-            // F1 (intentional, NOT a bug): do not resubmit the main recv slot
-            // here. The recv buffer is handed to the zero-copy relay send and
-            // released only after that send completes (release_buffer in the
-            // zc_relay_sends loop); re-arming/freeing it now would be a
-            // use-after-free. STUN-response paths (ForwardAction::Send) free the
-            // buffer immediately and DO re-arm the recv slot.
+            // The recv slot is carried through and re-armed by the zc loop below,
+            // AFTER the payload has been copied out of the buffer.
+            //
+            // It used to be deliberately not re-armed here, on the grounds that the
+            // registered buffer stayed with the kernel until the send completed.
+            // That was true of an earlier true-zero-copy send; the loop now copies
+            // (`to_vec`) and is done with the buffer immediately, so there is
+            // nothing to wait for — and because `msghdr_idx` was not even carried in
+            // the batch, the slot could never be re-armed at all. Every relayed
+            // packet permanently consumed one recv slot, so each worker went deaf
+            // after exactly as many relayed packets as it had slots: 64. Control
+            // traffic kept working (it takes the `Send` path, which re-arms), which
+            // is why allocation succeeded at 10k/s while media never moved.
+            zc_relay_sends.push(ZcRelaySend {
+                buf_idx,
+                msghdr_idx,
+                is_main,
+                relay_port,
+                offset,
+                len,
+                target,
+            });
         }
         ForwardAction::CreateRelay {
             port,
@@ -682,7 +762,15 @@ fn process_action(
                     } => {
                         stats.zc += 1;
                         has_zc = true;
-                        zc_relay_sends.push((buf_idx, relay_port, offset, len, target));
+                        zc_relay_sends.push(ZcRelaySend {
+                            buf_idx,
+                            msghdr_idx,
+                            is_main,
+                            relay_port,
+                            offset,
+                            len,
+                            target,
+                        });
                     }
                     ForwardAction::CreateRelay {
                         port,
@@ -728,6 +816,21 @@ fn process_relay_response(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// One relayed packet whose payload still lives in a registered recv buffer.
+///
+/// Carries `msghdr_idx` and `is_main` so the recv slot can be re-armed once the
+/// payload has been copied out. The previous tuple omitted both, which is why the
+/// slot could never be returned.
+struct ZcRelaySend {
+    buf_idx: u16,
+    msghdr_idx: u16,
+    is_main: bool,
+    relay_port: u16,
+    offset: usize,
+    len: usize,
+    target: SocketAddr,
+}
+
 #[derive(Default)]
 struct Stats {
     recv: u64,
@@ -736,6 +839,18 @@ struct Stats {
     relay_sent: u64,
     zc: u64,
     errors: u64,
+    /// Relay sends that COMPLETED with a negative result.
+    ///
+    /// Separate from `errors` on purpose. This was folded into `errors`, which is
+    /// neither logged per-event nor exported as a metric, so a datapath that
+    /// submitted every relay send successfully and then failed every completion was
+    /// indistinguishable from one that worked: no warning, no counter, no relayed
+    /// bytes. That is how "io_uring does not forward ChannelData" survived a 3-hour
+    /// soak reporting PASS on every signal.
+    relay_send_failed: u64,
+    /// First errno seen on a failed relay send, kept so the log line can name it
+    /// once rather than per packet.
+    relay_send_errno: i32,
 }
 
 #[cfg(target_os = "linux")]

@@ -155,7 +155,19 @@ pub(crate) async fn run_sctp_bridge(
             } => {
                 client_sinks.remove(&peer_addr);
                 debug!(%peer_addr, %conn_id, %reason, "SCTP connection closed");
-                let _ = conn_id;
+                // Release the allocation now instead of waiting for the TTL —
+                // same reasoning as the TURNS bridge: for TURN over a stream
+                // transport the control connection *is* the allocation's 5-tuple,
+                // so once it closes the allocation can never be refreshed or used
+                // again. Holding it only blocks a relay port and makes a
+                // reconnecting client collide with 437 Allocation Mismatch.
+                // (This was missing here while `tls_bridge` had it, so every
+                // closed SCTP association leaked its allocation until expiry.)
+                for action in processor.release_for_closed_connection(peer_addr) {
+                    if let Action::CloseRelay { port } = action {
+                        let _ = relay_tx.send(OutMsg::CloseRelay { port }).await;
+                    }
+                }
             }
         }
     }

@@ -149,8 +149,7 @@ impl QuicBridge {
             ctx.remote = new_addr;
         }
         self.by_addr.remove(&old_addr);
-        self.by_addr
-            .insert(new_addr, session_id.to_string());
+        self.by_addr.insert(new_addr, session_id.to_string());
     }
 
     /// Feed one `QuicEvent`. Returns the `Action`s the caller must deliver back
@@ -160,8 +159,7 @@ impl QuicBridge {
         let processor = self.processor.clone();
         match ev {
             QuicEvent::NewSession(s) => {
-                self.by_addr
-                    .insert(s.remote_addr, s.session_id.clone());
+                self.by_addr.insert(s.remote_addr, s.session_id.clone());
                 self.sessions.insert(
                     s.session_id.clone(),
                     SessionCtx {
@@ -176,7 +174,8 @@ impl QuicBridge {
                 if let Some(ctx) = self.sessions.remove(&session_id) {
                     // Only drop the reverse entry if it still points at us: a
                     // migrated session may have handed the old address on.
-                    if self.by_addr.get(&ctx.remote).map(|s| s.as_str()) == Some(session_id.as_str())
+                    if self.by_addr.get(&ctx.remote).map(|s| s.as_str())
+                        == Some(session_id.as_str())
                     {
                         self.by_addr.remove(&ctx.remote);
                     }

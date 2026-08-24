@@ -81,9 +81,10 @@ compile/test/clippy matrix is the source of truth.
   - NOTE: RX-side ring occupancy is intentionally NOT a separate gauge - it is covered by `_umem_free_frames`; only TX in-flight (`tx_inflight = tx_produced - comp_consumed`) is exported, since xsk-rs 0.6 exposes no ring indices and the fill ring is recycled 1:1.
 - **shipped+verified** DTLS outbound-drop metric (DTL-3).
 - **shipped+verified** `turna_backend_readiness` gauge (2.4).
-- **pending (Linux)** extra DTLS metrics (`turna_dtls_handshake_failures/timeouts`, per-IP rejects): some not observable above webrtc-dtls `accept()`.
-- **pending (Linux)** per-backend readiness granularity (separate state per tokio/io_uring/dtls/af_xdp; `Degraded` auto-set on partial failure).
-- **pending** dashboards, runbooks.
+- **shipped** per-IP DTLS reject counter (`turna_dtls_rejected_per_ip_total`) and the outbound-oversize counter (`turna_dtls_outbound_oversize_total`).
+- **won't fix (not observable)** `turna_dtls_handshake_failures/timeouts`: a failed DTLS handshake never surfaces above `webrtc-dtls::accept()`, so no counter can be honest. The alert that referenced it was removed from `docs/alerts/transport-backends.yml` rather than left unfirable. Equivalent counters DO exist for TURNS (`turna_tls_handshake_failures/timeouts_total`) and QUIC (`turna_quic_handshake_failures_total`), where the handshake is observable.
+- **shipped** per-listener readiness granularity: `turna_transport_readiness` (primary UDP backend), `turna_tls_readiness`, `turna_dtls_readiness`, `turna_quic_readiness`, `turna_afxdp_readiness`. **Correction 2026-08-18:** `turna_transport_readiness` was exported and documented but `set_transport_readiness()` was never called from anywhere, so it read `0` (starting) for the whole life of every process — including one serving traffic. Found by a browser interop run against a healthy node, alongside the same gap in AF_XDP. Both now set Ready at bind and Draining on shutdown — each derived from whether that listener's socket is bound, so a listener that dies while the process survives reads `2` (degraded) even when `/ready` is green. AF_XDP still shares the process-level backend gauge.
+- **shipped** runbook for the encrypted transports (`docs/runbooks/encrypted-transports.md`, covering the rules in `docs/alerts/transport-backends.yml`); **pending** dashboards.
 
 ## Stage 4b - AF_XDP Phase 2 (datapath completeness)
 All four planned items shipped, compile clean, frame logic unit-tested, and the
@@ -132,7 +133,7 @@ datapath validated live (IPv4+IPv6):
   bucket's production code swaps in loom atomics under that cfg. NOTE: the relay
   nonce loom test cannot run workspace-wide under `--cfg loom` because tokio gates
   `tokio::net` behind `cfg(not(loom))`; documented but not runnable in place.
-- **partially shipped** DTL-9 DoS: webrtc-dtls `listen()` performs a HelloVerifyRequest cookie exchange before `accept()` (amplification covered); edge rate-cap applied operationally via `iptables hashlimit` on the DTLS port (ops mitigation, not in-code). In-code per-IP handshake limits/metrics above `accept()` remain **pending (Linux)**.
+- **partially shipped** DTL-9 DoS: webrtc-dtls `listen()` performs a HelloVerifyRequest cookie exchange before `accept()` (amplification covered); a per-IP **concurrent session** cap is now in-code (`[turn.dtls].max_sessions_per_ip`, `turna_dtls_rejected_per_ip_total`). A per-IP handshake **rate** cap above `accept()` remains **pending (Linux)** and is still mitigated operationally via `iptables hashlimit` on the DTLS port — the handshake runs inside webrtc-dtls, so an in-code rate limit needs a UDP demultiplexer in front of the listener. The QUIC paths do have one in-code (`[turn.quic].max_handshakes_per_sec_per_ip`, token bucket + burst, checked pre-handshake).
 - **pending (hw)** load/soak runs, security docs.
 
 ## Transport-backend docs

@@ -91,6 +91,11 @@ pub fn spawn_dtls(
         idle_timeout: std::time::Duration::from_secs(cfg.idle_timeout_secs),
         outbound_queue_capacity: cfg.outbound_queue_capacity,
         max_sessions_per_ip: cfg.max_sessions_per_ip,
+        accept_timeout: std::time::Duration::from_secs(cfg.accept_timeout_secs),
+        demux: cfg.demux,
+        max_handshakes_per_sec_per_ip: cfg.max_handshakes_per_sec_per_ip,
+        handshake_burst_per_ip: cfg.handshake_burst_per_ip,
+        cert_reload_interval: std::time::Duration::from_secs(cfg.cert_reload_secs),
     };
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DtlsEvent>(1024);
@@ -114,16 +119,38 @@ pub fn spawn_dtls(
                 let s = stats.snapshot();
                 metrics.dtls_active.store(s.active as u64, Relaxed);
                 metrics.dtls_sessions_total.store(s.accepted, Relaxed);
-                metrics.dtls_rejected_over_cap.store(s.rejected_over_cap, Relaxed);
+                metrics
+                    .dtls_rejected_over_cap
+                    .store(s.rejected_over_cap, Relaxed);
                 metrics.dtls_closed_total.store(s.closed, Relaxed);
                 metrics.dtls_idle_timeouts.store(s.idle_timeouts, Relaxed);
                 metrics.dtls_bytes_rx.store(s.bytes_rx, Relaxed);
                 metrics.dtls_bytes_tx.store(s.bytes_tx, Relaxed);
-                metrics.dtls_outbound_dropped.store(s.outbound_dropped, Relaxed);
-                metrics.dtls_rejected_per_ip.store(s.rejected_per_ip, Relaxed);
+                metrics
+                    .dtls_outbound_dropped
+                    .store(s.outbound_dropped, Relaxed);
+                metrics
+                    .dtls_rejected_per_ip
+                    .store(s.rejected_per_ip, Relaxed);
                 metrics
                     .dtls_outbound_oversize
                     .store(s.outbound_oversize, Relaxed);
+                metrics
+                    .dtls_accept_timeouts
+                    .store(s.accept_timeouts, Relaxed);
+                metrics
+                    .dtls_handshake_failures
+                    .store(s.handshake_failures, Relaxed);
+                metrics
+                    .dtls_inbound_dropped
+                    .store(s.inbound_dropped, Relaxed);
+                metrics
+                    .dtls_rejected_rate_limit
+                    .store(s.rejected_rate_limit, Relaxed);
+                metrics.dtls_cert_reloads.store(s.cert_reloads, Relaxed);
+                metrics
+                    .dtls_cert_reload_failures
+                    .store(s.cert_reload_failures, Relaxed);
                 metrics.set_dtls_readiness(if s.listening {
                     turna_health::Readiness::Ready
                 } else {
@@ -143,9 +170,8 @@ pub fn spawn_dtls(
         let cert_path = cfg.cert_path.clone();
         let key_path = cfg.key_path.clone();
         tokio::spawn(async move {
-            let mtime = |p: &std::path::Path| {
-                std::fs::metadata(p).ok().and_then(|m| m.modified().ok())
-            };
+            let mtime =
+                |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
             let mut cert_mt = mtime(&cert_path);
             let mut key_mt = mtime(&key_path);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -419,7 +445,11 @@ mod tests {
             ..base()
         };
         let problems = validate_dtls(&cfg).expect_err("unreadable cert/key must fail");
-        assert_eq!(problems.len(), 2, "one problem per unreadable file: {problems:?}");
+        assert_eq!(
+            problems.len(),
+            2,
+            "one problem per unreadable file: {problems:?}"
+        );
     }
 
     #[test]
@@ -442,7 +472,10 @@ mod tests {
             mtu: 500,
             ..base()
         };
-        assert!(validate_dtls(&too_small).is_err(), "below the IPv4 576 floor");
+        assert!(
+            validate_dtls(&too_small).is_err(),
+            "below the IPv4 576 floor"
+        );
 
         let too_large = DtlsSection {
             cert_path: "".into(),

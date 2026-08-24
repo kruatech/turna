@@ -59,14 +59,14 @@ Which listeners reload at all:
 | listener | hot-reload | on failure |
 |---|---|---|
 | TURNS (`[tls]`) | yes, `cert_reload_secs` | keeps previous cert, counter increments |
-| QUIC, `web_transport = true` | yes, `[turn.quic].cert_reload_secs` | same, `turna_quic_cert_reload_failures_total` |
-| QUIC, `web_transport = false` | **no** | rotation needs a restart |
-| DTLS | **no** | logs `DTLS certificate material changed on disk`; needs a restart |
+| QUIC (both paths) | yes, `[turn.quic].cert_reload_secs` | same, `turna_quic_cert_reload_failures_total` |
+| DTLS, `demux = false` (default) | **no** | logs `DTLS certificate material changed on disk`; needs a restart |
+| DTLS, `demux = true` | yes, `[turn.dtls].cert_reload_secs` | keeps previous cert, `turna_dtls_cert_reload_failures_total` |
 
 So if you rotate a certificate shared between `[tls]`, `[turn.quic]` and
-`[turn.dtls]`, TURNS and WebTransport pick it up within their poll interval while
-DTLS keeps serving the old one until the node restarts. Plan the restart, or give
-DTLS its own certificate with a longer validity.
+`[turn.dtls]`, TURNS and QUIC pick it up within their poll interval while DTLS
+keeps serving the old one until the node restarts. Plan the restart, or give DTLS
+its own certificate with a longer validity.
 
 ---
 

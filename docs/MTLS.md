@@ -218,6 +218,27 @@ new CA trust for the duration of the rollover. Pragmatic approach:
 - Once all clients are on new certs, drop the old CA from
   `combined-ca.crt` (now just `new-ca.crt`).
 
+## TURNS client certificates (data plane)
+
+Everything above concerns the **management/gRPC plane**. The TURNS listener has its
+own, separate switch — `[tls].client_ca` and `[tls].require_client_cert` — because
+the two planes have different threat models: the management API is operator-only and
+wants mTLS, while a public TURN server generally must accept clients that have no
+certificate at all.
+
+| | management plane | TURNS data plane |
+|---|---|---|
+| CA setting | `[grpc] tls_ca` | `[tls] client_ca` |
+| Mandatory presentation | `tls_mode = "mtls"` | `require_client_cert = true` |
+| Optional presentation | — | `require_client_cert = false` (default) |
+
+`require_client_cert = false` with a `client_ca` set is the staged-rollout mode: a
+client with a valid certificate is verified, one without still completes the
+handshake and is then only as authenticated as its TURN long-term credentials make
+it. That is deliberate — it lets an existing fleet migrate without a flag day.
+
+The revocation position below applies identically to both planes.
+
 ## Revocation
 
 This setup does not implement CRL or OCSP in code, and that is a

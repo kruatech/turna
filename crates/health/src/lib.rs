@@ -71,6 +71,11 @@ pub struct Metrics {
     pub dtls_readiness: AtomicU8,
     pub tls_readiness: AtomicU8,
     pub quic_readiness: AtomicU8,
+    /// AF_XDP datapath readiness, same encoding as the others. AF_XDP was the only
+    /// datapath still sharing the process-level `backend_readiness`, which meant a
+    /// dead XSK socket was indistinguishable from a dead tokio datapath — and on a
+    /// kernel-bypass path that is exactly the failure worth naming.
+    pub afxdp_readiness: AtomicU8,
     /// #6/#4.5: management-plane readiness sub-signal (0=starting, 1=ready,
     /// 2=degraded, 3=draining), DISTINCT from the dataplane `readiness` flag so a
     /// bounded/resumable command-log migration gates the management plane without
@@ -245,6 +250,12 @@ pub struct Metrics {
     pub dtls_outbound_dropped: AtomicU64,
     pub dtls_rejected_per_ip: AtomicU64,
     pub dtls_outbound_oversize: AtomicU64,
+    pub dtls_accept_timeouts: AtomicU64,
+    pub dtls_handshake_failures: AtomicU64,
+    pub dtls_inbound_dropped: AtomicU64,
+    pub dtls_rejected_rate_limit: AtomicU64,
+    pub dtls_cert_reloads: AtomicU64,
+    pub dtls_cert_reload_failures: AtomicU64,
     pub quic_handshake_failures: AtomicU64,
     pub quic_control_dropped_no_stream: AtomicU64,
     pub quic_rejected_over_cap: AtomicU64,
@@ -269,6 +280,8 @@ pub struct Metrics {
     pub tls_bytes_tx: AtomicU64,
     pub tls_cert_reloads: AtomicU64,
     pub tls_cert_reload_failures: AtomicU64,
+    pub tls_rejected_rate_limit: AtomicU64,
+    pub tls_alpn_rejected: AtomicU64,
 
     // ── io_uring worker-pool ring utilisation (Linux io-uring backend) ───────
     // Summed across workers by a periodic copy task in the node's io_uring arm.
@@ -326,6 +339,7 @@ impl Metrics {
             dtls_readiness: AtomicU8::new(Readiness::Starting as u8),
             tls_readiness: AtomicU8::new(Readiness::Starting as u8),
             quic_readiness: AtomicU8::new(Readiness::Starting as u8),
+            afxdp_readiness: AtomicU8::new(Readiness::Starting as u8),
             management_readiness: AtomicU8::new(Readiness::Starting as u8),
             packets_received: AtomicU64::new(0),
             packets_sent: AtomicU64::new(0),
@@ -419,6 +433,12 @@ impl Metrics {
             dtls_outbound_dropped: AtomicU64::new(0),
             dtls_rejected_per_ip: AtomicU64::new(0),
             dtls_outbound_oversize: AtomicU64::new(0),
+            dtls_accept_timeouts: AtomicU64::new(0),
+            dtls_handshake_failures: AtomicU64::new(0),
+            dtls_inbound_dropped: AtomicU64::new(0),
+            dtls_rejected_rate_limit: AtomicU64::new(0),
+            dtls_cert_reloads: AtomicU64::new(0),
+            dtls_cert_reload_failures: AtomicU64::new(0),
             quic_handshake_failures: AtomicU64::new(0),
             quic_control_dropped_no_stream: AtomicU64::new(0),
             quic_rejected_over_cap: AtomicU64::new(0),
@@ -441,6 +461,8 @@ impl Metrics {
             tls_bytes_tx: AtomicU64::new(0),
             tls_cert_reloads: AtomicU64::new(0),
             tls_cert_reload_failures: AtomicU64::new(0),
+            tls_rejected_rate_limit: AtomicU64::new(0),
+            tls_alpn_rejected: AtomicU64::new(0),
             uring_workers: AtomicU64::new(0),
             uring_cqe_drained_total: AtomicU64::new(0),
             uring_cqe_batches_total: AtomicU64::new(0),
@@ -497,6 +519,10 @@ impl Metrics {
 
     pub fn set_quic_readiness(&self, r: Readiness) {
         self.quic_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_afxdp_readiness(&self, r: Readiness) {
+        self.afxdp_readiness.store(r as u8, Ordering::SeqCst);
     }
 
     /// #6/#4.5: set management-plane readiness (see the field docs). Distinct
@@ -825,6 +851,24 @@ impl Metrics {
              # HELP turna_dtls_outbound_oversize_total Outbound DTLS datagrams dropped for exceeding the configured record MTU\n\
              # TYPE turna_dtls_outbound_oversize_total counter\n\
              turna_dtls_outbound_oversize_total {}\n\
+             # HELP turna_dtls_accept_timeouts_total DTLS handshakes abandoned because accept() exceeded accept_timeout_secs (liveness guard for webrtc-rs/webrtc#614)\n\
+             # TYPE turna_dtls_accept_timeouts_total counter\n\
+             turna_dtls_accept_timeouts_total {}\n\
+             # HELP turna_dtls_handshake_failures_total DTLS handshakes that failed (demux path only; not observable on the stock listener)\n\
+             # TYPE turna_dtls_handshake_failures_total counter\n\
+             turna_dtls_handshake_failures_total {}\n\
+             # HELP turna_dtls_inbound_dropped_total Inbound DTLS datagrams dropped because a peer queue was full (demux path)\n\
+             # TYPE turna_dtls_inbound_dropped_total counter\n\
+             turna_dtls_inbound_dropped_total {}\n\
+             # HELP turna_dtls_rejected_rate_limit_total DTLS handshakes refused by the per-IP rate limiter before any DTLS state existed (demux path)\n\
+             # TYPE turna_dtls_rejected_rate_limit_total counter\n\
+             turna_dtls_rejected_rate_limit_total {}\n\
+             # HELP turna_dtls_cert_reloads_total Successful DTLS certificate hot-reloads (demux path)\n\
+             # TYPE turna_dtls_cert_reloads_total counter\n\
+             turna_dtls_cert_reloads_total {}\n\
+             # HELP turna_dtls_cert_reload_failures_total Failed DTLS certificate hot-reloads; the previous certificate stays in service\n\
+             # TYPE turna_dtls_cert_reload_failures_total counter\n\
+             turna_dtls_cert_reload_failures_total {}\n\
              # HELP turna_quic_handshake_failures_total QUIC/WebTransport sessions that failed before becoming usable\n\
              # TYPE turna_quic_handshake_failures_total counter\n\
              turna_quic_handshake_failures_total {}\n\
@@ -891,6 +935,12 @@ impl Metrics {
              # HELP turna_tls_cert_reload_failures_total Failed TURNS certificate hot-reloads (previous certificate kept)\n\
              # TYPE turna_tls_cert_reload_failures_total counter\n\
              turna_tls_cert_reload_failures_total {}\n\
+             # HELP turna_tls_rejected_rate_limit_total TURNS connections refused by the per-IP handshake rate limiter\n\
+             # TYPE turna_tls_rejected_rate_limit_total counter\n\
+             turna_tls_rejected_rate_limit_total {}\n\
+             # HELP turna_tls_alpn_rejected_total TURNS connections refused because alpn_required was set and the client negotiated no ALPN\n\
+             # TYPE turna_tls_alpn_rejected_total counter\n\
+             turna_tls_alpn_rejected_total {}\n\
              # HELP turna_backend_readiness Process readiness (0=starting,1=ready,2=degraded,3=draining)\n\
              # TYPE turna_backend_readiness gauge\n\
              turna_backend_readiness {}\n\
@@ -906,6 +956,9 @@ impl Metrics {
              # HELP turna_quic_readiness QUIC/WebTransport listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if QUIC disabled)\n\
              # TYPE turna_quic_readiness gauge\n\
              turna_quic_readiness {}\n\
+             # HELP turna_afxdp_readiness AF_XDP datapath readiness (0=starting,1=ready,2=degraded,3=draining; starting if AF_XDP is not the selected backend)\n\
+             # TYPE turna_afxdp_readiness gauge\n\
+             turna_afxdp_readiness {}\n\
              # HELP turna_management_readiness Management-plane readiness incl. command-log migration (0=starting,1=ready,2=degraded,3=draining)\n\
              # TYPE turna_management_readiness gauge\n\
              turna_management_readiness {}\n",
@@ -952,6 +1005,12 @@ impl Metrics {
             l(&self.afxdp_tx_inflight),
             l(&self.afxdp_neighbor_cache_entries),
             l(&self.dtls_outbound_oversize),
+            l(&self.dtls_accept_timeouts),
+            l(&self.dtls_handshake_failures),
+            l(&self.dtls_inbound_dropped),
+            l(&self.dtls_rejected_rate_limit),
+            l(&self.dtls_cert_reloads),
+            l(&self.dtls_cert_reload_failures),
             l(&self.quic_handshake_failures),
             l(&self.quic_control_dropped_no_stream),
             l(&self.quic_rejected_over_cap),
@@ -974,11 +1033,14 @@ impl Metrics {
             l(&self.tls_bytes_tx),
             l(&self.tls_cert_reloads),
             l(&self.tls_cert_reload_failures),
+            l(&self.tls_rejected_rate_limit),
+            l(&self.tls_alpn_rejected),
             self.readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.transport_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.tls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
         )
     }

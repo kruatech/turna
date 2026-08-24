@@ -207,19 +207,31 @@ fn zerocopy_forward_enabled() -> bool {
 /// as ICMP "fragmentation needed", which the Data-error path can relay back).
 ///
 /// Applied per allocation when the client set DONT-FRAGMENT on Allocate
-/// (RFC 8656 §16.4). The relay socket binds IPv4 (`0.0.0.0`), so only the IPv4
-/// knob is needed today; an IPv6 relay would also want `IPV6_MTU_DISCOVER`.
+/// (RFC 8656 §16.4).
+///
+/// The option is family-specific: `IPPROTO_IP`/`IP_MTU_DISCOVER` on an
+/// `AF_INET6` socket fails (or, worse, silently does nothing), so a v6 relay
+/// socket needs `IPPROTO_IPV6`/`IPV6_MTU_DISCOVER` instead. Now that IPv6
+/// relaying exists (`[turn] external_ip6`), the caller passes the family it bound.
 #[cfg(target_os = "linux")]
-fn set_dont_fragment(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    // IP_MTU_DISCOVER = IP_PMTUDISC_DO → kernel sets DF and never fragments.
+fn set_dont_fragment(
+    fd: std::os::fd::RawFd,
+    family: turna_session::RelayFamily,
+) -> std::io::Result<()> {
+    // *_PMTUDISC_DO → kernel sets DF and never fragments.
     let val: libc::c_int = libc::IP_PMTUDISC_DO;
+    let (level, name) = if family.is_v6() {
+        (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+    };
     // SAFETY: `fd` is the caller's open socket; `val` is a c_int living for the call,
     // optlen = size_of::<c_int>().
     let rc = unsafe {
         libc::setsockopt(
             fd,
-            libc::IPPROTO_IP,
-            libc::IP_MTU_DISCOVER,
+            level,
+            name,
             &val as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -233,7 +245,10 @@ fn set_dont_fragment(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 /// Non-Linux builds (e.g. macOS dev hosts) are a no-op: production runs on
 /// Linux, and the dev build only needs the control-plane logic to compile.
 #[cfg(not(target_os = "linux"))]
-fn set_dont_fragment(_fd: std::os::fd::RawFd) -> std::io::Result<()> {
+fn set_dont_fragment(
+    _fd: std::os::fd::RawFd,
+    _family: turna_session::RelayFamily,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -369,6 +384,13 @@ pub struct PacketProcessor {
     auth: Arc<AuthRegistry>,
     rate_limiter: TieredRateLimiter,
     external_ip: std::net::IpAddr,
+    /// RFC 6156 IPv6 relayed transport. `None` (the default) keeps the historical
+    /// IPv4-only behaviour: an explicit `REQUESTED-ADDRESS-FAMILY = IPv6` is
+    /// refused with 440. `Some(v6)` is the address advertised in
+    /// XOR-RELAYED-ADDRESS for v6 allocations; the relay socket is bound v6.
+    /// Set with [`PacketProcessor::with_external_ip6`] so no constructor
+    /// signature changes.
+    external_ip6: Option<std::net::Ipv6Addr>,
     nonce_mgr: NonceManager,
     metrics: Arc<Metrics>,
     rtp_analyzer: Arc<RtpAnalyzer>,
@@ -462,6 +484,7 @@ impl PacketProcessor {
                 TieredRateLimiter::new(limits)
             },
             external_ip,
+            external_ip6: None,
             nonce_mgr: NonceManager::new(),
             metrics,
             rtp_analyzer: Arc::new(RtpAnalyzer::new()),
@@ -1201,18 +1224,24 @@ impl PacketProcessor {
             );
         }
 
-        // RFC 8656 §14.1 / §7.2: REQUESTED-ADDRESS-FAMILY. This build is
-        // IPv4-only (see RC scope): an explicit IPv4 request is accepted, an
-        // IPv6 request is refused with 440 Address Family not Supported, and a
-        // malformed attribute was already rejected at parse time (the packet
-        // fails to decode → handled as a bad request upstream). §7.2 also makes
-        // REQUESTED-ADDRESS-FAMILY and RESERVATION-TOKEN mutually exclusive.
-        match msg.get_requested_address_family() {
-            None | Some(turna_proto_stun::attribute::AddressFamily::Ipv4) => {}
-            Some(turna_proto_stun::attribute::AddressFamily::Ipv6) => {
-                return self.encode_error(msg, src, 440, "Address Family not Supported");
+        // RFC 8656 §14.1 / §7.2 + RFC 6156: REQUESTED-ADDRESS-FAMILY. An IPv6
+        // request is honoured only when this node was given a v6 address to
+        // advertise (`with_external_ip6`); otherwise it is still refused with 440,
+        // because handing out a relayed candidate we cannot route is worse than an
+        // honest refusal. A malformed attribute was already rejected at parse
+        // time. §7.2 also makes REQUESTED-ADDRESS-FAMILY and RESERVATION-TOKEN
+        // mutually exclusive.
+        let relay_family = match msg.get_requested_address_family() {
+            None | Some(turna_proto_stun::attribute::AddressFamily::Ipv4) => {
+                turna_session::RelayFamily::V4
             }
-        }
+            Some(turna_proto_stun::attribute::AddressFamily::Ipv6) => {
+                if self.external_ip6.is_none() {
+                    return self.encode_error(msg, src, 440, "Address Family not Supported");
+                }
+                turna_session::RelayFamily::V6
+            }
+        };
         if msg.get_requested_address_family().is_some() && msg.get_reservation_token().is_some() {
             return self.encode_error(msg, src, 400, "Bad Request");
         }
@@ -1233,12 +1262,12 @@ impl PacketProcessor {
                 None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
             }
         } else if let Some(reserve_next) = even_port {
-            match pool.allocate_even_and_bind(reserve_next) {
+            match pool.allocate_even_and_bind_family(reserve_next, relay_family) {
                 Some(x) => x,
                 None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
             }
         } else {
-            match pool.allocate_and_bind() {
+            match pool.allocate_and_bind_family(relay_family) {
                 Some((p, s)) => (p, s, None),
                 None => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
             }
@@ -1254,12 +1283,22 @@ impl PacketProcessor {
             .any(|a| matches!(a, turna_proto_stun::attribute::Attribute::DontFragment));
         if dont_fragment {
             use std::os::fd::AsRawFd;
-            if let Err(e) = set_dont_fragment(relay_sock.as_raw_fd()) {
+            if let Err(e) = set_dont_fragment(relay_sock.as_raw_fd(), relay_family) {
                 warn!(%src, %e, "DONT-FRAGMENT: failed to set DF on relay socket");
             }
         }
 
-        let relay_addr = SocketAddr::new(self.external_ip, relay_port);
+        // Advertise the address matching the family the socket was bound in.
+        let relay_addr = match relay_family {
+            turna_session::RelayFamily::V6 => SocketAddr::new(
+                std::net::IpAddr::V6(
+                    self.external_ip6
+                        .expect("V6 is only selected when external_ip6 is set"),
+                ),
+                relay_port,
+            ),
+            turna_session::RelayFamily::V4 => SocketAddr::new(self.external_ip, relay_port),
+        };
         let mut port_reservation = turna_session::PortReservationGuard::new(
             self.store.pool_for_port(relay_port),
             relay_port,
@@ -1403,7 +1442,9 @@ impl PacketProcessor {
         if msg.get_even_port().is_some() || msg.get_reservation_token().is_some() || has_df {
             return self.encode_error(msg, src, 400, "Bad Request");
         }
-        // IPv4-only build (mirrors the UDP path): refuse an explicit IPv6 family.
+        // RFC 6062 TCP allocations stay IPv4-only even when `external_ip6` is set:
+        // the TCP relay datapath has no v6 path yet, so an IPv6 family request is
+        // refused with 440 rather than accepted and then unable to CONNECT.
         if matches!(
             msg.get_requested_address_family(),
             Some(turna_proto_stun::attribute::AddressFamily::Ipv6)
@@ -1603,6 +1644,44 @@ impl PacketProcessor {
         reason: &str,
     ) -> Vec<Action> {
         self.encode_error(orig, src, code, reason)
+    }
+
+    /// RFC 6156 §4.2: a relayed transport address can only reach peers in its own
+    /// address family. Returns true when `peer` does not match the allocation's
+    /// relayed family, which the callers answer with **443 Peer Address Family
+    /// Mismatch**. Peers are already normalised (`::ffff:` → v4) before this, so
+    /// a v4-mapped literal is compared as v4.
+    fn peer_family_mismatch(&self, src: &SocketAddr, peer: &std::net::IpAddr) -> bool {
+        match self.store.get(src) {
+            Some(a) => a.relay_addr.is_ipv6() != peer.is_ipv6(),
+            // No allocation: the caller's own 437 path reports that; do not turn it
+            // into a 443.
+            None => false,
+        }
+    }
+
+    /// Enable RFC 6156 IPv6 relayed transport by giving the address to advertise
+    /// in XOR-RELAYED-ADDRESS for v6 allocations. Additive builder so the four
+    /// existing constructors keep their signatures.
+    ///
+    /// Without this, `REQUESTED-ADDRESS-FAMILY = IPv6` stays refused with 440 —
+    /// which is the correct answer for a node that has no routable v6 address to
+    /// hand out.
+    pub fn with_external_ip6(mut self, ip6: Option<std::net::Ipv6Addr>) -> Self {
+        self.external_ip6 = ip6;
+        self
+    }
+
+    /// In-place form of [`with_external_ip6`], for callers that already own the
+    /// processor by `&mut` (see `RelayServer::with_external_ip6`, which reaches it
+    /// through `Arc::get_mut` immediately after construction).
+    pub fn set_external_ip6(&mut self, ip6: Option<std::net::Ipv6Addr>) {
+        self.external_ip6 = ip6;
+    }
+
+    /// The relayed address family this node can offer, for diagnostics.
+    pub fn relay_ipv6_enabled(&self) -> bool {
+        self.external_ip6.is_some()
     }
 
     /// RFC 6062 §4.4 ConnectionBind validation (sync): authenticate and extract
@@ -1926,6 +2005,15 @@ impl PacketProcessor {
                 self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
                 return self.encode_error(msg, src, 403, "Forbidden");
             }
+            // RFC 6156 §4.2: the relayed address family is fixed at Allocate; a
+            // peer in the other family is unreachable through this relay socket.
+            // Refuse the whole request rather than install a permission that can
+            // never carry traffic.
+            if self.peer_family_mismatch(&src, peer_ip) {
+                warn!(%src, %peer_ip, "CreatePermission peer address family mismatch");
+                self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
+                return self.encode_error(msg, src, 443, "Peer Address Family Mismatch");
+            }
         }
 
         // Then install all permissions. add_permission only fails if the
@@ -1994,6 +2082,12 @@ impl PacketProcessor {
             self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
             return self.encode_error(msg, src, 403, "Forbidden");
         }
+        // RFC 6156 §4.2: see `peer_family_mismatch`.
+        if self.peer_family_mismatch(&src, &peer_addr.ip()) {
+            warn!(%src, peer = %peer_addr.ip(), "ChannelBind peer address family mismatch");
+            self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
+            return self.encode_error(msg, src, 443, "Peer Address Family Mismatch");
+        }
 
         match self.store.add_channel(&src, channel, peer_addr) {
             Ok(_) => {
@@ -2037,6 +2131,12 @@ impl PacketProcessor {
         // Normalize ::ffff: → v4 and reject special-use peers (C2/C3).
         let peer_addr = normalize_addr(peer_addr);
         if is_forbidden_peer(peer_addr.ip()) {
+            self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
+            return vec![Action::None];
+        }
+        // RFC 6156 §4.2 family mismatch. An indication has no error response, so
+        // this is a counted silent drop rather than a 443.
+        if self.peer_family_mismatch(&src, &peer_addr.ip()) {
             self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
@@ -2380,7 +2480,8 @@ mod a3_f4_dont_fragment_tests {
     #[test]
     fn set_dont_fragment_sets_pmtudisc_do() {
         let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
-        set_dont_fragment(sock.as_raw_fd()).expect("setsockopt IP_MTU_DISCOVER should succeed");
+        set_dont_fragment(sock.as_raw_fd(), turna_session::RelayFamily::V4)
+            .expect("setsockopt IP_MTU_DISCOVER should succeed");
 
         // Read the option back to confirm DF/PMTUD is enabled.
         let mut val: libc::c_int = -1;
@@ -2395,6 +2496,31 @@ mod a3_f4_dont_fragment_tests {
             )
         };
         assert_eq!(rc, 0, "getsockopt failed");
+        assert_eq!(val, libc::IP_PMTUDISC_DO);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_dont_fragment_uses_the_v6_knob_on_a_v6_socket() {
+        // Regression guard for the family split: IPPROTO_IP on an AF_INET6 socket
+        // does not set DF, so a v6 allocation with DONT-FRAGMENT would silently
+        // fragment.
+        let sock = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        set_dont_fragment(sock.as_raw_fd(), turna_session::RelayFamily::V6)
+            .expect("setsockopt IPV6_MTU_DISCOVER should succeed");
+
+        let mut val: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt IPV6_MTU_DISCOVER failed");
         assert_eq!(val, libc::IP_PMTUDISC_DO);
     }
 }

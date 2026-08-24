@@ -447,6 +447,97 @@ pub struct PortAllocator {
     reservations: Mutex<HashMap<[u8; 8], Reservation>>,
 }
 
+/// Address family of a relay socket. Relay ports are drawn from one pool
+/// regardless of family: a given port number is bound in exactly one family at a
+/// time, which keeps the pool accounting (and `pool_for_port`) unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayFamily {
+    V4,
+    V6,
+}
+
+impl RelayFamily {
+    pub fn of(addr: &std::net::SocketAddr) -> Self {
+        if addr.is_ipv6() {
+            Self::V6
+        } else {
+            Self::V4
+        }
+    }
+
+    pub fn is_v6(&self) -> bool {
+        matches!(self, Self::V6)
+    }
+}
+
+/// Bind one relay UDP socket in `family`.
+///
+/// A v6 socket is bound with **`IPV6_V6ONLY`**. Without it a v6 wildcard bind also
+/// receives v4 traffic on the same port (the Linux default is dual-stack), so one
+/// relay port would straddle both families and the "one allocation, one family"
+/// invariant would hold only by accident. The path already failed *closed* without
+/// the option — a v4-mapped source normalises to plain v4
+/// (`peer_filter::normalize_ip`), no v4 permission exists on a v6 allocation, and
+/// the 443 family-mismatch check refuses v4 peers up front — but relying on three
+/// downstream checks to compensate for a socket bound too widely is the kind of
+/// implicit invariant that breaks when one of them is refactored. Now it is
+/// explicit at the socket.
+///
+/// The option must be set between `socket()` and `bind()`, which `std` cannot
+/// express, hence `socket2` under `cfg(unix)`. On a non-unix target the std bind is
+/// used and the platform default applies; the downstream checks still hold.
+fn bind_relay_socket(family: RelayFamily, port: u16) -> std::io::Result<std::net::UdpSocket> {
+    match family {
+        RelayFamily::V4 => std::net::UdpSocket::bind(("0.0.0.0", port)),
+        #[cfg(unix)]
+        RelayFamily::V6 => {
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )?;
+            sock.set_only_v6(true)?;
+            sock.bind(
+                &std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into(),
+            )?;
+            Ok(sock.into())
+        }
+        #[cfg(not(unix))]
+        RelayFamily::V6 => std::net::UdpSocket::bind(std::net::SocketAddr::from((
+            std::net::Ipv6Addr::UNSPECIFIED,
+            port,
+        ))),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod v6only_tests {
+    use super::*;
+
+    #[test]
+    fn v6_relay_socket_is_v6_only() {
+        // The point of the option: binding v6 on a port must leave the same v4
+        // port free. Without IPV6_V6ONLY this second bind fails with EADDRINUSE on
+        // Linux, which is exactly the straddling we do not want.
+        let v6 = match bind_relay_socket(RelayFamily::V6, 0) {
+            Ok(s) => s,
+            // A host with IPv6 disabled cannot exercise this; skip rather than
+            // report a failure that is about the environment.
+            Err(e) => {
+                eprintln!("skipping: no IPv6 on this host ({e})");
+                return;
+            }
+        };
+        let port = v6.local_addr().expect("local_addr").port();
+        let v4 = std::net::UdpSocket::bind(("0.0.0.0", port));
+        assert!(
+            v4.is_ok(),
+            "v4 bind on port {port} must still be possible; the v6 socket is not \
+             v6-only: {v4:?}"
+        );
+    }
+}
+
 impl PortAllocator {
     pub fn new(min_port: u16, max_port: u16) -> Self {
         Self {
@@ -510,9 +601,20 @@ impl PortAllocator {
     /// and another is tried. Returns the port and a non-blocking std socket,
     /// or `None` if no port could be bound.
     pub fn allocate_and_bind(&self) -> Option<(u16, std::net::UdpSocket)> {
+        self.allocate_and_bind_family(RelayFamily::V4)
+    }
+
+    /// Like [`allocate_and_bind`] but binds the relay socket in the requested
+    /// address family (RFC 6156 REQUESTED-ADDRESS-FAMILY). A v6 socket is bound
+    /// `only_v6`, so a v6 allocation never accidentally serves v4 peers — the
+    /// families stay separable, which is what the 443 mismatch check relies on.
+    pub fn allocate_and_bind_family(
+        &self,
+        family: RelayFamily,
+    ) -> Option<(u16, std::net::UdpSocket)> {
         for _ in 0..64 {
             let port = self.allocate().ok()?;
-            match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+            match bind_relay_socket(family, port) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
                     return Some((port, sock));
@@ -616,6 +718,15 @@ impl PortAllocator {
         &self,
         reserve_next: bool,
     ) -> Option<(u16, std::net::UdpSocket, Option<[u8; 8]>)> {
+        self.allocate_even_and_bind_family(reserve_next, RelayFamily::V4)
+    }
+
+    /// [`allocate_even_and_bind`] in an explicit address family.
+    pub fn allocate_even_and_bind_family(
+        &self,
+        reserve_next: bool,
+        family: RelayFamily,
+    ) -> Option<(u16, std::net::UdpSocket, Option<[u8; 8]>)> {
         for _ in 0..64 {
             let (even, token) = if reserve_next {
                 let (e, t) = self.allocate_even_with_reservation()?;
@@ -623,7 +734,7 @@ impl PortAllocator {
             } else {
                 (self.allocate_even()?, None)
             };
-            match std::net::UdpSocket::bind(("0.0.0.0", even)) {
+            match bind_relay_socket(family, even) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
                     return Some((even, sock, token));
@@ -644,8 +755,20 @@ impl PortAllocator {
     /// Claim a RESERVATION-TOKEN and bind its reserved port. Releases the port
     /// on bind failure. Returns `None` if the token is invalid/expired.
     pub fn claim_and_bind(&self, token: &[u8; 8]) -> Option<(u16, std::net::UdpSocket)> {
+        self.claim_and_bind_family(token, RelayFamily::V4)
+    }
+
+    /// [`claim_and_bind`] in an explicit address family. Note RFC 8656 §7.2 makes
+    /// RESERVATION-TOKEN and REQUESTED-ADDRESS-FAMILY mutually exclusive, so in
+    /// practice this is only ever called with `V4` today; the parameter exists so
+    /// the three bind paths cannot drift.
+    pub fn claim_and_bind_family(
+        &self,
+        token: &[u8; 8],
+        family: RelayFamily,
+    ) -> Option<(u16, std::net::UdpSocket)> {
         let port = self.claim_reservation(token)?;
-        match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+        match bind_relay_socket(family, port) {
             Ok(sock) => {
                 let _ = sock.set_nonblocking(true);
                 Some((port, sock))

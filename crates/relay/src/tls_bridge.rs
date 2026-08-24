@@ -393,7 +393,9 @@ fn spawn_tls_metrics_mirror(stats: Arc<TlsStats>, metrics: Arc<turna_health::Met
             metrics
                 .tls_rejected_over_cap
                 .store(s.rejected_over_cap, Relaxed);
-            metrics.tls_rejected_per_ip.store(s.rejected_per_ip, Relaxed);
+            metrics
+                .tls_rejected_per_ip
+                .store(s.rejected_per_ip, Relaxed);
             metrics.tls_idle_timeouts.store(s.idle_timeouts, Relaxed);
             metrics.tls_framing_errors.store(s.framing_errors, Relaxed);
             metrics.tls_accept_errors.store(s.accept_errors, Relaxed);
@@ -403,6 +405,10 @@ fn spawn_tls_metrics_mirror(stats: Arc<TlsStats>, metrics: Arc<turna_health::Met
             metrics
                 .tls_cert_reload_failures
                 .store(s.cert_reload_failures, Relaxed);
+            metrics
+                .tls_rejected_rate_limit
+                .store(s.rejected_rate_limit, Relaxed);
+            metrics.tls_alpn_rejected.store(s.alpn_rejected, Relaxed);
             metrics.set_tls_readiness(if s.listening {
                 turna_health::Readiness::Ready
             } else {

@@ -44,6 +44,29 @@ pub struct DtlsConfig {
     pub outbound_queue_capacity: usize,
     /// DTL-9: max concurrent sessions per source IP (0 = unlimited).
     pub max_sessions_per_ip: usize,
+    /// Upper bound on how long one `accept()` may sit in a handshake before the
+    /// listener gives up on it. 0 disables the bound (the previous behaviour).
+    ///
+    /// This exists because of an upstream liveness bug, not as tuning: see the
+    /// comment on the accept loop in [`DtlsServer::run`]. On the demux path it is
+    /// the per-task handshake timeout, which is the same intent without the
+    /// serialisation.
+    pub accept_timeout: Duration,
+    /// Use the owned UDP demultiplexer ([`crate::dtls_demux`]) instead of
+    /// `webrtc_dtls::listener::listen()`. Off by default: the stock path is the
+    /// one with recorded verification. The demux path makes handshakes
+    /// concurrent, moves admission control ahead of the handshake, and enables
+    /// certificate hot-reload and a per-IP handshake rate limit.
+    pub demux: bool,
+    /// Per-source-IP handshake **rate** limit (handshakes/second, 0 = unlimited).
+    /// **Demux path only** — on the stock path the handshake runs below
+    /// `accept()`, so there is nowhere to enforce it.
+    pub max_handshakes_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate.
+    pub handshake_burst_per_ip: u32,
+    /// Poll interval for certificate hot-reload. 0 disables it. **Demux path
+    /// only** — `listen()` fixes its config at bind time.
+    pub cert_reload_interval: Duration,
 }
 
 /// Events surfaced from established DTLS sessions. `session_id` is the client's
@@ -105,6 +128,32 @@ pub struct DtlsStats {
     /// one anyway would rely on IP fragmentation (commonly dropped on the
     /// public Internet) — the datagram is dropped and counted instead.
     pub outbound_oversize: std::sync::atomic::AtomicU64,
+    /// Handshakes that failed (bad cert, unsupported suite, malformed flight).
+    ///
+    /// **Demux path only, and only there is it honest.** On the stock path a
+    /// failed handshake never surfaces above `webrtc-dtls::accept()`, which is
+    /// why no such counter existed; on the demux path the handshake fails inside
+    /// our own task, so this is a real observation rather than a guess.
+    pub handshake_failures: std::sync::atomic::AtomicU64,
+    /// Datagrams dropped because a peer's inbound queue was full (demux path).
+    /// The handshake retransmits, and a live session that cannot keep up must not
+    /// stall the demux loop for everyone else.
+    pub inbound_dropped: std::sync::atomic::AtomicU64,
+    /// Handshakes refused by the per-IP rate limiter, before any DTLS state was
+    /// created (demux path).
+    pub rejected_rate_limit: std::sync::atomic::AtomicU64,
+    /// Successful certificate hot-reloads (demux path).
+    pub cert_reloads: std::sync::atomic::AtomicU64,
+    /// Failed certificate hot-reloads; the previous material stays in service.
+    pub cert_reload_failures: std::sync::atomic::AtomicU64,
+    /// Handshakes abandoned because they exceeded `accept_timeout`.
+    ///
+    /// NOTE the precise meaning: this counts accepts *we* gave up on, not DTLS
+    /// handshake failures observed by the stack (those happen below `accept()`
+    /// and are not observable — see docs/roadmap/IMPLEMENTATION_STATUS.md). A
+    /// non-zero value means either a peer that started a handshake and stopped,
+    /// or a legitimate client too slow for the configured bound.
+    pub accept_timeouts: std::sync::atomic::AtomicU64,
     /// True once the UDP listener is bound and accepting handshakes; cleared on
     /// drain/exit. Mirrored into `turna_dtls_readiness` by the node.
     pub listening: std::sync::atomic::AtomicBool,
@@ -125,6 +174,12 @@ pub struct DtlsStatsSnapshot {
     pub outbound_dropped: u64,
     pub rejected_per_ip: u64,
     pub outbound_oversize: u64,
+    pub accept_timeouts: u64,
+    pub handshake_failures: u64,
+    pub inbound_dropped: u64,
+    pub rejected_rate_limit: u64,
+    pub cert_reloads: u64,
+    pub cert_reload_failures: u64,
     pub listening: bool,
 }
 
@@ -143,6 +198,12 @@ impl DtlsStats {
             outbound_dropped: self.outbound_dropped.load(Relaxed),
             rejected_per_ip: self.rejected_per_ip.load(Relaxed),
             outbound_oversize: self.outbound_oversize.load(Relaxed),
+            accept_timeouts: self.accept_timeouts.load(Relaxed),
+            handshake_failures: self.handshake_failures.load(Relaxed),
+            inbound_dropped: self.inbound_dropped.load(Relaxed),
+            rejected_rate_limit: self.rejected_rate_limit.load(Relaxed),
+            cert_reloads: self.cert_reloads.load(Relaxed),
+            cert_reload_failures: self.cert_reload_failures.load(Relaxed),
             listening: self.listening.load(Relaxed),
         }
     }
@@ -156,7 +217,7 @@ pub enum DtlsError {
     Other(String),
 }
 
-type Result<T> = std::result::Result<T, DtlsError>;
+pub(crate) type Result<T> = std::result::Result<T, DtlsError>;
 
 /// Whether this build actually supports DTLS, i.e. was compiled with the
 /// `dtls` feature.
@@ -219,6 +280,22 @@ impl DtlsServer {
         use webrtc_dtls::listener::listen;
         use webrtc_util::conn::Listener;
 
+        // Opt-in: own the UDP socket instead of letting `listen()` own it. See
+        // `crate::dtls_demux` for why (concurrent handshakes, pre-handshake
+        // admission, certificate hot-reload). Default off — the stock path below
+        // is the one with recorded verification.
+        if self.config.demux {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            return crate::dtls_demux::run_demux(
+                self.config.clone(),
+                event_tx,
+                outbound,
+                stats,
+                shutdown,
+            )
+            .await;
+        }
+
         // rustls 0.23 in this dependency tree unifies both the `ring` and
         // `aws-lc-rs` crypto features (pulled by quinn + webrtc), which disables
         // automatic crypto-provider selection. quinn passes its provider
@@ -252,6 +329,7 @@ impl DtlsServer {
         let mtu = self.config.mtu;
         let max_sessions = self.config.max_sessions;
         let max_per_ip = self.config.max_sessions_per_ip;
+        let accept_timeout = self.config.accept_timeout;
         let per_ip: std::sync::Arc<
             std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -262,10 +340,51 @@ impl DtlsServer {
             if *shutdown.borrow() {
                 break;
             }
-            let (conn, remote) = tokio::select! {
-                _ = shutdown.changed() => break,
-                accepted = listener.accept() => {
-                    accepted.map_err(|e| DtlsError::Other(format!("accept: {e}")))?
+            // UPSTREAM LIVENESS BUG (webrtc-rs/webrtc#614). `DtlsListener::accept()`
+            // runs `DTLSConn::new()` — the whole handshake — inline, with no
+            // timeout of its own:
+            //
+            //     let (conn, raddr) = self.parent.accept().await?;
+            //     let dtls_conn = DTLSConn::new(conn, self.config.clone(), false, None).await?;
+            //
+            // So a peer that begins a handshake and then goes silent parks
+            // `accept()` forever, and this loop never reaches the next peer. One
+            // unfinished handshake takes the entire DTLS listener out of service
+            // while the process stays healthy, the socket stays bound, and
+            // `turna_dtls_readiness` still reads Ready — a silent outage from a
+            // single packet. The HelloVerifyRequest cookie exchange does not help:
+            // it defends against spoofed source addresses, not against a real peer
+            // that simply stops.
+            //
+            // Bounding the accept gives the loop back its liveness: on timeout the
+            // in-flight future is dropped (webrtc-dtls tears its handshake state
+            // down) and we move on. This is a mitigation, not a fix — an attacker
+            // can still consume one timeout window at a time, so new-session
+            // throughput degrades under a deliberate flood. The real fix is owning
+            // the UDP demultiplexer so handshakes run concurrently instead of
+            // serially inside accept(); see docs/design/dtls-turn.md.
+            let accept_fut = listener.accept();
+            let accepted = if accept_timeout.is_zero() {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    r = accept_fut => Some(r),
+                }
+            } else {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    r = tokio::time::timeout(accept_timeout, accept_fut) => r.ok(),
+                }
+            };
+            let (conn, remote) = match accepted {
+                Some(r) => r.map_err(|e| DtlsError::Other(format!("accept: {e}")))?,
+                None => {
+                    stats.accept_timeouts.fetch_add(1, Relaxed);
+                    tracing::warn!(
+                        timeout = ?accept_timeout,
+                        "DTLS handshake abandoned: accept() exceeded the bound. The \
+                         listener stays live; see turna_dtls_accept_timeouts_total."
+                    );
+                    continue;
                 }
             };
 
@@ -353,7 +472,7 @@ fn spawn_stats_logger(stats: std::sync::Arc<DtlsStats>) {
 /// idle reaper bounds half-open sessions left by clients that vanish).
 #[cfg(feature = "dtls")]
 #[allow(clippy::too_many_arguments)]
-async fn handle_dtls_session(
+pub(crate) async fn handle_dtls_session(
     conn: std::sync::Arc<dyn webrtc_util::conn::Conn + Send + Sync>,
     remote: SocketAddr,
     tx: tokio::sync::mpsc::Sender<DtlsEvent>,
@@ -476,7 +595,10 @@ async fn handle_dtls_session(
 /// KEY`) / SEC1 (`EC PRIVATE KEY`) keys are not accepted — convert with
 /// `openssl pkcs8 -topk8 -nocrypt` if needed.
 #[cfg(feature = "dtls")]
-fn load_certificate(cert_path: &str, key_path: &str) -> Result<webrtc_dtls::crypto::Certificate> {
+pub(crate) fn load_certificate(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<webrtc_dtls::crypto::Certificate> {
     // If the operator did not configure a cert/key, use an ephemeral
     // self-signed cert (dev/test convenience — DTLS-TURN has no CA trust needs
     // for a throwaway handshake). But if a cert/key WAS configured and fails to

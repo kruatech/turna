@@ -19,8 +19,18 @@ pub(crate) fn ensure(have: usize, need: usize) -> Result<()> {
 
 // Comprehension-required attributes
 pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
-/// RFC 5389 §15.5: alternate server for 300 Try Alternate redirects.
-pub const ATTR_ALTERNATE_SERVER: u16 = 0x0003;
+/// RFC 5389 §15.5 / RFC 8489 §14.15: alternate server for 300 Try Alternate
+/// redirects. **Corrected from 0x0003**, which is CHANGE-REQUEST (RFC 5780) and
+/// not this attribute at all: every 300 Try Alternate the cluster sent on
+/// redirect or lame-duck drain carried the wrong type, so a conforming client
+/// (coturn, pion, browsers) could not find the alternate address and the
+/// redirect silently did nothing. Comprehension-optional (>= 0x8000), which is
+/// also correct for a response-only attribute.
+pub const ATTR_ALTERNATE_SERVER: u16 = 0x8023;
+/// RFC 5780 CHANGE-REQUEST. Reserved here only to document what 0x0003 actually
+/// is, so the collision above cannot be reintroduced. NAT behaviour discovery is
+/// NOT implemented (see docs/protocol-gap.md → RFC 5780).
+pub const ATTR_CHANGE_REQUEST_RESERVED: u16 = 0x0003;
 pub const ATTR_USERNAME: u16 = 0x0006;
 pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
 /// RFC 8489 §14.6 MESSAGE-INTEGRITY-SHA256 (HMAC-SHA-256; 16..=32 bytes).
