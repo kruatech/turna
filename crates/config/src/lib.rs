@@ -1715,6 +1715,18 @@ pub struct SctpSection {
     pub read_timeout_secs: u64,
     /// Max concurrent SCTP connections.
     pub max_connections: usize,
+    /// Per-source-IP association cap. 0 = unlimited.
+    ///
+    /// Without it one source can hold every one of `max_connections` — the gap
+    /// the DTLS and TURNS listeners already closed.
+    pub max_connections_per_ip: usize,
+    /// Per-source-IP association rate limit, associations/second. 0 = unlimited.
+    ///
+    /// `max_connections_per_ip` bounds concurrency only: a source that
+    /// associates and drops in a loop never trips it.
+    pub max_associations_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate.
+    pub association_burst_per_ip: u32,
     /// listen(2) backlog.
     pub backlog: i32,
 }
@@ -1727,6 +1739,11 @@ impl Default for SctpSection {
             max_frame_size: 64 * 1024,
             read_timeout_secs: 300,
             max_connections: 10_000,
+            // Off by default, matching TURNS: a limit that surprises an operator
+            // on upgrade is worse than one they had to opt into.
+            max_connections_per_ip: 0,
+            max_associations_per_sec_per_ip: 0,
+            association_burst_per_ip: 0,
             backlog: 1024,
         }
     }

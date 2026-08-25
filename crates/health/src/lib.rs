@@ -70,6 +70,7 @@ pub struct Metrics {
     pub transport_readiness: AtomicU8,
     pub dtls_readiness: AtomicU8,
     pub tls_readiness: AtomicU8,
+    pub sctp_readiness: AtomicU8,
     pub quic_readiness: AtomicU8,
     /// AF_XDP datapath readiness, same encoding as the others. AF_XDP was the only
     /// datapath still sharing the process-level `backend_readiness`, which meant a
@@ -283,6 +284,25 @@ pub struct Metrics {
     pub tls_rejected_rate_limit: AtomicU64,
     pub tls_alpn_rejected: AtomicU64,
 
+    // TURN-over-SCTP. Mirrored from `turna_transport::sctp::SctpStats` by the
+    // SCTP bridge; all zero when the listener is disabled or not built.
+    //
+    // No handshake, certificate or ALPN counters here, unlike TURNS: this
+    // transport has none of those, and a series that can only ever read zero
+    // costs an operator more than an absent one.
+    pub sctp_active: AtomicU64,
+    pub sctp_conns_total: AtomicU64,
+    pub sctp_closed_total: AtomicU64,
+    pub sctp_rejected_over_cap: AtomicU64,
+    pub sctp_rejected_per_ip: AtomicU64,
+    pub sctp_rejected_rate_limit: AtomicU64,
+    pub sctp_idle_timeouts: AtomicU64,
+    pub sctp_framing_errors: AtomicU64,
+    pub sctp_accept_errors: AtomicU64,
+    pub sctp_send_dropped: AtomicU64,
+    pub sctp_bytes_rx: AtomicU64,
+    pub sctp_bytes_tx: AtomicU64,
+
     // ── io_uring worker-pool ring utilisation (Linux io-uring backend) ───────
     // Summed across workers by a periodic copy task in the node's io_uring arm.
     // `*_total` are monotonic; the rest are last-sampled gauges. All zero on
@@ -338,6 +358,7 @@ impl Metrics {
             transport_readiness: AtomicU8::new(Readiness::Starting as u8),
             dtls_readiness: AtomicU8::new(Readiness::Starting as u8),
             tls_readiness: AtomicU8::new(Readiness::Starting as u8),
+            sctp_readiness: AtomicU8::new(Readiness::Starting as u8),
             quic_readiness: AtomicU8::new(Readiness::Starting as u8),
             afxdp_readiness: AtomicU8::new(Readiness::Starting as u8),
             management_readiness: AtomicU8::new(Readiness::Starting as u8),
@@ -463,6 +484,18 @@ impl Metrics {
             tls_cert_reload_failures: AtomicU64::new(0),
             tls_rejected_rate_limit: AtomicU64::new(0),
             tls_alpn_rejected: AtomicU64::new(0),
+            sctp_active: AtomicU64::new(0),
+            sctp_conns_total: AtomicU64::new(0),
+            sctp_closed_total: AtomicU64::new(0),
+            sctp_rejected_over_cap: AtomicU64::new(0),
+            sctp_rejected_per_ip: AtomicU64::new(0),
+            sctp_rejected_rate_limit: AtomicU64::new(0),
+            sctp_idle_timeouts: AtomicU64::new(0),
+            sctp_framing_errors: AtomicU64::new(0),
+            sctp_accept_errors: AtomicU64::new(0),
+            sctp_send_dropped: AtomicU64::new(0),
+            sctp_bytes_rx: AtomicU64::new(0),
+            sctp_bytes_tx: AtomicU64::new(0),
             uring_workers: AtomicU64::new(0),
             uring_cqe_drained_total: AtomicU64::new(0),
             uring_cqe_batches_total: AtomicU64::new(0),
@@ -511,6 +544,10 @@ impl Metrics {
 
     pub fn set_dtls_readiness(&self, r: Readiness) {
         self.dtls_readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    pub fn set_sctp_readiness(&self, r: Readiness) {
+        self.sctp_readiness.store(r as u8, Ordering::SeqCst);
     }
 
     pub fn set_tls_readiness(&self, r: Readiness) {
@@ -941,6 +978,42 @@ impl Metrics {
              # HELP turna_tls_alpn_rejected_total TURNS connections refused because alpn_required was set and the client negotiated no ALPN\n\
              # TYPE turna_tls_alpn_rejected_total counter\n\
              turna_tls_alpn_rejected_total {}\n\
+             # HELP turna_sctp_active_associations Active TURN-over-SCTP associations\n\
+             # TYPE turna_sctp_active_associations gauge\n\
+             turna_sctp_active_associations {}\n\
+             # HELP turna_sctp_associations_total TURN-over-SCTP associations accepted since start\n\
+             # TYPE turna_sctp_associations_total counter\n\
+             turna_sctp_associations_total {}\n\
+             # HELP turna_sctp_closed_total TURN-over-SCTP associations closed since start\n\
+             # TYPE turna_sctp_closed_total counter\n\
+             turna_sctp_closed_total {}\n\
+             # HELP turna_sctp_rejected_over_cap_total SCTP associations refused at the max_connections cap\n\
+             # TYPE turna_sctp_rejected_over_cap_total counter\n\
+             turna_sctp_rejected_over_cap_total {}\n\
+             # HELP turna_sctp_rejected_per_ip_total SCTP associations refused at max_connections_per_ip\n\
+             # TYPE turna_sctp_rejected_per_ip_total counter\n\
+             turna_sctp_rejected_per_ip_total {}\n\
+             # HELP turna_sctp_rejected_rate_limit_total SCTP associations refused by the per-IP rate limiter\n\
+             # TYPE turna_sctp_rejected_rate_limit_total counter\n\
+             turna_sctp_rejected_rate_limit_total {}\n\
+             # HELP turna_sctp_idle_timeouts_total SCTP associations closed by the idle read timeout\n\
+             # TYPE turna_sctp_idle_timeouts_total counter\n\
+             turna_sctp_idle_timeouts_total {}\n\
+             # HELP turna_sctp_framing_errors_total SCTP associations closed on invalid or over-sized TURN-over-stream framing\n\
+             # TYPE turna_sctp_framing_errors_total counter\n\
+             turna_sctp_framing_errors_total {}\n\
+             # HELP turna_sctp_accept_errors_total SCTP accept() errors survived without stopping the listener\n\
+             # TYPE turna_sctp_accept_errors_total counter\n\
+             turna_sctp_accept_errors_total {}\n\
+             # HELP turna_sctp_send_dropped_total Outbound SCTP frames dropped because the per-association channel was full or gone\n\
+             # TYPE turna_sctp_send_dropped_total counter\n\
+             turna_sctp_send_dropped_total {}\n\
+             # HELP turna_sctp_bytes_rx_total Bytes read from TURN-over-SCTP clients\n\
+             # TYPE turna_sctp_bytes_rx_total counter\n\
+             turna_sctp_bytes_rx_total {}\n\
+             # HELP turna_sctp_bytes_tx_total Bytes written to TURN-over-SCTP clients\n\
+             # TYPE turna_sctp_bytes_tx_total counter\n\
+             turna_sctp_bytes_tx_total {}\n\
              # HELP turna_backend_readiness Process readiness (0=starting,1=ready,2=degraded,3=draining)\n\
              # TYPE turna_backend_readiness gauge\n\
              turna_backend_readiness {}\n\
@@ -953,6 +1026,9 @@ impl Metrics {
              # HELP turna_tls_readiness TURNS listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if TURNS disabled)\n\
              # TYPE turna_tls_readiness gauge\n\
              turna_tls_readiness {}\n\
+             # HELP turna_sctp_readiness TURN-over-SCTP listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if SCTP disabled)\n\
+             # TYPE turna_sctp_readiness gauge\n\
+             turna_sctp_readiness {}\n\
              # HELP turna_quic_readiness QUIC/WebTransport listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if QUIC disabled)\n\
              # TYPE turna_quic_readiness gauge\n\
              turna_quic_readiness {}\n\
@@ -1035,10 +1111,23 @@ impl Metrics {
             l(&self.tls_cert_reload_failures),
             l(&self.tls_rejected_rate_limit),
             l(&self.tls_alpn_rejected),
+            l(&self.sctp_active),
+            l(&self.sctp_conns_total),
+            l(&self.sctp_closed_total),
+            l(&self.sctp_rejected_over_cap),
+            l(&self.sctp_rejected_per_ip),
+            l(&self.sctp_rejected_rate_limit),
+            l(&self.sctp_idle_timeouts),
+            l(&self.sctp_framing_errors),
+            l(&self.sctp_accept_errors),
+            l(&self.sctp_send_dropped),
+            l(&self.sctp_bytes_rx),
+            l(&self.sctp_bytes_tx),
             self.readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.transport_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.tls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            self.sctp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,

@@ -165,6 +165,32 @@ built once and stay valid.
 | `turna_tls_rejected_rate_limit_total` | counter | Handshakes refused by `max_handshakes_per_sec_per_ip`, before `accept()` does any TLS work. Distinct from `rejected_per_ip`, which caps *concurrent* connections: a source that connects and drops in a loop trips this one and never that one. |
 | `turna_tls_alpn_rejected_total` | counter | Connections closed after the handshake because `alpn_required` was set and the client negotiated no ALPN. Non-zero here means either a probe or a real client that does not offer ALPN — check before assuming the former. |
 
+#### TURN-over-SCTP (`[turn.sctp]`)
+
+Refused under `production = true`. These exist so a deployment that opts in on an
+internal network can see what the listener is doing — it shipped with no counters
+at all, which meant a listener that had stopped accepting looked identical to an
+idle one: socket bound, process healthy, nothing moving.
+
+`turna_sctp_readiness` follows the listener's own `listening` flag, set after bind
+and cleared on drain. It is not a separate belief about whether the listener is
+up, because a separate belief is what lets a dead listener keep reporting Ready.
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_sctp_active_associations` | gauge | Established associations. |
+| `turna_sctp_associations_total` | counter | Associations accepted since start. |
+| `turna_sctp_closed_total` | counter | Associations closed. |
+| `turna_sctp_rejected_over_cap_total` | counter | Refused at `max_connections`. |
+| `turna_sctp_rejected_per_ip_total` | counter | Refused at `max_connections_per_ip`. |
+| `turna_sctp_rejected_rate_limit_total` | counter | Refused by `max_associations_per_sec_per_ip`, before any per-association work. Distinct from `rejected_per_ip`, which caps *concurrent* associations: a source that associates and drops in a loop trips this one and never that one. |
+| `turna_sctp_idle_timeouts_total` | counter | Closed by `read_timeout_secs`. |
+| `turna_sctp_framing_errors_total` | counter | Invalid or over-sized TURN-over-stream framing. Same codec as TURN-over-TCP. |
+| `turna_sctp_accept_errors_total` | counter | `accept()` errors survived without stopping the listener (e.g. `EMFILE`). Non-zero used to be impossible here for the wrong reason: a single such error returned from the accept loop and took the listener down until restart. |
+| `turna_sctp_send_dropped_total` | counter | Outbound frames dropped because the per-association channel was full or gone. Non-zero means a client lost relayed data. Previously discarded without a counter, so this was invisible. |
+| `turna_sctp_bytes_rx_total` / `turna_sctp_bytes_tx_total` | counter | Bytes read from / written to clients. |
+| `turna_sctp_readiness` | gauge | 0=starting, 1=ready, 2=degraded, 3=draining. `starting` while SCTP is disabled or not built. |
+
 #### DTLS (`[turn.dtls]`)
 
 | metric | type | meaning |

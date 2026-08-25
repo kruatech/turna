@@ -372,6 +372,9 @@ fn build_sctp_transport_config(
         max_frame_size: c.max_frame_size,
         read_timeout: std::time::Duration::from_secs(c.read_timeout_secs),
         max_connections: c.max_connections,
+        max_connections_per_ip: c.max_connections_per_ip,
+        max_associations_per_sec_per_ip: c.max_associations_per_sec_per_ip,
+        association_burst_per_ip: c.association_burst_per_ip,
         backlog: c.backlog,
     }
 }

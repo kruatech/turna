@@ -37,22 +37,77 @@ type BridgeResult = std::result::Result<(), Box<dyn std::error::Error + Send + S
 /// * `processor` — shared TURN processor (same instance as the UDP path).
 /// * `relay_tx` — the UDP server's relay [`OutMsg`] channel.
 /// * `client_sinks` — shared addr→writer registry (relay return path lives in server.rs).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sctp_bridge(
     cfg: SctpTransportConfig,
     processor: Arc<PacketProcessor>,
     relay_tx: mpsc::Sender<OutMsg>,
     client_sinks: ClientSinks,
+    metrics: Arc<turna_health::Metrics>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> BridgeResult {
     let server = SctpTransportServer::new(cfg)?;
 
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
     let (sctp_send_tx, sctp_send_rx) = mpsc::channel::<TcpSendCommand>(8192);
 
-    tokio::spawn(async move {
-        if let Err(e) = server.run(event_tx, sctp_send_rx).await {
-            error!(error = %e, "TURN-over-SCTP server stopped");
-        }
-    });
+    let stats = Arc::new(turna_transport::sctp::SctpStats::default());
+
+    // Mirror the transport's counters into Prometheus on a ticker, the same way
+    // the TURNS bridge does. Without this the counters exist and nothing scrapes
+    // them, which is the state pass 1 left behind.
+    {
+        let stats = stats.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let s = stats.snapshot();
+                metrics.sctp_active.store(s.active as u64, Relaxed);
+                metrics.sctp_conns_total.store(s.accepted, Relaxed);
+                metrics.sctp_closed_total.store(s.closed, Relaxed);
+                metrics
+                    .sctp_rejected_over_cap
+                    .store(s.rejected_over_cap, Relaxed);
+                metrics
+                    .sctp_rejected_per_ip
+                    .store(s.rejected_per_ip, Relaxed);
+                metrics
+                    .sctp_rejected_rate_limit
+                    .store(s.rejected_rate_limit, Relaxed);
+                metrics.sctp_idle_timeouts.store(s.idle_timeouts, Relaxed);
+                metrics.sctp_framing_errors.store(s.framing_errors, Relaxed);
+                metrics.sctp_accept_errors.store(s.accept_errors, Relaxed);
+                metrics.sctp_send_dropped.store(s.send_dropped, Relaxed);
+                metrics.sctp_bytes_rx.store(s.bytes_rx, Relaxed);
+                metrics.sctp_bytes_tx.store(s.bytes_tx, Relaxed);
+                // Readiness follows the listener's own flag rather than a
+                // separate belief about it: `listening` is set after bind and
+                // cleared on drain, so a listener that stopped accepting cannot
+                // keep reporting Ready.
+                metrics.set_sctp_readiness(if s.listening {
+                    turna_health::Readiness::Ready
+                } else {
+                    turna_health::Readiness::Draining
+                });
+            }
+        });
+    }
+
+    {
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server
+                .run_with_shutdown(event_tx, sctp_send_rx, stats, shutdown)
+                .await
+            {
+                error!(error = %e, "TURN-over-SCTP server stopped");
+            }
+        });
+    }
 
     info!("TURN-over-SCTP bridge started");
 
