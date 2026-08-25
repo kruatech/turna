@@ -127,6 +127,144 @@ fn spawn_hermetic() -> TestServer {
     }
 }
 
+/// Startup must fail, loudly, when a configured listener cannot be bound.
+///
+/// The health port used to be bound inside a spawned task with its error
+/// discarded, so the node started anyway. That is worse than having no health
+/// endpoint: whatever else holds the port answers scrapes in its place. It was
+/// found in the field, not by a test — a scrape window read an unrelated
+/// process's metrics as if they were this node's.
+///
+/// Asserts observable behaviour — a non-zero exit and a message naming the port
+/// — rather than the presence of a `?` in the source, which is what a test
+/// written against the code would have done while the bug was live.
+#[test]
+fn occupied_health_port_is_fatal_and_says_why() {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: node binary not built");
+        return;
+    }
+
+    // `cargo test` does not rebuild turna-node: this test runs whatever binary is
+    // on disk, because Cargo cannot express a test's dependency on another
+    // crate's executable. A stale binary gives a result about code that is no
+    // longer in the tree — which happened while writing this test, costing a
+    // confusing twenty-second failure. Warn rather than fail, since the staleness
+    // may be intentional (TURNA_TEST_TARGET).
+    if let (Ok(bin_time), Ok(src_time)) = (
+        std::fs::metadata(&bin).and_then(|m| m.modified()),
+        std::fs::metadata(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../services/node/src/main.rs"
+        ))
+        .and_then(|m| m.modified()),
+    ) {
+        if bin_time < src_time {
+            eprintln!(
+                "WARNING: {bin:?} is older than services/node/src/main.rs. This test \
+                 exercises the binary on disk, not the source tree. Run \
+                 `cargo build -p turna-node` first."
+            );
+        }
+    }
+
+    // Hold the port for the duration of the attempt.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("bind squatter");
+    let health_port = squatter.local_addr().expect("squatter addr").port();
+    let turn_port = free_port(true);
+
+    let dir = std::env::temp_dir().join(format!("turna-health-fatal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cfg_path = dir.join("turn.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n"
+        ),
+    )
+    .expect("write config");
+
+    // Polled with a deadline rather than `.output()`, which blocks forever. On the
+    // old behaviour the node *starts* — that is the whole bug — so a test that
+    // waits for exit hangs instead of failing, and in CI that reads as a stuck
+    // job rather than a regression. Verified by reintroducing the old shape: it
+    // hung, which is how this deadline came to be here.
+    let mut child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn node");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break Some(st),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    use std::io::Read;
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_end(&mut out_buf);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_end(&mut err_buf);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(squatter);
+
+    let status = status.expect(
+        "the node was still running 20 s after being given an occupied health port. \
+         It must refuse to start: binding inside the spawned task discards the error \
+         and leaves the operator believing the configured port is being scraped.",
+    );
+
+    let out = std::process::Output {
+        status,
+        stdout: out_buf,
+        stderr: err_buf,
+    };
+
+    assert!(
+        !out.status.success(),
+        "node started with its health port already taken; exit status {:?}. \
+         Binding must happen before the serving task is spawned, or the failure \
+         is discarded and the operator believes the port is being scraped.",
+        out.status.code()
+    );
+
+    let combined =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    assert!(
+        combined.contains(&health_port.to_string()),
+        "exit was non-zero but nothing named the port that could not be bound, \
+         so an operator cannot tell what to fix. Output was:\n{combined}"
+    );
+    assert!(
+        combined.to_lowercase().contains("health"),
+        "the failure does not mention which listener failed. Output was:\n{combined}"
+    );
+}
+
 fn boot_node() -> Result<(SocketAddr, std::process::Child), String> {
     let bin = node_binary();
     if !bin.exists() {
