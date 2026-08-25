@@ -138,6 +138,185 @@ fn spawn_hermetic() -> TestServer {
 /// Asserts observable behaviour — a non-zero exit and a message naming the port
 /// — rather than the presence of a `?` in the source, which is what a test
 /// written against the code would have done while the bug was live.
+/// Start the node with `body` appended to a minimal working config, and return
+/// (exit status, combined output).
+///
+/// Shared by the gate tests below. Polls with a deadline rather than `.output()`
+/// because a gate that fails to refuse leaves a *running* node — the failure
+/// mode being tested — and waiting for exit would hang the suite instead of
+/// failing it.
+fn start_with_config(body: &str) -> Option<(std::process::ExitStatus, String)> {
+    start_with_config_transport(body, "tokio")
+}
+
+/// As above, with the datapath chosen explicitly.
+///
+/// `transport` cannot travel through `body`: putting it there means either a
+/// second `[turn]` table or a dotted `turn.transport` key, and TOML rejects both
+/// as duplicating the table this harness already opens.
+fn start_with_config_transport(
+    body: &str,
+    transport: &str,
+) -> Option<(std::process::ExitStatus, String)> {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: node binary not built");
+        return None;
+    }
+    let turn_port = free_port(true);
+    let health_port = free_port(false);
+    let dir = std::env::temp_dir().join(format!("turna-gate-{}-{turn_port}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cfg_path = dir.join("turn.toml");
+    // TOML is positional: a bare key after `[health]` belongs to that table. So
+    // `body` is split — lines before the first `[section]` are top-level keys and
+    // go above `[turn]`, the rest go below. Without this, `production = true`
+    // parsed as `health.production` and the node failed with "unknown field",
+    // which looked like the gate not firing.
+    let (top_level, sections) = match body.find('[') {
+        Some(i) => (&body[..i], &body[i..]),
+        None => (body, ""),
+    };
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "{top_level}\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             realm = \"turna\"\n\
+             transport = \"{transport}\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [turn.relay]\n\
+             min_port = 49152\n\
+             max_port = 49500\n\
+             max_allocations = 256\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n\
+             {sections}\n"
+        ),
+    )
+    .expect("write config");
+
+    let mut child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn node");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(st) => break Some(st),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_end(&mut out);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_end(&mut err);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let combined = String::from_utf8_lossy(&err).into_owned() + &String::from_utf8_lossy(&out);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "node was still running 20 s after a config that should have been \
+             refused. Output so far:\n{combined}"
+        )
+    });
+    Some((status, combined))
+}
+
+/// Assert the node refuses `body` and names `expect_in_message`.
+///
+/// Both halves matter. A non-zero exit alone leaves an operator with nothing to
+/// fix; and a message without the exit means the node started anyway.
+fn assert_refused(what: &str, body: &str, expect_in_message: &str) {
+    assert_refused_transport(what, body, "tokio", expect_in_message)
+}
+
+fn assert_refused_transport(what: &str, body: &str, transport: &str, expect_in_message: &str) {
+    let Some((status, out)) = start_with_config_transport(body, transport) else {
+        return;
+    };
+    assert!(
+        !status.success(),
+        "{what}: the node started with a config that should have been refused \
+         (exit {:?}). Output:\n{out}",
+        status.code()
+    );
+    assert!(
+        out.contains(expect_in_message),
+        "{what}: refused, but the message does not contain {expect_in_message:?}, \
+         so an operator cannot tell what to change. Output:\n{out}"
+    );
+}
+
+/// `production = true` MUST refuse the RFC 6062 TCP relay... no longer: the gate
+/// was lifted once interop was on record. What must still hold is that the
+/// *other* production gates refuse, so this file documents which is which.
+///
+/// These tests exist because the project had exactly one startup-failure test
+/// before them (the health port, added the day before). Every other refusal —
+/// including three that exist specifically to stop an unfinished feature
+/// reaching production — rested on nobody quietly turning a `?` into a `let _`.
+#[test]
+fn refuses_to_start_when_sctp_is_enabled_in_production() {
+    assert_refused(
+        "SCTP under production",
+        "production = true\n[turn.sctp]\nenabled = true",
+        "sctp",
+    );
+}
+
+#[test]
+fn refuses_to_start_when_oauth_is_enabled_in_production() {
+    assert_refused(
+        "OAuth under production",
+        "production = true\n[turn.auth.oauth]\nenabled = true",
+        "oauth",
+    );
+}
+
+#[test]
+fn refuses_af_xdp_frame_count_that_would_silently_kill_reception() {
+    // Not a policy gate: above roughly twice the fill-ring size, more frames end
+    // up free than the ring can hold and RX stops with no error. Measured at
+    // 16384. The check went in without a test, which is how it would quietly
+    // come back out.
+    assert_refused_transport(
+        "AF_XDP frame_count",
+        "[turn.af_xdp]\ninterface = \"lo\"\nframe_count = 16384",
+        "af_xdp",
+        "frame_count",
+    );
+}
+
+#[test]
+fn refuses_af_xdp_ring_sizes_that_are_not_applied() {
+    // The UMEM is built with library defaults, so these keys change nothing.
+    // Accepting them is the config lying about what it does.
+    assert_refused_transport(
+        "AF_XDP ring size",
+        "[turn.af_xdp]\ninterface = \"lo\"\nfill_ring_size = 8192",
+        "af_xdp",
+        "fill_ring_size",
+    );
+}
+
 #[test]
 fn occupied_health_port_is_fatal_and_says_why() {
     let bin = node_binary();

@@ -44,6 +44,28 @@ pub type Result<T> = std::result::Result<T, AfXdpError>;
 // Config
 // ---------------------------------------------------------------------------
 
+/// Ring and frame geometry the UMEM is actually created with.
+///
+/// `UmemConfig::default()` is used because xsk-rs 0.6 gates `FrameSize` and
+/// `QueueSize` behind newtype constructors whose signatures move between
+/// versions. The consequence is that five `[turn.af_xdp]` keys are inert, and
+/// these constants exist so config validation can say so with the real numbers
+/// rather than repeating literals that drift.
+///
+/// If the sizes ever become configurable, these constants and the validation in
+/// `turna-config` are the two places to change together.
+pub const LIB_FRAME_SIZE: u32 = 4096;
+/// Fill, completion, RX and TX rings are all this size.
+pub const LIB_RING_SIZE: u32 = 2048;
+/// Upper bound on `frame_count`.
+///
+/// Above roughly twice the fill-ring size, more frames are free than the ring
+/// can hold and reception stops with no error: measured at frame_count = 16384,
+/// where `umem_free_frames` reached 8160 against a 2048-entry fill ring and RX
+/// went to zero. Rejecting at startup turns a silent dead datapath into a
+/// message.
+pub const MAX_FRAME_COUNT: u32 = LIB_RING_SIZE * 2;
+
 #[derive(Debug, Clone)]
 pub struct AfXdpConfig {
     /// Interface name (e.g., "eth0").
@@ -74,7 +96,9 @@ impl Default for AfXdpConfig {
             interface: "eth0".into(),
             queue_id: 0,
             frame_count: 4096,
-            frame_size: 2048,
+            // 4096, not 2048: this is what UmemConfig::default() uses, and the
+            // old value described a geometry the code never created.
+            frame_size: LIB_FRAME_SIZE,
             fill_ring_size: 2048,
             comp_ring_size: 2048,
             rx_ring_size: 2048,

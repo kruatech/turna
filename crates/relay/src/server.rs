@@ -587,9 +587,21 @@ impl RelayServer {
             let sinks = self.client_sinks.clone();
             let listener_metrics = self.processor.metrics().clone();
             let listener_shutdown = shutdown.clone();
+            // A second receiver: the first is consumed by the post-exit check
+            // below, which distinguishes a deliberate drain from a crash. The
+            // bridge needs its own so it can stop accepting on the same signal.
+            let sctp_bridge_shutdown = shutdown.clone();
+            let sctp_bridge_metrics = listener_metrics.clone();
             sctp_handle = Some(tokio::spawn(async move {
-                let res =
-                    crate::sctp_bridge::run_sctp_bridge(sctp_cfg, proc, relay_tx, sinks).await;
+                let res = crate::sctp_bridge::run_sctp_bridge(
+                    sctp_cfg,
+                    proc,
+                    relay_tx,
+                    sinks,
+                    sctp_bridge_metrics,
+                    sctp_bridge_shutdown,
+                )
+                .await;
                 if !*listener_shutdown.borrow() {
                     match res {
                         Ok(()) => error!("TURN-over-SCTP bridge exited unexpectedly"),

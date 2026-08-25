@@ -11,7 +11,7 @@ from facts rather than re-derived.
 
 ## Decisions
 
-### 1. Lift the `production = true` gate on RFC 6062 TCP relay?
+### 1. Lift the `production = true` gate on RFC 6062 TCP relay? — lifted 2026-08-25
 
 **Established.** Interop is recorded (`docs/interop/transports-2026-08-19.md`): Allocate
 over TCP, CreatePermission, Connect, ConnectionBind and data in both directions — in
@@ -26,6 +26,17 @@ a missing prerequisite: one line in `config::validate()`.
 **The actual question** is whether you are prepared to support TCP relay in production —
 it consumes a listener and a connection per relayed peer, which is a different
 operational profile from UDP.
+
+**Decided: lifted.** The refusal in `config::validate()` is gone. Interop was
+since confirmed a second time against coturn's own client
+(`docs/interop/coturn-2026-08-23.md`), so two independent implementations agree
+about the wire.
+
+The sizing consequence is documented rather than enforced: a refusal cannot make
+a capacity decision on an operator's behalf, and one that pretends to just means
+the feature is unavailable to everyone. What remains genuinely missing is IPv6 on
+this path — an IPv6 `Connect` is refused with 440 — which is recorded in
+`docs/protocol-gap.md`.
 
 ### 2. Flip `[turn.dtls] demux` to `true` by default?
 

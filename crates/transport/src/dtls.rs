@@ -330,6 +330,9 @@ impl DtlsServer {
         let max_sessions = self.config.max_sessions;
         let max_per_ip = self.config.max_sessions_per_ip;
         let accept_timeout = self.config.accept_timeout;
+        // Reset by a successful accept below, so a stall after real traffic warns
+        // again rather than staying quiet because the listener was idle earlier.
+        let mut consecutive_timeouts: u64 = 0;
         let per_ip: std::sync::Arc<
             std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -376,14 +379,43 @@ impl DtlsServer {
                 }
             };
             let (conn, remote) = match accepted {
-                Some(r) => r.map_err(|e| DtlsError::Other(format!("accept: {e}")))?,
+                Some(r) => {
+                    consecutive_timeouts = 0;
+                    r.map_err(|e| DtlsError::Other(format!("accept: {e}")))?
+                }
                 None => {
                     stats.accept_timeouts.fetch_add(1, Relaxed);
-                    tracing::warn!(
-                        timeout = ?accept_timeout,
-                        "DTLS handshake abandoned: accept() exceeded the bound. The \
-                         listener stays live; see turna_dtls_accept_timeouts_total."
-                    );
+                    // WARN for the first, DEBUG for the run that follows.
+                    //
+                    // `accept()` blocks waiting for the next client, so on an idle
+                    // listener it times out every `accept_timeout` and there is
+                    // nothing wrong: 8640 identical warnings a day, which teaches
+                    // an operator to filter out the line that is supposed to mean
+                    // a stalled handshake.
+                    //
+                    // The two cases cannot be told apart from here — webrtc-dtls
+                    // runs the handshake inside the same `accept()` call, so a
+                    // timeout carries no information about whether a peer had
+                    // started one. Counting consecutive timeouts is the honest
+                    // approximation: the first still warns, and
+                    // turna_dtls_accept_timeouts_total keeps the full total for
+                    // anyone alerting on the rate.
+                    consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+                    if consecutive_timeouts == 1 {
+                        tracing::warn!(
+                            timeout = ?accept_timeout,
+                            "DTLS accept() exceeded the bound: either a peer began a \
+                             handshake and went silent, or the listener is idle. The \
+                             listener stays live; repeats log at DEBUG. See \
+                             turna_dtls_accept_timeouts_total."
+                        );
+                    } else {
+                        tracing::debug!(
+                            timeout = ?accept_timeout,
+                            consecutive = consecutive_timeouts,
+                            "DTLS accept() timed out again (listener idle or peer silent)"
+                        );
+                    }
                     continue;
                 }
             };

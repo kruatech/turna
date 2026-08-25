@@ -106,8 +106,8 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   is Linux-only (its `build.rs` refuses to build elsewhere by design) and is the
   only feature that pulls an LGPL-licensed branch into the dependency graph —
   see §7.
-- **Three features are refused outright under `production = true`.**
-  `config::validate()` fails the start when `turn.tcp_relay.enabled`,
+- **Two features are refused outright under `production = true`.**
+  `config::validate()` fails the start when
   `turn.sctp.enabled` or `turn.auth.oauth.enabled` is set in a production
   profile. This is policy, not a defect: each is implemented and testable with
   `production = false`, and each has an exit condition

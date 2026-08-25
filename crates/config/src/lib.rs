@@ -117,6 +117,56 @@ impl TurnaConfig {
         let mut ports = HashSet::new();
         let prod = self.is_production();
 
+        // AF_XDP: five keys in this section are read and then ignored, because
+        // the UMEM is created with `UmemConfig::default()` (see the comment at
+        // the call site in crates/transport/src/af_xdp.rs). Accepting a value
+        // that changes nothing is the config lying to the operator, so they are
+        // refused instead — with the real number, so the message is actionable.
+        //
+        // Numbers duplicated from af_xdp.rs's LIB_* constants rather than
+        // imported: this is a leaf crate and inverting the dependency for three
+        // integers is a worse trade. If the transport starts honouring the keys,
+        // both places change together.
+        if matches!(self.turn.transport, TransportSelection::AfXdp) {
+            const LIB_FRAME_SIZE: u32 = 4096;
+            const LIB_RING_SIZE: u32 = 2048;
+            const MAX_FRAME_COUNT: u32 = LIB_RING_SIZE * 2;
+
+            let a = &self.turn.af_xdp;
+            if a.frame_size != LIB_FRAME_SIZE {
+                errors.push(format!(
+                    "turn.af_xdp.frame_size = {} is not applied: the UMEM is built with the library default of {LIB_FRAME_SIZE}. Set it to {LIB_FRAME_SIZE} or remove the key.",
+                    a.frame_size
+                ));
+            }
+            for (name, value) in [
+                ("fill_ring_size", a.fill_ring_size),
+                ("comp_ring_size", a.comp_ring_size),
+                ("rx_ring_size", a.rx_ring_size),
+                ("tx_ring_size", a.tx_ring_size),
+            ] {
+                if value != LIB_RING_SIZE {
+                    errors.push(format!(
+                        "turn.af_xdp.{name} = {value} is not applied: all four rings are built at the library default of {LIB_RING_SIZE}. Set it to {LIB_RING_SIZE} or remove the key."
+                    ));
+                }
+            }
+            // Not merely inert: above roughly twice the fill-ring size, more
+            // frames end up free than the ring can hold and reception stops with
+            // no error at all. Measured at frame_count = 16384 — 8160 free frames
+            // against a 2048-entry fill ring, zero packets received. Failing at
+            // startup turns a dead datapath into a message.
+            if a.frame_count > MAX_FRAME_COUNT {
+                errors.push(format!(
+                    "turn.af_xdp.frame_count = {} exceeds {MAX_FRAME_COUNT}: with a {LIB_RING_SIZE}-entry fill ring, a larger UMEM leaves more free frames than the ring can hold and reception stops silently. Use {MAX_FRAME_COUNT} or fewer.",
+                    a.frame_count
+                ));
+            }
+            if a.frame_count == 0 {
+                errors.push("turn.af_xdp.frame_count must be > 0".into());
+            }
+        }
+
         // Check port conflicts
         let all_ports = [
             ("turn", self.turn.listen),
@@ -266,12 +316,16 @@ impl TurnaConfig {
         // partial/experimental, and TURN-over-SCTP is experimental. Refuse to
         // enable either under `production` so an unfinished datapath is never
         // shipped as if it were supported.
-        if prod && self.turn.tcp_relay.enabled {
-            errors.push(
-                "turn.tcp_relay.enabled = true in production, but RFC 6062 TCP relay is experimental/partial and not supported in production"
-                    .into(),
-            );
-        }
+        // RFC 6062 TCP relay is no longer refused under `production`. Interop is
+        // recorded (docs/interop/transports-2026-08-19.md and
+        // docs/interop/coturn-2026-08-23.md), including the pipelined
+        // ConnectionBind case that the prebuffer in transport::tcp_tls exists to
+        // handle and that no independent client had exercised before.
+        //
+        // It still carries a different operational profile from UDP — a listener
+        // and a connection per relayed peer — but that is a sizing decision for
+        // the operator, documented in docs/feature-support.md, not something a
+        // config refusal can make for them.
         if prod && self.turn.sctp.enabled {
             errors.push(
                 "turn.sctp.enabled = true in production, but TURN-over-SCTP is experimental and not supported in production"
@@ -1603,7 +1657,9 @@ impl Default for AfXdpSection {
             interface: "eth0".into(),
             queue_id: 0,
             frame_count: 4096,
-            frame_size: 2048,
+            // 4096, not 2048: this is the size the UMEM is actually created
+            // with. The old default described a geometry that never existed.
+            frame_size: 4096,
             fill_ring_size: 2048,
             comp_ring_size: 2048,
             rx_ring_size: 2048,
@@ -1715,6 +1771,18 @@ pub struct SctpSection {
     pub read_timeout_secs: u64,
     /// Max concurrent SCTP connections.
     pub max_connections: usize,
+    /// Per-source-IP association cap. 0 = unlimited.
+    ///
+    /// Without it one source can hold every one of `max_connections` — the gap
+    /// the DTLS and TURNS listeners already closed.
+    pub max_connections_per_ip: usize,
+    /// Per-source-IP association rate limit, associations/second. 0 = unlimited.
+    ///
+    /// `max_connections_per_ip` bounds concurrency only: a source that
+    /// associates and drops in a loop never trips it.
+    pub max_associations_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate.
+    pub association_burst_per_ip: u32,
     /// listen(2) backlog.
     pub backlog: i32,
 }
@@ -1727,6 +1795,11 @@ impl Default for SctpSection {
             max_frame_size: 64 * 1024,
             read_timeout_secs: 300,
             max_connections: 10_000,
+            // Off by default, matching TURNS: a limit that surprises an operator
+            // on upgrade is worse than one they had to opt into.
+            max_connections_per_ip: 0,
+            max_associations_per_sec_per_ip: 0,
+            association_burst_per_ip: 0,
             backlog: 1024,
         }
     }

@@ -143,13 +143,35 @@ if [ -f "$CONFIG" ]; then
   # Match the operator-visible diagnostic, not just the field path: the field path
   # also appears in the schema and in unrelated checks, so grepping for it would
   # still pass after the gate itself was deleted (verified with a negative test).
-  for key in turn.tcp_relay.enabled turn.sctp.enabled turn.auth.oauth.enabled; do
+  for key in turn.sctp.enabled turn.auth.oauth.enabled; do
     field=$(printf '%s' "$key" | sed 's/^turn\.//; s/\.enabled$//')
     if grep -qF "$key = true in production" "$CONFIG"; then
       pass "validate() refuses $key in production"
     else
       fail "$key is no longer refused in production by $CONFIG" \
         "If the gate was lifted deliberately, update docs/PRODUCTION_READINESS.md (R9), docs/feature-support.md and README.md — they all still say 'refused in production' for $field."
+    fi
+  done
+
+  # The reverse assertion, for gates that were lifted deliberately.
+  #
+  # turn.tcp_relay.enabled was refused under `production` until 2026-08-25, when
+  # interop against coturn's client put the missing evidence on record
+  # (docs/interop/coturn-2026-08-23.md). Removing it from the list above stops
+  # this check demanding a gate that should no longer exist — but leaves nothing
+  # watching for its return, and a revert or a bad merge would reinstate it
+  # silently. Which is exactly the kind of quiet regression this script exists
+  # for, so it is checked in both directions.
+  #
+  # If you are reintroducing the refusal on purpose, delete the matching entry
+  # here and move the key back to the loop above.
+  LIFTED_GATES="turn.tcp_relay.enabled"
+  for key in $LIFTED_GATES; do
+    if grep -qF "$key = true in production" "$CONFIG"; then
+      fail "$key is refused in production again, but the docs say the gate was lifted" \
+        "Either the refusal came back by accident (a revert or a merge), or it came back on purpose — in which case move $key from LIFTED_GATES back into the required list in this script, and correct docs/PRODUCTION_READINESS.md (R9), docs/feature-support.md and README.md."
+    else
+      pass "$key stays lifted (gate not reintroduced)"
     fi
   done
 fi
