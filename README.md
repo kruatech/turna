@@ -69,12 +69,17 @@ project in this position can deliver.
   language and another reading of the RFC
   ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)).
 
-- **Refused in production** — RFC 6062 TCP relay (`[turn.tcp_relay]`),
-  TURN-over-SCTP (`[turn.sctp]`) and RFC 7635 OAuth (`[turn.auth.oauth]`). Implemented
-  and usable for testing; `production = true` makes config validation **reject** them,
-  so they cannot ship by accident. For RFC 6062 the interop that gate was waiting for
-  now exists — lifting it is a decision, recorded in
-  [docs/OPEN-DECISIONS.md](docs/OPEN-DECISIONS.md).
+- **Refused in production** — TURN-over-SCTP (`[turn.sctp]`) and RFC 7635 OAuth
+  (`[turn.auth.oauth]`). Implemented and usable for testing; `production = true` makes
+  config validation **reject** them, so they cannot ship by accident. Two are refused in
+  production for different reasons: SCTP has none of the hardening the other listeners
+  received and no users, and OAuth has never run against a real authorization server.
+
+  RFC 6062 TCP relay was on this list until 2026-08-25. It came off because the evidence
+  the gate was waiting for arrived — interop against coturn's own client
+  ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)) — not because
+  the risk changed. Size for it before enabling: each relayed peer costs a listener and
+  a connection, which the gate used to decide on your behalf.
 
 Two known functional gaps, independent of testing: several `[turn.quic]` limits do not
 apply on the WebTransport path (the listener warns at startup), and QUIC connection
@@ -245,7 +250,7 @@ per-feature production maturity always check
 | Message integrity, SHA-256 (`MESSAGE-INTEGRITY-SHA256`) | RFC 8489 | Supported |
 | TURN allocation lifecycle, UDP relay | RFC 5766 / RFC 8656 | Supported (default tokio datapath) |
 | Relayed transport family | RFC 6156 / 8656 | IPv4 by default; IPv6 opt-in via `[turn] external_ip6` (unset → `440`). One family per allocation, cross-family peers get `443`. `ADDITIONAL-ADDRESS-FAMILY` not implemented |
-| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; **refused under `production = true`**. Requires the `tls` listener |
+| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; allowed in production since 2026-08-25. Requires the `tls` listener. IPv4 only — an IPv6 TCP allocation answers 440 |
 | Session migration | RFC 8016 | Partial — tickets are issued and re-issued on the tokio datapath; cross-node migration is **unwired** (no allocation is transferred between nodes), treat as same-node |
 | TLS-over-TCP transport (`tls`) | — | **Supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, and 24 h under load ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)) |
 | DTLS transport (`dtls`) | RFC 7350 | Beta — both listener paths, 20 min under load, and interop against coturn's client ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)) |
