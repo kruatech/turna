@@ -590,6 +590,18 @@ impl PortAllocator {
         self.used.lock().contains(&port)
     }
 
+    /// Ports currently held, including those held by an unclaimed EVEN-PORT
+    /// reservation — a reserved port is unavailable to anyone else, so counting
+    /// it as free would understate how full the pool is.
+    pub fn in_use(&self) -> usize {
+        self.used.lock().len()
+    }
+
+    /// Total ports in this pool's range, inclusive of both bounds.
+    pub fn capacity(&self) -> usize {
+        (self.max_port as usize).saturating_sub(self.min_port as usize) + 1
+    }
+
     /// Allocate a port AND bind its relay UDP socket, retrying on conflicts.
     ///
     /// Binding here — synchronously, before the caller responds — is what
@@ -2386,6 +2398,28 @@ impl AllocationStore {
     /// exporter: `(tenant, bytes, packets, closed_allocations)`. Reflects all
     /// allocations torn down so far; bytes of currently-live allocations are
     /// counted when those allocations are removed.
+    /// Relay port usage: `(pool_name, in_use, capacity)` for the global pool and
+    /// each tenant pool.
+    ///
+    /// Shaped like [`Self::tenant_traffic_snapshot`] deliberately — a second
+    /// snapshot method with a different convention is how a codebase acquires
+    /// two ways to ask the same question.
+    ///
+    /// The global pool is named `"global"`; tenant pools carry their tenant id.
+    /// Ranges are disjoint by config validation, so the sums do not double-count.
+    pub fn port_pool_usage(&self) -> Vec<(String, usize, usize)> {
+        let mut out = Vec::with_capacity(1 + self.tenant_pools.len());
+        out.push((
+            "global".to_string(),
+            self.ports.in_use(),
+            self.ports.capacity(),
+        ));
+        for t in &self.tenant_pools {
+            out.push((t.id.clone(), t.ports.in_use(), t.ports.capacity()));
+        }
+        out
+    }
+
     pub fn tenant_traffic_snapshot(&self) -> Vec<(String, u64, u64, u64)> {
         match self.tenant_traffic.lock() {
             Ok(map) => map

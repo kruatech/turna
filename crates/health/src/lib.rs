@@ -90,6 +90,26 @@ pub struct Metrics {
     pub bytes_sent: AtomicU64,
     pub active_allocations: AtomicU64,
     pub total_allocations: AtomicU64,
+
+    // Capacity limits, published by the node at startup rather than read from
+    // config here: this crate has no view of config, and threading it in would
+    // mean changing `serve_*`'s signature for the third time this week.
+    //
+    // `capacity_max_allocations == 0` means "not published", which is reported as
+    // UNAVAILABLE rather than as unlimited headroom. An unset limit read as
+    // infinite capacity is exactly the kind of default that puts a node into
+    // service claiming room it does not have.
+    // Relay port pool occupancy, summed across the global pool and any
+    // tenant pools. Summed rather than labelled per tenant: labels are how a
+    // Prometheus instance dies when a customer has ten thousand tenants, and
+    // §10 asks for cardinality protection in the same specification that asks
+    // for this metric. Per-tenant detail: AllocationStore::port_pool_usage().
+    pub relay_ports_in_use: AtomicU64,
+    pub relay_ports_total: AtomicU64,
+
+    pub capacity_max_allocations: AtomicU64,
+    pub capacity_soft_percent: AtomicU64,
+    pub capacity_hard_percent: AtomicU64,
     pub auth_failures: AtomicU64,
     pub rate_limited: AtomicU64,
     pub zero_copy_forwards: AtomicU64,
@@ -368,6 +388,11 @@ impl Metrics {
             bytes_sent: AtomicU64::new(0),
             active_allocations: AtomicU64::new(0),
             total_allocations: AtomicU64::new(0),
+            relay_ports_in_use: AtomicU64::new(0),
+            relay_ports_total: AtomicU64::new(0),
+            capacity_max_allocations: AtomicU64::new(0),
+            capacity_soft_percent: AtomicU64::new(75),
+            capacity_hard_percent: AtomicU64::new(95),
             auth_failures: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             zero_copy_forwards: AtomicU64::new(0),
@@ -1029,6 +1054,15 @@ impl Metrics {
              # HELP turna_sctp_readiness TURN-over-SCTP listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if SCTP disabled)\n\
              # TYPE turna_sctp_readiness gauge\n\
              turna_sctp_readiness {}\n\
+             # HELP turna_relay_ports_in_use Relay ports currently held by an allocation or an unclaimed EVEN-PORT reservation\n\
+             # TYPE turna_relay_ports_in_use gauge\n\
+             turna_relay_ports_in_use {}\n\
+             # HELP turna_relay_ports_total Relay ports configured across the global pool and any tenant pools\n\
+             # TYPE turna_relay_ports_total gauge\n\
+             turna_relay_ports_total {}\n\
+             # HELP turna_relay_ports_utilization_percent Percent of the relay port range in use\n\
+             # TYPE turna_relay_ports_utilization_percent gauge\n\
+             turna_relay_ports_utilization_percent {}\n\
              # HELP turna_quic_readiness QUIC/WebTransport listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if QUIC disabled)\n\
              # TYPE turna_quic_readiness gauge\n\
              turna_quic_readiness {}\n\
@@ -1128,6 +1162,22 @@ impl Metrics {
             self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.tls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.sctp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            l(&self.relay_ports_in_use),
+            l(&self.relay_ports_total),
+            {
+                let total = self.relay_ports_total.load(std::sync::atomic::Ordering::Relaxed);
+                let used = self.relay_ports_in_use.load(std::sync::atomic::Ordering::Relaxed);
+                // 0 rather than 100 when no range is published: unlike capacity
+                // state, an unreported port range is not a reason to call the node
+                // full — it means the sampler has not run yet.
+                // checked_div over a manual zero test: clippy's manual_checked_ops
+                // rejects the latter, and the None arm carries the meaning anyway —
+                // no range published yet, which is 0 rather than 100 so an alert on
+                // a high value cannot fire during startup.
+                used.saturating_mul(100)
+                    .checked_div(total)
+                    .map_or(0, |v| v.min(100))
+            },
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
@@ -1138,6 +1188,163 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Capacity state, in the vocabulary the enterprise spec asks for.
+///
+/// Ordered by decreasing willingness to take work, which is also the order the
+/// checks run in: the first that matches wins, so DRAINING beats SATURATED and a
+/// node that is both reports the one that will not change on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum CapacityState {
+    /// Accepting work with headroom.
+    Available,
+    /// Accepting work, but past the soft threshold or with a degraded
+    /// dependency. A caller with a choice should choose elsewhere.
+    Degraded,
+    /// Shutting down. Will not take new work and existing work is being wound
+    /// down. Distinct from SATURATED because it does not recover.
+    Draining,
+    /// At or past the hard threshold, or shedding. New work will suffer.
+    Saturated,
+    /// Not able to serve: startup incomplete, or no capacity limit published so
+    /// there is nothing to reason about.
+    Unavailable,
+}
+
+/// `GET /capacity` — per-node capacity, for a caller deciding where to place a
+/// session.
+///
+/// Both the state and the numbers behind it are returned. The state is our
+/// opinion; the numbers let a caller form its own, which matters because the
+/// thresholds here are generic and a deployment's real limit is usually
+/// something else — bandwidth on a shared uplink, or a licence count.
+#[derive(Debug, serde::Serialize)]
+struct CapacityResponse {
+    /// Response schema version. Increment on any change that is not additive.
+    version: u32,
+    state: CapacityState,
+    /// Why, in a form worth logging. Empty when AVAILABLE.
+    reasons: Vec<&'static str>,
+    active_allocations: u64,
+    max_allocations: u64,
+    /// Percent of `max_allocations` in use. 100 when the limit is unpublished,
+    /// pairing with UNAVAILABLE rather than reading as empty.
+    utilization_percent: u64,
+    soft_threshold_percent: u64,
+    hard_threshold_percent: u64,
+    ready: bool,
+    draining: bool,
+    /// Which inputs this state actually weighed.
+    ///
+    /// Present so a caller is not left to assume the state considered load it
+    /// could not see. The spec asks for bps, pps, CPU and memory pressure in
+    /// admission decisions; none of those is here yet, and saying so in the
+    /// response is cheaper than a caller discovering it during an incident.
+    signals: CapacitySignals,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CapacitySignals {
+    allocations: bool,
+    send_queue_pressure: bool,
+    readiness: bool,
+    /// Rate of bytes relayed. Counters exist; a rate needs a sampler.
+    bandwidth_rate: bool,
+    /// Rate of packets relayed. Same.
+    packet_rate: bool,
+    /// Host CPU load. No source in this crate.
+    cpu: bool,
+    /// Host memory pressure. No source in this crate.
+    memory: bool,
+}
+
+impl Metrics {
+    /// Publish the node's capacity limits. Called once at startup.
+    ///
+    /// Until this is called, `/capacity` reports UNAVAILABLE: a node that does
+    /// not know its own ceiling cannot honestly claim headroom.
+    pub fn set_capacity_limits(&self, max_allocations: u64, soft_percent: u64, hard_percent: u64) {
+        self.capacity_max_allocations
+            .store(max_allocations, Ordering::SeqCst);
+        self.capacity_soft_percent
+            .store(soft_percent.min(100), Ordering::SeqCst);
+        self.capacity_hard_percent
+            .store(hard_percent.min(100), Ordering::SeqCst);
+    }
+
+    fn capacity(&self) -> CapacityResponse {
+        let max = self.capacity_max_allocations.load(Ordering::Relaxed);
+        let active = self.active_allocations.load(Ordering::Relaxed);
+        let soft = self.capacity_soft_percent.load(Ordering::Relaxed);
+        let hard = self.capacity_hard_percent.load(Ordering::Relaxed);
+        let draining = self.is_draining();
+        let ready = self.is_ready();
+        // Any drop means the egress queue has already overflowed at least once.
+        // Treated as saturation rather than degradation: by the time a frame is
+        // dropped the damage is done, and a caller placing more work on this
+        // node makes it worse.
+        let shedding = self.send_queue_dropped.load(Ordering::Relaxed) > 0;
+
+        // 100 when no limit is published, pairing with the UNAVAILABLE state
+        // below: a node that does not know its ceiling must not read as empty.
+        // Opposite default from the port gauge above, and deliberately so — there
+        // an unpublished range means "not sampled yet", here it means "cannot
+        // reason about headroom".
+        let utilization = active
+            .saturating_mul(100)
+            .checked_div(max)
+            .map_or(100, |v| v.min(100));
+
+        let mut reasons: Vec<&'static str> = Vec::new();
+        let state = if draining {
+            reasons.push("node is draining");
+            CapacityState::Draining
+        } else if !ready {
+            reasons.push("node is not ready");
+            CapacityState::Unavailable
+        } else if max == 0 {
+            reasons.push("no capacity limit published; cannot reason about headroom");
+            CapacityState::Unavailable
+        } else if utilization >= hard {
+            reasons.push("allocations at or above the hard threshold");
+            CapacityState::Saturated
+        } else if shedding {
+            reasons.push("send queue has dropped frames");
+            CapacityState::Saturated
+        } else if utilization >= soft {
+            reasons.push("allocations at or above the soft threshold");
+            CapacityState::Degraded
+        } else if self.readiness() == Readiness::Degraded {
+            reasons.push("a listener or backend reports degraded");
+            CapacityState::Degraded
+        } else {
+            CapacityState::Available
+        };
+
+        CapacityResponse {
+            version: 1,
+            state,
+            reasons,
+            active_allocations: active,
+            max_allocations: max,
+            utilization_percent: utilization,
+            soft_threshold_percent: soft,
+            hard_threshold_percent: hard,
+            ready,
+            draining,
+            signals: CapacitySignals {
+                allocations: true,
+                send_queue_pressure: true,
+                readiness: true,
+                bandwidth_rate: false,
+                packet_rate: false,
+                cpu: false,
+                memory: false,
+            },
+        }
     }
 }
 
@@ -1380,6 +1587,19 @@ pub async fn serve_on(
                     ),
                     None => ("200 OK", "[]".to_string(), "application/json"),
                 },
+                "/capacity" => {
+                    // 200 in every state, including SATURATED and UNAVAILABLE:
+                    // the body carries the state, and a caller asking "can you
+                    // take this" needs an answer rather than an error it has to
+                    // interpret. `/ready` remains the endpoint that speaks in
+                    // status codes for load balancers.
+                    let cap = metrics.capacity();
+                    (
+                        "200 OK",
+                        serde_json::to_string(&cap).unwrap_or_else(|_| "{}".into()),
+                        "application/json",
+                    )
+                }
                 "/health" => {
                     if metrics.is_draining() {
                         (

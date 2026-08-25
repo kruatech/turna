@@ -284,10 +284,22 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         let base = tracing_subscriber::registry().with(otel_layer).with(filter);
         try_init_with_fmt!(base)?;
     } else {
-        info!("OTLP endpoint not configured — distributed tracing disabled");
+        // No log here: the subscriber is installed on the next line, and anything
+        // emitted before it exists is discarded. This message used to live here
+        // and had therefore never appeared in a log — found when an air-gap check
+        // looked for it and a correctly-behaving node failed the check. It now
+        // goes out below, with the other startup line.
+        //
         // Registry → EnvFilter → fmt
         let base = tracing_subscriber::registry().with(filter);
         try_init_with_fmt!(base)?;
+    }
+
+    if !otlp_enabled {
+        // Stated explicitly rather than left to be inferred from the empty
+        // `otlp=` field below. An operator verifying that a deployment sends
+        // nothing outward should find a sentence saying so, not an absence.
+        info!("distributed tracing disabled (no OTLP endpoint configured)");
     }
 
     info!(

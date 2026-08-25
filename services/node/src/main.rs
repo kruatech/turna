@@ -298,6 +298,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
+    // Publish the node's own ceiling so `/capacity` has something to reason
+    // about. Until this runs, that endpoint reports UNAVAILABLE — a node that
+    // does not know its limit must not advertise headroom, because an unset
+    // limit read as "unlimited" is how a node gets sent work it cannot take.
+    //
+    // The thresholds are percentages of `max_allocations`, which is the only
+    // ceiling this process actually enforces. A deployment's real constraint is
+    // often something else — uplink bandwidth, a licence count — which is why
+    // `/capacity` returns the raw numbers next to the state rather than only a
+    // verdict.
+    metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
+
     // M1: install the configured peer-filter policy before serving.
     // Default profile is internet-facing (denies RFC1918/ULA); opt into
     // LAN relaying via [turn.peer_filter] profile = "lan".
@@ -776,6 +788,39 @@ fn run_tokio(
             };
             #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
             let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = None;
+
+            // Relay-port occupancy, mirrored on a ticker.
+            //
+            // A ticker rather than a scrape-time provider like the two below: a
+            // provider would need another parameter on `serve_*`, whose signature
+            // has already grown twice this week, and the cost of the ticker is up
+            // to five seconds of staleness. A port range does not fill in five
+            // seconds, so an alert firing one interval late is not a worse alert.
+            //
+            // Tenant pools are summed into the global gauges rather than exported
+            // per tenant. `port_pool_usage()` keeps the per-pool detail for
+            // anything that wants it without every scrape paying for the labels.
+            {
+                let store = store.clone();
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(5));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        let (used, total) = store
+                            .port_pool_usage()
+                            .iter()
+                            .fold((0usize, 0usize), |(u, t), (_, in_use, cap)| {
+                                (u + in_use, t + cap)
+                            });
+                        metrics.relay_ports_in_use.store(used as u64, Relaxed);
+                        metrics.relay_ports_total.store(total as u64, Relaxed);
+                    }
+                });
+            }
 
             // Per-tenant traffic provider: snapshot the store's cumulative
             // per-tenant counters (accrued at allocation teardown) on each
