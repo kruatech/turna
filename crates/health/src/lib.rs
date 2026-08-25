@@ -1219,6 +1219,18 @@ pub async fn serve_with_cluster(
 /// the derived `turna_relay_route_forwarded_ratio` gauge) to `/metrics`; pass
 /// `None` to omit it — e.g. on builds without the io_uring datapath, where no
 /// route table exists.
+/// Bind the health port, returning the listener for [`serve_on`].
+///
+/// Split out from `serve_*` so a caller can fail startup when the port is
+/// unavailable. Binding inside a spawned task means the error surfaces nowhere:
+/// the node keeps serving traffic while the operator believes the port they
+/// configured is being scraped. It is worse than no health endpoint, because
+/// whatever else holds that port answers in its place — a scrape can end up
+/// reading an unrelated process and reporting it as this node.
+pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    TcpListener::bind(addr).await
+}
+
 pub async fn serve_with_cluster_routes(
     addr: SocketAddr,
     metrics: Arc<Metrics>,
@@ -1226,7 +1238,27 @@ pub async fn serve_with_cluster_routes(
     relay_routes: Option<RelayRouteMetricsProvider>,
     tenant_traffic: Option<TenantTrafficProvider>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind(addr).await?;
+    serve_on(
+        listener,
+        addr,
+        metrics,
+        cluster,
+        relay_routes,
+        tenant_traffic,
+    )
+    .await
+}
+
+/// Serve on an already-bound listener.
+pub async fn serve_on(
+    listener: TcpListener,
+    addr: SocketAddr,
+    metrics: Arc<Metrics>,
+    cluster: Option<Arc<dyn ClusterView>>,
+    relay_routes: Option<RelayRouteMetricsProvider>,
+    tenant_traffic: Option<TenantTrafficProvider>,
+) -> std::io::Result<()> {
     info!(%addr, "health check server started");
 
     loop {

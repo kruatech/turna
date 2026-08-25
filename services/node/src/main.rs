@@ -783,15 +783,32 @@ fn run_tokio(
                 Some(Arc::new(move || store.tenant_traffic_snapshot()))
             };
 
+            // Bound here rather than inside the task: the same reasoning as the
+            // DTLS check above. A bind failure inside a spawned task is
+            // swallowed, the node carries on, and the operator believes the
+            // configured port is being scraped. We ran into exactly that — the
+            // port was held by an unrelated process and a whole scrape window
+            // read that process's metrics as if they were this node's.
+            let health_listener = turna_health::bind(health_listen).await.map_err(|e| {
+                format!(
+                    "[health] listen = \"{health_listen}\" could not be bound: {e}. \
+                     Free the port or change [health].listen; the node will not start \
+                     without the health endpoint it was told to serve"
+                )
+            })?;
             tokio::spawn(async move {
-                let _ = turna_health::serve_with_cluster_routes(
+                if let Err(e) = turna_health::serve_on(
+                    health_listener,
                     health_listen,
                     health_metrics,
                     Some(cluster_view),
                     relay_route_metrics,
                     tenant_traffic,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!(error = %e, "health server stopped");
+                }
             });
         }
 
