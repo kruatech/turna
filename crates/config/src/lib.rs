@@ -316,12 +316,16 @@ impl TurnaConfig {
         // partial/experimental, and TURN-over-SCTP is experimental. Refuse to
         // enable either under `production` so an unfinished datapath is never
         // shipped as if it were supported.
-        if prod && self.turn.tcp_relay.enabled {
-            errors.push(
-                "turn.tcp_relay.enabled = true in production, but RFC 6062 TCP relay is experimental/partial and not supported in production"
-                    .into(),
-            );
-        }
+        // RFC 6062 TCP relay is no longer refused under `production`. Interop is
+        // recorded (docs/interop/transports-2026-08-19.md and
+        // docs/interop/coturn-2026-08-23.md), including the pipelined
+        // ConnectionBind case that the prebuffer in transport::tcp_tls exists to
+        // handle and that no independent client had exercised before.
+        //
+        // It still carries a different operational profile from UDP — a listener
+        // and a connection per relayed peer — but that is a sizing decision for
+        // the operator, documented in docs/feature-support.md, not something a
+        // config refusal can make for them.
         if prod && self.turn.sctp.enabled {
             errors.push(
                 "turn.sctp.enabled = true in production, but TURN-over-SCTP is experimental and not supported in production"
