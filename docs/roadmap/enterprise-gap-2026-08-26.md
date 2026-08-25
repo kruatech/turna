@@ -67,13 +67,13 @@ requirement to effort anywhere in the document.
 |---|---|---|---|
 | Real media scale 10k/25k/50k | P0 | **partial** + **iron** | Generator, harness and report format done. The scale numbers need hardware and distributed generation. |
 | Capacity-aware admission control | P0 | **build** | Today: per-IP rate limits, per-user quotas, `max_allocations`, bounded relay ports. All *count* limits. Nothing admits on bps, pps, CPU or queue depth. Weeks. |
-| Capacity API | P0 | **partial**, observed (2026-08-26) | `GET /capacity`: five states, versioned, raw numbers beside the verdict (`docs/design/capacity-api.md`). Verified live — AVAILABLE idle, SATURATED at the hard threshold with the reason named. Partial because the state weighs allocations and send-queue pressure only; bps, pps, CPU and memory are absent and the `signals` field says so. **The 75 % soft threshold is unverified**: one host cannot drive enough concurrent allocations past `TieredRateLimiter`, which needs multiple source addresses or configurable limits. |
+| Capacity API | P0 | **partial**, observed (2026-08-26) | `GET /capacity`: five states, versioned, raw numbers beside the verdict (`docs/design/capacity-api.md`). Verified live — AVAILABLE idle, SATURATED at the hard threshold with the reason named. Partial because the state weighs allocations and send-queue pressure only; bps, pps, CPU and memory are absent and the `signals` field says so. Three of five states observed live: AVAILABLE, DEGRADED at 80 %, SATURATED at 100 %, thresholds distinct. |
 | Horizontal scaling | P0 | **partial** | Cluster, gossip and hash ring exist. `node_migration.rs` is unwired (the doc-claims gate asserts the docs say so). No media-session migration — a node loss drops its allocations. |
 | Per-node capacity profile | P1 | **iron** | Needs measurement on the hardware being sold. |
 | Resource forecasting | P1 | **build** | |
 | Port exhaustion monitoring | P0 | **done** (2026-08-26) | Three gauges: in use, total, utilisation percent. Tenant pools summed rather than labelled — per-tenant series are how a Prometheus instance dies at ten thousand tenants, and §10 asks for cardinality protection in the same document. Verified live against the allocation count. |
-| Bandwidth saturation alerts | P0 | **partial** | Byte counters per transport and per tenant exist; `docs/alerts/` has a rule pack. No saturation threshold because there is no published capacity to compare against — this one is downstream of the hardware profiles. |
-| PPS saturation monitoring | P0 | **partial** | Same shape: `turna_packets_received`/`_sent` exist, the threshold does not. |
+| Bandwidth saturation alerts | P0 | **partial** (2026-08-26) | A ten-second rate sampler now reports bytes/s inside the process, verified live at 32 320 B/s against a predicted ~32 kB/s. Still no *threshold*: there is no published capacity to compare against, which is downstream of the hardware profiles. |
+| PPS saturation monitoring | P0 | **partial** (2026-08-26) | Same sampler, verified at 160 pkt/s against a predicted 160. Threshold likewise pending a capacity figure. |
 
 ## §5 High availability
 

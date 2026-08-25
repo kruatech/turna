@@ -789,6 +789,38 @@ fn run_tokio(
             #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
             let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = None;
 
+            // Relayed traffic rate, sampled once a second.
+            //
+            // Its own task rather than a branch of the five-second port ticker
+            // below: `RateSampler`'s window is ten one-second buckets, so ticking
+            // it every five seconds would put a five-second delta into a bucket
+            // meant to hold one second and leave eight buckets stale. The mean
+            // would be wrong by roughly a factor of five while still looking like
+            // a plausible number — the failure mode worth avoiding, since nothing
+            // would flag it.
+            //
+            // The cost is two loads, two swaps and two stores per second.
+            {
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(1));
+                    // Skip rather than Burst: after a stall, catching up would
+                    // write several buckets from one counter reading and report a
+                    // rate that never happened.
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        let bytes = metrics.bytes_received.load(Relaxed)
+                            + metrics.bytes_sent.load(Relaxed);
+                        let packets = metrics.packets_received.load(Relaxed)
+                            + metrics.packets_sent.load(Relaxed);
+                        metrics.rates.tick(bytes, packets);
+                    }
+                });
+            }
+
             // Relay-port occupancy, mirrored on a ticker.
             //
             // A ticker rather than a scrape-time provider like the two below: a

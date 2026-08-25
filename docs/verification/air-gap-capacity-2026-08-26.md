@@ -42,21 +42,67 @@ Offline *installation* is packaging and is not covered here.
 
 ## Capacity API
 
-`GET /capacity` on a node with `max_allocations = 8`:
+Three of the five states observed live. Each was sampled three times, four
+seconds apart, and returned the same result — a steady state, not a transient.
+`turna_relay_ports_in_use` agreed with the allocation count throughout.
 
-```
-idle:            AVAILABLE   0 of 8
-under load:      SATURATED   8 of 8   100%   ['allocations at or above the hard threshold']
-```
+| `max_allocations` | live allocations | state | reason returned |
+|---|---|---|---|
+| 8 | 0 | `AVAILABLE` | — |
+| 10 | 8 (80 %) | `DEGRADED` | allocations at or above the soft threshold |
+| 8 | 8 (100 %) | `SATURATED` | allocations at or above the hard threshold |
 
-Three consecutive samples four seconds apart returned the same result, so this is
-a steady state rather than a transient. `turna_relay_ports_in_use` agreed with the
-allocation count throughout.
+The two thresholds are distinct and not confused with each other, which is the
+thing worth checking: a soft threshold that reports `SATURATED` would tell a
+caller to stop using a node with 20 % headroom left.
+
+`DRAINING` and `UNAVAILABLE` are not covered here. `DRAINING` follows the same
+flag the drain check already exercises; `UNAVAILABLE` needs either a node that
+has not finished starting or one with no published limit, neither of which this
+harness produces.
 
 The useful finding is not that `SATURATED` appeared. It is that **the endpoint
 reported reality the whole way through the debugging below** — when it said eight
 allocations, there were eight, and the number that looked wrong was the one I
 expected, not the one it returned.
+
+## Rate sampler
+
+Ten one-second buckets, mean over the window. Fed by a one-second ticker in the
+node; read by `/capacity`.
+
+Predicted before running, then observed:
+
+| phase | expected | observed |
+|---|---|---|
+| first 3 s after start | `null` — window not filled | `null` |
+| after 12 s, no traffic | `0` | `0` |
+| 8 channels x 10 pps, 200 B payload | ~160 pkt/s, ~32 kB/s | **160 pkt/s, 32 320 B/s** |
+
+Three samples five seconds apart under load returned the same numbers.
+
+Two things the arithmetic confirms. 160 packets for 80 sent means the counters
+total both directions — a relayed frame is received and then sent, so the figure
+is the load on the node rather than the traffic of one direction, which is what an
+admission decision wants. And 32 320 / 160 = 202 bytes per packet: the 200-byte
+payload plus a 4-byte ChannelData header, less rounding on the window.
+
+`null` and `0` are deliberately different answers. "No traffic" and "not yet
+known" are different states, and a partial mean over three of ten buckets would
+understate the load by two thirds — a node that under-reports during its first ten
+seconds accepts work it cannot serve.
+
+### What the rates are not used for
+
+The capacity state still weighs allocations and send-queue pressure only. The
+rates are reported, not acted on, because a threshold needs a capacity figure to
+compare against and this node's throughput ceiling has never been measured — that
+is the hardware-profile item. Wiring a threshold now would mean inventing a limit
+and then declaring nodes saturated against it.
+
+So of the three requirements that were waiting on this sampler, two are closed
+honestly (`/capacity`'s bandwidth and packet-rate signals) and the third,
+capacity-aware admission control, still needs hardware rather than code.
 
 ## Two things found while verifying
 
@@ -75,27 +121,24 @@ It surfaced because the air-gap check looked for the sentence and failed on a no
 that was behaving correctly. A check asserting on intended output rather than
 observed output finds this; one asserting on the code does not.
 
-### The soft threshold is not verified, and cannot be from this host
-
-The 95 % hard threshold is confirmed above. The 75 % soft threshold is **not**,
-and the reason is worth recording rather than leaving as a gap someone assumes
-was covered.
+### A rate limiter that obstructs measurement, and a wrong conclusion about it
 
 Driving 38 concurrent allocations from one host does not work: every client
 arrives from loopback and `TieredRateLimiter` refuses most of them —
 `rate_limited: 122` against `total_allocations: 59`, with `quota_exceeded: 0`
-confirming it was the rate limiter and not a quota. The limiter is doing its job;
-it is the measurement it obstructs.
+confirming the limiter rather than a quota. Eight allocations is what this host
+sustains. The limiter is doing its job; it is the measurement it obstructs.
 
-The threshold was reached instead by lowering `max_allocations` to 8, which the
-host can sustain. That proves the hard threshold and leaves the soft one
-untested, because there is no configuration where 8 allocations sit between 75 %
-and 95 % of 8.
+I first concluded from this that the soft threshold could not be verified without
+multiple source addresses or making `TieredLimits` configurable, and wrote that
+down. It was wrong. The threshold does not need many allocations, only allocations
+that land inside the band: with `max_allocations = 10`, the eight this host
+sustains are 80 %, which is between the two thresholds. `DEGRADED` followed.
 
-Testing the soft threshold needs either a load source with multiple source
-addresses, or `TieredLimits` becoming configurable — it is currently constructed
-in `processor.rs` rather than read from config. Neither is difficult; both are
-more than this run.
+Recorded because the mistake is instructive. The obstacle was real and the
+inference from it was not — "I cannot generate enough load" became "this cannot be
+measured", when the measurement never needed the load. Worth suspecting the next
+time a limit looks like it blocks a test.
 
 ## Scope
 
