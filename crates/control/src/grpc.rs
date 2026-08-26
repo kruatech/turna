@@ -1149,7 +1149,25 @@ const AUDIT_RING_CAPACITY: usize = 1024;
 /// identifies the client without parsing the X.509 structure (no extra
 /// dependency). Falls back to the peer socket address when no client
 /// certificate is presented (server-only TLS / loopback).
+/// Identify the caller, and log their correlation id if they sent one.
+///
+/// The logging lives here rather than in each RPC because every operation that
+/// needs to know who called it already calls this — five call sites instead of
+/// sixteen, and no way for a new privileged RPC to forget.
+///
+/// A `debug!` rather than `info!`: the id is only useful to somebody already
+/// tracing a specific request, and an unconditional line per RPC on a management
+/// plane that also serves streaming metrics is noise. The RPC's own audit entry
+/// and error paths log at info.
 fn actor_of<T>(req: &Request<T>) -> String {
+    let correlation = correlation_of(req);
+    if !correlation.is_empty() {
+        tracing::debug!(
+            target: "management",
+            correlation_id = %correlation,
+            "management RPC carries a caller correlation id"
+        );
+    }
     if let Some(certs) = req.peer_certs() {
         if let Some(leaf) = certs.first() {
             let der: &[u8] = leaf.as_ref();
@@ -1160,6 +1178,43 @@ fn actor_of<T>(req: &Request<T>) -> String {
     req.remote_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Metadata key carrying a caller-supplied correlation identifier.
+///
+/// Lower-case because gRPC metadata keys are case-insensitive but tonic requires
+/// the lower form when constructing them.
+pub const CORRELATION_HEADER: &str = "x-turna-correlation-id";
+
+/// Maximum length kept. Long enough for a UUID, a W3C traceparent, or a
+/// reasonable composite; short enough that a caller cannot use it as a channel.
+const CORRELATION_MAX: usize = 128;
+
+/// A caller's opaque correlation identifier, or empty if absent.
+///
+/// **Sanitised deliberately.** This string arrives from whoever called the RPC
+/// and lands in a log line and an audit entry. A newline in it would let a caller
+/// write a second audit record of their choosing, and the audit log is
+/// hash-chained precisely because its contents are meant to be trustworthy —
+/// a chain over forgeable entries proves only that the forgery came in order.
+///
+/// So: printable ASCII only, everything else dropped rather than escaped, and
+/// truncated. Dropped rather than escaped because an escaped control character is
+/// still a control character to the next thing that unescapes it, and this value
+/// passes through more than one consumer.
+fn correlation_of<T>(req: &Request<T>) -> String {
+    let Some(raw) = req.metadata().get(CORRELATION_HEADER) else {
+        return String::new();
+    };
+    let Ok(s) = raw.to_str() else {
+        // Binary metadata under a text key: the caller sent something that is not
+        // an identifier. Ignored rather than lossily decoded.
+        return String::new();
+    };
+    s.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(CORRELATION_MAX)
+        .collect()
 }
 
 /// Start the gRPC management server with graceful shutdown support.

@@ -1596,6 +1596,68 @@ fn render_relay_route_metrics(s: &RelayRouteMetrics) -> String {
 
 /// Pulls a per-tenant relayed-traffic snapshot on each `/metrics` scrape:
 /// `(tenant, bytes, packets, closed_allocations)`. Supplied by the node from
+/// Maximum tenants emitted individually per metric family.
+///
+/// Five families carry a `tenant` label. Without a cap, a deployment with ten
+/// thousand tenants returns fifty thousand series on every scrape from every
+/// node, and Prometheus's memory use is proportional to series count — the
+/// operator discovers this when it dies rather than when it grows.
+///
+/// 100 by default: a deployment with a handful of real tenants sees no change,
+/// and the worst case becomes 500 series rather than unbounded.
+static TENANT_SERIES_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+
+/// Label value used for the aggregate of everything past the cap.
+///
+/// Double underscore because a tenant identifier could plausibly be "other";
+/// this one is chosen to be awkward on purpose.
+const TENANT_OTHER: &str = "__other";
+
+/// Longest tenant name emitted. A name is an identifier from configuration, and
+/// one long enough to matter inflates every line of every scrape.
+const TENANT_NAME_MAX: usize = 64;
+
+/// Override how many tenants are emitted individually. 0 disables the cap, which
+/// is a decision an operator can make for a deployment they know is small.
+pub fn set_tenant_series_cap(n: usize) {
+    TENANT_SERIES_CAP.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tenant_cap() -> usize {
+    TENANT_SERIES_CAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Escape a tenant name for a Prometheus label value, and truncate it.
+fn tenant_label(t: &str) -> String {
+    let mut out = t.replace('\\', "\\\\").replace('"', "\\\"");
+    if out.len() > TENANT_NAME_MAX {
+        out.truncate(TENANT_NAME_MAX);
+        out.push('~');
+    }
+    out
+}
+
+/// Split tenants into those emitted individually and an aggregate of the rest.
+///
+/// Ranked by `weight` descending, so the tenants an operator is most likely to
+/// investigate stay visible and the long tail collapses. Returns
+/// `(kept, other_count)` — the caller sums the tail itself, since what to sum
+/// differs per family.
+fn cap_tenants<T: Copy>(
+    samples: &[(String, T)],
+    weight: impl Fn(&T) -> u64,
+) -> (Vec<(String, T)>, usize) {
+    let cap = tenant_cap();
+    if cap == 0 || samples.len() <= cap {
+        return (samples.to_vec(), 0);
+    }
+    let mut ranked: Vec<(String, T)> = samples.to_vec();
+    ranked.sort_by_key(|(_, v)| std::cmp::Reverse(weight(v)));
+    let omitted = ranked.len() - cap;
+    ranked.truncate(cap);
+    (ranked, omitted)
+}
+
 /// `AllocationStore::tenant_traffic_snapshot`. `None` omits
 /// the block (single-tenant deployments never populate it).
 pub type TenantTrafficProvider = Arc<dyn Fn() -> Vec<(String, u64, u64, u64)> + Send + Sync>;
@@ -1608,39 +1670,88 @@ fn render_tenant_traffic_metrics(samples: &[(String, u64, u64, u64)]) -> String 
     if samples.is_empty() {
         return String::new();
     }
-    let esc = |t: &str| t.replace('\\', "\\\\").replace('"', "\\\"");
+
+    // Ranked by bytes: of the three counters here, bytes is the one an operator
+    // chases first, and using a single ranking for all three keeps the same
+    // tenants visible across families — a tenant present in one and aggregated
+    // in another would be worse than either.
+    let triples: Vec<(String, (u64, u64, u64))> = samples
+        .iter()
+        .map(|(t, b, p, c)| (t.clone(), (*b, *p, *c)))
+        .collect();
+    let (kept, omitted) = cap_tenants(&triples, |(b, _, _)| *b);
+    let tail: (u64, u64, u64) = if omitted == 0 {
+        (0, 0, 0)
+    } else {
+        let kept_names: std::collections::HashSet<&str> =
+            kept.iter().map(|(t, _)| t.as_str()).collect();
+        triples
+            .iter()
+            .filter(|(t, _)| !kept_names.contains(t.as_str()))
+            .fold((0u64, 0u64, 0u64), |(a, b2, c2), (_, (b, p, c))| {
+                (a + b, b2 + p, c2 + c)
+            })
+    };
+
+    let esc = |t: &str| tenant_label(t);
     let mut out = String::new();
+
+    // Emitted whether or not anything was omitted, so the series exists to alert
+    // on and a dashboard does not have to cope with it appearing and vanishing.
+    out.push_str(
+        "# HELP turna_tenant_series_omitted Tenants aggregated into __other because the per-family cap was reached\n\
+         # TYPE turna_tenant_series_omitted gauge\n",
+    );
+    out.push_str(&format!("turna_tenant_series_omitted {omitted}\n"));
 
     out.push_str(
         "# HELP turna_tenant_bytes_relayed_total Bytes relayed per tenant (accrued at allocation close)\n\
          # TYPE turna_tenant_bytes_relayed_total counter\n",
     );
-    for (t, bytes, _, _) in samples {
+    for (t, (bytes, _, _)) in &kept {
         out.push_str(&format!(
             "turna_tenant_bytes_relayed_total{{tenant=\"{}\"}} {bytes}\n",
             esc(t)
         ));
     }
 
+    if omitted > 0 {
+        out.push_str(&format!(
+            "turna_tenant_bytes_relayed_total{{tenant=\"{}\"}} {}\n",
+            TENANT_OTHER, tail.0
+        ));
+    }
     out.push_str(
         "# HELP turna_tenant_packets_relayed_total Packets relayed per tenant (accrued at allocation close)\n\
          # TYPE turna_tenant_packets_relayed_total counter\n",
     );
-    for (t, _, packets, _) in samples {
+    for (t, (_, packets, _)) in &kept {
         out.push_str(&format!(
             "turna_tenant_packets_relayed_total{{tenant=\"{}\"}} {packets}\n",
             esc(t)
         ));
     }
 
+    if omitted > 0 {
+        out.push_str(&format!(
+            "turna_tenant_packets_relayed_total{{tenant=\"{}\"}} {}\n",
+            TENANT_OTHER, tail.1
+        ));
+    }
     out.push_str(
         "# HELP turna_tenant_allocations_closed_total Allocations closed per tenant\n\
          # TYPE turna_tenant_allocations_closed_total counter\n",
     );
-    for (t, _, _, closed) in samples {
+    for (t, (_, _, closed)) in &kept {
         out.push_str(&format!(
             "turna_tenant_allocations_closed_total{{tenant=\"{}\"}} {closed}\n",
             esc(t)
+        ));
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "turna_tenant_allocations_closed_total{{tenant=\"{}\"}} {}\n",
+            TENANT_OTHER, tail.2
         ));
     }
 

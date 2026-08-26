@@ -59,6 +59,11 @@ pub struct AuditEntry {
     pub action: String,
     /// Non-secret parameters / identifiers for the operation.
     pub detail: String,
+    // A caller's correlation id is deliberately NOT here. It would have to be in
+    // the persisted line for `verify` to recompute the hash, and changing that
+    // line format stops old logs verifying — a migration, not a detail. The id
+    // goes to the tracing log instead (see `correlation_of` in grpc.rs), which is
+    // where §13 asks for it to be findable.
     /// `true` if the operation succeeded, `false` if it was rejected/failed.
     pub outcome: bool,
     /// Chain hash of the previous entry.
