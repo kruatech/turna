@@ -108,10 +108,37 @@ redact_secrets() {
     cat
     return
   fi
-  sed -E \
-    -e 's/^([[:space:]]*(shared_secret|turn_shared_secret|password|token|secret|client_secret|mac_key|api_key)[[:space:]]*=[[:space:]]*).*/\1"<redacted>"/I' \
-    -e 's/^([[:space:]]*key[[:space:]]*=[[:space:]]*)"[^"]*"/\1"<redacted>"/' \
-    -e 's/(BEGIN [A-Z ]*PRIVATE KEY-----)/\1 <redacted, body removed>/'
+  # Key names taken from what `turna-node --dump-config` masks, which is the
+  # authority here — it covers `cluster_secret` and `migration.ticket_secret`,
+  # both of which this list originally missed. Two tools redacting different sets
+  # is how an operator comes to trust the weaker one.
+  #
+  # The replacement keeps a prefix and the length, copying the same tool's format:
+  #
+  #     shared_secret = "***abcd…[24 chars]"
+  #
+  # That answers a question a flat marker cannot — whether the secret in this
+  # bundle is the same one as in a bundle taken last week. It comes up when an
+  # incident follows a rotation and nobody is certain the rotation took effect.
+  # Four characters and a length do not meaningfully narrow a brute force on a
+  # 24-character secret; they do settle that question.
+  awk '
+    BEGIN { FS = "="; OFS = "=" }
+    {
+      key = $1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key ~ /^(shared_secret|turn_shared_secret|cluster_secret|ticket_secret|password|token|secret|client_secret|mac_key|api_key|key)$/) {
+        val = $0
+        sub(/^[^=]*=[[:space:]]*/, "", val)
+        gsub(/^"|"$/, "", val)
+        if (length(val) == 0) { print; next }
+        indent = $0; sub(/[^[:space:]].*/, "", indent)
+        printf "%s%s = \"***%s…[%d chars]\"\n", indent, key, substr(val, 1, 4), length(val)
+        next
+      }
+      print
+    }' |
+  sed -E 's/(BEGIN [A-Z ]*PRIVATE KEY-----)/\1 <redacted, body removed>/'
 }
 
 fetch() {
