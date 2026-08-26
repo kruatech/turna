@@ -94,10 +94,47 @@ struct Cli {
     /// means nothing.
     #[arg(long)]
     bind_ip: Option<String>,
+
+    /// Spread client control sockets over N addresses in 127.0.0.0/8.
+    ///
+    /// Defaults to 1 — every client from 127.0.0.1, as before. Raise it when a
+    /// run is meant to measure the server rather than the per-source-IP allocate
+    /// limiter, which is 32/s with a burst of 16: 38 channels from one address
+    /// produced 122 refusals against 59 allocations.
+    ///
+    /// Linux only. The whole of 127.0.0.0/8 is local there; macOS needs
+    /// `ifconfig lo0 alias 127.0.0.2` for each address and will otherwise bind
+    /// them all to the same place without saying so.
+    ///
+    /// Ignored when --bind-ip is given, and for IPv6 servers.
+    #[arg(long, default_value_t = 1)]
+    source_ips: u32,
 }
 
 #[derive(Subcommand, Clone)]
 enum Mode {
+    /// Establish N allocations, drop them all at once, and re-establish them
+    /// simultaneously — a link flap or a node loss, from the server's side.
+    ///
+    /// Reports how many came back, how long the slowest took, and what the
+    /// server refused along the way. Pair it with `--source-ips`: from a single
+    /// source this measures the per-IP allocate limiter (32/s, burst 16) rather
+    /// than the server, which is a different and much smaller question.
+    ReconnectStorm {
+        /// Clients in the storm.
+        #[arg(long, default_value_t = 100)]
+        clients: usize,
+        /// Storms to run. More than one shows whether recovery degrades as
+        /// limiter budgets deplete — the first storm is always the kindest.
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+        /// Seconds to hold allocations before dropping them.
+        #[arg(long, default_value_t = 5)]
+        settle: u64,
+        /// Seconds to wait for reconnection before calling a client lost.
+        #[arg(long, default_value_t = 30)]
+        recover_timeout: u64,
+    },
     Binding {
         #[arg(short, long, default_value = "10")]
         concurrency: usize,
@@ -308,6 +345,7 @@ impl Mode {
         match self {
             Mode::Binding { .. } => "binding",
             Mode::Allocate { .. } => "allocate",
+            Mode::ReconnectStorm { .. } => "reconnect-storm",
             Mode::ChannelData { .. } => "channeldata",
             Mode::Conformance { .. } => "conformance",
             #[cfg(feature = "quic")]
@@ -1044,9 +1082,191 @@ fn progress_reporter(stats: &Arc<Stats>, json: bool) {
     });
 }
 
+/// One round: establish `clients` allocations, drop them, re-establish.
+///
+/// Returns `(established, recovered, slowest_recovery_ms)`.
+///
+/// Establishment and recovery are both concurrent — a storm is defined by
+/// everyone arriving at once, and staggering them would measure something else.
+/// Each client is timed individually so the reported figure is the slowest
+/// client's recovery rather than the wall time of the round, which would be the
+/// same number only by coincidence.
+async fn storm_round(
+    server: SocketAddr,
+    creds: &turn_client::Creds,
+    clients: usize,
+    settle: u64,
+    recover_timeout: u64,
+    round: usize,
+    rtt_ms: u64,
+) -> (usize, usize, u128) {
+    // ── establish ──────────────────────────────────────────────────────────
+    let mut sessions = Vec::with_capacity(clients);
+    let mut handles = Vec::with_capacity(clients);
+    for _ in 0..clients {
+        let creds = creds.clone();
+        handles.push(tokio::spawn(async move {
+            turn_client::allocate_family(server, &creds, rtt_ms, None)
+                .await
+                .ok()
+        }));
+    }
+    for h in handles {
+        if let Ok(Some(sess)) = h.await {
+            sessions.push(sess);
+        }
+    }
+    let established = sessions.len();
+    if established == 0 {
+        eprintln!("  round {round}: nothing established — check credentials and --source-ips");
+        return (0, 0, 0);
+    }
+
+    tokio::time::sleep(Duration::from_secs(settle)).await;
+
+    // ── the drop ───────────────────────────────────────────────────────────
+    //
+    // Sockets dropped without a Refresh(lifetime=0). A client that sends the
+    // Refresh is a client shutting down politely, and the server frees the
+    // allocation immediately; a client whose network vanished sends nothing and
+    // the allocation lingers until its lifetime expires. The second is the case
+    // a storm is about, and it is harder on the server: the returning clients
+    // ask for new allocations while the old ones still hold relay ports.
+    drop(sessions);
+
+    // ── the storm ──────────────────────────────────────────────────────────
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(established);
+    for _ in 0..established {
+        let creds = creds.clone();
+        let deadline = Duration::from_secs(recover_timeout);
+        handles.push(tokio::spawn(async move {
+            let started = Instant::now();
+            match tokio::time::timeout(
+                deadline,
+                turn_client::allocate_family(server, &creds, rtt_ms, None),
+            )
+            .await
+            {
+                Ok(Ok(_sess)) => Some(started.elapsed().as_millis()),
+                _ => None,
+            }
+        }));
+    }
+
+    let mut recovered = 0usize;
+    let mut slowest = 0u128;
+    for h in handles {
+        if let Ok(Some(ms)) = h.await {
+            recovered += 1;
+            slowest = slowest.max(ms);
+        }
+    }
+
+    println!(
+        "  round {round}: {recovered}/{established} recovered, slowest {slowest} ms, \
+         round took {} ms",
+        t0.elapsed().as_millis()
+    );
+    (established, recovered, slowest)
+}
+
+/// Knobs for the reconnect storm, bundled so a caller cannot transpose two of
+/// the four consecutive integers without noticing.
+#[derive(Clone, Copy)]
+struct StormParams {
+    clients: usize,
+    rounds: usize,
+    settle: u64,
+    recover_timeout: u64,
+    /// Response timeout per STUN exchange, ms. A 0 here makes every client give
+    /// up before the server answers.
+    rtt_ms: u64,
+}
+
+async fn run_reconnect_storm(
+    server: SocketAddr,
+    creds: turn_client::Creds,
+    p: StormParams,
+    json: bool,
+) {
+    let StormParams {
+        clients,
+        rounds,
+        settle,
+        recover_timeout,
+        rtt_ms,
+    } = p;
+    if !json {
+        println!("Reconnect storm: {clients} clients, {rounds} rounds, {settle}s settle");
+        println!("Drop is ungraceful — no Refresh(0) — so old allocations still hold");
+        println!("relay ports while the returning clients ask for new ones.");
+        println!("═══════════════════════════════════════════");
+    }
+
+    let mut worst_recovery = 0u128;
+    let mut total_established = 0usize;
+    let mut total_recovered = 0usize;
+
+    for round in 1..=rounds {
+        let (est, rec, slow) = storm_round(
+            server,
+            &creds,
+            clients,
+            settle,
+            recover_timeout,
+            round,
+            rtt_ms,
+        )
+        .await;
+        total_established += est;
+        total_recovered += rec;
+        worst_recovery = worst_recovery.max(slow);
+        // Between rounds: long enough for a token bucket to refill, short enough
+        // that the run stays useful. Without a gap, later rounds would measure
+        // depletion from earlier ones rather than the storm itself — which is
+        // worth measuring, but as a separate question.
+        if round < rounds {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    let lost = total_established.saturating_sub(total_recovered);
+    if json {
+        println!(
+            "{{\"mode\":\"reconnect_storm\",\"clients\":{clients},\"rounds\":{rounds},\
+             \"established\":{total_established},\"recovered\":{total_recovered},\
+             \"lost\":{lost},\"worst_recovery_ms\":{worst_recovery}}}"
+        );
+    } else {
+        println!("═══════════════════════════════════════════");
+        println!("  Established:  {total_established}");
+        println!("  Recovered:    {total_recovered}");
+        println!("  Lost:         {lost}");
+        println!("  Worst client: {worst_recovery} ms");
+        println!("───────────────────────────────────────────");
+        if lost > 0 {
+            println!("  A client that did not come back is one whose call stays down.");
+            println!("  Check the server's rate_limited and quota_exceeded counters");
+            println!("  before concluding the server was overloaded — a refusal and");
+            println!("  an overload look identical from here.");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // Set before any client runs: `control_bind_addr_indexed` reads it.
+    if cli.source_ips > 1 {
+        let _ = turn_client::SOURCE_SPREAD.set(cli.source_ips);
+        eprintln!(
+            "source spread: clients bound across 127.0.0.1-127.0.0.{} \
+             (Linux only; on macOS these need lo0 aliases)",
+            cli.source_ips.min(250)
+        );
+    }
 
     // Set before any client runs: `peer_bind_addr` reads it for every socket.
     if let Some(ref ip) = cli.bind_ip {
@@ -1271,6 +1491,37 @@ async fn main() {
                 eprintln!("Mode: STUN Binding (c={concurrency})");
             }
             run_binding(cli.server, concurrency, dur, wu, cli.json).await
+        }
+        Mode::ReconnectStorm {
+            clients,
+            rounds,
+            settle,
+            recover_timeout,
+        } => {
+            if !cli.json && turn_client::SOURCE_SPREAD.get().is_none() {
+                eprintln!(
+                    "warning: no --source-ips, so every client shares 127.0.0.1 and this                      measures the per-IP allocate limiter (32/s, burst 16) rather than the                      server. Deliberate? Then this is the everyone-behind-one-NAT case."
+                );
+            }
+            run_reconnect_storm(
+                cli.server,
+                creds,
+                StormParams {
+                    clients,
+                    rounds,
+                    settle,
+                    recover_timeout,
+                    rtt_ms: cli.rtt_timeout_ms,
+                },
+                cli.json,
+            )
+            .await;
+            // Exit here rather than returning an empty Stats: the summary printer
+            // below would render a table of zeros under the storm's own report,
+            // and a reader would have to know that "Errors: 0" refers to frames
+            // this mode never sends. A report that has to be explained away is
+            // worse than no report.
+            std::process::exit(0);
         }
         Mode::Allocate { concurrency } => {
             if !cli.json {

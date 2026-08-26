@@ -789,6 +789,45 @@ fn run_tokio(
             #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
             let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = None;
 
+            // Host CPU and memory, every five seconds.
+            //
+            // A single long-lived `System`, refreshed in place. CPU usage in
+            // sysinfo is a delta between refreshes, so a persistent instance
+            // reports the load over the whole interval; building a fresh one each
+            // tick — which `heartbeat::sample_resources` did — measures only the
+            // library's internal ~100 ms settling window, and a node busy in
+            // bursts reads low if the sample falls between them.
+            //
+            // Runs regardless of whether a cluster backend is configured. The
+            // previous arrangement collected this only inside the heartbeat loop,
+            // so a standalone node had no CPU or memory reading at all — the two
+            // signals a capacity decision most wants, missing exactly where there
+            // is no cluster to ask instead.
+            {
+                let metrics = metrics.clone();
+                tokio::task::spawn_blocking(move || {
+                    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+                    let mut sys = System::new_with_specifics(
+                        RefreshKind::nothing()
+                            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                            .with_memory(MemoryRefreshKind::nothing().with_ram()),
+                    );
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        sys.refresh_cpu_usage();
+                        sys.refresh_memory();
+                        let cpu = sys.global_cpu_usage().round() as u64;
+                        let mem = if sys.total_memory() > 0 {
+                            ((sys.used_memory() as f64 / sys.total_memory() as f64) * 100.0)
+                                .round() as u64
+                        } else {
+                            0
+                        };
+                        metrics.set_host_load(cpu, mem);
+                    }
+                });
+            }
+
             // Relayed traffic rate, sampled once a second.
             //
             // Its own task rather than a branch of the five-second port ticker
@@ -1797,7 +1836,8 @@ fn run_tokio(
                     migration,
                     tcp_relay,
                 )
-                .with_external_ip6(external_ip6);
+                .with_external_ip6(external_ip6)
+                .with_drain_timeout_secs(config.relay.drain_timeout_secs);
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
                     info!(listen = %tls_cfg.listen, cert = %tls_cfg.cert_path.display(), "TURNS (TLS) enabled");

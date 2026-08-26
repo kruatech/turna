@@ -951,6 +951,15 @@ pub struct RelayConfig {
     /// Per-user bandwidth + allocation count limits. Defaults are
     /// "no bandwidth limit, 100 allocations per username".
     pub quota: QuotaConfig,
+    /// How long to wait for allocations to end on shutdown, seconds.
+    ///
+    /// The node stops accepting immediately and then waits for existing
+    /// allocations. Raise it to let long calls finish; lower it to roll a
+    /// cluster faster. Measured: a node holding allocations whose clients had
+    /// vanished took the full timeout, because nothing was going to expire
+    /// inside it — see the stall detection in `relay::server::drain`, which now
+    /// cuts that case short without shortening the wait for live traffic.
+    pub drain_timeout_secs: u64,
 }
 
 impl Default for RelayConfig {
@@ -960,6 +969,8 @@ impl Default for RelayConfig {
             max_port: 65535,
             max_allocations: 10000,
             quota: QuotaConfig::default(),
+            // The value this was hard-coded to before it became configurable.
+            drain_timeout_secs: 30,
         }
     }
 }

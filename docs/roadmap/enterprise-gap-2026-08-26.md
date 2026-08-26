@@ -66,8 +66,8 @@ requirement to effort anywhere in the document.
 | req | P | state | note |
 |---|---|---|---|
 | Real media scale 10k/25k/50k | P0 | **partial** + **iron** | Generator, harness and report format done. The scale numbers need hardware and distributed generation. |
-| Capacity-aware admission control | P0 | **build** | Today: per-IP rate limits, per-user quotas, `max_allocations`, bounded relay ports. All *count* limits. Nothing admits on bps, pps, CPU or queue depth. Weeks. |
-| Capacity API | P0 | **partial**, observed (2026-08-26) | `GET /capacity`: five states, versioned, raw numbers beside the verdict (`docs/design/capacity-api.md`). Verified live — AVAILABLE idle, SATURATED at the hard threshold with the reason named. Partial because the state weighs allocations and send-queue pressure only; bps, pps, CPU and memory are absent and the `signals` field says so. Three of five states observed live: AVAILABLE, DEGRADED at 80 %, SATURATED at 100 %, thresholds distinct. |
+| Capacity-aware admission control | P0 | **build** — inputs now exist (2026-08-26) | The four signals it needs are collected and exposed: bytes/s and packets/s over a ten-second window, host CPU and memory from a persistent sampler. What is missing is not measurement but a *limit to compare against* — nobody has established what throughput or CPU load constitutes "too busy" for this workload on given hardware, so a threshold today would be invented. Downstream of the hardware profiles, like the saturation alerts. |
+| Capacity API | P0 | **partial**, observed (2026-08-26) | `GET /capacity`: five states, versioned, raw numbers beside the verdict (`docs/design/capacity-api.md`). Three of five states observed live — AVAILABLE, DEGRADED at 80 %, SATURATED at 100 % — with the two thresholds distinct. All four load signals now report: bytes/s, packets/s, CPU, memory. Still partial because the **state** weighs allocations and send-queue pressure only; the rest are reported, not acted on, for want of a capacity figure to compare against. |
 | Horizontal scaling | P0 | **partial** | Cluster, gossip and hash ring exist. `node_migration.rs` is unwired (the doc-claims gate asserts the docs say so). No media-session migration — a node loss drops its allocations. |
 | Per-node capacity profile | P1 | **iron** | Needs measurement on the hardware being sold. |
 | Resource forecasting | P1 | **build** | |
@@ -82,7 +82,7 @@ requirement to effort anywhere in the document.
 | N+1/N+2 redundancy | P0 | **decide** + **build** | A deployment contract, then a test that proves it. |
 | Fast node failure detection | P0 | **partial** | Gossip detects a dead node. What is untested is the time to detect under load, which is the number that matters. |
 | Client recovery / ICE restart | P0 | **build** (docs) | Mostly a client-side contract. Turna's part — fail cleanly and free the allocation — works; the integration spec does not exist. |
-| Graceful drain | P0 | **done** | Verified on TURNS, DTLS, QUIC and SCTP. The `300 Try Alternate` redirect that drain relies on was broken for three releases — `ATTR_ALTERNATE_SERVER` carried `0x0003` instead of `0x8023`, so no conforming client could read the alternate address. Fixed and guarded by a test asserting the encoded bytes. |
+| Graceful drain | P0 | **done**, improved (2026-08-26) | Verified on TURNS, DTLS, QUIC and SCTP. The wait is now `[turn.relay] drain_timeout_secs` rather than a hard-coded 30 s, and the loop exits early when nothing is expiring — a node holding abandoned allocations took the full 30 s waiting for expiries that could not happen inside the window. The `300 Try Alternate` redirect that drain relies on was broken for three releases — `ATTR_ALTERNATE_SERVER` carried `0x0003` instead of `0x8023`, so no conforming client could read the alternate address. Fixed and guarded by a test asserting the encoded bytes. |
 | Rolling upgrades | P1 | **partial** | Drain works; the procedure is not written or tested. |
 | Failure-under-load mode | P0 | **build** | Needs the node-loss-at-peak test from §15. |
 | Multi-DC / region awareness / fallback | P1 | **build** (design first) | |
@@ -245,7 +245,7 @@ these, and "partial" here means the shape can still change under it.
 | 72 h endurance | P1 | **build** (run) | The analyser compares halves; a 72 h run needs day-resolution instead. |
 | 10k/25k/50k certified profiles | P0 | **iron** | |
 | Mixed UDP/TURNS load | P0 | **build** | Drivers exist per transport; nothing mixes them in one run. Days, not weeks. |
-| Reconnect storm | P0 | **build** | |
+| Reconnect storm | P0 | **done** (2026-08-26) | `reconnect-storm` mode in the load tool. 150/150 recovered across three rounds, slowest client 3 ms, limiter and quotas untouched. Needs `--source-ips`, without which it measures the per-IP allocate limiter instead. | |
 | Node loss at peak | P0 | **build** | Needs a cluster. |
 | Backend degradation | P1 | **partial** | A Tarantool CAS failover test runs in CI. |
 | Certificate rotation under load | P1 | **build** | |

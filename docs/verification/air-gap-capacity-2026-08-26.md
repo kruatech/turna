@@ -92,6 +92,23 @@ known" are different states, and a partial mean over three of ten buckets would
 understate the load by two thirds — a node that under-reports during its first ten
 seconds accepts work it cannot serve.
 
+### Host CPU and memory
+
+Collected by a persistent `System` refreshed every five seconds, in a task that
+runs whether or not a cluster backend is configured.
+
+Two things were wrong with where this lived before. It ran only inside the
+heartbeat loop, so a standalone node collected nothing — the two signals a
+capacity decision most wants, absent exactly where there is no cluster to ask
+instead. And it built a fresh `System` each tick; CPU usage in sysinfo is a delta
+between refreshes, so a new instance has nothing to compare against and falls back
+on the library's ~100 ms settling window. A node busy in bursts reads low if the
+sample lands between them.
+
+`u64::MAX` marks "never sampled", distinct from a genuine 0. A node whose sampler
+had died would otherwise look idle, which is the worst available way to be wrong
+about load.
+
 ### What the rates are not used for
 
 The capacity state still weighs allocations and send-queue pressure only. The
@@ -103,6 +120,111 @@ and then declaring nodes saturated against it.
 So of the three requirements that were waiting on this sampler, two are closed
 honestly (`/capacity`'s bandwidth and packet-rate signals) and the third,
 capacity-aware admission control, still needs hardware rather than code.
+
+## Reconnect storm
+
+50 clients establish allocations, all vanish at once without a `Refresh(0)` —
+what a link flap looks like from the server — and all return simultaneously.
+Three rounds, sources spread across `127.0.0.0/8`.
+
+```
+round 1: 50/50 recovered, slowest 2 ms
+round 2: 50/50 recovered, slowest 2 ms
+round 3: 50/50 recovered, slowest 3 ms
+rate_limited: 0   quota_exceeded: 0
+```
+
+150 of 150, no loss, no degradation across rounds, and neither the rate limiter
+nor the quotas were touched. On this host, at this size, a reconnect storm is not
+a problem.
+
+The ungraceful drop matters to the result: a client that sends `Refresh(0)` frees
+its allocation immediately, while one whose network vanished leaves it holding a
+relay port until the lifetime expires. The returning clients therefore ask for new
+allocations while the old ones are still held — the harder of the two cases, and
+the realistic one.
+
+### Two findings that were mine, not the server's
+
+The first run of this reported slot exhaustion and failed recovery. Both were
+artefacts: `allocate_family`'s third parameter is the response timeout in
+milliseconds and I passed 0, so every client gave up before the server could
+answer. Rounds "completed" in 1 ms with most allocations failing and nothing on
+the server side to show for it.
+
+What caught it was the 1 ms, not the failures — a round establishing fifty
+allocations cannot take a millisecond. Had the number been merely bad rather than
+impossible, two non-existent server defects would now be written here as measured
+facts.
+
+The lesson is not "check your parameters". It is that a result which is *wrong*
+often looks plausible, while a result which is *impossible* does not, so the
+impossible one is the gift.
+
+### What the storm did find: drain waits when there is nothing to wait for
+
+Shutting down a node holding 300 abandoned allocations took **36 seconds**. The
+drain loop is `while !store.is_empty() && now < timeout` with a hard-coded 30
+seconds, polling `cleanup_expired()`. Allocations with a 600-second lifetime do
+not expire inside a 30-second window, so the loop polls until the timeout with
+nothing to wait for.
+
+That is a fixed cost, not a load-dependent one: a node whose clients disappeared
+always pays it in full. Rolling ten nodes sequentially spends five minutes there.
+
+Both halves are now addressed — `[turn.relay] drain_timeout_secs` makes the wait
+an operator's decision rather than a constant, and the loop exits early when three
+consecutive polls remove nothing and the count has not moved. A node draining live
+traffic is unaffected: its allocations end, the count moves, the loop keeps
+waiting. The two cases were previously indistinguishable despite wanting opposite
+handling.
+
+Not yet measured after the change. The number to check is both directions —
+abandoned allocations should now exit in seconds, and live traffic should still
+take as long as its clients need. A change that makes shutdown fast by cutting
+calls short would be a regression wearing a fix's clothes.
+
+### Two drain settings, and why the names mislead
+
+Adding `[turn.relay] drain_timeout_secs` produced a second knob next to an
+existing one, and they are not duplicates:
+
+| key | waits for | applies to |
+|---|---|---|
+| `[turn.relay] drain_timeout_secs` | **allocations** to end | the tokio datapath's `RelayServer::drain` |
+| `[cluster] drain_grace_secs` | **io_uring worker threads** to finish | the io_uring worker pool's lame-duck window |
+
+One is about clients, the other about threads. Both are needed.
+
+Two things about this are worth fixing eventually, and neither is fixed here
+because renaming a key breaks existing configuration and that is not a decision
+to make in passing:
+
+`drain_grace_secs` lives in `[cluster]` but has nothing to do with clustering —
+io_uring worker threads exist on a single node too. An operator looking for it
+will not look there.
+
+And an operator reading two similarly-named drain settings in different sections
+will reasonably conclude one is redundant, set the wrong one, and get a shutdown
+that behaves differently from the one they configured. The names describe their
+implementations rather than their effects.
+
+## Three false alarms about io_uring, recorded because the pattern repeated
+
+While tracing the drain path I concluded three times that the io_uring datapath
+lacked something, and was wrong each time:
+
+- "io_uring builds no `RelayServer`, so it has no drain" — it has one, a worker
+  pool lame-duck window at a different call site.
+- "that window is a hard-coded constant" — it reads `cluster.drain_grace_secs`.
+- "so `drain_timeout_secs` silently does not apply there" — correct, but not a
+  defect: the two settings wait for different things.
+
+Each conclusion came from a grep that found nothing, and each grep searched for a
+word I had guessed. **Not finding something is not the same as its absence**, and
+the difference is invisible from inside the search. The tell, in hindsight, was
+that every one of these was an assertion about what does *not* exist — the class
+of claim a keyword search is worst at supporting.
 
 ## Two things found while verifying
 
@@ -121,24 +243,49 @@ It surfaced because the air-gap check looked for the sentence and failed on a no
 that was behaving correctly. A check asserting on intended output rather than
 observed output finds this; one asserting on the code does not.
 
-### A rate limiter that obstructs measurement, and a wrong conclusion about it
+### The harness was measuring the rate limiter, not the server
 
-Driving 38 concurrent allocations from one host does not work: every client
-arrives from loopback and `TieredRateLimiter` refuses most of them —
-`rate_limited: 122` against `total_allocations: 59`, with `quota_exceeded: 0`
-confirming the limiter rather than a quota. Eight allocations is what this host
-sustains. The limiter is doing its job; it is the measurement it obstructs.
+Every load client bound its control socket to `127.0.0.1`, and
+`TieredLimits::allocate` is 32 allocations/second per source IP with a burst of
+16. So 38 requested channels produced `rate_limited: 122` against
+`total_allocations: 59`, `quota_exceeded: 0` confirming the limiter rather than a
+quota.
 
-I first concluded from this that the soft threshold could not be verified without
-multiple source addresses or making `TieredLimits` configurable, and wrote that
-down. It was wrong. The threshold does not need many allocations, only allocations
-that land inside the band: with `max_allocations = 10`, the eight this host
-sustains are 80 %, which is between the two thresholds. `DEGRADED` followed.
+Fixed by spreading control sockets across `127.0.0.0/8`, which is entirely local
+on Linux and needs no interface configuration. `--source-ips N` in the load tool.
+Measured back-to-back against the same node:
 
-Recorded because the mistake is instructive. The obstacle was real and the
-inference from it was not — "I cannot generate enough load" became "this cannot be
-measured", when the measurement never needed the load. Worth suspecting the next
-time a limit looks like it blocks a test.
+| | frames received | errors | allocations | `rate_limited` delta |
+|---|---|---|---|---|
+| 38 channels, one source | 205 | 33 | 5 | +33 |
+| 38 channels, 40 sources | **1558** | **0** | **38** | **0** |
+
+The limiter was never touched in the second run. Seven and a half times the
+traffic, and every channel established.
+
+**This invalidates a statement made earlier in this document and now corrected:**
+"eight allocations is what this host sustains" was wrong. Eight was what leaked
+through a per-source-IP limit. The host sustains at least 38, and the ceiling is
+still unmeasured.
+
+It also means the single-source case is not a capacity measurement at all — it is
+the everyone-behind-one-NAT case. Worth testing deliberately, and worth not
+confusing with the other.
+
+### A wrong inference about the soft threshold, kept here because it is instructive
+
+Before the above was understood, I concluded the 75 % soft threshold could not be
+verified without multiple source addresses or making `TieredLimits` configurable,
+and wrote that into this file as a finding. It was wrong twice over.
+
+Wrong first because the threshold never needed many allocations, only allocations
+landing inside the band: with `max_allocations = 10`, the eight then available are
+80 %, and `DEGRADED` followed immediately. Wrong again because the obstacle itself
+turned out to be removable in an afternoon.
+
+"I cannot generate enough load" became "this cannot be measured". The obstacle was
+real; the inference was not. Worth suspecting the next time a limit looks like it
+blocks a test.
 
 ## Scope
 

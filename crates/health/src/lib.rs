@@ -109,6 +109,16 @@ pub struct Metrics {
     /// control.
     pub rates: RateSampler,
 
+    /// Host CPU and memory, whole percent, refreshed every five seconds by a
+    /// sampler task in the node.
+    ///
+    /// `u64::MAX` means "never sampled" — distinct from 0, which is a real and
+    /// unremarkable reading. Without that distinction a node whose sampler had
+    /// died would look idle, which is the worst possible way to be wrong about
+    /// load.
+    pub host_cpu_percent: AtomicU64,
+    pub host_memory_percent: AtomicU64,
+
     pub relay_ports_in_use: AtomicU64,
     pub relay_ports_total: AtomicU64,
 
@@ -394,6 +404,8 @@ impl Metrics {
             active_allocations: AtomicU64::new(0),
             total_allocations: AtomicU64::new(0),
             rates: RateSampler::new(),
+            host_cpu_percent: AtomicU64::new(u64::MAX),
+            host_memory_percent: AtomicU64::new(u64::MAX),
             relay_ports_in_use: AtomicU64::new(0),
             relay_ports_total: AtomicU64::new(0),
             capacity_max_allocations: AtomicU64::new(0),
@@ -1350,6 +1362,10 @@ struct CapacityResponse {
     bytes_per_sec: Option<u64>,
     /// Relayed packets/second over the last ten seconds. `null` on the same terms.
     packets_per_sec: Option<u64>,
+    /// Host CPU, whole percent. `null` until the first sample.
+    cpu_percent: Option<u64>,
+    /// Host memory in use, whole percent. `null` until the first sample.
+    memory_percent: Option<u64>,
     /// Which inputs this state actually weighed.
     ///
     /// Present so a caller is not left to assume the state considered load it
@@ -1375,6 +1391,30 @@ struct CapacitySignals {
 }
 
 impl Metrics {
+    /// Store a host CPU and memory sample, whole percent.
+    pub fn set_host_load(&self, cpu_percent: u64, memory_percent: u64) {
+        self.host_cpu_percent
+            .store(cpu_percent.min(100), Ordering::Relaxed);
+        self.host_memory_percent
+            .store(memory_percent.min(100), Ordering::Relaxed);
+    }
+
+    /// Host CPU percent, or `None` if no sample has been taken yet.
+    pub fn host_cpu(&self) -> Option<u64> {
+        match self.host_cpu_percent.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v),
+        }
+    }
+
+    /// Host memory percent, or `None` if no sample has been taken yet.
+    pub fn host_memory(&self) -> Option<u64> {
+        match self.host_memory_percent.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v),
+        }
+    }
+
     /// Publish the node's capacity limits. Called once at startup.
     ///
     /// Until this is called, `/capacity` reports UNAVAILABLE: a node that does
@@ -1450,14 +1490,16 @@ impl Metrics {
             draining,
             bytes_per_sec: self.rates.bytes_per_sec(),
             packets_per_sec: self.rates.packets_per_sec(),
+            cpu_percent: self.host_cpu(),
+            memory_percent: self.host_memory(),
             signals: CapacitySignals {
                 allocations: true,
                 send_queue_pressure: true,
                 readiness: true,
                 bandwidth_rate: self.rates.bytes_per_sec().is_some(),
                 packet_rate: self.rates.packets_per_sec().is_some(),
-                cpu: false,
-                memory: false,
+                cpu: self.host_cpu().is_some(),
+                memory: self.host_memory().is_some(),
             },
         }
     }

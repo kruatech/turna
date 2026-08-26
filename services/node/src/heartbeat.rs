@@ -28,7 +28,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -79,24 +78,6 @@ fn build_heartbeat(
         last_seen_ms: epoch_ms(),
         draining: draining || metrics.is_draining(),
     }
-}
-
-/// Collect current CPU and memory usage via sysinfo.
-/// Creates a fresh `System` each tick — lightweight enough at 5s interval.
-fn sample_resources() -> (f32, f32) {
-    let sys = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
-            .with_memory(MemoryRefreshKind::nothing().with_ram()),
-    );
-
-    let cpu_pct = sys.global_cpu_usage();
-    let mem_pct = if sys.total_memory() > 0 {
-        (sys.used_memory() as f32 / sys.total_memory() as f32) * 100.0
-    } else {
-        0.0f32
-    };
-    (cpu_pct, mem_pct)
 }
 
 /// Run the heartbeat loop. Returns when `shutdown_rx` flips to `true`.
@@ -150,12 +131,18 @@ pub async fn run_heartbeat(
                     / cfg.interval.as_secs_f64() * 8.0) as u64;
                 prev_bytes = cur_bytes;
 
-                // ── CPU + memory (blocking, runs in a short thread) ──────────
-                // sample_resources sleeps for MINIMUM_CPU_UPDATE_INTERVAL
-                // (~100ms) — spawn_blocking so we don't block the async runtime.
-                let (cpu_pct, mem_pct) = tokio::task::spawn_blocking(sample_resources)
-                    .await
-                    .unwrap_or((0.0, 0.0));
+                // ── CPU + memory ─────────────────────────────────────────────
+                // Read from the shared sampler rather than taking our own: it
+                // keeps a persistent `System` and so measures CPU over its whole
+                // interval, where a fresh instance per tick only sees the
+                // library's ~100 ms settling window. It also means one /proc
+                // reader on a node whose job includes measuring its own load.
+                //
+                // 0.0 before the first sample lands. The heartbeat is periodic and
+                // the next one will carry a real figure; reporting 0 once is
+                // better than blocking a heartbeat on a resource read.
+                let cpu_pct = metrics.host_cpu().unwrap_or(0) as f32;
+                let mem_pct = metrics.host_memory().unwrap_or(0) as f32;
 
                 let hb = build_heartbeat(&cfg, &metrics, /*draining=*/ false,
                                          cpu_pct, mem_pct, bw_bps);
