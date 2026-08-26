@@ -118,11 +118,11 @@ The strongest section. Most of it is done, and two gaps are specific.
 | Credential revocation | P1 | **build** | No CRL/OCSP, deliberately — revocation means rotating the CA. Consistent with `docs/MTLS.md`, but a customer will ask. |
 | Ephemeral TURN credentials | P0 | **done** | REST shared-secret and JWT. |
 | Private CA support | P0 | **done** | The mTLS check mints a throwaway private CA, because client certificates come from a CA you run — public issuers sign server certificates only. |
-| Certificate hot rotation | P0 | **partial** | Works on TLS, QUIC and WebTransport. **Absent on the stock DTLS path.** |
+| Certificate hot rotation | P0 | **partial** — a decision, not work (2026-08-26) | Works on TLS, QUIC and WebTransport, and on DTLS **via the demux path**, where it is already implemented (`[turn.dtls] cert_reload_interval`). Absent on the stock path for a structural reason: `webrtc_dtls::listener::listen()` owns the socket and fixes its config at bind time, so rotating means rebinding and dropping every session. So this is not missing code — it is gated on flipping `demux` to default, which is already an open decision in `docs/OPEN-DECISIONS.md`. What that decision needs is recorded verification of the demux path. |
 | CA trust rotation | P1 | **partial** | |
 | Secret source abstraction | P1 | **done** | `${ENV}` and `file:///run/secrets/...` in config values. |
 | Per-IP connection limits | P0 | **done** | The spec says "partially, for transports" — that was true until this week. SCTP was the last gap and now has both a cap and a rate limit. |
-| Handshake rate limiting | P0 | **partial** | The spec's "uneven across transport paths" is still accurate: TURNS, QUIC and SCTP have it; the **stock DTLS path does not**. Same gap as certificate rotation, same place. |
+| Handshake rate limiting | P0 | **partial** — same decision (2026-08-26) | TURNS, QUIC and SCTP have it, and so does DTLS on the demux path (`max_handshakes_per_sec_per_ip`, validated to require `demux = true`). Not available on the stock path because the handshake runs below `accept()` inside the library — turna never sees the packets, so there is nowhere to enforce a limit. Same gate as certificate rotation, same decision. |
 | Protocol abuse protection | P0 | **done** | Peer filter denies private ranges *and* the v4-embedding v6 prefixes (NAT64, 6to4, Teredo, IPv4-compatible) — without those, every IPv4 rule was bypassable by asking for the v6 spelling of the same target. Five fuzz targets on the codec. |
 | BPF early packet filtering | P1 | **partial** | AF_XDP attaches in SKB mode on veth, which copies every frame and reproduces none of the bypass behaviour the feature exists for. |
 | Security hardening profile | P0 | **build** (docs) | Material exists across `docs/security/`; the single profile document does not. |
@@ -230,7 +230,7 @@ these, and "partial" here means the shape can still change under it.
 | SBOM | P0 | **needs checking** | |
 | Signed artifacts and images | P0 | **partial** | Build provenance attestation is in the release workflow. |
 | Checksums | P0 | **needs checking** | |
-| Reproducible builds | P1 | **build** | |
+| Reproducible builds | P1 | **done** (2026-08-26) | All three release binaries reproduce byte-for-byte on Linux from different build directories, with `--remap-path-prefix` and `SOURCE_DATE_EPOCH`. `scripts/verify/reproducible-build.sh`. macOS cannot pass (`LC_UUID`) and the script refuses to run there rather than reporting an unfixable failure. |
 | Dependency vulnerability scanning | P0 | **done** | `cargo-deny` on every PR, plus Dependabot. Two advisories were closed the day they appeared, one by dropping an unmaintained crate. |
 | Pinned CI dependencies | P1 | **done** | Actions pinned by commit SHA; the AF_XDP check image pinned by digest rather than a mutable tag. |
 | FIPS-capable profile / HSM | P2 | **question** | Research, and worth confirming a customer actually requires it before starting. |
@@ -287,9 +287,22 @@ the kernel/NIC matrix are the spec's headline claims, and none of them can be
 started without deciding what hardware the product will be sold on. That decision
 gates about eight P0s and belongs before the engineering, not after.
 
-**Two P0s that are one piece of work:** certificate hot rotation and handshake rate
-limiting are both missing on the stock DTLS path and nowhere else. Whoever touches
-that listener should do both.
+**Two P0s that are neither missing nor work.** Certificate hot rotation and
+handshake rate limiting are both implemented for DTLS — on the demux path, which
+is off by default because the stock path is the one with recorded verification.
+Neither can exist on the stock path: `listen()` owns the socket and fixes its
+config at bind time, and the handshake completes below `accept()` where turna
+never sees the packets.
+
+So the task is verifying the demux path, after which flipping the default closes
+both. That flip is already listed in `docs/OPEN-DECISIONS.md`, and this is the
+argument for it that was missing: two P0 requirements are structurally
+unavailable on the current default.
+
+Worth recording how this was found: I had read my own gap entry — "absent on the
+stock DTLS path" — as "absent", and set out to write a certificate reloader that
+already existed. The entry was accurate and incomplete, which is a harder failure
+to catch than an inaccurate one.
 
 ## Where this document may be wrong
 

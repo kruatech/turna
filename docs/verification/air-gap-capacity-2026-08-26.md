@@ -226,6 +226,54 @@ the difference is invisible from inside the search. The tell, in hindsight, was
 that every one of these was an assertion about what does *not* exist — the class
 of claim a keyword search is worst at supporting.
 
+## Reproducible builds
+
+The release binaries reproduce on Linux. Built twice from the same commit in
+`/tmp/ra` and `/tmp/rb-longer-path-here` — deliberately different path lengths,
+so a fixed-size field cannot match by luck:
+
+```
+turnactl             911bb95a…  911bb95a…   identical
+turna-node           fd278c9d…  fd278c9d…   identical
+turna-control-plane  955872f8…  955872f8…   identical
+```
+
+`RUSTFLAGS=--remap-path-prefix` for the build directory and `~/.cargo`, plus
+`SOURCE_DATE_EPOCH`. Toolchain was already pinned to 1.95.0 and `--locked`
+already in use, which is most of the way there.
+
+**The remapping is doing the work, and there is evidence rather than an
+assumption.** A first attempt ran the second build without `RUSTFLAGS` and
+`turna-control-plane` differed; with matching flags it matches. So the property
+depends on the flags being set identically, which means it depends on them being
+in the release workflow rather than in a developer's shell — where they now are.
+
+### macOS cannot pass this, and the script now refuses to try
+
+The first run was on macOS and reported all three binaries differing within the
+first two kilobytes. That is `LC_UUID`: Apple's linker embeds a UUID that changes
+between links, so the bytes diverge regardless of the source.
+
+The release artifacts are linux/amd64. Verifying reproducibility on a platform
+the project does not ship measures the wrong thing, and reports a failure nobody
+can fix — which is how a check comes to be ignored. The script exits 2 on Darwin
+with the explanation.
+
+Worth noting what nearly happened: byte 457 looked suspiciously early, in Mach-O
+header territory rather than code, which is why `LC_UUID` was the first guess. Had
+the offset been deeper I would have gone looking for a timestamp in a `build.rs`
+that was never there.
+
+### Three attempts at copying the tree
+
+`git ls-files -z | tar --null -T -` — rejected by bsdtar on macOS. `rsync` — not
+installed on the Linux host. `git archive HEAD | tar -x` — works on both, gives
+exactly the tracked files, and cannot drag `target` along.
+
+Recorded because the sequence has a lesson: each method was chosen for elegance
+and failed on availability, on a script whose whole purpose is to run on more than
+one machine. The third was the obvious one from the start.
+
 ## Two things found while verifying
 
 ### A log line that had never been logged
