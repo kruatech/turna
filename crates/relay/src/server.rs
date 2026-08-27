@@ -584,7 +584,7 @@ impl RelayServer {
                 .await;
                 if !*listener_shutdown.borrow() {
                     match res {
-                        Ok(()) => error!("TURNS bridge exited unexpectedly"),
+                        Ok(()) => error!(event = "task_died", "TURNS bridge exited unexpectedly"),
                         Err(e) => error!(error = %e, "TURNS bridge failed"),
                     }
                     listener_metrics.set_readiness(turna_health::Readiness::Degraded);
@@ -618,7 +618,10 @@ impl RelayServer {
                 .await;
                 if !*listener_shutdown.borrow() {
                     match res {
-                        Ok(()) => error!("TURN-over-SCTP bridge exited unexpectedly"),
+                        Ok(()) => error!(
+                            event = "task_died",
+                            "TURN-over-SCTP bridge exited unexpectedly"
+                        ),
                         Err(e) => error!(error = %e, "TURN-over-SCTP bridge failed"),
                     }
                     listener_metrics.set_readiness(turna_health::Readiness::Degraded);
@@ -641,7 +644,7 @@ impl RelayServer {
                 match TokioTransport::bind_reuseport(listen_addr).await {
                     Ok(t) => t,
                     Err(e) => {
-                        error!(worker = i, %e, "SO_REUSEPORT bind failed, continuing with fewer workers");
+                        error!(event = "bind_failed", worker = i, %e, "SO_REUSEPORT bind failed, continuing with fewer workers");
                         break;
                     }
                 }
@@ -671,7 +674,7 @@ impl RelayServer {
                         match transport.recv_mmsg(&mut slots, &mut metas).await {
                             Ok(n) => n,
                             Err(e) => {
-                                error!(worker = i, %e, "recv error, worker stopping");
+                                error!(event = "worker_stopped", worker = i, %e, "recv error, worker stopping");
                                 break;
                             }
                         }
@@ -794,21 +797,30 @@ impl RelayServer {
                 break;
             }
             if !workers.is_empty() && workers.iter().all(|w| w.is_finished()) {
-                error!("all recv workers exited — datapath is dead");
+                error!(
+                    event = "datapath_dead",
+                    "all recv workers exited — datapath is dead"
+                );
                 self.processor
                     .metrics()
                     .set_readiness(turna_health::Readiness::Degraded);
                 break;
             }
             if sender_task.is_finished() {
-                error!("relay egress task exited — datapath is dead");
+                error!(
+                    event = "datapath_dead",
+                    "relay egress task exited — datapath is dead"
+                );
                 self.processor
                     .metrics()
                     .set_readiness(turna_health::Readiness::Degraded);
                 break;
             }
             if cleanup_handle.is_finished() {
-                error!("cleanup/metrics task exited unexpectedly");
+                error!(
+                    event = "task_died",
+                    "cleanup/metrics task exited unexpectedly"
+                );
                 self.processor
                     .metrics()
                     .set_readiness(turna_health::Readiness::Degraded);
@@ -819,7 +831,10 @@ impl RelayServer {
             // check the JoinHandle here, which flips to finished on panic too.
             #[cfg(feature = "tls")]
             if tls_handle.as_ref().is_some_and(|h| h.is_finished()) {
-                error!("TURNS/TLS listener task exited unexpectedly (possible panic) — degraded");
+                error!(
+                    event = "task_died",
+                    "TURNS/TLS listener task exited unexpectedly (possible panic) — degraded"
+                );
                 self.processor
                     .metrics()
                     .set_readiness(turna_health::Readiness::Degraded);
@@ -827,14 +842,20 @@ impl RelayServer {
             }
             #[cfg(feature = "sctp")]
             if sctp_handle.as_ref().is_some_and(|h| h.is_finished()) {
-                error!("SCTP listener task exited unexpectedly (possible panic) — degraded");
+                error!(
+                    event = "task_died",
+                    "SCTP listener task exited unexpectedly (possible panic) — degraded"
+                );
                 self.processor
                     .metrics()
                     .set_readiness(turna_health::Readiness::Degraded);
                 break;
             }
         }
-        info!("shutdown signal received, draining...");
+        info!(
+            event = "drain_started",
+            "shutdown signal received, draining..."
+        );
         self.processor.metrics().set_draining(true);
         self.processor
             .metrics()
@@ -908,9 +929,13 @@ impl RelayServer {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         if !store.is_empty() {
-            info!(remaining = store.len(), "drain timeout — forcing shutdown");
+            info!(
+                event = "drain_timeout",
+                remaining = store.len(),
+                "drain timeout — forcing shutdown"
+            );
         } else {
-            info!("all allocations drained");
+            info!(event = "drain_complete", "all allocations drained");
         }
     }
 }

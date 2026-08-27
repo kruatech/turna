@@ -1012,12 +1012,15 @@ pub struct RelayConfig {
     /// `scripts/verify/capacity-profile.sh` run on this hardware — a figure from
     /// other hardware is worse than none, because it looks measured.
     ///
-    /// **The measurement is uncertain by a factor of two, and it matters here.**
-    /// The profiler echoes frames back to the client, so every frame crosses the
-    /// relay twice; a real call is one traversal. A measured 112 000 may therefore
-    /// be worth 224 000 one-way, in which case a threshold from the smaller figure
-    /// diverts traffic at half the rate the node can carry. That is the safe
-    /// direction and it is not free. One run with a forwarding driver settles it.
+    /// The figure is in one-way traversals, the same unit a call's media consumes:
+    /// `channel-data` mode sends client -> relay -> peer, so the relay receives
+    /// each frame once and sends it once.
+    ///
+    /// An earlier version of this comment claimed a factor-of-two uncertainty, on
+    /// the reasoning that the profiler echoed frames back to the client. It does
+    /// not — the receive task listens on the peer socket. The `sent ~= recv`
+    /// equality that suggested a round trip is equally true of a one-way path, and
+    /// an equality consistent with two readings is evidence for neither.
     #[serde(default)]
     pub max_packets_per_sec: u64,
     /// Percent of `max_packets_per_sec` at which `/capacity` reports DEGRADED.

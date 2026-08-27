@@ -112,11 +112,11 @@ def main() -> int:
     p.add_argument(
         "--traversal-factor",
         type=float,
-        default=2.0,
+        default=1.0,
         help=(
-            "how many measured units one session-second of media costs. Default 2 "
-            "and this is the number most likely to be wrong by a factor of two — "
-            "see the note the tool prints. Set 1.0 for the optimistic reading."
+            "how many measured units one session-second of media costs. Default 1: "
+            "the capacity measurement counts one-way traversals, the same unit a "
+            "call's media consumes. Raise it only if sessions cross the relay twice."
         ),
     )
     args = p.parse_args()
@@ -212,26 +212,19 @@ def main() -> int:
     )
     print()
 
-    print("The factor of two this cannot resolve")
+    print("One-way traversals, settled")
     print("-" * 58)
     print(
-        "  The measurement counted round trips. In the capacity profile `sent` and\n"
-        "  `recv` were within 30 of each other over 5.4 million frames, which means\n"
-        "  every frame the client sent came back: client -> relay -> peer -> relay ->\n"
-        "  client. The node touched each frame four times.\n"
+        "  The measurement counts one traversal per frame, the same unit a call\n"
+        "  consumes: client -> relay -> peer, the relay receiving once and sending\n"
+        "  once.\n"
         "\n"
-        "  A real call is not a round trip. A -> relay -> B is one traversal, and the\n"
-        f"  node touches each frame twice. So {BASELINE['pps']:,} round trips per second\n"
-        f"  might be worth about {BASELINE['pps'] * 2:,} one-way traversals — in which case\n"
-        "  this forecast asks for twice the hardware it needs.\n"
-        "\n"
-        f"  --traversal-factor is 2.0 by default, the pessimistic reading. At 1.0 you\n"
-        f"  would need {-(-total_pps // 2 // usable) if usable else 0} nodes instead of {nodes}.\n"
-        "\n"
-        "  Resolving this needs one measurement, not more arithmetic: run\n"
-        "  capacity-profile.sh with a driver that forwards rather than echoes, and\n"
-        "  compare. Until then the default errs toward buying too much, which is the\n"
-        "  cheaper mistake."
+        "  This defaulted to 2.0 and printed a long note about a factor-of-two\n"
+        "  uncertainty. There was none. `sent ~= recv` in the capacity profile was\n"
+        "  read as evidence of a round trip without reading the receive path, which\n"
+        "  listens on the peer socket — and that equality is exactly what a one-way\n"
+        "  path produces. An equality consistent with two readings is evidence for\n"
+        "  neither."
     )
     print()
     print("What this deliberately does not print")

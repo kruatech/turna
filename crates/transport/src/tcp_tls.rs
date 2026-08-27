@@ -543,24 +543,30 @@ impl TlsTransportServer {
         // (ACME renewal) needed a process restart. Each accepted connection now
         // takes the current `ServerConfig` out of this watch channel, so a
         // reload applies to new connections without touching established ones.
-        let cert_rx: Option<tokio::sync::watch::Receiver<Arc<ServerConfig>>> =
-            if self.config.cert_reload_interval.is_zero() {
-                info!("TURNS certificate hot-reload disabled (cert_reload_interval = 0)");
-                None
-            } else {
-                match CertReloader::new(&self.config, self.config.cert_reload_interval)
-                    .spawn(stats.clone())
-                    .await
-                {
-                    Ok(rx) => Some(rx),
-                    Err(e) => {
-                        // Non-fatal: `new()` already validated this material, so
-                        // keep serving with the static acceptor.
-                        error!(%e, "TURNS certificate hot-reload unavailable; using static cert");
-                        None
-                    }
+        let cert_rx: Option<tokio::sync::watch::Receiver<Arc<ServerConfig>>> = if self
+            .config
+            .cert_reload_interval
+            .is_zero()
+        {
+            info!(
+                event = "cert_reload_disabled",
+                "TURNS certificate hot-reload disabled (cert_reload_interval = 0)"
+            );
+            None
+        } else {
+            match CertReloader::new(&self.config, self.config.cert_reload_interval)
+                .spawn(stats.clone())
+                .await
+            {
+                Ok(rx) => Some(rx),
+                Err(e) => {
+                    // Non-fatal: `new()` already validated this material, so
+                    // keep serving with the static acceptor.
+                    error!(event = "cert_reload_unavailable", %e, "TURNS certificate hot-reload unavailable; using static cert");
+                    None
                 }
-            };
+            }
+        };
 
         // Per-source-IP connection counts for `max_connections_per_ip`.
         let per_ip: Arc<tokio::sync::RwLock<HashMap<std::net::IpAddr, u32>>> =
@@ -685,7 +691,7 @@ impl TlsTransportServer {
                 stats
                     .rejected_rate_limit
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(%peer, "TURNS connection refused: per-IP handshake rate limit");
+                warn!(event = "peer_refused_rate_limit", %peer, "TURNS connection refused: per-IP handshake rate limit");
                 continue;
             }
 
@@ -695,7 +701,7 @@ impl TlsTransportServer {
                     stats
                         .rejected_over_cap
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!(%peer, max = self.config.max_connections, "connection limit reached");
+                    warn!(event = "peer_refused_max_connections", %peer, max = self.config.max_connections, "connection limit reached");
                     continue;
                 }
             }
@@ -711,7 +717,7 @@ impl TlsTransportServer {
                     stats
                         .rejected_per_ip
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!(%peer, max_per_ip, "TURNS connection refused: per-IP cap reached");
+                    warn!(event = "peer_refused_per_ip_cap", %peer, max_per_ip, "TURNS connection refused: per-IP cap reached");
                     continue;
                 }
                 *m.entry(ip).or_insert(0) += 1;
@@ -792,7 +798,10 @@ impl TlsTransportServer {
         stats
             .listening
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        info!("TURNS listener draining: shutdown signalled, no new connections");
+        info!(
+            event = "listener_draining",
+            "TURNS listener draining: shutdown signalled, no new connections"
+        );
         Ok(())
     }
 }
@@ -1121,13 +1130,13 @@ impl CertReloader {
                             cert_mt = new_cert;
                             key_mt = new_key;
                             stats.cert_reloads.fetch_add(1, Relaxed);
-                            info!("TLS cert reloaded");
+                            info!(event = "cert_rotated", "TLS cert reloaded");
                         }
                         Err(e) => {
                             // Keep serving the previous material rather than
                             // dropping TLS because of a half-written PEM.
                             stats.cert_reload_failures.fetch_add(1, Relaxed);
-                            error!(%e, "cert reload failed; keeping previous certificate");
+                            error!(event = "cert_rotate_failed", %e, "cert reload failed; keeping previous certificate");
                         }
                     }
                 }

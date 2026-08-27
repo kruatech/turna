@@ -367,7 +367,7 @@ fn admit_session(
     use std::sync::atomic::Ordering::Relaxed;
     if max_sessions != 0 && stats.active.load(Relaxed) >= max_sessions {
         stats.rejected_over_cap.fetch_add(1, Relaxed);
-        warn!(%remote, max_sessions, "QUIC session refused: max_sessions reached");
+        warn!(event = "peer_refused_max_sessions", %remote, max_sessions, "QUIC session refused: max_sessions reached");
         return false;
     }
     let ip = remote.ip();
@@ -378,7 +378,7 @@ fn admit_session(
     if max_per_ip != 0 && *m.get(&ip).unwrap_or(&0) as usize >= max_per_ip {
         drop(m);
         stats.rejected_per_ip.fetch_add(1, Relaxed);
-        warn!(%remote, max_per_ip, "QUIC session refused: per-IP cap reached");
+        warn!(event = "peer_refused_per_ip_cap", %remote, max_per_ip, "QUIC session refused: per-IP cap reached");
         return false;
     }
     *m.entry(ip).or_insert(0) += 1;
@@ -555,7 +555,10 @@ impl QuicServer {
         let mut cert_mt = file_mtime(&self.config.cert_path);
         let mut key_mt = file_mtime(&self.config.key_path);
         if !reload_enabled {
-            info!("QUIC certificate hot-reload disabled (cert_reload_interval = 0)");
+            info!(
+                event = "cert_reload_disabled",
+                "QUIC certificate hot-reload disabled (cert_reload_interval = 0)"
+            );
         }
 
         // Accept loop: one task per connection, each translating quinn events
@@ -587,13 +590,13 @@ impl QuicServer {
                                     stats
                                         .cert_reloads
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    info!("QUIC certificate reloaded");
+                                    info!(event = "cert_rotated", "QUIC certificate reloaded");
                                 }
                                 Err(e) => {
                                     stats
                                         .cert_reload_failures
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    warn!(%e, "QUIC certificate reload failed; keeping previous certificate");
+                                    warn!(event = "cert_rotate_failed", %e, "QUIC certificate reload failed; keeping previous certificate");
                                 }
                             }
                         }
@@ -613,7 +616,7 @@ impl QuicServer {
                 stats
                     .rejected_rate_limit
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(%peer, "QUIC handshake refused: per-IP rate limit");
+                warn!(event = "peer_refused_rate_limit", %peer, "QUIC handshake refused: per-IP rate limit");
                 drop(incoming);
                 continue;
             }
@@ -636,7 +639,10 @@ impl QuicServer {
         stats
             .listening
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        info!("QUIC listener draining: shutdown signalled, no new connections");
+        info!(
+            event = "listener_draining",
+            "QUIC listener draining: shutdown signalled, no new connections"
+        );
         Ok(())
     }
 
@@ -710,7 +716,10 @@ impl QuicServer {
         let mut cert_mt = file_mtime(&self.config.cert_path);
         let mut key_mt = file_mtime(&self.config.key_path);
         if !reload_enabled {
-            info!("WebTransport certificate hot-reload disabled (cert_reload_interval = 0)");
+            info!(
+                event = "cert_reload_disabled",
+                "WebTransport certificate hot-reload disabled (cert_reload_interval = 0)"
+            );
         }
 
         loop {
@@ -735,20 +744,20 @@ impl QuicServer {
                                         stats
                                             .cert_reloads
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        info!("WebTransport certificate reloaded");
+                                        info!(event = "cert_rotated", "WebTransport certificate reloaded");
                                     }
                                     Err(e) => {
                                         stats
                                             .cert_reload_failures
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        warn!(%e, "WebTransport certificate reload rejected; keeping previous certificate");
+                                        warn!(event = "cert_rotate_failed", %e, "WebTransport certificate reload rejected; keeping previous certificate");
                                     }
                                 },
                                 Err(e) => {
                                     stats
                                         .cert_reload_failures
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    warn!(%e, "WebTransport certificate reload failed to build; keeping previous certificate");
+                                    warn!(event = "cert_rotate_failed", %e, "WebTransport certificate reload failed to build; keeping previous certificate");
                                 }
                             }
                         }
@@ -768,7 +777,7 @@ impl QuicServer {
                 stats
                     .rejected_rate_limit
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(%remote, "WebTransport handshake refused: per-IP rate limit");
+                warn!(event = "peer_refused_rate_limit", %remote, "WebTransport handshake refused: per-IP rate limit");
                 incoming.refuse();
                 continue;
             }
@@ -796,7 +805,10 @@ impl QuicServer {
         stats
             .listening
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        info!("WebTransport listener draining: shutdown signalled, no new sessions");
+        info!(
+            event = "listener_draining",
+            "WebTransport listener draining: shutdown signalled, no new sessions"
+        );
         Ok(())
     }
 

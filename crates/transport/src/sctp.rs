@@ -375,7 +375,7 @@ impl SctpTransportServer {
             // a map lookup.
             if !limiter.allow(peer.ip()) {
                 stats.rejected_rate_limit.fetch_add(1, Relaxed);
-                warn!(%peer, "SCTP association refused: per-IP rate limit");
+                warn!(event = "peer_refused_rate_limit", %peer, "SCTP association refused: per-IP rate limit");
                 continue;
             }
 
@@ -383,7 +383,7 @@ impl SctpTransportServer {
                 let c = conns.read().await;
                 if c.len() >= self.config.max_connections {
                     stats.rejected_over_cap.fetch_add(1, Relaxed);
-                    warn!(%peer, max = self.config.max_connections, "SCTP connection limit reached");
+                    warn!(event = "peer_refused_max_connections", %peer, max = self.config.max_connections, "SCTP connection limit reached");
                     continue;
                 }
             }
@@ -396,7 +396,7 @@ impl SctpTransportServer {
                 if max_per_ip != 0 && *m.get(&ip).unwrap_or(&0) as usize >= max_per_ip {
                     drop(m);
                     stats.rejected_per_ip.fetch_add(1, Relaxed);
-                    warn!(%peer, max_per_ip, "SCTP association refused: per-IP cap reached");
+                    warn!(event = "peer_refused_per_ip_cap", %peer, max_per_ip, "SCTP association refused: per-IP cap reached");
                     continue;
                 }
                 *m.entry(ip).or_insert(0) += 1;
@@ -460,7 +460,10 @@ impl SctpTransportServer {
         }
 
         stats.listening.store(false, Relaxed);
-        info!("TURN-over-SCTP listener draining: shutdown signalled, no new associations");
+        info!(
+            event = "listener_draining",
+            "TURN-over-SCTP listener draining: shutdown signalled, no new associations"
+        );
         Ok(())
     }
 }

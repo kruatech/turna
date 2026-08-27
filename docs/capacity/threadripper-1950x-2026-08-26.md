@@ -74,6 +74,22 @@ That third one is the same mistake as changing `compute_chain`'s signature
 earlier in the day: **change an output format, forget a reader.** The compiler
 caught it in Rust. Shell caught nothing and returned a number instead.
 
+## The unit, and a correction
+
+**112 000 is one-way traversals.** `channel-data` mode sends client -> relay ->
+peer and the receive task listens on the peer socket, so the relay handles each
+frame once in and once out — the same work a real call's media costs.
+
+A later reading of this document concluded the measurement counted *round trips*,
+from `sent` and `recv` being within 30 of each other across 5.4 million frames.
+That was wrong: the equality is exactly what a one-way path produces, since every
+frame sent arrives. It sent me looking for a forwarding driver to settle an
+uncertainty that did not exist, and it briefly doubled the hardware forecast — 26
+nodes where 13 were needed.
+
+**An equality consistent with two readings is evidence for neither.** Reading the
+receive path took a minute.
+
 ## Using it
 
 This is what `/capacity` has been missing. It reports `bytes_per_sec` and
