@@ -117,7 +117,7 @@ build_at() {
   # A worktree rather than a checkout: a build that mutates the working tree
   # loses uncommitted work, and this script should be safe to run mid-change.
   git worktree add --detach "$tree" "$ref" > /dev/null 2>&1 || return 1
-  export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$ref")"
+  export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "${ref}^{commit}")"
   ( cd "$tree" && cargo build --locked --release \
       --bin turna-node --bin turna-control-plane --bin turnactl ) \
       > "$WORK/build-$dest.log" 2>&1

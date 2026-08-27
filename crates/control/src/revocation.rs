@@ -227,11 +227,18 @@ mod tests {
     use std::io::Write;
 
     fn write_temp(contents: &str) -> std::path::PathBuf {
+        // A counter, not the content length. The first version used
+        // `contents.len()`, and two tests whose contents happened to be the same
+        // length got the same path — then one removed the file while the other was
+        // still reading it. Tests run in parallel; a name that depends on content
+        // is not a unique name.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
         let mut p = std::env::temp_dir();
         p.push(format!(
             "turna-revoke-test-{}-{}",
             std::process::id(),
-            contents.len()
+            N.fetch_add(1, Ordering::Relaxed)
         ));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(contents.as_bytes()).unwrap();

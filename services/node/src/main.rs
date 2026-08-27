@@ -309,15 +309,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it. Covering only the crates that could reach it would leave the journal
     // without certificate rotation, which happens in the transport crate — a hole
     // exactly where the interesting event is.
-    // The ring is not constructed either, for the same reason: nothing would fill
-    // it. The config key stays documented so the decision is visible rather than
-    // absent.
-    // No audit layer here, deliberately. See services/node/src/audit_layer.rs —
-    // it stays in the tree with its 11 tests and is not installed, because
-    // installing it needs subscriber construction moved out of turna-observability
-    // and into this file. What that would buy is reading, over gRPC, events that
-    // already reach the SIEM through the syslog layer and that vanish on restart
-    // because the ring is in memory.
+    // The node's audit chain.
+    //
+    // Persistent when a path is configured: `open` replays and verifies the whole
+    // existing chain, fails closed on a break, and resumes `seq` across a rotation
+    // boundary. In memory otherwise.
+    //
+    // A previous version of this code had a comment here saying the log was
+    // memory-only and that lifecycle events therefore belonged in syslog alone.
+    // That was wrong — `new(capacity)` is the in-memory constructor and there are
+    // two more below it, which I did not read.
+    //
+    // Both destinations are used and neither is redundant: syslog carries events
+    // off the host, where a compromised node cannot reach them, and the chain
+    // makes them tamper-evident, which syslog is not.
+
+    // Start recorded in both places. The chain survives the restart this event
+    // describes; syslog puts it somewhere a compromised node cannot reach.
+
     //
     // `AuditLog` is an in-memory ring, not a file, so it cannot hold start or stop
     // events — those describe the restart that erases it, and they go to syslog
@@ -732,6 +741,52 @@ fn run_tokio(
     #[cfg(not(feature = "tls"))]
     let _ = &tls_cfg;
     let external_ip6 = resolve_external_ip6(&config);
+
+    let node_audit = {
+        let path = &config.observability.node_audit_path;
+        if path.is_empty() {
+            std::sync::Arc::new(turna_control::audit::AuditLog::new(
+                config.observability.node_audit_entries,
+            ))
+        } else {
+            match turna_control::audit::AuditLog::open(
+                config.observability.node_audit_entries,
+                path,
+                None,
+            ) {
+                Ok(log) => {
+                    info!(path = %path, "node audit chain opened and verified");
+                    std::sync::Arc::new(log)
+                }
+                // Fail-closed, matching what `open` already does internally. A
+                // chain that cannot be verified is either corrupt or tampered
+                // with, and starting anyway would append to something whose
+                // history is unknown — which destroys the one property the chain
+                // exists to provide.
+                Err(e) => {
+                    return Err(format!(
+                        "node audit chain at {path} could not be opened: {e:?}. \
+                         Refusing to start: appending to a chain whose history \
+                         cannot be verified destroys the property it exists for. \
+                         Move the file aside to start a fresh chain, and keep it — \
+                         it is evidence whatever state it is in."
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+
+    node_audit.record_infra(
+        turna_control::audit::InfraEvent::NodeStarted,
+        &format!(
+            "version={} pid={}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
+        true,
+    );
+
     let num_threads = std::env::var("TURNA_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1829,21 +1884,36 @@ fn run_tokio(
         let drain_gossip_notify = gossip_drain_notify.clone();
         let drain_metrics = metrics.clone();
         let drain_grace = cluster.drain_grace_secs;
+        let sig_audit = node_audit.clone();
         tokio::spawn(async move {
             let ctrl_c = tokio::signal::ctrl_c();
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
                 let mut sigterm = signal(SignalKind::terminate()).unwrap();
-                tokio::select! {
-                    _ = ctrl_c => info!("SIGINT received"),
-                    _ = sigterm.recv() => info!("SIGTERM received"),
-                }
+                let sig = tokio::select! {
+                    _ = ctrl_c => "SIGINT",
+                    _ = sigterm.recv() => "SIGTERM",
+                };
+                info!(event = "node_stopping", signal = sig, "{sig} received");
+                // SIGTERM is an orchestrator; SIGINT is a person at a terminal. An
+                // auditor asking who stopped the node wants that distinction, and
+                // it costs one field.
+                sig_audit.record_infra(
+                    turna_control::audit::InfraEvent::NodeStopping,
+                    &format!("signal={sig}"),
+                    true,
+                );
             }
             #[cfg(not(unix))]
             {
                 ctrl_c.await.ok();
-                info!("SIGINT received");
+                info!(event = "node_stopping", signal = "SIGINT", "SIGINT received");
+                sig_audit.record_infra(
+                    turna_control::audit::InfraEvent::NodeStopping,
+                    "signal=SIGINT",
+                    true,
+                );
             }
             // Reject new allocations immediately on every node (508 Server
             // Draining via the processor). On a cluster also flip the routing

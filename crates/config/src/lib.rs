@@ -1238,6 +1238,20 @@ pub struct ObservabilityConfig {
     /// transitions, small enough to cost nothing.
     #[serde(default = "default_node_audit_entries")]
     pub node_audit_entries: usize,
+    /// Where the node writes its audit chain. Empty keeps it in memory only.
+    ///
+    /// With a path, `AuditLog::open` replays and **verifies** the existing chain
+    /// on startup and fails closed on a break, resuming `seq` across rotation
+    /// boundaries. That is what makes start and stop events worth recording here
+    /// rather than only in syslog: they survive the restart they describe, and
+    /// they are tamper-evident, which syslog is not.
+    ///
+    /// An earlier version of this comment said the log was memory-only and that
+    /// lifecycle events therefore belonged in syslog alone. That was wrong — I
+    /// found `new(capacity)`, saw a ring buffer, and did not read the two
+    /// constructors below it.
+    #[serde(default)]
+    pub node_audit_path: String,
 
     /// OTLP gRPC endpoint.  Set to empty string to disable tracing.
     /// Example: "http://otel-collector:4317"
@@ -1258,7 +1272,8 @@ impl Default for ObservabilityConfig {
             syslog_endpoint: String::new(),
             syslog_redact_addresses: false,
             log_allocation_addresses: true,
-            node_audit_entries: 256, // disabled by default
+            node_audit_entries: 256,
+            node_audit_path: String::new(), // disabled by default
             trace_sample_rate: 0.01, // 1%
             json_logs: false,
             max_spans_per_second: 1000,
