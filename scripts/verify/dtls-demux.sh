@@ -148,7 +148,29 @@ start_node() {
   done
   return 1
 }
-trap 'kill -TERM "${NODE_PID:-0}" 2>/dev/null; sleep 1; kill -KILL "${NODE_PID:-0}" 2>/dev/null' EXIT INT TERM
+# Kill the node and any stragglers, then say whether a core was dropped.
+#
+# The first run ended in `segmentation fault (core dumped)` after the report, and
+# it was not clear whether that was an artefact of Ctrl+C during a handshake or
+# something real. That distinction matters more than any check in this script, so
+# it must not be lost in the scrollback.
+cleanup() {
+  kill -TERM "${NODE_PID:-0}" 2>/dev/null
+  sleep 1
+  kill -KILL "${NODE_PID:-0}" 2>/dev/null
+  pkill -KILL -f "turna-load-test.*$DTLS_PORT" 2>/dev/null
+  for c in core core.* /var/lib/systemd/coredump/*turna*; do
+    [ -e "$c" ] || continue
+    echo
+    echo "A core file exists: $c" >&2
+    echo "That is worth more attention than any result above. Either the node" >&2
+    echo "crashed, or a client did. Check which:" >&2
+    echo "  file $c" >&2
+    echo "  coredumpctl info 2>/dev/null | head -20" >&2
+    break
+  done
+}
+trap cleanup EXIT INT TERM
 
 # Tolerant metric read: the exact series names are the node's to choose, and a
 # script that hard-codes them fails on a rename with a message about the wrong
@@ -244,13 +266,31 @@ say "check 4: per-IP handshake rate limit (P0, unavailable on the stock path)"
 REJECTED_BEFORE=$(metric turna_dtls_rejected_rate_limit_total)
 # Well above the limit, all from one source. The stock path cannot do this at all:
 # the handshake completes below accept() and turna never sees the packets.
+# One deadline for the whole burst, not one per client.
+#
+# The first version gave each client `timeout 3` and then called a bare `wait` —
+# which waits for all of them, and the limiter does not let them finish: they sit
+# in a handshake that will not complete. The run hung for 23 minutes.
+#
+# What this check needs is that the limiter *fired*, which is visible in the
+# counter. Whether each client eventually returned is not the question.
+BURST_PIDS=""
 for _ in $(seq $(( HANDSHAKE_LIMIT * 6 ))); do
   timeout 3 "$REPO/$LOAD" --server "127.0.0.1:$DTLS_PORT" --secret "$SECRET" \
     --duration 1 --json \
     dtls -c 1 --pps 1 --payload 100 \
     >> "$OUT/limit.json" 2>> "$OUT/limit.err" &
+  BURST_PIDS="$BURST_PIDS $!"
 done
-wait
+burst_deadline=$(( $(date +%s) + 15 ))
+while [ "$(date +%s)" -lt "$burst_deadline" ]; do
+  still=0
+  for pid in $BURST_PIDS; do kill -0 "$pid" 2>/dev/null && still=1; done
+  [ "$still" = "0" ] && break
+  sleep 1
+done
+for pid in $BURST_PIDS; do kill -KILL "$pid" 2>/dev/null; done
+wait 2>/dev/null
 REJECTED_AFTER=$(metric turna_dtls_rejected_rate_limit_total)
 
 if [ -z "$REJECTED_AFTER" ]; then
@@ -308,7 +348,7 @@ NODE_PID=""
   echo
   echo "## What this establishes"
   echo
-  if [ "$FAIL" -eq 0 ]; then
+  if [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
     cat <<'GOOD'
 The demux path relays correctly, handles concurrent handshakes, reloads
 certificates live, and rate-limits handshakes per source — the last two being the
@@ -316,6 +356,25 @@ certificates live, and rate-limits handshakes per source — the last two being 
 
 That is the evidence the default-flip decision was missing.
 GOOD
+  elif [ "$FAIL" -eq 0 ]; then
+    # An earlier version printed the paragraph above whenever nothing failed,
+    # including when the rate-limit check had been skipped. It claimed the path
+    # rate-limits handshakes on the strength of a check that did not run — a
+    # conclusion independent of its evidence, which is the failure this project has
+    # been correcting in documents throughout.
+    cat <<'PARTIAL'
+The demux path relays correctly, handles concurrent handshakes, and reloads
+certificates live. Certificate hot-reload is one of the two §7 P0 requirements
+that are structurally unavailable on the stock path, and it is confirmed.
+
+**The other one is not.** The handshake rate limit could not be confirmed here:
+the counter it would show up in is not exported by the node, so the check was
+skipped rather than passed. The limiter may well work; this run does not say so.
+
+So the default-flip decision has half the evidence it was missing. Exporting
+`turna_dtls_rejected_rate_limit_total` would get the other half from a five-minute
+rerun.
+PARTIAL
   else
     echo "**$FAIL check(s) failed.** The flip should not happen on this evidence."
     echo "See the failures above; each says what it would mean."
