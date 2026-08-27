@@ -298,6 +298,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
+    // The node's own audit ring is NOT constructed here yet, deliberately.
+    //
+    // `AuditLog` is an in-memory ring, not a file, so it cannot hold start or stop
+    // events — those describe the restart that erases it, and they go to syslog
+    // instead. What belongs in it is what happens while the process lives: drain
+    // transitions, certificate rotations, a listener that failed to bind.
+    //
+    // Those call sites are not wired, so constructing the ring here would leave a
+    // documented, dead object that reads as plumbing. Construct it at the same
+    // time as the first real caller:
+    //
+    //   let node_audit = Arc::new(turna_control::audit::AuditLog::new(
+    //       config.observability.node_audit_entries));
+    //
+    // The config key exists and is documented.
+
     // Security-event export. Constructed here so it exists before anything can
     // refuse a request: an exporter created later would miss exactly the events
     // that happen during startup, which is when a misconfigured listener refuses
@@ -334,6 +350,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // Startup goes to syslog, not to the ring.
+    //
+    // The ring is in memory and does not survive a restart, so a start event
+    // recorded there is one nobody can ever read — it describes the very
+    // discontinuity that erases it. Putting it in the ring anyway would look like
+    // coverage and provide none, which is the worse kind of nothing.
+    //
+    // Version and config path because the first question after any incident is
+    // which build was running.
+    _syslog.emit(
+        // ReadinessChanged, not ControlFailed: nothing failed. Using the failure
+        // kind for a normal start would put successes and failures under one
+        // MSGID, and a SIEM rule cannot separate them again.
+        turna_observability::syslog::EventKind::ReadinessChanged,
+        &[
+            ("state", "started"),
+            ("version", env!("CARGO_PKG_VERSION")),
+            ("pid", &std::process::id().to_string()),
+        ],
+    );
 
     if _syslog.is_enabled() {
         info!(

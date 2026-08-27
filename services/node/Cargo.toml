@@ -25,6 +25,7 @@ turna-config.workspace = true
 turna-observability.workspace = true
 turna-transport.workspace = true
 turna-relay.workspace = true
+turna-control.workspace = true
 turna-cluster.workspace = true
 turna-session.workspace = true
 turna-auth.workspace = true

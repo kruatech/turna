@@ -16,6 +16,7 @@
 //! ```
 
 pub mod syslog;
+pub mod syslog_layer;
 pub mod telemetry;
 
 pub use telemetry::{

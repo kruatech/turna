@@ -1105,6 +1105,16 @@ impl SignalingConfig {
 
 // ── Observability ─────────────────────────────────────────────────────────────
 
+/// serde cannot express `default = true` for a bool inline.
+/// 256 entries: a rolling upgrade's worth of transitions, and no more.
+fn default_node_audit_entries() -> usize {
+    256
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {
@@ -1132,6 +1142,41 @@ pub struct ObservabilityConfig {
     /// most of what a SIEM is for — a real trade, not a free improvement.
     #[serde(default)]
     pub syslog_redact_addresses: bool,
+    /// Log client IP addresses on the allocation lines.
+    ///
+    /// **Default true**, which is the existing behaviour. Three INFO lines carry
+    /// `src`: allocation created, TCP allocation created, allocation migrated.
+    /// All three are per-allocation, so a busy node writes one line containing a
+    /// client's address for every allocation it grants — 13.7 million of them in
+    /// this project's own 3-hour soak.
+    ///
+    /// The default is not the privacy-forward choice and that is deliberate: `src`
+    /// on the allocation line is the field an operator correlates a complaint
+    /// against, and removing it silently in an upgrade would break the thing logs
+    /// are used for. The switch exists so the decision is made rather than
+    /// inherited.
+    ///
+    /// Set false where an IP address counts as personal data you would rather not
+    /// retain. Addresses then log as `ip-<12 hex>` under a per-process salt:
+    /// traceable within one node's lifetime, not recoverable from the log.
+    #[serde(default = "default_true")]
+    pub log_client_addresses: bool,
+    /// Entries the node keeps in its own in-memory audit ring.
+    ///
+    /// Separate from the control plane's, because a hash chain assumes one writer
+    /// and two processes appending to one can each claim the same predecessor.
+    ///
+    /// **In memory, so it does not survive a restart.** That is a real limit and
+    /// it decides what belongs here: drain transitions, certificate rotations, a
+    /// listener that failed — things that happen while the process lives and are
+    /// worth reading soon after. Start and stop events are about restarts and are
+    /// therefore useless here; they go to `syslog_endpoint`, which is off the
+    /// host.
+    ///
+    /// 256 by default. Large enough to hold a rolling upgrade's worth of
+    /// transitions, small enough to cost nothing.
+    #[serde(default = "default_node_audit_entries")]
+    pub node_audit_entries: usize,
 
     /// OTLP gRPC endpoint.  Set to empty string to disable tracing.
     /// Example: "http://otel-collector:4317"
@@ -1150,8 +1195,10 @@ impl Default for ObservabilityConfig {
         Self {
             otlp_endpoint: String::new(),
             syslog_endpoint: String::new(),
-            syslog_redact_addresses: false, // disabled by default
-            trace_sample_rate: 0.01,        // 1%
+            syslog_redact_addresses: false,
+            log_client_addresses: true,
+            node_audit_entries: 256, // disabled by default
+            trace_sample_rate: 0.01, // 1%
             json_logs: false,
             max_spans_per_second: 1000,
         }

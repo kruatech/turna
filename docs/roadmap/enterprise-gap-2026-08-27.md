@@ -49,7 +49,7 @@ the stock path: `listen()` owns the socket and the handshake completes below
 | Capacity API | P0 | **done** | `GET /capacity`, five states, three observed live with distinct thresholds. `docs/design/capacity-api.md`. |
 | Horizontal scaling | P0 | **partial** | Cluster, gossip, hash ring. `node_migration.rs` unwired and the docs say so. No media-session migration. |
 | Per-node capacity profile | P1 | **done** for one machine | `docs/capacity/threadripper-1950x-2026-08-26.md`. One point, honestly bounded. |
-| Resource forecasting | P1 | **build** | |
+| Resource forecasting | P1 | **written**, with a factor-of-two open | `scripts/forecast.py`. Scales from the one measurement and states every assumption inline. It also surfaced a real ambiguity: the capacity measurement counted **round trips** (`sent` and `recv` differed by 30 in 5.4 M frames), while a call is one traversal. So 112 000 may be worth 224 000 one-way, and the forecast may ask for twice the hardware. Resolvable by one run with a forwarding driver instead of an echo. |
 | Port exhaustion monitoring | P0 | **done** | Three gauges, verified against the allocation count. Was a blind spot: the range filled silently and the first symptom was `Allocate` failing. |
 | Bandwidth saturation alerts | P0 | **partial** | Rate sampler verified at 32 320 B/s against a prediction. Threshold pending the same decision as admission control. |
 | PPS saturation monitoring | P0 | **partial** | Same sampler, 160 pkt/s against a predicted 160. |
@@ -66,7 +66,7 @@ the stock path: `listen()` owns the socket and the handshake completes below
 | Failure-under-load mode | P0 | **iron** | Needs a cluster. |
 | Multi-DC / region awareness / fallback | P1 | **build** (design first) | |
 | Backup/restore runtime config | P1 | **partial** | Durable command log exists; restore untested. |
-| DR runbook | P1 | **build** | |
+| DR runbook | P1 | **done** | `docs/runbooks/disaster-recovery.md`. Starts from what changes every priority: a relay carries no durable user data, so getting a node serving again matters more than recovering what it served. Ends with a table of eight scenarios and which four have been rehearsed — a runbook whose steps have never run is a document, not a procedure. |
 
 ## §6 Air-gapped operation (8)
 
@@ -76,10 +76,10 @@ the stock path: `listen()` owns the socket and the handshake completes below
 | Zero outbound telemetry by default | P0 | **done** | Observed. Found on the way: the log line announcing this was emitted before the tracing subscriber existed and had never appeared in any log. |
 | No mandatory cloud dependencies | P0 | **done** | Asserted with `ss` inside the namespace rather than argued. |
 | No mandatory external DNS | P0 | **done** | Ran with no nameserver. |
-| Offline installation | P0 | **build** | Packaging. |
-| Offline upgrade bundles | P1 | **build** | |
+| Offline installation | P0 | **written** | `scripts/offline-bundle.sh`. Image tarball, chart, static binaries, config template, generated INSTALL.md with the image digest — recorded there and not only in the checksums, because anyone handing over a modified bundle hands over a matching SHA256SUMS with it. Checksums are computed last so INSTALL.md is covered; a first version left the digest outside the only integrity check. |
+| Offline upgrade bundles | P1 | **written** | `scripts/offline-upgrade-bundle.sh`. Both binaries, and the artifact that matters: the config key diff between the two versions. `deny_unknown_fields` means a key the new version added makes the **old** binary refuse the config the new one wrote, so the rollback window closes once the upgrade has run. Verified on real versions — the five keys added this session are exactly what it reports. |
 | Privacy-safe support bundle | P1 | **done** | `scripts/support-bundle.sh`. Redaction is the default; addresses hashed with a discarded per-bundle salt. Verified against six real secrets. |
-| Data-minimizing logs | P0 | **partial** | The bundle minimises. A pass over what INFO logs by default is still owed. |
+| Data-minimizing logs | P0 | **done** | `docs/security/log-data-audit-2026-08-27.md`. Usernames and secrets never reach a log — a negative result worth recording. Three INFO lines carried the client address, all per-allocation, so 13.7 M allocations meant 13.7 M lines of personal data. `[observability] log_client_addresses`, default **true** to preserve behaviour, because `src` is the field an operator correlates a complaint against. |
 
 ## §7 Security and access control (15)
 
@@ -87,7 +87,7 @@ the stock path: `listen()` owns the socket and the handshake completes below
 |---|---|---|---|
 | mTLS management plane | P0 | **done** | Both halves: accepted with a certificate, **refused without one**. The refusal is what carries it. |
 | Management RBAC | P1 | **written** | `crates/control/src/rbac.rs`, 11 tests, 16 RPCs checked. Roles in config so a new one needs no release. Default-deny. |
-| Infrastructure audit log | P1 | **partial** | `InfraEvent` and `record_infra` written, eight categories from CIS 8.2 / ISO 27001 A.12.4. Not wired: the hash chain lives in the control plane, the events happen in the node, and two writers on one chain is a correctness problem. Syslog covers the SIEM case. |
+| Infrastructure audit log | P1 | **partial** | `InfraEvent` with eight categories from CIS 8.2 / ISO 27001 A.12.4, plus the node's own ring. Partial, and the reason is specific: `AuditLog` is an **in-memory ring**, not a file, so start and stop events — the two an auditor asks for first — cannot live in it, because they describe the restart that erases it. Those go to syslog. | `InfraEvent` and `record_infra` written, eight categories from CIS 8.2 / ISO 27001 A.12.4. Not wired: the hash chain lives in the control plane, the events happen in the node, and two writers on one chain is a correctness problem. Syslog covers the SIEM case. |
 | Credential rotation without downtime | P0 | **written** | `scripts/verify/rotation-under-load.sh` checks both halves — live sessions survive, and the old secret stops granting new allocations. |
 | Credential revocation | P1 | **decide** | No CRL/OCSP by design; revocation means rotating the CA. Documented, and the first thing a customer asks. |
 | Ephemeral TURN credentials | P0 | **done** | |
@@ -134,8 +134,8 @@ Remaining: per-tenant bandwidth quotas **partial**, dedicated relay port pools
 | OpenTelemetry tracing | P0 | **done** | |
 | Health/readiness API | P0 | **done** | Hardened: the health port was bound inside a spawned task with its error discarded, so a node whose port was taken started anyway and scrapes read whatever else held it. Now fatal, with the project's first startup-failure test. |
 | SLO metrics | P0 | **partial** | Histograms exist; no SLO to measure against. |
-| SIEM export | P1 | **written** | `crates/observability/src/syslog.rs`, RFC 5424, 8 tests. Security events only — a SIEM billed per event that receives a line per frame gets switched off. |
-| Syslog | P1 | **written** | Same module, UDP and TCP with octet framing. |
+| SIEM export | P1 | **written** | `crates/observability/src/syslog.rs` plus `syslog_layer.rs`, a tracing layer that forwards matching log events. Not call sites: the refusal sites already log with the address as a field, so a layer covers new ones automatically and leaves `processor.rs` untouched. `unmatched_security_targets` counts what the rules miss. | `crates/observability/src/syslog.rs`, RFC 5424, 8 tests. Security events only — a SIEM billed per event that receives a line per frame gets switched off. |
+| Syslog | P1 | **written** | Same module. UDP and TCP with octet framing. | Same module, UDP and TCP with octet framing. |
 | Structured JSON logs | P0 | **done** | Already existed. I had this as "needs checking" and would have written it again. |
 | Metrics cardinality protection | P0 | **done** | See §8. |
 | Operational dashboards | P1 | **written** | `deploy/grafana/turna-overview.json`, 24 panels, schema 39. Every metric checked to exist; three panel overlaps found and fixed — an overlapped panel is in the JSON and invisible on screen. |
@@ -164,10 +164,10 @@ Remaining: per-tenant bandwidth quotas **partial**, dedicated relay port pools
 | Tokio baseline | P0 | **done** | |
 | io_uring | P1 | **done** (kernel-scoped) | Two kernels, 9.6 h, 0.006 % loss. Found a slot leak that made a worker deaf after exactly 64 packets. |
 | AF_XDP | P2 | **partial** | Correct on veth, SKB mode, **not a capacity result**. Found a frame leak that stopped reception after exactly 2015 frames. |
-| NUMA / IRQ / socket tuning | P1–P2 | **build** (docs) | |
+| NUMA / IRQ / socket tuning | P1–P2 | **done** | `docs/deployment/host-tuning.md`, from measurements on this project's hardware. Leads with the two things that are not settings: there is no warning band before the ceiling, and the relay range must not overlap the ephemeral range — the second is a correctness failure, not a performance one. IRQ and RSS advice is marked as **not verified here**, because loopback has no interrupts. |
 | Hardware sizing calculator | P1 | **iron** | |
 | Published hardware capacity profiles | P0 | **partial** | One machine, honestly bounded. The blocker for the rest is which hardware the product is sold on. |
-| Performance regression CI | P1 | **build** | `capacity-profile.sh` is the measurement; making it a gate needs a baseline and a tolerance. |
+| Performance regression CI | P1 | **written**, and deliberately not on PRs | `capacity-regression.sh` plus `.github/workflows/capacity.yml` on a self-hosted runner. A gate on hosted runners does not work: shared two-core VMs vary more between runs than any regression worth catching, and a check that fails half the time gets re-run until green. Baseline per machine, keyed on CPU model, core count and kernel — not hostname, which survives a hardware change. |
 
 ## §13 Integration contract (8)
 
@@ -203,9 +203,9 @@ provenance, checksums, dependency scanning, pinned CI. I had two of those as
 | req | P | state | note |
 |---|---|---|---|
 | 24 h endurance | P0 | **done** | Zero loss, no leak. What made it valid: the load client was not refreshing TURN bindings, so every earlier long run measured a decaying session. |
-| 72 h endurance | P1 | **build** | The analyser compares halves; 72 h needs day resolution. |
+| 72 h endurance | P1 | **written** | Per-day mode in `analyze.py` for runs over 30 h. Halves hide a leak starting at hour 40 and a 2 %/day leak; per-day floors catch the second and the halves test still catches the first — the two are complementary and neither replaces the other. Found by synthetic data that the first threshold was unreachable on a 3-day run. |
 | 10k/25k/50k certified | P0 | **iron** | |
-| Mixed UDP/TURNS load | P0 | **build** | Drivers exist per transport; nothing mixes them. |
+| Mixed UDP/TURNS load | P0 | **written** | `scripts/verify/mixed-load.sh`. Solo baselines first, at the same rates, and the mixed result as a delta — a loss figure without a baseline is unreadable. Threshold 0.5 pp, loose enough that run-to-run variance does not trip it. |
 | Reconnect storm | P0 | **done** | 150/150. Needs `--source-ips`, without which it measures the per-IP limiter. |
 | Node loss at peak | P0 | **iron** | |
 | Backend degradation | P1 | **partial** | CAS failover in CI. |
@@ -220,24 +220,52 @@ provenance, checksums, dependency scanning, pinned CI. I had two of those as
 
 ## What to do next, in order
 
-**1. Compile and run the written items.** Nine requirements are marked
-**written** — code that exists and has never executed. That is the largest
-category and the cheapest to convert.
+**1. Compile and run what is marked "written".** That category is now the largest
+in this document, and it is the only one where I can be wrong invisibly. Each item
+is code that exists and has never executed. Converting one to **done** costs a
+command; leaving it costs the illusion of coverage.
 
-**2. Decide the demux default (§7).** Two P0s, no code.
+The cheapest first: `cargo test -p turna-control rbac`,
+`cargo test -p turna-observability syslog`, then the scripts in
+`scripts/verify/`.
 
-**3. Decide the admission threshold.** 112 000 is measured. A fraction of it turns
-`/capacity`'s honest reporting into an actual decision. The cliff argues for
-something well under.
+**2. Resolve the factor of two in the capacity figure.** One run settles it: the
+current measurement echoes frames back to the client, so every frame crosses the
+relay twice. A driver that forwards instead would say whether 112 000 means
+112 000 or 224 000 one-way traversals. Until then every forecast and any admission
+threshold is uncertain by 2×, which is the difference between 13 nodes and 26.
 
-**4. Decide the hardware.** Eight P0s across §4, §11, §12 and §15 wait on which
-machine the product is sold on. That decision belongs before the engineering.
+This is one measurement and it gates two other things. It should come before
+either.
 
-**5. Then the cluster items.** Everything marked **iron** in §5 and §15 needs
-three nodes.
+**3. Decide the demux default.** Two P0s in §7, no code. Needs a recorded run of
+the demux path, which is the same shape of work as item 1.
 
-## What this document may still be wrong about
+**4. Decide the admission threshold**, after item 2. The measured curve is a cliff
+— nothing degrades before the ceiling and 7 % above it a million frames go in two
+minutes — so the argument is for a fraction well under, not for a margin.
 
-`bare-metal/systemd` is the one item I have marked "needs checking" for three
-revisions and never checked. It is probably fine. I have not looked, and saying so
-is better than the alternative — which this document exists to correct.
+**5. Decide the hardware.** Eight P0s across §4, §11, §12 and §15 wait on which
+machine the product is sold on, and that decision belongs before the engineering
+rather than after it.
+
+**6. Then the cluster items.** Everything marked **iron** in §5 and §15 needs
+three nodes and cannot be faked on one.
+
+## What this document is still wrong about, as far as I know
+
+`bare-metal/systemd` has been marked "needs checking" through four revisions and
+has never been checked. It is probably fine. I have not looked.
+
+The **written** entries are marks on code, not on behaviour. Every one of them was
+verified as far as a toolchain-free check reaches — brace balance either side of
+each edit, shell and python syntax, JSON and YAML validity, and the arithmetic run
+against synthetic data. Three of them needed a second pass because such a check
+caught what the script's own success message did not, which is the honest measure
+of how far that gets you.
+
+And one correction from this batch worth carrying forward: I designed a second
+on-disk audit chain, at length and with reasons, before discovering that
+`AuditLog` is an in-memory ring. The reasoning was sound and answered a question
+the code had already settled differently. **Read the constructor before designing
+around the type.**

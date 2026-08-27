@@ -163,6 +163,49 @@ fn encode_with_integrity_auto(
 // instead. Default N = 1 (sample everything — identical to the previous
 // behaviour); operators under load set `TURNA_LATENCY_SAMPLE_N` to trade
 // histogram fidelity for fewer clock reads on the hot path.
+/// A client address as it should appear in a log.
+///
+/// Verbatim when `[observability] log_client_addresses` is true, which is the
+/// default and the existing behaviour. Otherwise `ip-<12 hex>` under a salt
+/// generated once per process: an incident stays traceable across the lines of one
+/// node's lifetime, and the address is not recoverable from the log afterwards.
+///
+/// One function rather than a conditional at each site. The three call sites must
+/// agree, and a log where two lines carry an address and the third carries a hash
+/// is worse than either choice made consistently — a reader correlating them gets
+/// nothing and does not know why.
+fn loggable_addr(addr: &std::net::SocketAddr) -> String {
+    use std::sync::OnceLock;
+    static SALT: OnceLock<u64> = OnceLock::new();
+    if LOG_CLIENT_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
+        return addr.to_string();
+    }
+    let salt = *SALT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15)
+    });
+    // FNV-1a. Not cryptographic and does not need to be: the salt is not written
+    // anywhere, and what this provides is a stable label within a process rather
+    // than resistance to an attacker who already holds the log.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt;
+    for b in addr.ip().to_string().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("ip-{h:012x}")
+}
+
+/// Set once at startup from configuration.
+static LOG_CLIENT_ADDRESSES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Called by the node before serving.
+pub fn set_log_client_addresses(on: bool) {
+    LOG_CLIENT_ADDRESSES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn latency_sample_n() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| {
@@ -1397,7 +1440,7 @@ impl PacketProcessor {
             encode_with_integrity_auto(&resp, &mut buf, &key, msg),
             vec![Action::None]
         );
-        info!(%src, %relay_addr, lifetime, "allocation created");
+        info!(src = %loggable_addr(&src), %relay_addr, lifetime, "allocation created");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -1529,7 +1572,7 @@ impl PacketProcessor {
             encode_with_integrity_auto(&resp, &mut buf, &key, msg),
             vec![Action::None]
         );
-        info!(%src, %relay_addr, lifetime, "TCP allocation created (RFC 6062)");
+        info!(src = %loggable_addr(&src), %relay_addr, lifetime, "TCP allocation created (RFC 6062)");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -1933,7 +1976,7 @@ impl PacketProcessor {
         self.metrics
             .bytes_sent
             .fetch_add(len as u64, Ordering::Relaxed);
-        info!(%src, %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
+        info!(src = %loggable_addr(&src), %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
 
         let mut actions = vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),

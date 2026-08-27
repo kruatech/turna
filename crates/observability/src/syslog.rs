@@ -69,6 +69,16 @@ pub enum EventKind {
     ReadinessChanged,
     ConfigChanged,
     TlsHandshakeFailed,
+    /// Input that did not parse: a decode error, an over-long attribute, a frame
+    /// that did not fit. Individually ordinary — the internet sends rubbish — but
+    /// the rate is a probing signal, which is why it is a distinct kind and not
+    /// folded into AuthFailure.
+    MalformedInput,
+    /// A listener would not bind, or a control refused to start.
+    ///
+    /// The moment something meant to protect the deployment did not engage.
+    /// Distinct from a crash: the process is fine, one of its defences is not.
+    ControlFailed,
 }
 
 impl EventKind {
@@ -83,6 +93,8 @@ impl EventKind {
             EventKind::ReadinessChanged => "READINESS",
             EventKind::ConfigChanged => "CONFIG_CHANGED",
             EventKind::TlsHandshakeFailed => "TLS_HANDSHAKE_FAILED",
+            EventKind::MalformedInput => "MALFORMED_INPUT",
+            EventKind::ControlFailed => "CONTROL_FAILED",
         }
     }
 
@@ -104,6 +116,12 @@ impl EventKind {
             EventKind::ReadinessChanged => Severity::Notice,
             EventKind::ConfigChanged => Severity::Notice,
             EventKind::TlsHandshakeFailed => Severity::Warning,
+            // Notice, not Warning: one malformed packet is the internet being the
+            // internet. The rate is the alertable thing, and that is a SIEM rule.
+            EventKind::MalformedInput => Severity::Notice,
+            // Error: a defence that did not engage is not routine, and unlike the
+            // refusals above it will not resolve on its own.
+            EventKind::ControlFailed => Severity::Error,
         }
     }
 }
@@ -342,18 +360,14 @@ fn looks_like_address(key: &str) -> bool {
 
 /// Stable label for an address, salted per process.
 ///
-/// FNV-1a rather than SHA-256, and deliberately not a cryptographic hash:
-/// pulling `turna_crypto` into this crate for an optional feature would add a
-/// dependency to every binary that logs. What this needs is that one address maps
-/// to one label within a process — enough to correlate an attacker across events
-/// — and the salt is discarded, so an operator holding the log cannot reverse it
-/// by inspection. Somebody with the log *and* a guess at the address could
-/// confirm the guess; that is true of SHA-256 here too, since the input space is
-/// four billion.
+/// FNV-1a, not a cryptographic hash. Pulling `turna_crypto` into this crate for
+/// an optional feature would add a dependency to every binary that logs. What
+/// this needs is that one address maps to one label within a process — enough to
+/// correlate an attacker across events — and the salt is never written down.
 ///
-/// If that distinction matters for a deployment, use `--strip-addresses` in the
-/// support bundle and `syslog_redact_addresses` here, and accept losing
-/// correlation.
+/// Somebody holding the log *and* guessing an address could confirm the guess.
+/// That is true of SHA-256 here too: the input space is four billion. If that
+/// matters, use `--strip-addresses` and accept losing correlation.
 fn hash_address(salt: &str, v: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in salt.bytes().chain(v.bytes()) {
