@@ -165,7 +165,8 @@ fn encode_with_integrity_auto(
 // histogram fidelity for fewer clock reads on the hot path.
 /// A client address as it should appear in a log.
 ///
-/// Verbatim when `[observability] log_client_addresses` is true, which is the
+/// Verbatim when `[observability] log_allocation_addresses` is true, which is
+/// the
 /// default and the existing behaviour. Otherwise `ip-<12 hex>` under a salt
 /// generated once per process: an incident stays traceable across the lines of one
 /// node's lifetime, and the address is not recoverable from the log afterwards.
@@ -177,7 +178,7 @@ fn encode_with_integrity_auto(
 fn loggable_addr(addr: &std::net::SocketAddr) -> String {
     use std::sync::OnceLock;
     static SALT: OnceLock<u64> = OnceLock::new();
-    if LOG_CLIENT_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
+    if LOG_ALLOCATION_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
         return addr.to_string();
     }
     let salt = *SALT.get_or_init(|| {
@@ -198,12 +199,12 @@ fn loggable_addr(addr: &std::net::SocketAddr) -> String {
 }
 
 /// Set once at startup from configuration.
-static LOG_CLIENT_ADDRESSES: std::sync::atomic::AtomicBool =
+static LOG_ALLOCATION_ADDRESSES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
 /// Called by the node before serving.
-pub fn set_log_client_addresses(on: bool) {
-    LOG_CLIENT_ADDRESSES.store(on, std::sync::atomic::Ordering::Relaxed);
+pub fn set_log_allocation_addresses(on: bool) {
+    LOG_ALLOCATION_ADDRESSES.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn latency_sample_n() -> u64 {

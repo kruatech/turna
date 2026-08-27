@@ -298,7 +298,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
-    // The node's own audit ring is NOT constructed here yet, deliberately.
+    // The node's audit ring, and the layer that fills it.
+    //
+    // The ring is in memory, so it holds what happens while the process lives:
+    // drain transitions, certificate rotations, a listener that died. Start and
+    // stop events describe the restart that erases it and go to syslog instead.
+    //
+    // The layer observes rather than being called: `record_infra` needs a type
+    // from turna-control, and neither turna-relay nor turna-transport depends on
+    // it. Covering only the crates that could reach it would leave the journal
+    // without certificate rotation, which happens in the transport crate — a hole
+    // exactly where the interesting event is.
+    // The ring is not constructed either, for the same reason: nothing would fill
+    // it. The config key stays documented so the decision is visible rather than
+    // absent.
+    // No audit layer here, deliberately. See services/node/src/audit_layer.rs —
+    // it stays in the tree with its 11 tests and is not installed, because
+    // installing it needs subscriber construction moved out of turna-observability
+    // and into this file. What that would buy is reading, over gRPC, events that
+    // already reach the SIEM through the syslog layer and that vanish on restart
+    // because the ring is in memory.
     //
     // `AuditLog` is an in-memory ring, not a file, so it cannot hold start or stop
     // events — those describe the restart that erases it, and they go to syslog
@@ -390,6 +409,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/capacity` returns the raw numbers next to the state rather than only a
     // verdict.
     metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
+    // The packet-rate ceiling and its thresholds. Separate call because the two
+    // come from different places: the allocation cap is a configuration decision,
+    // the rate ceiling is a measurement. 0 leaves the rate reported and not
+    // judged.
+    metrics.set_rate_limits(
+        config.relay.max_packets_per_sec,
+        config.relay.rate_soft_percent,
+        config.relay.rate_hard_percent,
+    );
 
     // M1: install the configured peer-filter policy before serving.
     // Default profile is internet-facing (denies RFC1918/ULA); opt into

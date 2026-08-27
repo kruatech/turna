@@ -4355,6 +4355,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "turna-auth",
  "turna-cluster",
  "turna-config",

@@ -20,6 +20,7 @@ dtls = ["turna-transport/dtls"]
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 parking_lot.workspace = true
 turna-config.workspace = true
 turna-observability.workspace = true

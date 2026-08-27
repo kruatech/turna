@@ -401,6 +401,12 @@ struct TurnaManagementService {
     /// evaluating, so a deployment that has not configured roles behaves exactly
     /// as before and nothing appears in the audit log as a grant.
     rbac: Arc<crate::rbac::RbacPolicy>,
+    /// Certificates that may not be used, whatever their roles.
+    ///
+    /// Checked before RBAC. A revoked certificate that also lacked a permission
+    /// would otherwise be audited as a missing role, and an operator reading that
+    /// would grant the role — after which the revoked certificate works.
+    revoked: Arc<crate::revocation::RevocationList>,
     /// Fired when the server starts shutting down.
     shutdown_token: CancellationToken,
     /// Counts currently open streaming RPCs.
@@ -1193,6 +1199,25 @@ impl TurnaManagementService {
     /// and a small one is still one.
     fn authorize<T>(&self, req: &Request<T>, permission: &str) -> Result<String, Status> {
         let actor = actor_of(req);
+
+        // Revocation first. Both paths end in `permission_denied`, so the order
+        // looks cosmetic and is not: a revoked certificate that also lacks the
+        // permission must be audited as revoked, or an operator reading
+        // `rbac_denied` grants a role and the revoked certificate starts working.
+        if self.revoked.is_revoked(&actor) {
+            self.audit.record(
+                &actor,
+                "cert_revoked",
+                format!("refused {permission}: certificate is on the revocation list").as_str(),
+                false,
+            );
+            // The caller is told only "permission denied". Saying "your
+            // certificate is revoked" confirms it was once valid and that the
+            // operator knows it leaked — the detail belongs in the audit log,
+            // read by somebody already inside.
+            return Err(Status::permission_denied("permission denied"));
+        }
+
         match self.rbac.check(&actor, permission) {
             Ok(()) => Ok(actor),
             Err(denial) => {
@@ -1285,6 +1310,7 @@ pub async fn start_grpc_server(
     core: Arc<dyn TurnCore>,
     metrics: Arc<Metrics>,
     rbac: Arc<crate::rbac::RbacPolicy>,
+    revoked: Arc<crate::revocation::RevocationList>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown_token = CancellationToken::new();
@@ -1355,6 +1381,7 @@ pub async fn start_grpc_server(
         audit,
         require_idempotency_key,
         rbac,
+        revoked,
     })
     .max_decoding_message_size(config.max_message_size)
     .max_encoding_message_size(config.max_message_size);

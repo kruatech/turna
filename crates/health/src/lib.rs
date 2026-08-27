@@ -121,6 +121,25 @@ pub struct Metrics {
     /// Mirrored from `SyslogExporter` by the node. `dropped` is the one to alert
     /// on: a gap in a security log is worse than a visible failure, because an
     /// investigation reads absence as "nothing happened".
+    /// Relayed packets/second this node can carry, from a measurement.
+    ///
+    /// 0 means unmeasured: the rate is reported and not judged. Deliberately not
+    /// fatal, unlike an unpublished allocation limit — allocations still bound the
+    /// node, so it knows something about its capacity, just not this. Making both
+    /// fatal would stop anybody running before they had measured a ceiling, and
+    /// most never will.
+    pub capacity_max_pps: AtomicU64,
+    /// Percent of `capacity_max_pps` at which to report DEGRADED. Default 60.
+    ///
+    /// Lower than the allocation threshold on purpose. Allocations degrade
+    /// gracefully — at the cap, existing clients are unaffected. Packet rate does
+    /// not degrade and then falls off a cliff: measured, clean at 112 000 pps and
+    /// shedding a million frames at 128 000. Seven percent between perfect and
+    /// broken, so the warning has to sit further back.
+    pub capacity_rate_soft_percent: AtomicU64,
+    /// Percent of `capacity_max_pps` at which to report SATURATED. Default 80.
+    pub capacity_rate_hard_percent: AtomicU64,
+
     pub syslog_sent: AtomicU64,
     pub syslog_dropped: AtomicU64,
 
@@ -412,6 +431,9 @@ impl Metrics {
             active_allocations: AtomicU64::new(0),
             total_allocations: AtomicU64::new(0),
             rates: RateSampler::new(),
+            capacity_max_pps: AtomicU64::new(0),
+            capacity_rate_soft_percent: AtomicU64::new(60),
+            capacity_rate_hard_percent: AtomicU64::new(80),
             syslog_sent: AtomicU64::new(0),
             syslog_dropped: AtomicU64::new(0),
             host_cpu_percent: AtomicU64::new(u64::MAX),
@@ -1380,6 +1402,15 @@ struct CapacityResponse {
     bytes_per_sec: Option<u64>,
     /// Relayed packets/second over the last ten seconds. `null` on the same terms.
     packets_per_sec: Option<u64>,
+    /// The measured ceiling, if one has been published. `null` means the rate is
+    /// reported and not judged — not that there is no limit.
+    max_packets_per_sec: Option<u64>,
+    /// Rate as a percent of the ceiling. `null` when either the ceiling is
+    /// unpublished or the sampler's ten-second window has not filled.
+    ///
+    /// Two causes, one `null`, and a consumer cannot tell them apart from this
+    /// field alone — `max_packets_per_sec` distinguishes them.
+    rate_utilization_percent: Option<u64>,
     /// Host CPU, whole percent. `null` until the first sample.
     cpu_percent: Option<u64>,
     /// Host memory in use, whole percent. `null` until the first sample.
@@ -1433,6 +1464,28 @@ impl Metrics {
         }
     }
 
+    /// Publish the measured packet-rate ceiling and its thresholds.
+    ///
+    /// Separate from `set_capacity_limits` because the two come from different
+    /// places: the allocation cap is a configuration decision, and this is a
+    /// measurement. Folding them into one call would invite passing a guess for
+    /// the ceiling to satisfy the signature.
+    ///
+    /// `max_pps` of 0 leaves the rate unjudged.
+    pub fn set_rate_limits(&self, max_pps: u64, soft_percent: u64, hard_percent: u64) {
+        self.capacity_max_pps.store(max_pps, Ordering::Relaxed);
+        // Clamped and ordered: a soft threshold above the hard one would make the
+        // DEGRADED branch unreachable, and the node would go from AVAILABLE
+        // straight to SATURATED with no warning — the exact failure the soft
+        // threshold exists to prevent.
+        let hard = hard_percent.clamp(1, 100);
+        let soft = soft_percent.clamp(1, hard);
+        self.capacity_rate_soft_percent
+            .store(soft, Ordering::Relaxed);
+        self.capacity_rate_hard_percent
+            .store(hard, Ordering::Relaxed);
+    }
+
     /// Publish the node's capacity limits. Called once at startup.
     ///
     /// Until this is called, `/capacity` reports UNAVAILABLE: a node that does
@@ -1469,6 +1522,19 @@ impl Metrics {
             .checked_div(max)
             .map_or(100, |v| v.min(100));
 
+        // Rate utilisation, or None when either the ceiling is unpublished or the
+        // sampler's window has not filled. Two different absences and both must
+        // read as "no verdict" rather than as zero — a node whose sampler has not
+        // warmed up is not idle.
+        let max_pps = self.capacity_max_pps.load(Ordering::Relaxed);
+        let rate_soft = self.capacity_rate_soft_percent.load(Ordering::Relaxed);
+        let rate_hard = self.capacity_rate_hard_percent.load(Ordering::Relaxed);
+        let rate_utilization: Option<u64> = match (max_pps, self.rates.packets_per_sec()) {
+            (0, _) => None,
+            (_, None) => None,
+            (m, Some(pps)) => Some(pps.saturating_mul(100).saturating_div(m).min(100)),
+        };
+
         let mut reasons: Vec<&'static str> = Vec::new();
         let state = if draining {
             reasons.push("node is draining");
@@ -1483,8 +1549,25 @@ impl Metrics {
             reasons.push("allocations at or above the hard threshold");
             CapacityState::Saturated
         } else if shedding {
+            // Before the rate check, not after.
+            //
+            // Both give SATURATED, so the order looks cosmetic — and modelling the
+            // combination showed it is not. With both signals firing, the reason
+            // reported was the rate, which is the weaker claim: shedding is a
+            // failure that has already happened, and a rate threshold is a
+            // prediction that one will. The reason is what an operator acts on, so
+            // evidence has to outrank prediction.
             reasons.push("send queue has dropped frames");
             CapacityState::Saturated
+        } else if rate_utilization.is_some_and(|u| u >= rate_hard) {
+            // Above the soft allocation threshold: the rate is the signal with the
+            // cliff behind it. An operator seeing DEGRADED for allocations has
+            // time; one seeing it for rate may have seconds.
+            reasons.push("relayed packet rate at or above the hard threshold");
+            CapacityState::Saturated
+        } else if rate_utilization.is_some_and(|u| u >= rate_soft) {
+            reasons.push("relayed packet rate at or above the soft threshold");
+            CapacityState::Degraded
         } else if utilization >= soft {
             reasons.push("allocations at or above the soft threshold");
             CapacityState::Degraded
@@ -1508,6 +1591,8 @@ impl Metrics {
             draining,
             bytes_per_sec: self.rates.bytes_per_sec(),
             packets_per_sec: self.rates.packets_per_sec(),
+            max_packets_per_sec: if max_pps == 0 { None } else { Some(max_pps) },
+            rate_utilization_percent: rate_utilization,
             cpu_percent: self.host_cpu(),
             memory_percent: self.host_memory(),
             signals: CapacitySignals {

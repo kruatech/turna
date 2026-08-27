@@ -42,7 +42,9 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use turna_config::TurnaConfig;
-use turna_control::{start_grpc_server, GrpcConfig, GrpcTlsConfig, RbacPolicy, TurnCoreImpl};
+use turna_control::{
+    start_grpc_server, GrpcConfig, GrpcTlsConfig, RbacPolicy, RevocationList, TurnCoreImpl,
+};
 use turna_state_backend::{create_backend, now_ms, Backend, BackendConfig, CommandLogRetention};
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
@@ -215,13 +217,32 @@ async fn main() -> Result<(), AnyError> {
         Arc::new(policy)
     };
 
+    let revoked = {
+        let path = &cfg.grpc.revocation_list;
+        if path.is_empty() {
+            Arc::new(RevocationList::empty())
+        } else {
+            match RevocationList::load(path) {
+                Ok(list) => {
+                    info!(path = %path, revoked = list.len(),
+                          "certificate revocation list loaded");
+                    Arc::new(list)
+                }
+                // Refusing at deploy time is loud and happens when somebody is
+                // looking. A list that is configured and silently empty looks
+                // like protection and is not.
+                Err(e) => return Err(format!("{e}").into()),
+            }
+        }
+    };
+
     let config = GrpcConfig {
         listen_addr: grpc_addr,
         tls,
         ..Default::default()
     };
 
-    if let Err(e) = start_grpc_server(config, core, metrics, rbac, shutdown_fut).await {
+    if let Err(e) = start_grpc_server(config, core, metrics, rbac, revoked, shutdown_fut).await {
         tracing::error!(%e, "gRPC server error");
     }
 

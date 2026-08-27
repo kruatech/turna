@@ -1006,6 +1006,31 @@ pub struct RelayConfig {
     /// Per-user bandwidth + allocation count limits. Defaults are
     /// "no bandwidth limit, 100 allocations per username".
     pub quota: QuotaConfig,
+    /// Relayed packets/second this node can carry, from a measurement.
+    ///
+    /// 0 (the default) leaves the rate reported and not judged. Set it from
+    /// `scripts/verify/capacity-profile.sh` run on this hardware — a figure from
+    /// other hardware is worse than none, because it looks measured.
+    ///
+    /// **The measurement is uncertain by a factor of two, and it matters here.**
+    /// The profiler echoes frames back to the client, so every frame crosses the
+    /// relay twice; a real call is one traversal. A measured 112 000 may therefore
+    /// be worth 224 000 one-way, in which case a threshold from the smaller figure
+    /// diverts traffic at half the rate the node can carry. That is the safe
+    /// direction and it is not free. One run with a forwarding driver settles it.
+    #[serde(default)]
+    pub max_packets_per_sec: u64,
+    /// Percent of `max_packets_per_sec` at which `/capacity` reports DEGRADED.
+    ///
+    /// 60 by default, lower than the allocation threshold because the failure
+    /// shapes differ. Allocations degrade gracefully; packet rate is a cliff —
+    /// measured, clean at 112 000 pps and shedding a million frames at 128 000.
+    /// Seven percent between the two, so the warning sits further back.
+    #[serde(default = "default_rate_soft")]
+    pub rate_soft_percent: u64,
+    /// Percent at which `/capacity` reports SATURATED. 80 by default.
+    #[serde(default = "default_rate_hard")]
+    pub rate_hard_percent: u64,
     /// How long to wait for allocations to end on shutdown, seconds.
     ///
     /// The node stops accepting immediately and then waits for existing
@@ -1025,6 +1050,9 @@ impl Default for RelayConfig {
             max_allocations: 10000,
             quota: QuotaConfig::default(),
             // The value this was hard-coded to before it became configurable.
+            max_packets_per_sec: 0,
+            rate_soft_percent: 60,
+            rate_hard_percent: 80,
             drain_timeout_secs: 30,
         }
     }
@@ -1111,6 +1139,16 @@ fn default_node_audit_entries() -> usize {
     256
 }
 
+/// 60 % — see `rate_soft_percent`. The curve, not a convention.
+fn default_rate_soft() -> u64 {
+    60
+}
+
+/// 80 % — far enough below the measured cliff to leave room to react.
+fn default_rate_hard() -> u64 {
+    80
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1142,25 +1180,45 @@ pub struct ObservabilityConfig {
     /// most of what a SIEM is for — a real trade, not a free improvement.
     #[serde(default)]
     pub syslog_redact_addresses: bool,
-    /// Log client IP addresses on the allocation lines.
+    /// Log client IP addresses on the **allocation** lines.
     ///
-    /// **Default true**, which is the existing behaviour. Three INFO lines carry
-    /// `src`: allocation created, TCP allocation created, allocation migrated.
-    /// All three are per-allocation, so a busy node writes one line containing a
-    /// client's address for every allocation it grants — 13.7 million of them in
-    /// this project's own 3-hour soak.
+    /// Named for its scope rather than for the general idea, because the general
+    /// idea would be a promise this does not keep. It covers three INFO lines in
+    /// the relay — allocation created, TCP allocation created, allocation migrated
+    /// — and nothing else.
     ///
-    /// The default is not the privacy-forward choice and that is deliberate: `src`
-    /// on the allocation line is the field an operator correlates a complaint
-    /// against, and removing it silently in an upgrade would break the thing logs
-    /// are used for. The switch exists so the decision is made rather than
-    /// inherited.
+    /// **Default true**, which is the existing behaviour. Those three are
+    /// per-allocation, so a busy node writes one line containing a client's
+    /// address for every allocation it grants: 13.7 million of them in this
+    /// project's own 3-hour soak. The default is not the privacy-forward choice
+    /// and that is deliberate — `src` on the allocation line is the field an
+    /// operator correlates a complaint against, and removing it silently in an
+    /// upgrade breaks what logs are used for.
     ///
-    /// Set false where an IP address counts as personal data you would rather not
-    /// retain. Addresses then log as `ip-<12 hex>` under a per-process salt:
+    /// Set false and they log as `ip-<12 hex>` under a per-process salt:
     /// traceable within one node's lifetime, not recoverable from the log.
+    ///
+    /// # What this does not cover, and why not
+    ///
+    /// Ten WARN lines in the TURNS, QUIC and SCTP transports also carry an
+    /// address. They are outside this switch on purpose, and the reason is that
+    /// they are a different kind of line:
+    ///
+    /// - All ten are **refusals** — a per-IP cap, a rate limit, a session
+    ///   ceiling. A node relaying happily writes none of them, so the volume is
+    ///   bounded by attacks rather than by traffic.
+    /// - The address is the **most useful part**. "Who is being refused" is the
+    ///   question, and a refusal with no subject cannot be acted on.
+    /// - They are what the syslog layer forwards to a SIEM. Hashing them would
+    ///   send refusal events with no actionable subject, which is most of what a
+    ///   SIEM is for.
+    ///
+    /// A deployment that must log no client address anywhere cannot get that from
+    /// configuration today — it would have to raise the transport log level above
+    /// WARN, which silences things it wants. See
+    /// `docs/security/log-data-audit-2026-08-27.md`.
     #[serde(default = "default_true")]
-    pub log_client_addresses: bool,
+    pub log_allocation_addresses: bool,
     /// Entries the node keeps in its own in-memory audit ring.
     ///
     /// Separate from the control plane's, because a hash chain assumes one writer
@@ -1196,7 +1254,7 @@ impl Default for ObservabilityConfig {
             otlp_endpoint: String::new(),
             syslog_endpoint: String::new(),
             syslog_redact_addresses: false,
-            log_client_addresses: true,
+            log_allocation_addresses: true,
             node_audit_entries: 256, // disabled by default
             trace_sample_rate: 0.01, // 1%
             json_logs: false,
@@ -2096,6 +2154,22 @@ pub struct GrpcConfigSection {
     /// Role-based access control. See [`RbacSection`].
     #[serde(default)]
     pub rbac: RbacSection,
+    /// File listing client-certificate fingerprints that may not be used.
+    ///
+    /// One SHA-256 fingerprint per line, `#` for comments. Colons and upper case
+    /// are accepted because that is what `openssl x509 -fingerprint` emits.
+    ///
+    /// **Not RFC 5280 CRL.** No CA-signed list, no freshness rule — a local
+    /// deny-list checked when an RPC arrives, so a revoked client completes the
+    /// TLS handshake and is refused on its first call. That trade buys what CRL
+    /// cannot have here: it works with no route off the host, which is the
+    /// deployment that most needs revocation. See
+    /// `docs/security/mtls-revocation.md`.
+    ///
+    /// **Fail-closed.** A path that cannot be read stops the node from starting,
+    /// because a list that is configured and unread looks like protection.
+    #[serde(default)]
+    pub revocation_list: String,
 
     /// One of: `"disabled"` (default), `"tls"`, `"mtls"`.
     pub tls_mode: String,
@@ -2114,6 +2188,7 @@ impl Default for GrpcConfigSection {
     fn default() -> Self {
         Self {
             rbac: RbacSection::default(),
+            revocation_list: String::new(),
             tls_mode: "disabled".into(),
             tls_cert: String::new(),
             tls_key: String::new(),
