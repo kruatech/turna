@@ -349,63 +349,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Disabled unless an endpoint is configured, and a disabled exporter is a
     // no-op rather than a branch at every call site.
-    let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
-        turna_observability::syslog::SyslogConfig {
-            endpoint: config.observability.syslog_endpoint.clone(),
-            app_name: "turna".to_string(),
-            redact_addresses: config.observability.syslog_redact_addresses,
-            non_blocking: true,
-        },
-    ));
-    // Mirror the exporter's counters on the same ticker as the rest. Without
-    // this the two documented series read zero forever, and a dashboard panel
-    // showing no drops is indistinguishable from one showing no export.
-    {
-        let syslog = _syslog.clone();
-        let metrics = metrics.clone();
-        tokio::spawn(async move {
-            use std::sync::atomic::Ordering::Relaxed;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                metrics
-                    .syslog_sent
-                    .store(syslog.sent.load(Relaxed), Relaxed);
-                metrics
-                    .syslog_dropped
-                    .store(syslog.dropped.load(Relaxed), Relaxed);
-            }
-        });
-    }
-
-    // Startup goes to syslog, not to the ring.
-    //
-    // The ring is in memory and does not survive a restart, so a start event
-    // recorded there is one nobody can ever read — it describes the very
-    // discontinuity that erases it. Putting it in the ring anyway would look like
-    // coverage and provide none, which is the worse kind of nothing.
-    //
-    // Version and config path because the first question after any incident is
-    // which build was running.
-    _syslog.emit(
-        // ReadinessChanged, not ControlFailed: nothing failed. Using the failure
-        // kind for a normal start would put successes and failures under one
-        // MSGID, and a SIEM rule cannot separate them again.
-        turna_observability::syslog::EventKind::ReadinessChanged,
-        &[
-            ("state", "started"),
-            ("version", env!("CARGO_PKG_VERSION")),
-            ("pid", &std::process::id().to_string()),
-        ],
-    );
-
-    if _syslog.is_enabled() {
-        info!(
-            endpoint = %config.observability.syslog_endpoint,
-            "security events exporting to syslog"
-        );
-    }
 
     // Publish the node's own ceiling so `/capacity` has something to reason
     // about. Until this runs, that endpoint reports UNAVAILABLE — a node that
@@ -806,6 +749,64 @@ fn run_tokio(
         .build()?;
 
     rt.block_on(async {
+    let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
+        turna_observability::syslog::SyslogConfig {
+            endpoint: config.observability.syslog_endpoint.clone(),
+            app_name: "turna".to_string(),
+            redact_addresses: config.observability.syslog_redact_addresses,
+            non_blocking: true,
+        },
+    ));
+    // Mirror the exporter's counters on the same ticker as the rest. Without
+    // this the two documented series read zero forever, and a dashboard panel
+    // showing no drops is indistinguishable from one showing no export.
+    {
+        let syslog = _syslog.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                metrics
+                    .syslog_sent
+                    .store(syslog.sent.load(Relaxed), Relaxed);
+                metrics
+                    .syslog_dropped
+                    .store(syslog.dropped.load(Relaxed), Relaxed);
+            }
+        });
+    }
+
+    // Startup goes to syslog, not to the ring.
+    //
+    // The ring is in memory and does not survive a restart, so a start event
+    // recorded there is one nobody can ever read — it describes the very
+    // discontinuity that erases it. Putting it in the ring anyway would look like
+    // coverage and provide none, which is the worse kind of nothing.
+    //
+    // Version and config path because the first question after any incident is
+    // which build was running.
+    _syslog.emit(
+        // ReadinessChanged, not ControlFailed: nothing failed. Using the failure
+        // kind for a normal start would put successes and failures under one
+        // MSGID, and a SIEM rule cannot separate them again.
+        turna_observability::syslog::EventKind::ReadinessChanged,
+        &[
+            ("state", "started"),
+            ("version", env!("CARGO_PKG_VERSION")),
+            ("pid", &std::process::id().to_string()),
+        ],
+    );
+
+    if _syslog.is_enabled() {
+        info!(
+            endpoint = %config.observability.syslog_endpoint,
+            "security events exporting to syslog"
+        );
+    }
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // #5: resolve the deployment-profile worker gates once, up front.
         let gates = profile_gates(&cluster);
