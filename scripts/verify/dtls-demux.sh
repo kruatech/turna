@@ -191,9 +191,12 @@ fi
 
 # ── 1 and 2: relays, and concurrently ─────────────────────────────────────
 say "check 1-2: relaying, with concurrent handshakes"
-if "$REPO/$LOAD" --server "127.0.0.1:$TURN_PORT" --secret "$SECRET" \
+# --server is the DTLS address here: the dtls driver uses cli.server directly.
+# There is no --dtls-addr and no --insecure — I had borrowed both from the TLS
+# driver, which has them.
+if "$REPO/$LOAD" --server "127.0.0.1:$DTLS_PORT" --secret "$SECRET" \
      --duration "$DURATION" --warmup 10 --json \
-     dtls --dtls-addr "127.0.0.1:$DTLS_PORT" --insecure -c 12 --pps 30 --payload 200 \
+     dtls -c 12 --pps 30 --payload 200 \
      > "$OUT/relay.json" 2> "$OUT/relay.err"; then
   read -r RECV ERRS <<<"$(python3 - "$OUT/relay.json" <<'PY'
 import json, sys
@@ -242,9 +245,9 @@ REJECTED_BEFORE=$(metric turna_dtls_rejected_rate_limit_total)
 # Well above the limit, all from one source. The stock path cannot do this at all:
 # the handshake completes below accept() and turna never sees the packets.
 for _ in $(seq $(( HANDSHAKE_LIMIT * 6 ))); do
-  timeout 3 "$REPO/$LOAD" --server "127.0.0.1:$TURN_PORT" --secret "$SECRET" \
+  timeout 3 "$REPO/$LOAD" --server "127.0.0.1:$DTLS_PORT" --secret "$SECRET" \
     --duration 1 --json \
-    dtls --dtls-addr "127.0.0.1:$DTLS_PORT" --insecure -c 1 --pps 1 --payload 100 \
+    dtls -c 1 --pps 1 --payload 100 \
     >> "$OUT/limit.json" 2>> "$OUT/limit.err" &
 done
 wait
