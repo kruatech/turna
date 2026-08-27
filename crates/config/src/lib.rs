@@ -167,6 +167,61 @@ impl TurnaConfig {
             }
         }
 
+        // RBAC: the one configuration mistake here that has no benign reading is
+        // enabling it with no bindings, which denies every management request.
+        // Everything else warns — a typo in a role name should not stop a node,
+        // and on a fleet mid-upgrade a config naming a permission the older
+        // binary does not check is normal.
+        {
+            let r = &self.grpc.rbac;
+            if r.enabled && r.bindings.is_empty() {
+                errors.push(
+                    "[management.rbac] enabled = true with no bindings: every \
+                     management request would be denied, including the ones needed to \
+                     fix this. Add a binding or disable RBAC."
+                        .into(),
+                );
+            }
+            for (fp, roles) in &r.bindings {
+                if fp.len() != 64 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+                    tracing::warn!(
+                        fingerprint = %fp,
+                        "[grpc.rbac.bindings] does not look like a SHA-256 \
+                         fingerprint (64 hex characters, no colons). Get it with: \
+                         openssl x509 -in client.pem -noout -fingerprint -sha256 \
+                         | cut -d= -f2 | tr -d : | tr 'A-Z' 'a-z'"
+                    );
+                }
+                if roles.is_empty() {
+                    tracing::warn!(
+                        fingerprint = %fp,
+                        "[grpc.rbac.bindings] bound to no roles, so it can do nothing"
+                    );
+                }
+            }
+        }
+
+        // Syslog: a malformed endpoint disables export silently in the exporter,
+        // which is the wrong place to find out that security events are going
+        // nowhere.
+        if !self.turn.observability.syslog_endpoint.is_empty() {
+            let e = &self.turn.observability.syslog_endpoint;
+            let ok = e.starts_with("udp://") || e.starts_with("tcp://");
+            let has_port = e
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .is_some();
+            if !ok || !has_port {
+                errors.push(format!(
+                    "[observability] syslog_endpoint = {e:?} must be udp://host:port \
+                     or tcp://host:port. Refused here rather than at runtime: an \
+                     endpoint that silently fails to parse means security events go \
+                     nowhere and nothing says so."
+                ));
+            }
+        }
+
         // Check port conflicts
         let all_ports = [
             ("turn", self.turn.listen),
@@ -1053,6 +1108,31 @@ impl SignalingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {
+    /// Syslog collector for security events, RFC 5424.
+    ///
+    /// `udp://host:514` or `tcp://host:601`. Empty disables export.
+    ///
+    /// One string rather than host, port and protocol as three keys: three keys
+    /// admit a config where the protocol says TCP and the port is a UDP
+    /// convention, and that misconfiguration produces a collector which accepts
+    /// the connection and stores nothing.
+    ///
+    /// Only security-relevant events are sent — authentication failures,
+    /// authorisation denials, peer refusals, rate-limit trips, audit entries,
+    /// readiness transitions. Not relayed traffic. A SIEM billed per event that
+    /// receives a line per frame gets switched off, and a switched-off SIEM
+    /// catches nothing.
+    #[serde(default)]
+    pub syslog_endpoint: String,
+    /// Hash client addresses before sending them to the collector.
+    ///
+    /// Off by default: a SIEM is inside the operator's trust boundary and an
+    /// authentication-failure event without a source is not actionable. Turning
+    /// it on loses the ability to correlate one attacker across events, which is
+    /// most of what a SIEM is for — a real trade, not a free improvement.
+    #[serde(default)]
+    pub syslog_redact_addresses: bool,
+
     /// OTLP gRPC endpoint.  Set to empty string to disable tracing.
     /// Example: "http://otel-collector:4317"
     pub otlp_endpoint: String,
@@ -1068,8 +1148,10 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            otlp_endpoint: String::new(), // disabled by default
-            trace_sample_rate: 0.01,      // 1%
+            otlp_endpoint: String::new(),
+            syslog_endpoint: String::new(),
+            syslog_redact_addresses: false, // disabled by default
+            trace_sample_rate: 0.01,        // 1%
             json_logs: false,
             max_spans_per_second: 1000,
         }
@@ -1917,9 +1999,57 @@ impl Default for ManagementConfig {
 /// validator rejects `tls_mode = "disabled"` unless `management.listen`
 /// is bound to `127.0.0.1` / `::1`, and rejects missing paths when a
 /// non-disabled mode is selected.
+/// Role-based access control for the management plane.
+///
+/// Off by default, and enabling is **default-deny**: an identity with no binding
+/// can do nothing. That means turning this on for a running deployment locks out
+/// every existing client until each is bound, which is why it is opt-in rather
+/// than a default somebody discovers during an incident.
+///
+/// ```toml
+/// [management.rbac]
+/// enabled = true
+///
+/// # Optional. Extends and can override the built-in viewer/operator/admin.
+/// [management.rbac.roles]
+/// oncall = ["node:drain", "stats:read", "allocations:read"]
+///
+/// # Certificate SHA-256 fingerprints, lower-case hex, no colons.
+/// #   openssl x509 -in client.pem -noout -fingerprint -sha256 \
+/// #     | cut -d= -f2 | tr -d : | tr 'A-Z' 'a-z'
+/// [management.rbac.bindings]
+/// "3fa1...c9" = ["admin"]
+/// "7bd2...04" = ["oncall"]
+/// ```
+///
+/// Bindings are by fingerprint rather than by a field inside the certificate.
+/// Reading a role from the OU would be less configuration and would hand
+/// authorisation to whoever signs certificates — for a private CA often the same
+/// person, but not always, and the moment it is not, the separation is the point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(Default)]
+pub struct RbacSection {
+    /// Enforce roles. Default-deny when true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Extra roles, merged over the built-ins. A name that matches a built-in
+    /// replaces it, so a deployment that finds `operator` too broad can narrow
+    /// it rather than inventing a parallel name.
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, Vec<String>>,
+    /// Certificate fingerprint to role names.
+    #[serde(default)]
+    pub bindings: std::collections::HashMap<String, Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GrpcConfigSection {
+    /// Role-based access control. See [`RbacSection`].
+    #[serde(default)]
+    pub rbac: RbacSection,
+
     /// One of: `"disabled"` (default), `"tls"`, `"mtls"`.
     pub tls_mode: String,
     /// Path to PEM with the server certificate. Required when
@@ -1936,6 +2066,7 @@ pub struct GrpcConfigSection {
 impl Default for GrpcConfigSection {
     fn default() -> Self {
         Self {
+            rbac: RbacSection::default(),
             tls_mode: "disabled".into(),
             tls_cert: String::new(),
             tls_key: String::new(),

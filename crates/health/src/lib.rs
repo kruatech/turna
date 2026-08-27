@@ -116,6 +116,14 @@ pub struct Metrics {
     /// unremarkable reading. Without that distinction a node whose sampler had
     /// died would look idle, which is the worst possible way to be wrong about
     /// load.
+    /// Security events written to the syslog collector, and lost.
+    ///
+    /// Mirrored from `SyslogExporter` by the node. `dropped` is the one to alert
+    /// on: a gap in a security log is worse than a visible failure, because an
+    /// investigation reads absence as "nothing happened".
+    pub syslog_sent: AtomicU64,
+    pub syslog_dropped: AtomicU64,
+
     pub host_cpu_percent: AtomicU64,
     pub host_memory_percent: AtomicU64,
 
@@ -404,6 +412,8 @@ impl Metrics {
             active_allocations: AtomicU64::new(0),
             total_allocations: AtomicU64::new(0),
             rates: RateSampler::new(),
+            syslog_sent: AtomicU64::new(0),
+            syslog_dropped: AtomicU64::new(0),
             host_cpu_percent: AtomicU64::new(u64::MAX),
             host_memory_percent: AtomicU64::new(u64::MAX),
             relay_ports_in_use: AtomicU64::new(0),
@@ -1081,6 +1091,12 @@ impl Metrics {
              # HELP turna_relay_ports_utilization_percent Percent of the relay port range in use\n\
              # TYPE turna_relay_ports_utilization_percent gauge\n\
              turna_relay_ports_utilization_percent {}\n\
+             # HELP turna_syslog_sent_total Security events written to the syslog collector\n\
+             # TYPE turna_syslog_sent_total counter\n\
+             turna_syslog_sent_total {}\n\
+             # HELP turna_syslog_dropped_total Security events lost: transport error, or a busy path under non-blocking\n\
+             # TYPE turna_syslog_dropped_total counter\n\
+             turna_syslog_dropped_total {}\n\
              # HELP turna_quic_readiness QUIC/WebTransport listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if QUIC disabled)\n\
              # TYPE turna_quic_readiness gauge\n\
              turna_quic_readiness {}\n\
@@ -1196,6 +1212,8 @@ impl Metrics {
                     .checked_div(total)
                     .map_or(0, |v| v.min(100))
             },
+            l(&self.syslog_sent),
+            l(&self.syslog_dropped),
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,

@@ -148,6 +148,51 @@ Depending on enabled features and runtime paths, `/metrics` may also include:
 listener is disabled or the feature is not compiled in, so a dashboard can be
 built once and stay valid.
 
+#### Security event export (`[observability] syslog_endpoint`)
+
+RFC 5424 syslog to a SIEM. Security-relevant events only — authentication
+failures, authorisation denials, peer refusals, rate-limit trips, audit entries,
+readiness transitions. Not relayed traffic: a SIEM billed per event that receives
+a line per frame gets switched off, and a switched-off SIEM catches nothing.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_syslog_sent_total` | counter | Events written to the collector. |
+| `turna_syslog_dropped_total` | counter | Events lost: transport error, or a busy path under `non_blocking`. **Alert on any sustained value.** A gap in a security log is worse than a visible failure, because an investigation reads absence as "nothing happened". |
+
+Dropping rather than blocking is deliberate. A collector that stops reading must
+not be able to stall the relay — security logging that can take the service down
+is a worse posture than logging that can gap, provided the gap is counted. It is.
+
+Addresses are sent verbatim by default. That is the opposite of the support
+bundle's choice, and for a reason: a SIEM is inside the operator's trust boundary
+and an authentication-failure event without a source is not actionable.
+`syslog_redact_addresses = true` hashes them, and loses cross-event correlation —
+which is most of what a SIEM is for.
+
+#### Dashboard
+
+`deploy/grafana/turna-overview.json`. Schema 39, which loads on Grafana 10 and 11.
+Import and pick a Prometheus datasource.
+
+Panels are ordered by the question an operator asks first — is it serving, then
+traffic, then refusals, then per-transport. Each panel's description says what the
+number *means* rather than restating its name, because a dashboard that needs a
+runbook open beside it is half a dashboard.
+
+Three panels are worth knowing about before an incident:
+
+**Send queue drops.** Non-zero means the node discarded media before sending it.
+Clients cannot see this, so a clean-looking loss measurement is not evidence
+against it — a capacity figure came out 27 % too high for exactly that reason.
+
+**Relay ports in use.** The blind spot until 2026-08-26. A range fills silently
+and the first symptom is `Allocate` failing. Alert here, not on allocation count.
+
+**Tenants aggregated away.** Non-zero means some tenants are inside `__other`
+rather than named. Not a fault — but if a specific tenant cannot be found, this is
+why.
+
 #### Relay port exhaustion
 
 `turna_relay_ports_utilization_percent` is the series to alert on, and it was

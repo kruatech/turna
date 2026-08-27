@@ -731,6 +731,83 @@ fn replay(files: &[PathBuf], key: Option<&[u8]>, cap: usize) -> Result<Replayed,
     })
 }
 
+/// Infrastructure events: things the node did that no RPC asked for.
+///
+/// The management RPCs already audit themselves. This covers what happens on the
+/// node's own initiative, which is where an auditor's first question usually
+/// lands — "what version was running, and who restarted it" is not answerable
+/// from a log of API calls.
+///
+/// The categories follow CIS Controls 8.2 and ISO 27001 A.12.4, narrowed to what
+/// this process can observe. Relayed traffic and allocations are deliberately not
+/// here: an audit log is read by a person looking for a decision, and one entry
+/// per allocation makes that impossible. Those are metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfraEvent {
+    /// Process started. Detail carries version and config path.
+    NodeStarted,
+    /// Process stopping, with the reason if known (signal, fatal error).
+    NodeStopping,
+    /// Configuration reloaded from disk — whether or not anything changed.
+    ///
+    /// Recorded even on a no-op reload: "the operator reloaded and it changed
+    /// nothing" is a different finding from "nobody touched it", and only one of
+    /// them is visible without this.
+    ConfigReloaded,
+    /// A certificate or key was replaced in a running listener.
+    CertRotated,
+    /// The shared secret or another credential was reloaded.
+    CredentialRotated,
+    /// Entered or left drain.
+    ///
+    /// An outage window is bounded by these entries and by nothing else the
+    /// system records.
+    DrainStateChanged,
+    /// Readiness moved — to degraded, or back.
+    ReadinessChanged,
+    /// A listener could not bind, or startup validation refused the config.
+    ///
+    /// The moment a control was supposed to engage and did not.
+    SecurityControlFailed,
+}
+
+impl InfraEvent {
+    /// The action string in the audit entry.
+    ///
+    /// Prefixed `infra.` so a reader can separate node-initiated events from RPC
+    /// ones at a glance, and so a SIEM rule can match a whole class.
+    pub fn action(self) -> &'static str {
+        match self {
+            InfraEvent::NodeStarted => "infra.node_started",
+            InfraEvent::NodeStopping => "infra.node_stopping",
+            InfraEvent::ConfigReloaded => "infra.config_reloaded",
+            InfraEvent::CertRotated => "infra.cert_rotated",
+            InfraEvent::CredentialRotated => "infra.credential_rotated",
+            InfraEvent::DrainStateChanged => "infra.drain_state_changed",
+            InfraEvent::ReadinessChanged => "infra.readiness_changed",
+            InfraEvent::SecurityControlFailed => "infra.security_control_failed",
+        }
+    }
+}
+
+impl AuditLog {
+    /// Record an event the node caused itself.
+    ///
+    /// The actor is `"system"` rather than an address or a certificate: nobody
+    /// authenticated, and writing a plausible-looking actor would make these
+    /// entries indistinguishable from ones where somebody did. An auditor
+    /// filtering for a human's actions must not find these.
+    ///
+    /// `ok` deserves more attention here than on an RPC. An RPC that fails
+    /// returns an error to a caller who notices; a certificate reload that fails
+    /// is invisible, because the node correctly keeps serving on the old
+    /// material. `outcome: false` on an infrastructure event is often the only
+    /// trace that a control did not engage.
+    pub fn record_infra(&self, event: InfraEvent, detail: &str, ok: bool) {
+        self.record("system", event.action(), detail, ok);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>turna connectivity check</title>
+<!--
+  Client-side connectivity diagnosis — §9's "client/network diagnostics".
+
+  Answers the question a support ticket actually starts from: "the call does not
+  connect and I do not know why". It runs from the client's own browser, on the
+  client's own network, which is the only place the answer exists — a server-side
+  check cannot see a proxy that stops packets from ever arriving.
+
+  That case is why this exists at all. A system HTTP proxy silently prevents
+  WebTransport: Chrome returns ERR_TUNNEL_CONNECTION_FAILED, zero packets reach
+  the node, and every server-side signal says "no client arrived" — true, and
+  useless. This page distinguishes "blocked before leaving your network" from
+  "the relay refused".
+
+  Deliberately a single file with no dependencies. A diagnostic that needs npm
+  install is one that does not get run by the person having the problem.
+-->
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  input, button { font: inherit; padding: .4rem; }
+  input { width: 22rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  td, th { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #ddd; vertical-align: top; }
+  .ok { color: #0a0; } .bad { color: #c00; } .warn { color: #a60; } .run { color: #888; }
+  .why { color: #555; font-size: .9em; }
+  pre { background: #f6f6f6; padding: .8rem; overflow-x: auto; font-size: .85em; }
+</style>
+
+<h1>turna connectivity check</h1>
+
+<p>Runs from your browser on your network. Fill in what your application uses and
+press Run. Nothing is sent anywhere except to the relay you name.</p>
+
+<p>
+  <label>TURN URL <input id="url" value="turns:turn.example.com:443?transport=tcp"></label><br>
+  <label>Username <input id="user" placeholder="from your application"></label><br>
+  <label>Credential <input id="cred" type="password" placeholder="from your application"></label>
+</p>
+<p><button id="go">Run</button> <span id="status" class="run"></span></p>
+
+<table id="results"><thead><tr><th>Check</th><th>Result</th><th>What it means</th></tr></thead><tbody></tbody></table>
+
+<h2>Details</h2>
+<pre id="log">—</pre>
+
+<script>
+const $ = s => document.querySelector(s);
+const rows = $('#results tbody');
+const logEl = $('#log');
+let logLines = [];
+
+function log(s) { logLines.push(s); logEl.textContent = logLines.join('\n'); }
+
+function row(name, verdict, cls, why) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${name}</td><td class="${cls}">${verdict}</td><td class="why">${why}</td>`;
+  rows.appendChild(tr);
+}
+
+// A candidate of type "relay" is the only proof a relay works. srflx proves STUN
+// reached the server; host candidates prove nothing about the network at all,
+// and a page that reported success on those would be worse than no page.
+function gather(iceServers, transportPolicy) {
+  return new Promise(resolve => {
+    const found = { host: 0, srflx: 0, relay: 0, relayProtocols: new Set() };
+    const errors = [];
+    let pc;
+    try {
+      pc = new RTCPeerConnection({ iceServers, iceTransportPolicy: transportPolicy });
+    } catch (e) {
+      resolve({ found, errors: ['RTCPeerConnection rejected the configuration: ' + e.message] });
+      return;
+    }
+    pc.onicecandidateerror = e => {
+      // 701 is "the STUN/TURN server could not be reached". The address in the
+      // event is the one the browser tried, which is what distinguishes a DNS
+      // problem from a blocked port.
+      errors.push(`${e.errorCode} ${e.errorText || ''} (${e.url || 'no url'})`.trim());
+    };
+    pc.onicecandidate = e => {
+      if (!e.candidate) { finish(); return; }
+      const c = e.candidate;
+      if (c.type in found) found[c.type]++;
+      if (c.type === 'relay') found.relayProtocols.add(c.protocol);
+      log(`  candidate: ${c.type} ${c.protocol} ${c.address || ''}`);
+    };
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { pc.close(); } catch {}
+      resolve({ found, errors });
+    };
+    // 12 s: long enough for a TCP TURN handshake over a slow link, short enough
+    // that somebody in a support call does not give up first.
+    setTimeout(finish, 12000);
+    pc.createDataChannel('probe');
+    pc.createOffer().then(o => pc.setLocalDescription(o)).catch(e => {
+      errors.push('createOffer failed: ' + e.message);
+      finish();
+    });
+  });
+}
+
+async function run() {
+  rows.innerHTML = ''; logLines = []; logEl.textContent = '';
+  $('#go').disabled = true;
+  $('#status').textContent = 'running…';
+
+  const url = $('#url').value.trim();
+  const user = $('#user').value.trim();
+  const cred = $('#cred').value;
+
+  // 1. Local network, no relay. Establishes that WebRTC works here at all — if
+  // this fails, nothing about the relay is knowable yet and every later result
+  // would be a red herring.
+  log('1. host candidates, no server');
+  const local = await gather([], 'all');
+  if (local.found.host > 0) {
+    row('WebRTC works locally', 'yes', 'ok',
+        'The browser can gather local candidates. Any failure below is about the network or the relay, not about WebRTC.');
+  } else {
+    row('WebRTC works locally', 'no', 'bad',
+        'No host candidates at all. Something is blocking WebRTC in this browser — an extension, a policy, or a privacy setting. Nothing below will be meaningful until this is fixed.');
+    finish();
+    return;
+  }
+
+  // 2. STUN only. Reaching STUN and not TURN localises the problem to the TURN
+  // credential or the TURN port, which are different fixes.
+  const stunUrl = url.replace(/^turns?:/, 'stun:').split('?')[0];
+  log(`2. STUN only (${stunUrl})`);
+  const stun = await gather([{ urls: stunUrl }], 'all');
+  if (stun.found.srflx > 0) {
+    row('STUN reachable', 'yes', 'ok',
+        'The server answered a Binding request, so UDP to that host and port is open and DNS resolves.');
+  } else {
+    row('STUN reachable', 'no', 'warn',
+        'No server-reflexive candidate. UDP to the relay is blocked, or the host does not resolve. Not fatal — TURNS over TCP 443 often works where this does not, which the next check tells you.');
+  }
+
+  // 3. Relay only. `relay` transport policy discards host and srflx candidates,
+  // so a success here cannot be a local connection mistaken for a relayed one.
+  if (!user || !cred) {
+    row('Relay reachable', 'not tested', 'warn',
+        'No credentials given. A TURN server refuses allocations without them, so this check needs the username and credential your application uses.');
+  } else {
+    log(`3. relay only (${url})`);
+    const relay = await gather([{ urls: url, username: user, credential: cred }], 'relay');
+    if (relay.found.relay > 0) {
+      const protos = [...relay.found.relayProtocols].join(', ');
+      row('Relay reachable', `yes (${protos})`, 'ok',
+          'An allocation was granted and a relay candidate gathered. This is the check that matters — the others are for narrowing down a failure of this one.');
+    } else {
+      const e = relay.errors.join('; ') || 'no candidate error reported';
+      let why;
+      if (/401|403|Unauthor|Forbidden/i.test(e)) {
+        why = 'The relay was reached and refused the credential. Wrong username or credential, an expired ephemeral credential, or the wrong realm. Not a network problem.';
+      } else if (/701/.test(e)) {
+        why = 'The relay could not be reached: blocked port, wrong hostname, or — if the URL is a turns:/WebTransport one — a system HTTP proxy. A proxy produces exactly this with zero packets arriving at the server, so the server-side logs will show nothing. Check your proxy settings.';
+      } else if (/certificate|TLS|SSL/i.test(e)) {
+        why = 'TLS failed. The relay certificate is not trusted by this browser, or something is terminating TLS in the middle — a TLS-terminating proxy in front of TURNS breaks it, because TURNS is not HTTP.';
+      } else {
+        why = 'No relay candidate and no clear error. Try the same URL with transport=tcp on port 443: firewalls that block 3478 and 5349 usually permit 443.';
+      }
+      row('Relay reachable', 'no', 'bad', why + `<br><br>Errors: ${e}`);
+    }
+  }
+
+  // 4. Same but forced over TCP 443, which is the configuration that works on
+  // the most restrictive networks. Reported separately because "UDP blocked but
+  // 443 works" is a complete answer for the operator, not a partial failure.
+  if (user && cred && !/transport=tcp/.test(url)) {
+    const tcpUrl = url.split('?')[0].replace(/^turn:/, 'turns:') + '?transport=tcp';
+    log(`4. relay over TCP (${tcpUrl})`);
+    const t = await gather([{ urls: tcpUrl, username: user, credential: cred }], 'relay');
+    if (t.found.relay > 0) {
+      row('Relay over TCP', 'yes', 'ok',
+          'TURNS over TCP works. If UDP failed above, configure your application to use this URL — it is the path that survives restrictive networks.');
+    } else {
+      row('Relay over TCP', 'no', 'warn',
+          'The TCP path did not work either. If both fail with 701, the traffic is not leaving this network: proxy, firewall, or DNS.');
+    }
+  }
+
+  finish();
+}
+
+function finish() {
+  $('#go').disabled = false;
+  $('#status').textContent = 'done';
+  log('\nTo attach this to a support ticket, copy the table above and this log.');
+}
+
+$('#go').addEventListener('click', run);
+</script>

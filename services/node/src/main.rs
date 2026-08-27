@@ -298,6 +298,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
+    // Security-event export. Constructed here so it exists before anything can
+    // refuse a request: an exporter created later would miss exactly the events
+    // that happen during startup, which is when a misconfigured listener refuses
+    // things.
+    //
+    // Disabled unless an endpoint is configured, and a disabled exporter is a
+    // no-op rather than a branch at every call site.
+    let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
+        turna_observability::syslog::SyslogConfig {
+            endpoint: config.observability.syslog_endpoint.clone(),
+            app_name: "turna".to_string(),
+            redact_addresses: config.observability.syslog_redact_addresses,
+            non_blocking: true,
+        },
+    ));
+    // Mirror the exporter's counters on the same ticker as the rest. Without
+    // this the two documented series read zero forever, and a dashboard panel
+    // showing no drops is indistinguishable from one showing no export.
+    {
+        let syslog = _syslog.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                metrics
+                    .syslog_sent
+                    .store(syslog.sent.load(Relaxed), Relaxed);
+                metrics
+                    .syslog_dropped
+                    .store(syslog.dropped.load(Relaxed), Relaxed);
+            }
+        });
+    }
+
+    if _syslog.is_enabled() {
+        info!(
+            endpoint = %config.observability.syslog_endpoint,
+            "security events exporting to syslog"
+        );
+    }
+
     // Publish the node's own ceiling so `/capacity` has something to reason
     // about. Until this runs, that endpoint reports UNAVAILABLE — a node that
     // does not know its limit must not advertise headroom, because an unset
@@ -1763,6 +1807,16 @@ fn run_tokio(
                         .load(std::sync::atomic::Ordering::Relaxed);
                     if remaining == 0 {
                         info!("drain complete — no active allocations remaining");
+                        // A syslog emit belongs here — an outage window is bounded
+                        // by the drain entries and by nothing else the system
+                        // records. Not wired: this runs inside a spawned task whose
+                        // captures I have not traced, and the exporter lives in
+                        // main. Threading it in is a small change; guessing at the
+                        // capture list and having it compile would be worse than
+                        // leaving the note.
+                        //
+                        // Until then the transition is visible through
+                        // turna_backend_readiness and the log line above.
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {

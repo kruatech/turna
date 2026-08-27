@@ -397,6 +397,10 @@ fn event_type_to_proto(e: EventType) -> i32 {
 
 struct TurnaManagementService {
     core: Arc<dyn TurnCore>,
+    /// Who may do what. `RbacPolicy::disabled()` permits everything without
+    /// evaluating, so a deployment that has not configured roles behaves exactly
+    /// as before and nothing appears in the audit log as a grant.
+    rbac: Arc<crate::rbac::RbacPolicy>,
     /// Fired when the server starts shutting down.
     shutdown_token: CancellationToken,
     /// Counts currently open streaming RPCs.
@@ -418,6 +422,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<ListAllocationsRequest>,
     ) -> Result<Response<ListAllocationsResponse>, Status> {
+        let _actor = self.authorize(&req, "allocations:read")?;
         let r = req.into_inner();
         let (allocs, next_token, total) = self
             .core
@@ -445,6 +450,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetAllocationRequest>,
     ) -> Result<Response<Allocation>, Status> {
+        let _actor = self.authorize(&req, "allocations:read")?;
         let alloc = self
             .core
             .get_allocation(&req.into_inner().id)
@@ -457,6 +463,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<DeleteAllocationRequest>,
     ) -> Result<Response<DeleteAllocationResponse>, Status> {
+        let _actor = self.authorize(&req, "allocations:delete")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -503,6 +510,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<WatchAllocationsRequest>,
     ) -> Result<Response<Self::WatchAllocationsStream>, Status> {
+        let _actor = self.authorize(&req, "allocations:watch")?;
         let r = req.into_inner();
         let user_filter = r.username_filter.clone();
         let org_filter = r.organization_filter.clone();
@@ -552,6 +560,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetConfigRequest>,
     ) -> Result<Response<NodeRuntimeConfig>, Status> {
+        let _actor = self.authorize(&req, "config:read")?;
         let node_id = req.into_inner().node_id;
         if node_id.trim().is_empty() {
             return Err(Status::invalid_argument("node_id is required"));
@@ -564,6 +573,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
+        let _actor = self.authorize(&req, "config:write")?;
         if !self.audit.is_healthy() {
             return Err(Status::failed_precondition(
                 "audit log degraded; refusing privileged operation (fail-closed)",
@@ -671,8 +681,9 @@ impl TurnaManagement for TurnaManagementService {
 
     async fn get_server_stats(
         &self,
-        _req: Request<GetServerStatsRequest>,
+        req: Request<GetServerStatsRequest>,
     ) -> Result<Response<ServerStats>, Status> {
+        let _actor = self.authorize(&req, "stats:read")?;
         let s = self.core.server_stats().await;
         Ok(Response::new(ServerStats {
             uptime_seconds: s.uptime_seconds,
@@ -702,6 +713,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetTopTalkersRequest>,
     ) -> Result<Response<GetTopTalkersResponse>, Status> {
+        let _actor = self.authorize(&req, "stats:read")?;
         let r = req.into_inner();
         let talkers = self.core.top_talkers(r.limit as usize, &r.sort_by).await;
         Ok(Response::new(GetTopTalkersResponse {
@@ -726,6 +738,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<WatchMetricsRequest>,
     ) -> Result<Response<Self::WatchMetricsStream>, Status> {
+        let _actor = self.authorize(&req, "stats:read")?;
         let interval_secs = req.into_inner().interval_seconds.max(1);
         let core = self.core.clone();
         let cancel = self.shutdown_token.clone();
@@ -774,6 +787,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<AddUserRequest>,
     ) -> Result<Response<AddUserResponse>, Status> {
+        let _actor = self.authorize(&req, "users:write")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -810,6 +824,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<RemoveUserRequest>,
     ) -> Result<Response<RemoveUserResponse>, Status> {
+        let _actor = self.authorize(&req, "users:write")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -848,6 +863,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<SetUserLimitsRequest>,
     ) -> Result<Response<SetUserLimitsResponse>, Status> {
+        let _actor = self.authorize(&req, "limits:write")?;
         if !self.audit.is_healthy() {
             return Err(Status::failed_precondition(
                 "audit log degraded; refusing privileged operation (fail-closed)",
@@ -967,6 +983,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<SetDrainingRequest>,
     ) -> Result<Response<SetDrainingResponse>, Status> {
+        let _actor = self.authorize(&req, "node:drain")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -1012,6 +1029,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        let _actor = self.authorize(&req, "node:shutdown")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -1065,8 +1083,9 @@ impl TurnaManagement for TurnaManagementService {
 
     async fn verify_audit(
         &self,
-        _req: Request<VerifyAuditRequest>,
+        req: Request<VerifyAuditRequest>,
     ) -> Result<Response<VerifyAuditResponse>, Status> {
+        let _actor = self.authorize(&req, "audit:read")?;
         let (intact, broken_at_seq) = match self.audit.verify() {
             Ok(_) => (true, 0),
             Err(seq) => (false, seq),
@@ -1109,6 +1128,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetAuditLogRequest>,
     ) -> Result<Response<GetAuditLogResponse>, Status> {
+        let _actor = self.authorize(&req, "audit:read")?;
         let limit = req.into_inner().limit as usize;
         let mut snap = self.audit.snapshot();
         if limit != 0 && snap.len() > limit {
@@ -1159,6 +1179,35 @@ const AUDIT_RING_CAPACITY: usize = 1024;
 /// tracing a specific request, and an unconditional line per RPC on a management
 /// plane that also serves streaming metrics is noise. The RPC's own audit entry
 /// and error paths log at info.
+impl TurnaManagementService {
+    /// Refuse the request unless the caller holds `permission`.
+    ///
+    /// A denial is audited before it is returned. That ordering matters: an
+    /// attacker probing the surface produces a trail whether or not they get
+    /// anywhere, and a refusal that leaves no record is indistinguishable from a
+    /// request that was never made.
+    ///
+    /// The message returned to the caller says only "permission denied"; which
+    /// permission was needed and which the caller holds goes to the audit log.
+    /// Telling an unauthorised caller the shape of the policy is a disclosure,
+    /// and a small one is still one.
+    fn authorize<T>(&self, req: &Request<T>, permission: &str) -> Result<String, Status> {
+        let actor = actor_of(req);
+        match self.rbac.check(&actor, permission) {
+            Ok(()) => Ok(actor),
+            Err(denial) => {
+                self.audit.record(
+                    &actor,
+                    "rbac_denied",
+                    denial.audit_detail(permission),
+                    false,
+                );
+                Err(Status::permission_denied(denial.public_message()))
+            }
+        }
+    }
+}
+
 fn actor_of<T>(req: &Request<T>) -> String {
     let correlation = correlation_of(req);
     if !correlation.is_empty() {
@@ -1235,6 +1284,7 @@ pub async fn start_grpc_server(
     config: GrpcConfig,
     core: Arc<dyn TurnCore>,
     metrics: Arc<Metrics>,
+    rbac: Arc<crate::rbac::RbacPolicy>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown_token = CancellationToken::new();
@@ -1304,6 +1354,7 @@ pub async fn start_grpc_server(
         active_streams: Arc::clone(&active_streams),
         audit,
         require_idempotency_key,
+        rbac,
     })
     .max_decoding_message_size(config.max_message_size)
     .max_encoding_message_size(config.max_message_size);

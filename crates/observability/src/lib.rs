@@ -15,6 +15,7 @@
 //! // _guard must be kept alive for the duration of the process.
 //! ```
 
+pub mod syslog;
 pub mod telemetry;
 
 pub use telemetry::{
