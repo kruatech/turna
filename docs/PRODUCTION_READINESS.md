@@ -241,6 +241,35 @@ a finished-but-unverified feature; this is a *build* mismatch.
 - **Mitigation:** build with the features you configure; the error message names
   the required flag.
 
+### R12 — the node did not exit on `SIGTERM` (fixed 2026-08-28)
+
+**Every restart on every node, in every configuration.** `Runtime::drop` waits for
+each spawned task, and four metric tickers loop forever by design — one says "Runs
+until process exit" in its own comment. So the drop blocked and the process stayed
+alive until something killed it.
+
+Measured before: alive past 45 s after `SIGTERM`, two threads remaining, one a
+worker in `hrtimer_nanosleep`. After `rt.shutdown_timeout(5s)`: exits in ~12 s with
+status 0.
+
+*Impact while it existed:* an orchestrator waited out its termination grace period
+on every rollout and then killed hard. Drain itself was correct — allocations were
+released and `all allocations drained` appears in the log within milliseconds — so
+the symptom looked like a slow shutdown rather than a failure.
+
+*Why it survived:* the wait came after the last line anything writes, so logs ended
+looking clean. And every verification script finished by killing the node with
+`SIGKILL`, so none of them could observe it. `scripts/verify/dtls-demux.sh` was the
+first to *assert* that the node exits on its own, and found it on its first clean
+run.
+
+*Generalisable:* a check that observes a process is weaker than one that requires a
+result. Nine scripts watched shutdown happen; the tenth demanded it complete, and
+only that one worked.
+
+*Action for operators:* if your termination grace period was lengthened because
+turna "took a while to stop", it can be shortened.
+
 ### R5 — Cluster gossip must be authenticated on any shared network
 
 An empty `cluster.cluster_secret` leaves gossip unauthenticated. That is useful
@@ -295,6 +324,25 @@ and never reaches the nodes.
   active allocations on the serving node); periodic refresh propagates
   additions/updates, not deletions.
 
+### R13 — the shared secret cannot be rotated without a restart
+
+Measured 2026-08-28: `SIGHUP` is not handled (zero references in
+`services/node/src/main.rs`), and `UpdateConfig` carries `max_allocations`,
+`max_allocations_per_user` and `max_bytes_per_sec_per_allocation` — not the secret.
+
+So `[turn.auth] shared_secret` changes only with a restart. Certificate rotation
+*is* hot and verified under load (0 → 1, no failures, 36 021 frames relayed with
+zero errors across the swap); the secret is not.
+
+This matters because the shared secret is the credential a leak would force you to
+change, and changing it means a rolling restart of every node.
+
+*Mitigating:* ephemeral credentials derived from it carry a TTL, so ones already
+issued expire on their own. The secret itself still needs the restart.
+
+*Action:* plan secret rotation as a rolling upgrade, not as a config reload. Three
+possible fixes are recorded in `docs/OPEN-DECISIONS.md`.
+
 ## Metrics to watch first
 
 | Metric | Why it matters |
@@ -324,6 +372,47 @@ See [OBSERVABILITY.md](OBSERVABILITY.md) and `docs/alerts/turna.yml` for the
 starter alert set.
 
 ## Verification status
+
+### 2026-08-28 — measured, not argued
+
+| what | result |
+|---|---|
+| Packet-rate ceiling, 32-thread Threadripper 1950X | **112 000 pps**, 120 s, zero loss, zero egress drops. Measured twice, identically. |
+| Shape above the ceiling | **A cliff, not a slope.** 120 000 fails; 128 000 sheds a million frames in two minutes. There is no warning band. |
+| DTLS demux path | 9 of 9. Both §7 P0 requirements confirmed: certificate hot-reload, and the per-IP handshake limiter refusing 15 handshakes before any DTLS state existed. |
+| Mixed UDP + TURNS | No node interference. Zero loss on both transports in both phases, no egress drops. |
+| Air-gap | 7 of 7, re-verified after all of the above. |
+| Reproducible builds | 3 of 3 binaries byte-identical from different build directories. |
+| Certificate rotation under load | 0 → 1, no failures, media uninterrupted. |
+| Drain with abandoned allocations | 1 s, down from the full 30 s timeout. |
+| Node exits on `SIGTERM` | Now yes — see R12. It did not before. |
+
+**A node at 110 000 pps looks perfectly healthy and is one traffic bump from losing
+6 % of media.** That is the operationally important part, more than the number
+itself: run at a fraction of the measured ceiling, and watch
+`turna_send_queue_dropped_total`, which is the counter that sees what a
+client-side loss measurement cannot.
+
+### What the same runs did not establish
+
+**The mixed-load result held the wrong thing constant.** Loss was zero throughout,
+and the TLS *generator* sent 17 % fewer frames in the mixed phase (72 012 → 60 010)
+while UDP sent the same (180 060 → 180 059). The node delivered everything it was
+given; the two generators were competing for the cores they share. Generators on
+separate hosts would settle it.
+
+**The demux path has no 24-hour run.** Nine checks over five minutes say it is
+correct. The stock path holds the default on the strength of a recorded 24 hours,
+and correctness is a different claim from stability.
+
+**`turna_dtls_handshake_failures_total` did not move** on malformed input.
+Possibly correct — the datagram may be discarded before the DTLS state machine
+engages — but that check did not exercise the counter.
+
+Full record: `docs/verification/runs-2026-08-28.md`, including three conclusions of
+mine that the runs overturned.
+
+### Earlier
 
 | Area | Current verification expectation |
 |---|---|

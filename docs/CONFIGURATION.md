@@ -324,6 +324,175 @@ and `CAP_NET_RAW`. Any failure aborts startup.
 
 ---
 
+## `[turn.relay]` — capacity thresholds
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `max_packets_per_sec` | u64 | `0` | Relayed packets/second this node can carry, from a measurement. `0` leaves the rate reported by `/capacity` and **not judged**. |
+| `rate_soft_percent` | u64 | `60` | Percent of the above at which `/capacity` reports `DEGRADED`. |
+| `rate_hard_percent` | u64 | `80` | Percent at which it reports `SATURATED`. |
+| `drain_timeout_secs` | u64 | `30` | How long shutdown waits for allocations to end. |
+
+**Measure `max_packets_per_sec`; do not estimate it.**
+`scripts/verify/capacity-profile.sh` on the hardware in question. A figure from
+other hardware is worse than none, because it looks measured.
+
+**Why 60/80 and not the 75/95 the allocation thresholds use.** The failure shapes
+differ. Allocations degrade gracefully: at the cap no new allocation is granted and
+every existing client keeps working. Packet rate does not degrade at all and then
+falls off a cliff — measured on a 32-thread host, clean at 112 000 pps, failing at
+120 000, shedding a million frames in two minutes at 128 000. Seven percent between
+perfect and broken.
+
+At 80 % that leaves 30 400 pps of headroom before the cliff. At 90 % it would leave
+19 200, which at these rates is seconds of traffic growth.
+
+**`drain_timeout_secs` is a bound, not a target.** The drain loop also exits early
+when three consecutive polls remove nothing: a node whose clients vanished without
+a `Refresh(0)` holds allocations that cannot expire inside a 30-second window, so
+it used to pay the full timeout with nothing to wait for. Measured after the
+change: 1 second. A node draining live traffic is unaffected — its allocations end,
+the count moves, and the loop keeps waiting.
+
+---
+
+## `[grpc.rbac]` — management-plane access control
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Enforce roles. **Default-deny when true.** |
+| `roles` | map of name → list of permissions | `{}` | Extends and can override the built-ins. |
+| `bindings` | map of fingerprint → list of role names | `{}` | SHA-256 certificate fingerprints, lower-case hex, no colons. |
+
+```toml
+[grpc.rbac]
+enabled = true
+
+[grpc.rbac.roles]
+oncall = ["node:drain", "stats:read", "allocations:read"]
+
+[grpc.rbac.bindings]
+"3fa1...c9" = ["admin"]
+"7bd2...04" = ["oncall"]
+```
+
+Get a fingerprint with:
+
+```sh
+openssl x509 -in client.pem -noout -fingerprint -sha256 | cut -d= -f2 | tr -d : | tr 'A-Z' 'a-z'
+```
+
+Built-in roles, which `roles` may extend or replace: `viewer` (everything that
+cannot change state), `operator` (the above plus freeing an allocation, adjusting
+a user's limits, draining a node), `admin` (everything, including
+`node:shutdown`).
+
+`shutdown` is in `admin` alone. Draining is a rolling upgrade and happens weekly;
+shutting a node down is not, and no amount of care makes it reversible.
+
+**Enabling this on a running deployment locks out every client until each is
+bound.** That is why it is opt-in rather than a default somebody discovers during
+an incident. Startup refuses `enabled = true` with no bindings, because there is no
+reading of that which anybody meant.
+
+Roles live in configuration rather than in code because the interesting roles are
+the ones nobody anticipated, and a hardcoded set makes each new one a release.
+
+---
+
+## `[grpc] revocation_list` — revoking a client certificate
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `revocation_list` | string | `""` | Path to a file of SHA-256 fingerprints that may not be used. Empty disables it. |
+
+```text
+# laptop lost 2026-08-14, ticket OPS-4471
+3fa1c9...  # alice@example.com, issued 2026-06-01
+7bd204...
+```
+
+Colons and upper case are accepted, because that is what
+`openssl x509 -fingerprint -sha256` emits and an operator pasting its output
+should not have to know otherwise.
+
+**This is not RFC 5280 CRL.** No CA-signed list, no `nextUpdate` freshness rule, no
+distribution point. It is a local deny-list checked when an RPC arrives, so a
+revoked client completes the TLS handshake and is refused on its first call. If a
+compliance regime names CRL or OCSP specifically, this does not satisfy it — see
+`docs/security/mtls-revocation.md`.
+
+What it has that CRL cannot have here: **it works with no route off the host.** A
+CRL has to reach the node from the CA, and the deployments that most need
+revocation are the air-gapped ones. OCSP is worse for the same reason — it needs a
+reachable responder, and configuring it in an air-gapped contour means either
+failing every handshake or soft-fail, which is the absence of revocation with the
+appearance of it.
+
+**Fail-closed.** A configured path that cannot be read stops the node from
+starting, and a malformed line is an error naming the line. A list that is
+configured and silently empty looks like protection and is not.
+
+Checked **before** RBAC. Both refusals return `permission_denied`, so the order
+looks cosmetic and is not: a revoked certificate that also lacks the permission
+would be audited as a missing role, an operator reading that would grant the role,
+and the revoked certificate would then work.
+
+---
+
+## `[observability]` — security export and log content
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `syslog_endpoint` | string | `""` | `udp://host:514` or `tcp://host:601`. Empty disables export. |
+| `syslog_redact_addresses` | bool | `false` | Hash client addresses before sending them. |
+| `log_allocation_addresses` | bool | `true` | Log client IP addresses on the three per-allocation INFO lines. |
+| `node_audit_path` | string | `""` | Where the node writes its audit chain. Empty keeps it in memory only. |
+| `node_audit_entries` | usize | `256` | Entries kept in the in-memory ring. |
+
+**`syslog_endpoint` carries security events only** — authentication failures,
+authorisation denials, peer refusals, rate-limit trips, audit entries, readiness
+transitions. Not relayed traffic. A SIEM billed per event that receives a line per
+frame gets switched off, and a switched-off SIEM catches nothing.
+
+Dropping rather than blocking when the collector is slow, with the drops counted in
+`turna_syslog_dropped_total`. Security logging that can stall the relay is a worse
+posture than logging that can gap visibly. **Alert on that counter**: a silent gap
+in a security log is worse than a visible failure, because an investigation reads
+absence as "nothing happened".
+
+**`syslog_redact_addresses` defaults to false, and that is deliberate.** A SIEM is
+inside the operator's trust boundary, and an authentication-failure event without a
+source is not actionable. Turning it on loses the ability to correlate one attacker
+across events, which is most of what a SIEM is for.
+
+**`log_allocation_addresses` is named for its scope.** It covers three INFO lines
+in the relay — allocation created, TCP allocation created, allocation migrated —
+and nothing else. Those are per-allocation, so a busy node writes one line
+containing a client address for every allocation it grants: 13.7 million of them in
+this project's own three-hour soak.
+
+It defaults to `true`, which is not the privacy-forward choice. `src` on the
+allocation line is the field an operator correlates a complaint against, and
+removing it silently in an upgrade breaks what logs are used for. Set it false and
+those addresses log as `ip-<12 hex>` under a per-process salt.
+
+**What it does not cover:** ten WARN lines in the TURNS, QUIC and SCTP transports
+also carry an address, deliberately outside this switch. All ten are *refusals* —
+a per-IP cap, a rate limit, a session ceiling — so the volume is bounded by attacks
+rather than by traffic, and the address is the most useful part: "who is being
+refused" cannot be acted on without it. A deployment that must log no client
+address anywhere cannot get that from configuration today.
+See `docs/security/log-data-audit-transports.md`.
+
+**`node_audit_path`** makes the node's own audit chain persistent. On startup the
+existing chain is replayed and **verified**, `seq` resumes across rotation
+boundaries, and a break fails closed. That is what makes start and stop events
+worth recording there as well as in syslog: the chain survives the restart they
+describe, and syslog puts them where a compromised node cannot reach them.
+
+---
+
 ## Metrics (Prometheus)
 
 Exposed on `[health].listen` `/metrics`. Transport-relevant series:

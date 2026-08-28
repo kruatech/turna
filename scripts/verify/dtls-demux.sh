@@ -76,6 +76,12 @@ mkdir -p "$OUT"
 REPORT="$OUT/verification.md"
 
 PASS=0; FAIL=0; SKIP=0
+# The two §7 P0 requirements, tracked by name rather than inferred from the tally.
+# The report used to key on "did anything skip", which made it name the wrong check:
+# it denied the rate limiter on a run where the limiter passed and the *failures
+# counter* was the skip.
+P0_CERT=no
+P0_RATELIMIT=no
 say()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 ok()   { PASS=$((PASS+1)); say "  pass  $1"; printf -- '- **pass** %s\n' "$1" >> "$REPORT"; }
 bad()  { FAIL=$((FAIL+1)); say "  FAIL  $1"; printf -- '- **FAIL** %s\n' "$1" >> "$REPORT"; }
@@ -262,6 +268,7 @@ if [ -z "$RELOADS_AFTER" ]; then
   skip "turna_dtls_cert_reloads_total is not exported — the counter exists in DtlsStats but the node may not mirror it. A finding about observability, not about the reload."
 elif [ "${RELOADS_AFTER:-0}" -gt "${RELOADS_BEFORE:-0}" ]; then
   ok "certificate reloaded live (${RELOADS_BEFORE:-0} -> $RELOADS_AFTER)"
+  P0_CERT=yes
   if [ "${RELOAD_FAILS:-0}" = "0" ]; then
     ok "no reload failures — old material would have stayed in service"
   else
@@ -310,6 +317,7 @@ if [ -z "$REJECTED_AFTER" ]; then
   skip "turna_dtls_rejected_rate_limit_total is not exported; cannot confirm the limiter fired"
 elif [ "${REJECTED_AFTER:-0}" -gt "${REJECTED_BEFORE:-0}" ]; then
   ok "handshake rate limiter fired ($(( REJECTED_AFTER - REJECTED_BEFORE )) refused before any DTLS state was created)"
+  P0_RATELIMIT=yes
 else
   bad "the limiter did not fire at $(( HANDSHAKE_LIMIT * 6 )) attempts against a limit of $HANDSHAKE_LIMIT. Either the config key is not reaching the limiter, or the attempts were spread over more than a second — check limit.err for how many actually started."
 fi
@@ -385,7 +393,7 @@ NODE_PID=""
   echo
   echo "## What this establishes"
   echo
-  if [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
+  if [ "$FAIL" -eq 0 ] && [ "$P0_CERT" = "yes" ] && [ "$P0_RATELIMIT" = "yes" ]; then
     cat <<'GOOD'
 The demux path relays correctly, handles concurrent handshakes, reloads
 certificates live, and rate-limits handshakes per source — the last two being the
@@ -394,6 +402,26 @@ certificates live, and rate-limits handshakes per source — the last two being 
 That is the evidence the default-flip decision was missing.
 GOOD
   elif [ "$FAIL" -eq 0 ]; then
+    # Assembled from which P0 was established, not from whether anything skipped.
+    printf 'The demux path relays correctly and handles concurrent handshakes.\n\n'
+    if [ "$P0_CERT" = "yes" ]; then
+      printf 'Certificate hot-reload: **confirmed**.\n'
+    else
+      printf 'Certificate hot-reload: **not confirmed** by this run.\n'
+    fi
+    if [ "$P0_RATELIMIT" = "yes" ]; then
+      printf 'Per-IP handshake rate limit: **confirmed**.\n'
+    else
+      printf 'Per-IP handshake rate limit: **not confirmed** by this run.\n'
+    fi
+    printf '\nBoth are §7 P0 requirements that the stock path cannot provide, for\n'
+    printf 'structural reasons: listen() fixes its certificate at bind time, and the\n'
+    printf 'handshake completes below accept() where nothing can rate-limit it.\n'
+    if [ "$SKIP" -gt 0 ]; then
+      printf '\n%d check(s) were skipped — see above for which and why. A skip is not a\n' "$SKIP"
+      printf 'failure and not a pass; it means this run did not exercise that check.\n'
+    fi
+  elif false; then
     # An earlier version printed the paragraph above whenever nothing failed,
     # including when the rate-limit check had been skipped. It claimed the path
     # rate-limits handshakes on the strength of a check that did not run — a
