@@ -748,7 +748,7 @@ fn run_tokio(
         .enable_all()
         .build()?;
 
-    rt.block_on(async {
+    let result = rt.block_on(async {
     let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
         turna_observability::syslog::SyslogConfig {
             endpoint: config.observability.syslog_endpoint.clone(),
@@ -2347,7 +2347,28 @@ fn run_tokio(
         .await;
 
         datapath_result
-    })
+    });
+
+    // Explicit shutdown, not an implicit drop.
+    //
+    // `Runtime::drop` waits for every spawned task to finish. Four metric tickers
+    // loop forever by design — one says "Runs until process exit" in its own
+    // comment — so the drop blocked and the process never exited on SIGTERM.
+    //
+    // Measured before this change: still alive past 45 seconds, two threads left,
+    // one of them a worker in `hrtimer_nanosleep`. Drain had completed in
+    // milliseconds and every `join_within_budget` above had returned, so the wait
+    // was after the last line anything writes — which is why the log ends looking
+    // like a clean shutdown and no verification caught it. The scripts all killed
+    // the node with SIGKILL at the end.
+    //
+    // Not specific to any transport: measured the same with the stock DTLS
+    // listener and with DTLS disabled entirely.
+    //
+    // 5 seconds because everything that must flush has already been joined with
+    // its own budget. What remains has nothing to flush.
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    result
 }
 
 /// Exposes cluster membership to the health server's GET /cluster endpoint.
