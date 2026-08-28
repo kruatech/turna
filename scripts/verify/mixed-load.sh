@@ -182,9 +182,9 @@ udp_driver() {
 }
 
 tls_driver() {
-  "$REPO/$LOAD" --server "127.0.0.1:$TURN_PORT" --secret "$SECRET" \
+  "$REPO/$LOAD" --server "127.0.0.1:$TLS_PORT" --secret "$SECRET" \
     --duration "$PHASE_SECS" --warmup "$WARMUP" --json \
-    tls --tls-addr "127.0.0.1:$TLS_PORT" --server-name localhost --insecure \
+    tls --channel-data --server-name localhost \
     -c "$TLS_CONC" --pps "$TLS_PPS" --payload "$PAYLOAD"
 }
 
