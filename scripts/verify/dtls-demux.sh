@@ -205,10 +205,20 @@ else
   exit 1
 fi
 
-if [ "$(metric turna_dtls_readiness)" = "1" ]; then
+# Polled, not read once. `start_node` waits for /ready, which is the node's
+# readiness and not the DTLS listener's — the listener can still be coming up. A
+# single read there reported a failure that a curl three seconds later contradicted.
+readiness_deadline=$(( $(date +%s) + 15 ))
+dtls_ready=""
+while [ "$(date +%s)" -lt "$readiness_deadline" ]; do
+  dtls_ready=$(metric turna_dtls_readiness)
+  [ "$dtls_ready" = "1" ] && break
+  sleep 1
+done
+if [ "$dtls_ready" = "1" ]; then
   ok "DTLS listener reports ready"
 else
-  bad "turna_dtls_readiness is not 1 — the listener bound but does not consider itself up"
+  bad "turna_dtls_readiness is ${dtls_ready:-absent} after 15s, not 1. 2 means degraded and 3 draining; absent means the series is not exported at all, which is a different problem from the listener being down."
 fi
 
 # ── 1 and 2: relays, and concurrently ─────────────────────────────────────
@@ -290,7 +300,10 @@ while [ "$(date +%s)" -lt "$burst_deadline" ]; do
   sleep 1
 done
 for pid in $BURST_PIDS; do kill -KILL "$pid" 2>/dev/null; done
-wait 2>/dev/null
+# Per-pid, not a bare `wait`. A bare one waits for every background job in the
+# shell — including the node itself, which is not going to exit — and that is
+# where the run was stopping despite the deadline above.
+for pid in $BURST_PIDS; do wait "$pid" 2>/dev/null; done
 REJECTED_AFTER=$(metric turna_dtls_rejected_rate_limit_total)
 
 if [ -z "$REJECTED_AFTER" ]; then
