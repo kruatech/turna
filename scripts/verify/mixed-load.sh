@@ -267,6 +267,47 @@ usable() {
   [ "${1:-0}" -gt 0 ] && [ "$(python3 -c "print(1 if float('${2:-100}') < 50 else 0)")" = "1" ]
 }
 
+# Throughput, not just loss.
+#
+# The first clean run passed 4/4 with a 0.0000 pp delta both ways — and the TLS
+# driver had sent 17% fewer frames in the mixed phase than solo (72012 -> 60010)
+# while UDP sent the same (180060 -> 180059). Loss was zero throughout, so a
+# loss-delta check could not see it.
+#
+# The node delivered everything it was given; what degraded was the TLS generator,
+# competing with the UDP generator for the cores they share. That is worth
+# reporting, because four green lines otherwise read as "measured under equal
+# conditions".
+sent_of() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    print(json.loads(open(sys.argv[1]).read().strip().splitlines()[-1]).get("sent", 0))
+except Exception:
+    print(0)
+PY
+}
+UDP_SOLO_SENT=$(sent_of "$OUT/udp-solo.json")
+UDP_MIX_SENT=$(sent_of "$OUT/udp-mixed.json")
+TLS_SOLO_SENT=$(sent_of "$OUT/tls-solo.json")
+TLS_MIX_SENT=$(sent_of "$OUT/tls-mixed.json")
+
+for pair in "UDP $UDP_SOLO_SENT $UDP_MIX_SENT" "TURNS $TLS_SOLO_SENT $TLS_MIX_SENT"; do
+  set -- $pair
+  name=$1; solo=$2; mix=$3
+  [ "${solo:-0}" -gt 0 ] || continue
+  drop=$(python3 -c "print(int((1 - $mix / $solo) * 100))")
+  if [ "$drop" -gt 10 ]; then
+    say "  note  the $name generator sent ${drop}% fewer frames in the mixed phase ($solo -> $mix)."
+    say "        The node delivered all of them, so this is generator contention,"
+    say "        not node interference — but the two phases were not equal, and a"
+    say "        loss delta between unequal phases understates what a real"
+    say "        deployment would see. Generators on other hosts would settle it."
+    printf -- '- note the %s generator sent %s%%%s fewer frames mixed (%s -> %s); the phases were not equal\n' \
+      "$name" "$drop" "" "$solo" "$mix" >> "$REPORT"
+  fi
+done
+
 if ! usable "$UDP_SOLO_RECV" "$UDP_SOLO_LOSS"; then
   skip_cmp "UDP" "the solo phase relayed nothing usable (${UDP_SOLO_RECV:-0} frames, ${UDP_SOLO_LOSS}% loss) — no baseline to compare against"
 elif [ "$(over "$UDP_SOLO_LOSS" "$UDP_MIX_LOSS")" = "1" ]; then

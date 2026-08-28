@@ -339,14 +339,38 @@ fi
 
 # ── 6: drain releases the socket ──────────────────────────────────────────
 say "check 6: drain releases the listener"
+START_WAIT=$(date +%s)
 kill -TERM "$NODE_PID" 2>/dev/null
-WAITED=0
-while kill -0 "$NODE_PID" 2>/dev/null && [ "$WAITED" -lt 45 ]; do sleep 1; WAITED=$((WAITED+1)); done
-if kill -0 "$NODE_PID" 2>/dev/null; then
-  bad "node still running after ${WAITED}s. The demux path owns the socket, so it must also release it — a listener that survives drain blocks the replacement from binding."
-  kill -KILL "$NODE_PID" 2>/dev/null
+
+# `wait`, not `kill -0` in a loop.
+#
+# The node is a background job of this shell, so when it exits it becomes a zombie
+# until reaped — and `kill -0` succeeds on a zombie, because the process table
+# entry is still there. The previous version watched an already-dead node for 45
+# seconds and reported "still running", which I read as the demux path failing to
+# release its socket. The node had drained in two seconds and exited: its log ends
+# with `all allocations drained`, zero panics, and nothing remained afterwards.
+#
+# A watchdog still catches a genuine hang, so the check keeps the failure it was
+# written to find.
+( sleep 45; kill -KILL "$NODE_PID" 2>/dev/null ) 2>/dev/null &
+WATCHDOG=$!
+wait "$NODE_PID" 2>/dev/null
+NODE_RC=$?
+kill -KILL "$WATCHDOG" 2>/dev/null
+wait "$WATCHDOG" 2>/dev/null
+WAITED=$(( $(date +%s) - START_WAIT ))
+
+# 137 is SIGKILL — the watchdog fired, so it really did hang. Anything else means
+# it exited on its own, including a non-zero status worth mentioning.
+if [ "$NODE_RC" = "137" ]; then
+  bad "node did not exit within ${WAITED}s and had to be killed. The demux path owns the socket, so it must also release it — a listener that survives drain blocks the replacement from binding."
 else
-  ok "exited in ${WAITED}s"
+  if [ "$NODE_RC" = "0" ] || [ "$NODE_RC" = "143" ]; then
+    ok "exited in ${WAITED}s (status $NODE_RC)"
+  else
+    bad "exited in ${WAITED}s with status $NODE_RC — it did release the socket, but not cleanly. Check node.log."
+  fi
   sleep 1
   if ss -uln 2>/dev/null | grep -q ":$DTLS_PORT "; then
     bad "UDP $DTLS_PORT is still bound after exit"

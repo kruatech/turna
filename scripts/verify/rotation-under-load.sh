@@ -104,7 +104,7 @@ enabled   = true
 listen    = "127.0.0.1:$TLS_PORT"
 cert_path = "$REPO/$OUT/live.crt"
 key_path  = "$REPO/$OUT/live.key"
-cert_reload_interval_secs = 5
+cert_reload_secs = 5
 [health]
 listen = "127.0.0.1:$HEALTH_PORT"
 [signaling]
@@ -174,7 +174,24 @@ PY
 fi
 
 # ── shared secret ─────────────────────────────────────────────────────────
-if [ "$ONLY" = "both" ] || [ "$ONLY" = "secret" ]; then
+# The secret half is disabled, because the mechanism it tested does not exist.
+#
+# It sent SIGHUP to reload the config. The node does not handle SIGHUP — zero
+# references in services/node/src/main.rs — so it died, and the next check ("the
+# old secret no longer grants allocations") passed against a dead node. It would
+# have passed against any dead node.
+#
+# There is no hot rotation of shared_secret by any route: UpdateConfig carries
+# max_allocations, max_allocations_per_user and max_bytes_per_sec_per_allocation,
+# and not the secret.
+#
+# So §7's "credential rotation without downtime" holds for certificates —
+# verified above, 0 -> 1 with media uninterrupted — and does not hold for the
+# shared secret, which needs a restart. That is recorded in
+# docs/verification/ rather than tested by a check that cannot pass honestly.
+#
+# Set ROTATE_SECRET=1 to run it anyway, once a mechanism exists.
+if [ "${ROTATE_SECRET:-0}" = "1" ] && { [ "$ONLY" = "both" ] || [ "$ONLY" = "secret" ]; }; then
   say "secret rotation: starting $DURATION s of media on the old secret"
   "$REPO/$LOAD" --server "127.0.0.1:$TURN_PORT" --secret "$SECRET_OLD" \
     --source-ips 32 --duration "$DURATION" --warmup 10 --json \
