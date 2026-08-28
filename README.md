@@ -12,7 +12,7 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 
 ## Status
 
-**Production GA (`0.3.1`).** The default **Tokio datapath** is the primary supported path:
+**Production GA (`0.4.0`).** The default **Tokio datapath** is the primary supported path:
 STUN binding, the TURN allocation lifecycle, long-term-credential and JWT auth,
 Prometheus/OpenTelemetry, config validation, durable runtime configuration,
 per-subject limits, and graceful drain.
@@ -298,7 +298,7 @@ Workspace crates can be consumed via a git dependency:
 
 ```toml
 [dependencies]
-turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.1" }
+turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.4.0" }
 ```
 
 ## Development

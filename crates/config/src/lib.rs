@@ -1274,7 +1274,7 @@ impl Default for ObservabilityConfig {
             log_allocation_addresses: true,
             node_audit_entries: 256,
             node_audit_path: String::new(), // disabled by default
-            trace_sample_rate: 0.01, // 1%
+            trace_sample_rate: 0.01,        // 1%
             json_logs: false,
             max_spans_per_second: 1000,
         }

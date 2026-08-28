@@ -9,7 +9,9 @@ this repository, and point out the decision that has to come first.
 
 ## The decision before the decision
 
-**turna is 0.3.1.** Under semver, a 0.x version declares that anything may change.
+**turna is 0.4.0.** Under semver, a 0.x version declares that anything may change
+— and this release uses that latitude: shutdown behaviour changed and twenty-three
+configuration keys were added.
 An LTS channel promises the opposite.
 
 Offering LTS on 0.3 is not impossible — plenty of projects do it — but it means
