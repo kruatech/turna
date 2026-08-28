@@ -76,6 +76,11 @@ PASS=0; FAIL=0
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 ok()  { PASS=$((PASS+1)); say "  pass  $1"; }
 bad() { FAIL=$((FAIL+1)); say "  FAIL  $1"; }
+SKIP=0
+# Neither a pass nor a failure. The transport may be fine; this run cannot say,
+# and a clean delta between two broken phases — 100% loss minus 100% loss — looks
+# exactly like a pass.
+skip_cmp() { SKIP=$((SKIP+1)); say "  skip  $1 comparison — $2"; }
 
 NODE=target/release/turna-node
 LOAD=target/release/turna-load-test
@@ -258,13 +263,21 @@ TLS_DELTA=$(delta "$TLS_SOLO_LOSS" "$TLS_MIX_LOSS")
   printf '| TURNS | %s%% | %s%% | %s pp |\n' "$TLS_SOLO_LOSS" "$TLS_MIX_LOSS" "$TLS_DELTA"
 } >> "$SUMMARY"
 
-if [ "$(over "$UDP_SOLO_LOSS" "$UDP_MIX_LOSS")" = "1" ]; then
+usable() {
+  [ "${1:-0}" -gt 0 ] && [ "$(python3 -c "print(1 if float('${2:-100}') < 50 else 0)")" = "1" ]
+}
+
+if ! usable "$UDP_SOLO_RECV" "$UDP_SOLO_LOSS"; then
+  skip_cmp "UDP" "the solo phase relayed nothing usable (${UDP_SOLO_RECV:-0} frames, ${UDP_SOLO_LOSS}% loss) — no baseline to compare against"
+elif [ "$(over "$UDP_SOLO_LOSS" "$UDP_MIX_LOSS")" = "1" ]; then
   bad "UDP degraded by ${UDP_DELTA} pp when TURNS ran alongside. UDP is cheap per packet and TURNS carries record-layer crypto, so this is the direction starvation would take — look for a shared lock held across the TLS path."
 else
   ok "UDP unaffected by TURNS (${UDP_DELTA} pp)"
 fi
 
-if [ "$(over "$TLS_SOLO_LOSS" "$TLS_MIX_LOSS")" = "1" ]; then
+if ! usable "$TLS_SOLO_RECV" "$TLS_SOLO_LOSS"; then
+  skip_cmp "TURNS" "the solo phase relayed nothing usable (${TLS_SOLO_RECV:-0} frames, ${TLS_SOLO_LOSS}% loss). Read tls-solo.err first — a driver that would not start is not interference"
+elif [ "$(over "$TLS_SOLO_LOSS" "$TLS_MIX_LOSS")" = "1" ]; then
   bad "TURNS degraded by ${TLS_DELTA} pp when UDP ran alongside. The less expected direction — UDP volume displacing TLS work suggests contention on the store or the egress queue rather than on CPU."
 else
   ok "TURNS unaffected by UDP (${TLS_DELTA} pp)"
