@@ -100,7 +100,12 @@ LATEST_DIR=$(ls -td capacity-* 2>/dev/null | head -1)
 # second parser here would eventually disagree with it.
 PPS=$(grep -oE '\*\*(At least )?[0-9]+ relayed packets/second\*\*' "$LATEST_DIR/profile.md" 2>/dev/null |
       grep -oE '[0-9]+' | head -1)
-LOWER_BOUND_ONLY=$(grep -c 'At least' "$LATEST_DIR/profile.md" 2>/dev/null || echo 0)
+# `grep -q`, not `grep -c`. The counting form exits 1 on no match, so
+# `$(grep -c ... || echo 0)` captured both grep's 0 and echo's 0 — "0\n0" — and the
+# test against "0" was then true. It refused a run that measured exactly the
+# baseline figure, twice.
+LOWER_BOUND_ONLY=0
+grep -q '\*\*At least' "$LATEST_DIR/profile.md" 2>/dev/null && LOWER_BOUND_ONLY=1
 
 [ -n "$PPS" ] || {
   echo "could not read a ceiling from $LATEST_DIR/profile.md" >&2
