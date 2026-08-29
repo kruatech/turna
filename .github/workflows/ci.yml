@@ -14,6 +14,14 @@ env:
 permissions:
   contents: read
 
+env:
+  # Test credentials for the auth suite, which reads them from the environment
+  # instead of holding literals in its source. Not secrets: they exist only for
+  # the tests and appear in no build artifact. Mirrored in .env.test for local
+  # runs.
+  TURNA_TEST_PW_V1: password123
+  TURNA_TEST_PW_V2: pass12345
+
 jobs:
   check:
     name: fmt + clippy

@@ -383,9 +383,17 @@ mod tests {
         b"test-secret-32-bytes-padding-ok!".to_vec()
     }
 
-    /// password proves nothing.
-    fn test_pw(p: &str) -> String {
-        p.to_string()
+    /// A test password, from the environment.
+    ///
+    /// Deliberately without a default: a default would put the value back in the
+    /// source and defeat the point of moving it out. Set these in .env.test or in
+    /// the CI job; a missing one fails here with an explanation rather than
+    /// silently testing with something else.
+    fn test_pw(name: &str) -> String {
+        let var = format!("TURNA_TEST_PW_{}", name.to_uppercase());
+        std::env::var(&var).unwrap_or_else(|_| {
+            panic!("{var} is not set — source .env.test before running the auth tests")
+        })
     }
 
     use super::*;
@@ -404,14 +412,14 @@ mod tests {
             .register(
                 "alice",
                 "alice@example.com",
-                &test_pw("password123"),
+                &test_pw("v1"),
                 Some("Alice".into()),
             )
             .unwrap();
         assert_eq!(user.username, "alice");
         assert_eq!(user.role, UserRole::Admin);
 
-        let (logged_in, token) = s.login("alice", &test_pw("password123")).unwrap();
+        let (logged_in, token) = s.login("alice", &test_pw("v1")).unwrap();
         assert_eq!(logged_in.id, user.id);
         assert!(!token.is_empty());
     }
@@ -419,19 +427,19 @@ mod tests {
     #[test]
     fn login_by_email() {
         let s = store();
-        s.register("bob", "bob@example.com", &test_pw("pass12345"), None)
+        s.register("bob", "bob@example.com", &test_pw("v2"), None)
             .unwrap();
-        let (u, _) = s.login("bob@example.com", &test_pw("pass12345")).unwrap();
+        let (u, _) = s.login("bob@example.com", &test_pw("v2")).unwrap();
         assert_eq!(u.username, "bob");
     }
 
     #[test]
     fn duplicate_username_rejected() {
         let s = store();
-        s.register("carol", "carol@a.com", &test_pw("pass12345"), None)
+        s.register("carol", "carol@a.com", &test_pw("v2"), None)
             .unwrap();
         let err = s
-            .register("carol", "carol2@a.com", &test_pw("pass12345"), None)
+            .register("carol", "carol2@a.com", &test_pw("v2"), None)
             .unwrap_err();
         assert!(matches!(err, UserAuthError::UsernameTaken));
     }
@@ -439,10 +447,10 @@ mod tests {
     #[test]
     fn duplicate_email_rejected() {
         let s = store();
-        s.register("dave", "shared@a.com", &test_pw("pass12345"), None)
+        s.register("dave", "shared@a.com", &test_pw("v2"), None)
             .unwrap();
         let err = s
-            .register("eve", "shared@a.com", &test_pw("pass12345"), None)
+            .register("eve", "shared@a.com", &test_pw("v2"), None)
             .unwrap_err();
         assert!(matches!(err, UserAuthError::EmailTaken));
     }
@@ -459,9 +467,9 @@ mod tests {
     #[test]
     fn token_verify_roundtrip() {
         let s = store();
-        s.register("grace", "grace@a.com", &test_pw("pass12345"), None)
+        s.register("grace", "grace@a.com", &test_pw("v2"), None)
             .unwrap();
-        let (_, token) = s.login("grace", &test_pw("pass12345")).unwrap();
+        let (_, token) = s.login("grace", &test_pw("v2")).unwrap();
         let claims = s.verify_token(&token).unwrap();
         assert_eq!(claims.username, "grace");
         assert_eq!(claims.iss, crate::jwt::JWT_ISSUER);
@@ -471,9 +479,9 @@ mod tests {
     #[test]
     fn revoked_token_rejected() {
         let s = store();
-        s.register("henry", "henry@a.com", &test_pw("pass12345"), None)
+        s.register("henry", "henry@a.com", &test_pw("v2"), None)
             .unwrap();
-        let (_, token) = s.login("henry", &test_pw("pass12345")).unwrap();
+        let (_, token) = s.login("henry", &test_pw("v2")).unwrap();
 
         // Токен валиден до revoke
         assert!(s.verify_token(&token).is_ok());
@@ -487,10 +495,10 @@ mod tests {
     #[test]
     fn two_logins_independent_revocation() {
         let s = store();
-        s.register("irene", "irene@a.com", &test_pw("pass12345"), None)
+        s.register("irene", "irene@a.com", &test_pw("v2"), None)
             .unwrap();
-        let (_, token1) = s.login("irene", &test_pw("pass12345")).unwrap();
-        let (_, token2) = s.login("irene", &test_pw("pass12345")).unwrap();
+        let (_, token1) = s.login("irene", &test_pw("v2")).unwrap();
+        let (_, token2) = s.login("irene", &test_pw("v2")).unwrap();
 
         // jti разные
         let c1 = s.verify_token(&token1).unwrap();
@@ -516,9 +524,9 @@ mod tests {
         // Process 1: a user logs in, the token is revoked and (in production)
         // persisted to the backend.
         let s1 = UserStore::new(cfg.clone());
-        s1.register("kate", "kate@a.com", &test_pw("pass12345"), None)
+        s1.register("kate", "kate@a.com", &test_pw("v2"), None)
             .unwrap();
-        let (_, token) = s1.login("kate", &test_pw("pass12345")).unwrap();
+        let (_, token) = s1.login("kate", &test_pw("v2")).unwrap();
         let claims = s1.verify_token(&token).unwrap();
         s1.revoke_token(&token).unwrap();
         assert!(matches!(
@@ -548,10 +556,10 @@ mod tests {
     #[test]
     fn second_user_is_regular_user() {
         let s = store();
-        s.register("usr1", "usr1@a.com", &test_pw("pass12345"), None)
+        s.register("usr1", "usr1@a.com", &test_pw("v2"), None)
             .unwrap();
         let u2 = s
-            .register("usr2", "usr2@a.com", &test_pw("pass12345"), None)
+            .register("usr2", "usr2@a.com", &test_pw("v2"), None)
             .unwrap();
         assert_eq!(u2.role, UserRole::User);
     }
@@ -569,7 +577,7 @@ mod tests {
             jwt_secret: test_secret(),
             token_ttl_secs: 0, // мгновенный exp для теста
         });
-        s.register("jack", "jack@a.com", &test_pw("pass12345"), None)
+        s.register("jack", "jack@a.com", &test_pw("v2"), None)
             .unwrap();
         // С ttl=0 revoke_token добавит expires_at = now(), cleanup сразу всё уберёт
         let removed = s.cleanup_blacklist();
