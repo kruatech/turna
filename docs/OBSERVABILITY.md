@@ -53,6 +53,9 @@ scrape_configs:
 |---|---|---|
 | `turna_active_allocations` | gauge | Current allocation count. |
 | `turna_total_allocations` | counter | Total successful allocations since start. |
+| `turna_relay_ports_in_use` | gauge | Relay ports held by an allocation **or** by an unclaimed EVEN-PORT reservation — a reserved port is unavailable to anyone else, so counting it free would understate how full the pool is. Summed across the global pool and any tenant pools. |
+| `turna_relay_ports_total` | gauge | Relay ports configured, summed the same way: `max_port - min_port + 1` per pool. |
+| `turna_relay_ports_utilization_percent` | gauge | Percent of the range in use. **The one to alert on.** Reads 0 rather than 100 before the first sample, so an alert on a high value cannot fire during startup. |
 | `turna_packets_received` | counter | Packets received. |
 | `turna_packets_sent` | counter | Packets sent. |
 | `turna_bytes_received` | counter | Bytes received. |
@@ -144,6 +147,89 @@ Depending on enabled features and runtime paths, `/metrics` may also include:
 `render_transport_metrics()` always emits these series; they read `0` when the
 listener is disabled or the feature is not compiled in, so a dashboard can be
 built once and stay valid.
+
+#### Security event export (`[observability] syslog_endpoint`)
+
+RFC 5424 syslog to a SIEM. Security-relevant events only — authentication
+failures, authorisation denials, peer refusals, rate-limit trips, audit entries,
+readiness transitions. Not relayed traffic: a SIEM billed per event that receives
+a line per frame gets switched off, and a switched-off SIEM catches nothing.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_syslog_sent_total` | counter | Events written to the collector. |
+| `turna_syslog_dropped_total` | counter | Events lost: transport error, or a busy path under `non_blocking`. **Alert on any sustained value.** A gap in a security log is worse than a visible failure, because an investigation reads absence as "nothing happened". |
+
+Dropping rather than blocking is deliberate. A collector that stops reading must
+not be able to stall the relay — security logging that can take the service down
+is a worse posture than logging that can gap, provided the gap is counted. It is.
+
+Addresses are sent verbatim by default. That is the opposite of the support
+bundle's choice, and for a reason: a SIEM is inside the operator's trust boundary
+and an authentication-failure event without a source is not actionable.
+`syslog_redact_addresses = true` hashes them, and loses cross-event correlation —
+which is most of what a SIEM is for.
+
+#### Dashboard
+
+`deploy/grafana/turna-overview.json`. Schema 39, which loads on Grafana 10 and 11.
+Import and pick a Prometheus datasource.
+
+Panels are ordered by the question an operator asks first — is it serving, then
+traffic, then refusals, then per-transport. Each panel's description says what the
+number *means* rather than restating its name, because a dashboard that needs a
+runbook open beside it is half a dashboard.
+
+Three panels are worth knowing about before an incident:
+
+**Send queue drops.** Non-zero means the node discarded media before sending it.
+Clients cannot see this, so a clean-looking loss measurement is not evidence
+against it — a capacity figure came out 27 % too high for exactly that reason.
+
+**Relay ports in use.** The blind spot until 2026-08-26. A range fills silently
+and the first symptom is `Allocate` failing. Alert here, not on allocation count.
+
+**Tenants aggregated away.** Non-zero means some tenants are inside `__other`
+rather than named. Not a fault — but if a specific tenant cannot be found, this is
+why.
+
+#### Relay port exhaustion
+
+`turna_relay_ports_utilization_percent` is the series to alert on, and it was
+absent until 2026-08-26. The range is bounded by `[turn.relay] min_port`/`max_port`
+and config validation warns when `max_allocations` exceeds half of it, but nothing
+reported occupancy at runtime: the range filled silently and the first symptom was
+`Allocate` beginning to fail. The gap surfaced while looking for this metric during
+a 24-hour soak and finding it did not exist.
+
+Two things make a range fill faster than the allocation count suggests. EVEN-PORT
+reservations hold a port without an allocation behind it, and a range overlapping
+the host's ephemeral range loses ports to processes that have nothing to do with
+turna — which has bitten this project: a peer socket landed inside the relay range
+and the relay forwarded to itself.
+
+**Tenant pools are summed, not labelled.** Per-tenant series are how a Prometheus
+instance dies when a customer has ten thousand tenants, and §10 of the enterprise
+specification asks for cardinality protection in the same document that asks for
+this metric. `AllocationStore::port_pool_usage()` returns `(pool, in_use, capacity)`
+per pool for anything that needs the detail — the management API, a support bundle —
+without every scrape paying for it. Resist adding the label.
+
+#### `GET /capacity`
+
+Served on the health listener beside `/metrics`. Returns the node's capacity state
+in the vocabulary the enterprise specification asks for — `AVAILABLE`, `DEGRADED`,
+`DRAINING`, `SATURATED`, `UNAVAILABLE` — with the raw numbers beside the verdict so
+a caller can apply its own policy.
+
+Always answers `200`, including when saturated: a caller asking "can you take this"
+needs an answer rather than an error to interpret. `/ready` remains the endpoint
+that speaks in status codes.
+
+The response carries a `signals` object naming which inputs the state actually
+weighed. Allocations, send-queue pressure and readiness are in; bps, pps, CPU and
+memory are not, and saying so in the response is cheaper than a caller discovering
+it during an incident. Design and rationale: `docs/design/capacity-api.md`.
 
 #### TURNS — TLS over TCP (`[tls]`)
 

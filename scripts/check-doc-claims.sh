@@ -282,6 +282,22 @@ if [ -n "$FEATURE_MANIFESTS" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+section "Management proto: field numbers keep their meaning"
+# ---------------------------------------------------------------------------
+
+# Delegated to its own script because the parsing is substantial, but reported
+# here so one command still covers everything. A contract the Conference product
+# is about to bind to should not need a separate habit to check.
+if [ -x scripts/check-proto-compat.sh ]; then
+  if OUT=$(scripts/check-proto-compat.sh 2>&1); then
+    pass "wire contract unchanged ($(printf '%s' "$OUT" | tail -1))"
+  else
+    fail "management.proto changed incompatibly" \
+      "Run scripts/check-proto-compat.sh for the detail. A field number that changes meaning is misread by existing clients with no error on either side."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 printf '\ncheck-doc-claims: %d checks, %d failed\n' "$CHECKS" "$FAILED"
 [ "$FAILED" -eq 0 ] || {
   echo "check-doc-claims: FAIL — documentation and code disagree (see above)" >&2

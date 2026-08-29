@@ -4,7 +4,7 @@ production: false
 
 image:
   repository: turna
-  tag: "0.3.1"
+  tag: "0.4.0"
   pullPolicy: IfNotPresent
 
 turn:

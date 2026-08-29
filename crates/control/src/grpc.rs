@@ -397,6 +397,16 @@ fn event_type_to_proto(e: EventType) -> i32 {
 
 struct TurnaManagementService {
     core: Arc<dyn TurnCore>,
+    /// Who may do what. `RbacPolicy::disabled()` permits everything without
+    /// evaluating, so a deployment that has not configured roles behaves exactly
+    /// as before and nothing appears in the audit log as a grant.
+    rbac: Arc<crate::rbac::RbacPolicy>,
+    /// Certificates that may not be used, whatever their roles.
+    ///
+    /// Checked before RBAC. A revoked certificate that also lacked a permission
+    /// would otherwise be audited as a missing role, and an operator reading that
+    /// would grant the role — after which the revoked certificate works.
+    revoked: Arc<crate::revocation::RevocationList>,
     /// Fired when the server starts shutting down.
     shutdown_token: CancellationToken,
     /// Counts currently open streaming RPCs.
@@ -418,6 +428,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<ListAllocationsRequest>,
     ) -> Result<Response<ListAllocationsResponse>, Status> {
+        let _actor = self.authorize(&req, "allocations:read")?;
         let r = req.into_inner();
         let (allocs, next_token, total) = self
             .core
@@ -445,6 +456,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetAllocationRequest>,
     ) -> Result<Response<Allocation>, Status> {
+        let _actor = self.authorize(&req, "allocations:read")?;
         let alloc = self
             .core
             .get_allocation(&req.into_inner().id)
@@ -457,6 +469,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<DeleteAllocationRequest>,
     ) -> Result<Response<DeleteAllocationResponse>, Status> {
+        let _actor = self.authorize(&req, "allocations:delete")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -503,6 +516,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<WatchAllocationsRequest>,
     ) -> Result<Response<Self::WatchAllocationsStream>, Status> {
+        let _actor = self.authorize(&req, "allocations:watch")?;
         let r = req.into_inner();
         let user_filter = r.username_filter.clone();
         let org_filter = r.organization_filter.clone();
@@ -552,6 +566,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetConfigRequest>,
     ) -> Result<Response<NodeRuntimeConfig>, Status> {
+        let _actor = self.authorize(&req, "config:read")?;
         let node_id = req.into_inner().node_id;
         if node_id.trim().is_empty() {
             return Err(Status::invalid_argument("node_id is required"));
@@ -564,6 +579,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
+        let _actor = self.authorize(&req, "config:write")?;
         if !self.audit.is_healthy() {
             return Err(Status::failed_precondition(
                 "audit log degraded; refusing privileged operation (fail-closed)",
@@ -671,8 +687,9 @@ impl TurnaManagement for TurnaManagementService {
 
     async fn get_server_stats(
         &self,
-        _req: Request<GetServerStatsRequest>,
+        req: Request<GetServerStatsRequest>,
     ) -> Result<Response<ServerStats>, Status> {
+        let _actor = self.authorize(&req, "stats:read")?;
         let s = self.core.server_stats().await;
         Ok(Response::new(ServerStats {
             uptime_seconds: s.uptime_seconds,
@@ -702,6 +719,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetTopTalkersRequest>,
     ) -> Result<Response<GetTopTalkersResponse>, Status> {
+        let _actor = self.authorize(&req, "stats:read")?;
         let r = req.into_inner();
         let talkers = self.core.top_talkers(r.limit as usize, &r.sort_by).await;
         Ok(Response::new(GetTopTalkersResponse {
@@ -726,6 +744,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<WatchMetricsRequest>,
     ) -> Result<Response<Self::WatchMetricsStream>, Status> {
+        let _actor = self.authorize(&req, "stats:read")?;
         let interval_secs = req.into_inner().interval_seconds.max(1);
         let core = self.core.clone();
         let cancel = self.shutdown_token.clone();
@@ -774,6 +793,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<AddUserRequest>,
     ) -> Result<Response<AddUserResponse>, Status> {
+        let _actor = self.authorize(&req, "users:write")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -810,6 +830,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<RemoveUserRequest>,
     ) -> Result<Response<RemoveUserResponse>, Status> {
+        let _actor = self.authorize(&req, "users:write")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -848,6 +869,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<SetUserLimitsRequest>,
     ) -> Result<Response<SetUserLimitsResponse>, Status> {
+        let _actor = self.authorize(&req, "limits:write")?;
         if !self.audit.is_healthy() {
             return Err(Status::failed_precondition(
                 "audit log degraded; refusing privileged operation (fail-closed)",
@@ -967,6 +989,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<SetDrainingRequest>,
     ) -> Result<Response<SetDrainingResponse>, Status> {
+        let _actor = self.authorize(&req, "node:drain")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -1012,6 +1035,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
+        let _actor = self.authorize(&req, "node:shutdown")?;
         // D-enforcement (fail-closed): never perform a destructive/privileged
         // operation we cannot record. If the audit log is degraded (write or
         // rotation failure), refuse rather than act unaudited.
@@ -1065,8 +1089,9 @@ impl TurnaManagement for TurnaManagementService {
 
     async fn verify_audit(
         &self,
-        _req: Request<VerifyAuditRequest>,
+        req: Request<VerifyAuditRequest>,
     ) -> Result<Response<VerifyAuditResponse>, Status> {
+        let _actor = self.authorize(&req, "audit:read")?;
         let (intact, broken_at_seq) = match self.audit.verify() {
             Ok(_) => (true, 0),
             Err(seq) => (false, seq),
@@ -1109,6 +1134,7 @@ impl TurnaManagement for TurnaManagementService {
         &self,
         req: Request<GetAuditLogRequest>,
     ) -> Result<Response<GetAuditLogResponse>, Status> {
+        let _actor = self.authorize(&req, "audit:read")?;
         let limit = req.into_inner().limit as usize;
         let mut snap = self.audit.snapshot();
         if limit != 0 && snap.len() > limit {
@@ -1149,7 +1175,73 @@ const AUDIT_RING_CAPACITY: usize = 1024;
 /// identifies the client without parsing the X.509 structure (no extra
 /// dependency). Falls back to the peer socket address when no client
 /// certificate is presented (server-only TLS / loopback).
+/// Identify the caller, and log their correlation id if they sent one.
+///
+/// The logging lives here rather than in each RPC because every operation that
+/// needs to know who called it already calls this — five call sites instead of
+/// sixteen, and no way for a new privileged RPC to forget.
+///
+/// A `debug!` rather than `info!`: the id is only useful to somebody already
+/// tracing a specific request, and an unconditional line per RPC on a management
+/// plane that also serves streaming metrics is noise. The RPC's own audit entry
+/// and error paths log at info.
+impl TurnaManagementService {
+    /// Refuse the request unless the caller holds `permission`.
+    ///
+    /// A denial is audited before it is returned. That ordering matters: an
+    /// attacker probing the surface produces a trail whether or not they get
+    /// anywhere, and a refusal that leaves no record is indistinguishable from a
+    /// request that was never made.
+    ///
+    /// The message returned to the caller says only "permission denied"; which
+    /// permission was needed and which the caller holds goes to the audit log.
+    /// Telling an unauthorised caller the shape of the policy is a disclosure,
+    /// and a small one is still one.
+    fn authorize<T>(&self, req: &Request<T>, permission: &str) -> Result<String, Status> {
+        let actor = actor_of(req);
+
+        // Revocation first. Both paths end in `permission_denied`, so the order
+        // looks cosmetic and is not: a revoked certificate that also lacks the
+        // permission must be audited as revoked, or an operator reading
+        // `rbac_denied` grants a role and the revoked certificate starts working.
+        if self.revoked.is_revoked(&actor) {
+            self.audit.record(
+                &actor,
+                "cert_revoked",
+                format!("refused {permission}: certificate is on the revocation list").as_str(),
+                false,
+            );
+            // The caller is told only "permission denied". Saying "your
+            // certificate is revoked" confirms it was once valid and that the
+            // operator knows it leaked — the detail belongs in the audit log,
+            // read by somebody already inside.
+            return Err(Status::permission_denied("permission denied"));
+        }
+
+        match self.rbac.check(&actor, permission) {
+            Ok(()) => Ok(actor),
+            Err(denial) => {
+                self.audit.record(
+                    &actor,
+                    "rbac_denied",
+                    denial.audit_detail(permission),
+                    false,
+                );
+                Err(Status::permission_denied(denial.public_message()))
+            }
+        }
+    }
+}
+
 fn actor_of<T>(req: &Request<T>) -> String {
+    let correlation = correlation_of(req);
+    if !correlation.is_empty() {
+        tracing::debug!(
+            target: "management",
+            correlation_id = %correlation,
+            "management RPC carries a caller correlation id"
+        );
+    }
     if let Some(certs) = req.peer_certs() {
         if let Some(leaf) = certs.first() {
             let der: &[u8] = leaf.as_ref();
@@ -1160,6 +1252,43 @@ fn actor_of<T>(req: &Request<T>) -> String {
     req.remote_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Metadata key carrying a caller-supplied correlation identifier.
+///
+/// Lower-case because gRPC metadata keys are case-insensitive but tonic requires
+/// the lower form when constructing them.
+pub const CORRELATION_HEADER: &str = "x-turna-correlation-id";
+
+/// Maximum length kept. Long enough for a UUID, a W3C traceparent, or a
+/// reasonable composite; short enough that a caller cannot use it as a channel.
+const CORRELATION_MAX: usize = 128;
+
+/// A caller's opaque correlation identifier, or empty if absent.
+///
+/// **Sanitised deliberately.** This string arrives from whoever called the RPC
+/// and lands in a log line and an audit entry. A newline in it would let a caller
+/// write a second audit record of their choosing, and the audit log is
+/// hash-chained precisely because its contents are meant to be trustworthy —
+/// a chain over forgeable entries proves only that the forgery came in order.
+///
+/// So: printable ASCII only, everything else dropped rather than escaped, and
+/// truncated. Dropped rather than escaped because an escaped control character is
+/// still a control character to the next thing that unescapes it, and this value
+/// passes through more than one consumer.
+fn correlation_of<T>(req: &Request<T>) -> String {
+    let Some(raw) = req.metadata().get(CORRELATION_HEADER) else {
+        return String::new();
+    };
+    let Ok(s) = raw.to_str() else {
+        // Binary metadata under a text key: the caller sent something that is not
+        // an identifier. Ignored rather than lossily decoded.
+        return String::new();
+    };
+    s.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(CORRELATION_MAX)
+        .collect()
 }
 
 /// Start the gRPC management server with graceful shutdown support.
@@ -1180,6 +1309,8 @@ pub async fn start_grpc_server(
     config: GrpcConfig,
     core: Arc<dyn TurnCore>,
     metrics: Arc<Metrics>,
+    rbac: Arc<crate::rbac::RbacPolicy>,
+    revoked: Arc<crate::revocation::RevocationList>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown_token = CancellationToken::new();
@@ -1249,6 +1380,8 @@ pub async fn start_grpc_server(
         active_streams: Arc::clone(&active_streams),
         audit,
         require_idempotency_key,
+        rbac,
+        revoked,
     })
     .max_decoding_message_size(config.max_message_size)
     .max_encoding_message_size(config.max_message_size);

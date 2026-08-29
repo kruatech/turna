@@ -90,6 +90,68 @@ pub struct Metrics {
     pub bytes_sent: AtomicU64,
     pub active_allocations: AtomicU64,
     pub total_allocations: AtomicU64,
+
+    // Capacity limits, published by the node at startup rather than read from
+    // config here: this crate has no view of config, and threading it in would
+    // mean changing `serve_*`'s signature for the third time this week.
+    //
+    // `capacity_max_allocations == 0` means "not published", which is reported as
+    // UNAVAILABLE rather than as unlimited headroom. An unset limit read as
+    // infinite capacity is exactly the kind of default that puts a node into
+    // service claiming room it does not have.
+    // Relay port pool occupancy, summed across the global pool and any
+    // tenant pools. Summed rather than labelled per tenant: labels are how a
+    // Prometheus instance dies when a customer has ten thousand tenants, and
+    // §10 asks for cardinality protection in the same specification that asks
+    // for this metric. Per-tenant detail: AllocationStore::port_pool_usage().
+    /// Relayed traffic rate over the last ten seconds. Fed by a one-second
+    /// ticker in the node; read by `/capacity` and, later, by admission
+    /// control.
+    pub rates: RateSampler,
+
+    /// Host CPU and memory, whole percent, refreshed every five seconds by a
+    /// sampler task in the node.
+    ///
+    /// `u64::MAX` means "never sampled" — distinct from 0, which is a real and
+    /// unremarkable reading. Without that distinction a node whose sampler had
+    /// died would look idle, which is the worst possible way to be wrong about
+    /// load.
+    /// Security events written to the syslog collector, and lost.
+    ///
+    /// Mirrored from `SyslogExporter` by the node. `dropped` is the one to alert
+    /// on: a gap in a security log is worse than a visible failure, because an
+    /// investigation reads absence as "nothing happened".
+    /// Relayed packets/second this node can carry, from a measurement.
+    ///
+    /// 0 means unmeasured: the rate is reported and not judged. Deliberately not
+    /// fatal, unlike an unpublished allocation limit — allocations still bound the
+    /// node, so it knows something about its capacity, just not this. Making both
+    /// fatal would stop anybody running before they had measured a ceiling, and
+    /// most never will.
+    pub capacity_max_pps: AtomicU64,
+    /// Percent of `capacity_max_pps` at which to report DEGRADED. Default 60.
+    ///
+    /// Lower than the allocation threshold on purpose. Allocations degrade
+    /// gracefully — at the cap, existing clients are unaffected. Packet rate does
+    /// not degrade and then falls off a cliff: measured, clean at 112 000 pps and
+    /// shedding a million frames at 128 000. Seven percent between perfect and
+    /// broken, so the warning has to sit further back.
+    pub capacity_rate_soft_percent: AtomicU64,
+    /// Percent of `capacity_max_pps` at which to report SATURATED. Default 80.
+    pub capacity_rate_hard_percent: AtomicU64,
+
+    pub syslog_sent: AtomicU64,
+    pub syslog_dropped: AtomicU64,
+
+    pub host_cpu_percent: AtomicU64,
+    pub host_memory_percent: AtomicU64,
+
+    pub relay_ports_in_use: AtomicU64,
+    pub relay_ports_total: AtomicU64,
+
+    pub capacity_max_allocations: AtomicU64,
+    pub capacity_soft_percent: AtomicU64,
+    pub capacity_hard_percent: AtomicU64,
     pub auth_failures: AtomicU64,
     pub rate_limited: AtomicU64,
     pub zero_copy_forwards: AtomicU64,
@@ -368,6 +430,19 @@ impl Metrics {
             bytes_sent: AtomicU64::new(0),
             active_allocations: AtomicU64::new(0),
             total_allocations: AtomicU64::new(0),
+            rates: RateSampler::new(),
+            capacity_max_pps: AtomicU64::new(0),
+            capacity_rate_soft_percent: AtomicU64::new(60),
+            capacity_rate_hard_percent: AtomicU64::new(80),
+            syslog_sent: AtomicU64::new(0),
+            syslog_dropped: AtomicU64::new(0),
+            host_cpu_percent: AtomicU64::new(u64::MAX),
+            host_memory_percent: AtomicU64::new(u64::MAX),
+            relay_ports_in_use: AtomicU64::new(0),
+            relay_ports_total: AtomicU64::new(0),
+            capacity_max_allocations: AtomicU64::new(0),
+            capacity_soft_percent: AtomicU64::new(75),
+            capacity_hard_percent: AtomicU64::new(95),
             auth_failures: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             zero_copy_forwards: AtomicU64::new(0),
@@ -1029,6 +1104,21 @@ impl Metrics {
              # HELP turna_sctp_readiness TURN-over-SCTP listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if SCTP disabled)\n\
              # TYPE turna_sctp_readiness gauge\n\
              turna_sctp_readiness {}\n\
+             # HELP turna_relay_ports_in_use Relay ports currently held by an allocation or an unclaimed EVEN-PORT reservation\n\
+             # TYPE turna_relay_ports_in_use gauge\n\
+             turna_relay_ports_in_use {}\n\
+             # HELP turna_relay_ports_total Relay ports configured across the global pool and any tenant pools\n\
+             # TYPE turna_relay_ports_total gauge\n\
+             turna_relay_ports_total {}\n\
+             # HELP turna_relay_ports_utilization_percent Percent of the relay port range in use\n\
+             # TYPE turna_relay_ports_utilization_percent gauge\n\
+             turna_relay_ports_utilization_percent {}\n\
+             # HELP turna_syslog_sent_total Security events written to the syslog collector\n\
+             # TYPE turna_syslog_sent_total counter\n\
+             turna_syslog_sent_total {}\n\
+             # HELP turna_syslog_dropped_total Security events lost: transport error, or a busy path under non-blocking\n\
+             # TYPE turna_syslog_dropped_total counter\n\
+             turna_syslog_dropped_total {}\n\
              # HELP turna_quic_readiness QUIC/WebTransport listener readiness (0=starting,1=ready,2=degraded,3=draining; starting if QUIC disabled)\n\
              # TYPE turna_quic_readiness gauge\n\
              turna_quic_readiness {}\n\
@@ -1128,6 +1218,24 @@ impl Metrics {
             self.dtls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.tls_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.sctp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            l(&self.relay_ports_in_use),
+            l(&self.relay_ports_total),
+            {
+                let total = self.relay_ports_total.load(std::sync::atomic::Ordering::Relaxed);
+                let used = self.relay_ports_in_use.load(std::sync::atomic::Ordering::Relaxed);
+                // 0 rather than 100 when no range is published: unlike capacity
+                // state, an unreported port range is not a reason to call the node
+                // full — it means the sampler has not run yet.
+                // checked_div over a manual zero test: clippy's manual_checked_ops
+                // rejects the latter, and the None arm carries the meaning anyway —
+                // no range published yet, which is 0 rather than 100 so an alert on
+                // a high value cannot fire during startup.
+                used.saturating_mul(100)
+                    .checked_div(total)
+                    .map_or(0, |v| v.min(100))
+            },
+            l(&self.syslog_sent),
+            l(&self.syslog_dropped),
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
@@ -1138,6 +1246,365 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Bytes and packets per second, averaged over a sliding ten-second window.
+///
+/// The cumulative counters answer "how much since start"; a node deciding
+/// whether it is saturated needs "how much right now", and cannot wait for a
+/// Prometheus scrape to tell it.
+///
+/// Ten one-second buckets in a fixed ring. `tick()` is called once a second by a
+/// task in the node; the read path is three atomic loads and no lock, because
+/// `/capacity` calls it and is meant to be cheap enough to call before every
+/// session placement.
+///
+/// **Why ten seconds.** Short enough to catch saturation before the egress queue
+/// begins dropping; long enough that one burst does not flip the node to
+/// SATURATED and divert its callers. Relayed media is bursty — a rate computed
+/// from a single sample would report saturation on every keyframe, which is a
+/// worse failure than reporting nothing at all.
+pub struct RateSampler {
+    /// Per-bucket deltas. Index `pos % WINDOW` is the bucket being filled.
+    bytes_buckets: [AtomicU64; Self::WINDOW],
+    packets_buckets: [AtomicU64; Self::WINDOW],
+    /// Counter values at the last tick, for computing the delta.
+    last_bytes: AtomicU64,
+    last_packets: AtomicU64,
+    /// Ticks since start. Doubles as the ring position and as the "have we
+    /// filled the window yet" test — before `WINDOW` ticks the mean would be
+    /// divided by buckets that were never written.
+    ticks: AtomicU64,
+}
+
+impl Default for RateSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RateSampler {
+    const WINDOW: usize = 10;
+
+    pub fn new() -> Self {
+        Self {
+            bytes_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            packets_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            last_bytes: AtomicU64::new(0),
+            last_packets: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one second's worth of traffic. Called once a second.
+    ///
+    /// `total_bytes` and `total_packets` are the cumulative counters; the delta
+    /// against the previous tick becomes this bucket. `saturating_sub` because a
+    /// counter that appears to go backwards (it should not, but a reordered
+    /// relaxed load could) must produce zero rather than a vast number that
+    /// reads as saturation.
+    pub fn tick(&self, total_bytes: u64, total_packets: u64) {
+        let n = self.ticks.fetch_add(1, Ordering::Relaxed) as usize;
+        let slot = n % Self::WINDOW;
+
+        let prev_b = self.last_bytes.swap(total_bytes, Ordering::Relaxed);
+        let prev_p = self.last_packets.swap(total_packets, Ordering::Relaxed);
+
+        self.bytes_buckets[slot].store(total_bytes.saturating_sub(prev_b), Ordering::Relaxed);
+        self.packets_buckets[slot].store(total_packets.saturating_sub(prev_p), Ordering::Relaxed);
+    }
+
+    /// Mean bytes/second over the window, or `None` until the window has filled.
+    ///
+    /// `None` rather than a partial mean on purpose: a rate averaged over three
+    /// buckets when ten are expected understates by more than two thirds, and a
+    /// node that under-reports its load during the first ten seconds after start
+    /// is a node that accepts work it cannot serve. The caller decides what to do
+    /// with "not yet known" — `/capacity` reports the signal as unavailable
+    /// rather than guessing.
+    pub fn bytes_per_sec(&self) -> Option<u64> {
+        self.mean(&self.bytes_buckets)
+    }
+
+    /// Mean packets/second over the window, or `None` until it has filled.
+    pub fn packets_per_sec(&self) -> Option<u64> {
+        self.mean(&self.packets_buckets)
+    }
+
+    fn mean(&self, buckets: &[AtomicU64; Self::WINDOW]) -> Option<u64> {
+        if (self.ticks.load(Ordering::Relaxed) as usize) < Self::WINDOW {
+            return None;
+        }
+        let sum: u64 = buckets
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed))
+            .fold(0u64, |a, b| a.saturating_add(b));
+        Some(sum / Self::WINDOW as u64)
+    }
+
+    /// Seconds of history collected, capped at the window size. For diagnostics
+    /// and for a caller wanting to know how much to trust a fresh reading.
+    pub fn samples(&self) -> usize {
+        (self.ticks.load(Ordering::Relaxed) as usize).min(Self::WINDOW)
+    }
+}
+
+/// Capacity state, in the vocabulary the enterprise spec asks for.
+///
+/// Ordered by decreasing willingness to take work, which is also the order the
+/// checks run in: the first that matches wins, so DRAINING beats SATURATED and a
+/// node that is both reports the one that will not change on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum CapacityState {
+    /// Accepting work with headroom.
+    Available,
+    /// Accepting work, but past the soft threshold or with a degraded
+    /// dependency. A caller with a choice should choose elsewhere.
+    Degraded,
+    /// Shutting down. Will not take new work and existing work is being wound
+    /// down. Distinct from SATURATED because it does not recover.
+    Draining,
+    /// At or past the hard threshold, or shedding. New work will suffer.
+    Saturated,
+    /// Not able to serve: startup incomplete, or no capacity limit published so
+    /// there is nothing to reason about.
+    Unavailable,
+}
+
+/// `GET /capacity` — per-node capacity, for a caller deciding where to place a
+/// session.
+///
+/// Both the state and the numbers behind it are returned. The state is our
+/// opinion; the numbers let a caller form its own, which matters because the
+/// thresholds here are generic and a deployment's real limit is usually
+/// something else — bandwidth on a shared uplink, or a licence count.
+#[derive(Debug, serde::Serialize)]
+struct CapacityResponse {
+    /// Response schema version. Increment on any change that is not additive.
+    version: u32,
+    state: CapacityState,
+    /// Why, in a form worth logging. Empty when AVAILABLE.
+    reasons: Vec<&'static str>,
+    active_allocations: u64,
+    max_allocations: u64,
+    /// Percent of `max_allocations` in use. 100 when the limit is unpublished,
+    /// pairing with UNAVAILABLE rather than reading as empty.
+    utilization_percent: u64,
+    soft_threshold_percent: u64,
+    hard_threshold_percent: u64,
+    ready: bool,
+    draining: bool,
+    /// Relayed bytes/second over the last ten seconds. `null` until the window
+    /// has filled — a partial mean would understate the load, and a node that
+    /// under-reports during its first ten seconds accepts work it cannot serve.
+    bytes_per_sec: Option<u64>,
+    /// Relayed packets/second over the last ten seconds. `null` on the same terms.
+    packets_per_sec: Option<u64>,
+    /// The measured ceiling, if one has been published. `null` means the rate is
+    /// reported and not judged — not that there is no limit.
+    max_packets_per_sec: Option<u64>,
+    /// Rate as a percent of the ceiling. `null` when either the ceiling is
+    /// unpublished or the sampler's ten-second window has not filled.
+    ///
+    /// Two causes, one `null`, and a consumer cannot tell them apart from this
+    /// field alone — `max_packets_per_sec` distinguishes them.
+    rate_utilization_percent: Option<u64>,
+    /// Host CPU, whole percent. `null` until the first sample.
+    cpu_percent: Option<u64>,
+    /// Host memory in use, whole percent. `null` until the first sample.
+    memory_percent: Option<u64>,
+    /// Which inputs this state actually weighed.
+    ///
+    /// Present so a caller is not left to assume the state considered load it
+    /// could not see. The spec asks for bps, pps, CPU and memory pressure in
+    /// admission decisions; none of those is here yet, and saying so in the
+    /// response is cheaper than a caller discovering it during an incident.
+    signals: CapacitySignals,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CapacitySignals {
+    allocations: bool,
+    send_queue_pressure: bool,
+    readiness: bool,
+    /// Rate of bytes relayed. Counters exist; a rate needs a sampler.
+    bandwidth_rate: bool,
+    /// Rate of packets relayed. Same.
+    packet_rate: bool,
+    /// Host CPU load. No source in this crate.
+    cpu: bool,
+    /// Host memory pressure. No source in this crate.
+    memory: bool,
+}
+
+impl Metrics {
+    /// Store a host CPU and memory sample, whole percent.
+    pub fn set_host_load(&self, cpu_percent: u64, memory_percent: u64) {
+        self.host_cpu_percent
+            .store(cpu_percent.min(100), Ordering::Relaxed);
+        self.host_memory_percent
+            .store(memory_percent.min(100), Ordering::Relaxed);
+    }
+
+    /// Host CPU percent, or `None` if no sample has been taken yet.
+    pub fn host_cpu(&self) -> Option<u64> {
+        match self.host_cpu_percent.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v),
+        }
+    }
+
+    /// Host memory percent, or `None` if no sample has been taken yet.
+    pub fn host_memory(&self) -> Option<u64> {
+        match self.host_memory_percent.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            v => Some(v),
+        }
+    }
+
+    /// Publish the measured packet-rate ceiling and its thresholds.
+    ///
+    /// Separate from `set_capacity_limits` because the two come from different
+    /// places: the allocation cap is a configuration decision, and this is a
+    /// measurement. Folding them into one call would invite passing a guess for
+    /// the ceiling to satisfy the signature.
+    ///
+    /// `max_pps` of 0 leaves the rate unjudged.
+    pub fn set_rate_limits(&self, max_pps: u64, soft_percent: u64, hard_percent: u64) {
+        self.capacity_max_pps.store(max_pps, Ordering::Relaxed);
+        // Clamped and ordered: a soft threshold above the hard one would make the
+        // DEGRADED branch unreachable, and the node would go from AVAILABLE
+        // straight to SATURATED with no warning — the exact failure the soft
+        // threshold exists to prevent.
+        let hard = hard_percent.clamp(1, 100);
+        let soft = soft_percent.clamp(1, hard);
+        self.capacity_rate_soft_percent
+            .store(soft, Ordering::Relaxed);
+        self.capacity_rate_hard_percent
+            .store(hard, Ordering::Relaxed);
+    }
+
+    /// Publish the node's capacity limits. Called once at startup.
+    ///
+    /// Until this is called, `/capacity` reports UNAVAILABLE: a node that does
+    /// not know its own ceiling cannot honestly claim headroom.
+    pub fn set_capacity_limits(&self, max_allocations: u64, soft_percent: u64, hard_percent: u64) {
+        self.capacity_max_allocations
+            .store(max_allocations, Ordering::SeqCst);
+        self.capacity_soft_percent
+            .store(soft_percent.min(100), Ordering::SeqCst);
+        self.capacity_hard_percent
+            .store(hard_percent.min(100), Ordering::SeqCst);
+    }
+
+    fn capacity(&self) -> CapacityResponse {
+        let max = self.capacity_max_allocations.load(Ordering::Relaxed);
+        let active = self.active_allocations.load(Ordering::Relaxed);
+        let soft = self.capacity_soft_percent.load(Ordering::Relaxed);
+        let hard = self.capacity_hard_percent.load(Ordering::Relaxed);
+        let draining = self.is_draining();
+        let ready = self.is_ready();
+        // Any drop means the egress queue has already overflowed at least once.
+        // Treated as saturation rather than degradation: by the time a frame is
+        // dropped the damage is done, and a caller placing more work on this
+        // node makes it worse.
+        let shedding = self.send_queue_dropped.load(Ordering::Relaxed) > 0;
+
+        // 100 when no limit is published, pairing with the UNAVAILABLE state
+        // below: a node that does not know its ceiling must not read as empty.
+        // Opposite default from the port gauge above, and deliberately so — there
+        // an unpublished range means "not sampled yet", here it means "cannot
+        // reason about headroom".
+        let utilization = active
+            .saturating_mul(100)
+            .checked_div(max)
+            .map_or(100, |v| v.min(100));
+
+        // Rate utilisation, or None when either the ceiling is unpublished or the
+        // sampler's window has not filled. Two different absences and both must
+        // read as "no verdict" rather than as zero — a node whose sampler has not
+        // warmed up is not idle.
+        let max_pps = self.capacity_max_pps.load(Ordering::Relaxed);
+        let rate_soft = self.capacity_rate_soft_percent.load(Ordering::Relaxed);
+        let rate_hard = self.capacity_rate_hard_percent.load(Ordering::Relaxed);
+        let rate_utilization: Option<u64> = match (max_pps, self.rates.packets_per_sec()) {
+            (0, _) => None,
+            (_, None) => None,
+            (m, Some(pps)) => Some(pps.saturating_mul(100).saturating_div(m).min(100)),
+        };
+
+        let mut reasons: Vec<&'static str> = Vec::new();
+        let state = if draining {
+            reasons.push("node is draining");
+            CapacityState::Draining
+        } else if !ready {
+            reasons.push("node is not ready");
+            CapacityState::Unavailable
+        } else if max == 0 {
+            reasons.push("no capacity limit published; cannot reason about headroom");
+            CapacityState::Unavailable
+        } else if utilization >= hard {
+            reasons.push("allocations at or above the hard threshold");
+            CapacityState::Saturated
+        } else if shedding {
+            // Before the rate check, not after.
+            //
+            // Both give SATURATED, so the order looks cosmetic — and modelling the
+            // combination showed it is not. With both signals firing, the reason
+            // reported was the rate, which is the weaker claim: shedding is a
+            // failure that has already happened, and a rate threshold is a
+            // prediction that one will. The reason is what an operator acts on, so
+            // evidence has to outrank prediction.
+            reasons.push("send queue has dropped frames");
+            CapacityState::Saturated
+        } else if rate_utilization.is_some_and(|u| u >= rate_hard) {
+            // Above the soft allocation threshold: the rate is the signal with the
+            // cliff behind it. An operator seeing DEGRADED for allocations has
+            // time; one seeing it for rate may have seconds.
+            reasons.push("relayed packet rate at or above the hard threshold");
+            CapacityState::Saturated
+        } else if rate_utilization.is_some_and(|u| u >= rate_soft) {
+            reasons.push("relayed packet rate at or above the soft threshold");
+            CapacityState::Degraded
+        } else if utilization >= soft {
+            reasons.push("allocations at or above the soft threshold");
+            CapacityState::Degraded
+        } else if self.readiness() == Readiness::Degraded {
+            reasons.push("a listener or backend reports degraded");
+            CapacityState::Degraded
+        } else {
+            CapacityState::Available
+        };
+
+        CapacityResponse {
+            version: 1,
+            state,
+            reasons,
+            active_allocations: active,
+            max_allocations: max,
+            utilization_percent: utilization,
+            soft_threshold_percent: soft,
+            hard_threshold_percent: hard,
+            ready,
+            draining,
+            bytes_per_sec: self.rates.bytes_per_sec(),
+            packets_per_sec: self.rates.packets_per_sec(),
+            max_packets_per_sec: if max_pps == 0 { None } else { Some(max_pps) },
+            rate_utilization_percent: rate_utilization,
+            cpu_percent: self.host_cpu(),
+            memory_percent: self.host_memory(),
+            signals: CapacitySignals {
+                allocations: true,
+                send_queue_pressure: true,
+                readiness: true,
+                bandwidth_rate: self.rates.bytes_per_sec().is_some(),
+                packet_rate: self.rates.packets_per_sec().is_some(),
+                cpu: self.host_cpu().is_some(),
+                memory: self.host_memory().is_some(),
+            },
+        }
     }
 }
 
@@ -1232,6 +1699,68 @@ fn render_relay_route_metrics(s: &RelayRouteMetrics) -> String {
 
 /// Pulls a per-tenant relayed-traffic snapshot on each `/metrics` scrape:
 /// `(tenant, bytes, packets, closed_allocations)`. Supplied by the node from
+/// Maximum tenants emitted individually per metric family.
+///
+/// Five families carry a `tenant` label. Without a cap, a deployment with ten
+/// thousand tenants returns fifty thousand series on every scrape from every
+/// node, and Prometheus's memory use is proportional to series count — the
+/// operator discovers this when it dies rather than when it grows.
+///
+/// 100 by default: a deployment with a handful of real tenants sees no change,
+/// and the worst case becomes 500 series rather than unbounded.
+static TENANT_SERIES_CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+
+/// Label value used for the aggregate of everything past the cap.
+///
+/// Double underscore because a tenant identifier could plausibly be "other";
+/// this one is chosen to be awkward on purpose.
+const TENANT_OTHER: &str = "__other";
+
+/// Longest tenant name emitted. A name is an identifier from configuration, and
+/// one long enough to matter inflates every line of every scrape.
+const TENANT_NAME_MAX: usize = 64;
+
+/// Override how many tenants are emitted individually. 0 disables the cap, which
+/// is a decision an operator can make for a deployment they know is small.
+pub fn set_tenant_series_cap(n: usize) {
+    TENANT_SERIES_CAP.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tenant_cap() -> usize {
+    TENANT_SERIES_CAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Escape a tenant name for a Prometheus label value, and truncate it.
+fn tenant_label(t: &str) -> String {
+    let mut out = t.replace('\\', "\\\\").replace('"', "\\\"");
+    if out.len() > TENANT_NAME_MAX {
+        out.truncate(TENANT_NAME_MAX);
+        out.push('~');
+    }
+    out
+}
+
+/// Split tenants into those emitted individually and an aggregate of the rest.
+///
+/// Ranked by `weight` descending, so the tenants an operator is most likely to
+/// investigate stay visible and the long tail collapses. Returns
+/// `(kept, other_count)` — the caller sums the tail itself, since what to sum
+/// differs per family.
+fn cap_tenants<T: Copy>(
+    samples: &[(String, T)],
+    weight: impl Fn(&T) -> u64,
+) -> (Vec<(String, T)>, usize) {
+    let cap = tenant_cap();
+    if cap == 0 || samples.len() <= cap {
+        return (samples.to_vec(), 0);
+    }
+    let mut ranked: Vec<(String, T)> = samples.to_vec();
+    ranked.sort_by_key(|(_, v)| std::cmp::Reverse(weight(v)));
+    let omitted = ranked.len() - cap;
+    ranked.truncate(cap);
+    (ranked, omitted)
+}
+
 /// `AllocationStore::tenant_traffic_snapshot`. `None` omits
 /// the block (single-tenant deployments never populate it).
 pub type TenantTrafficProvider = Arc<dyn Fn() -> Vec<(String, u64, u64, u64)> + Send + Sync>;
@@ -1244,39 +1773,88 @@ fn render_tenant_traffic_metrics(samples: &[(String, u64, u64, u64)]) -> String 
     if samples.is_empty() {
         return String::new();
     }
-    let esc = |t: &str| t.replace('\\', "\\\\").replace('"', "\\\"");
+
+    // Ranked by bytes: of the three counters here, bytes is the one an operator
+    // chases first, and using a single ranking for all three keeps the same
+    // tenants visible across families — a tenant present in one and aggregated
+    // in another would be worse than either.
+    let triples: Vec<(String, (u64, u64, u64))> = samples
+        .iter()
+        .map(|(t, b, p, c)| (t.clone(), (*b, *p, *c)))
+        .collect();
+    let (kept, omitted) = cap_tenants(&triples, |(b, _, _)| *b);
+    let tail: (u64, u64, u64) = if omitted == 0 {
+        (0, 0, 0)
+    } else {
+        let kept_names: std::collections::HashSet<&str> =
+            kept.iter().map(|(t, _)| t.as_str()).collect();
+        triples
+            .iter()
+            .filter(|(t, _)| !kept_names.contains(t.as_str()))
+            .fold((0u64, 0u64, 0u64), |(a, b2, c2), (_, (b, p, c))| {
+                (a + b, b2 + p, c2 + c)
+            })
+    };
+
+    let esc = |t: &str| tenant_label(t);
     let mut out = String::new();
+
+    // Emitted whether or not anything was omitted, so the series exists to alert
+    // on and a dashboard does not have to cope with it appearing and vanishing.
+    out.push_str(
+        "# HELP turna_tenant_series_omitted Tenants aggregated into __other because the per-family cap was reached\n\
+         # TYPE turna_tenant_series_omitted gauge\n",
+    );
+    out.push_str(&format!("turna_tenant_series_omitted {omitted}\n"));
 
     out.push_str(
         "# HELP turna_tenant_bytes_relayed_total Bytes relayed per tenant (accrued at allocation close)\n\
          # TYPE turna_tenant_bytes_relayed_total counter\n",
     );
-    for (t, bytes, _, _) in samples {
+    for (t, (bytes, _, _)) in &kept {
         out.push_str(&format!(
             "turna_tenant_bytes_relayed_total{{tenant=\"{}\"}} {bytes}\n",
             esc(t)
         ));
     }
 
+    if omitted > 0 {
+        out.push_str(&format!(
+            "turna_tenant_bytes_relayed_total{{tenant=\"{}\"}} {}\n",
+            TENANT_OTHER, tail.0
+        ));
+    }
     out.push_str(
         "# HELP turna_tenant_packets_relayed_total Packets relayed per tenant (accrued at allocation close)\n\
          # TYPE turna_tenant_packets_relayed_total counter\n",
     );
-    for (t, _, packets, _) in samples {
+    for (t, (_, packets, _)) in &kept {
         out.push_str(&format!(
             "turna_tenant_packets_relayed_total{{tenant=\"{}\"}} {packets}\n",
             esc(t)
         ));
     }
 
+    if omitted > 0 {
+        out.push_str(&format!(
+            "turna_tenant_packets_relayed_total{{tenant=\"{}\"}} {}\n",
+            TENANT_OTHER, tail.1
+        ));
+    }
     out.push_str(
         "# HELP turna_tenant_allocations_closed_total Allocations closed per tenant\n\
          # TYPE turna_tenant_allocations_closed_total counter\n",
     );
-    for (t, _, _, closed) in samples {
+    for (t, (_, _, closed)) in &kept {
         out.push_str(&format!(
             "turna_tenant_allocations_closed_total{{tenant=\"{}\"}} {closed}\n",
             esc(t)
+        ));
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "turna_tenant_allocations_closed_total{{tenant=\"{}\"}} {}\n",
+            TENANT_OTHER, tail.2
         ));
     }
 
@@ -1380,6 +1958,19 @@ pub async fn serve_on(
                     ),
                     None => ("200 OK", "[]".to_string(), "application/json"),
                 },
+                "/capacity" => {
+                    // 200 in every state, including SATURATED and UNAVAILABLE:
+                    // the body carries the state, and a caller asking "can you
+                    // take this" needs an answer rather than an error it has to
+                    // interpret. `/ready` remains the endpoint that speaks in
+                    // status codes for load balancers.
+                    let cap = metrics.capacity();
+                    (
+                        "200 OK",
+                        serde_json::to_string(&cap).unwrap_or_else(|_| "{}".into()),
+                        "application/json",
+                    )
+                }
                 "/health" => {
                     if metrics.is_draining() {
                         (

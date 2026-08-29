@@ -16,6 +16,13 @@ import sys
 
 # ── thresholds, with reasoning ───────────────────────────────────────────────
 
+# Long runs (>=30 h) additionally get a per-day breakdown. Halves are a good test
+# over 24 h and a poor one over 72: a leak starting at hour 40 has its
+# second-half minimum taken from the flat part at hour 36, and a 2 %/day leak is
+# 6 % over three days — under any sane threshold, and obvious as three rising
+# points. The halves verdict is kept unchanged so the archive of 24 h results
+# stays comparable.
+#
 # RSS: compared between the *idle* floor early on and the idle floor at the end,
 # never peaks. A relay under load legitimately grows; what matters is whether it
 # gives the memory back. 15% allows for allocator fragmentation and jemalloc-style
@@ -78,6 +85,58 @@ def num(row, key):
         return None
 
 
+# Runs longer than this get the per-day treatment. 30 h rather than 24 because a
+# run of exactly one day yields two buckets, and two buckets is the halves
+# comparison with extra steps.
+LONG_RUN_HOURS = 30
+
+# A metric that rises in every bucket is a leak even when the total sits under the
+# threshold.
+#
+# The test is "rose in every bucket", not a fixed count. A fixed three was the
+# first attempt and was unreachable: three days give three buckets and therefore
+# at most two rises, so the threshold could never trip on the run length it was
+# written for. Found by feeding synthetic data through it rather than by waiting
+# 72 hours to see.
+#
+# Needs at least three buckets, because two buckets rising is the halves
+# comparison and is already covered by the growth threshold.
+MONOTONE_MIN_BUCKETS = 3
+
+
+def per_day_floors(samples, key, t0):
+    """Minimum of `key` per 24-hour bucket.
+
+    Returns [(day_index, floor)], skipping buckets with no samples rather than
+    reporting them as zero — an absent bucket means the collector stopped, which
+    is a different problem from a floor of nothing and must not read as one.
+    """
+    buckets = {}
+    for r in samples:
+        try:
+            t = float(r.get("t", 0))
+            v = float(r.get(key, 0))
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        day = int((t - t0) // 86400)
+        buckets.setdefault(day, []).append(v)
+    return [(d, min(vs)) for d, vs in sorted(buckets.items())]
+
+
+def monotone_rise(floors):
+    """Longest run of consecutive increases in the floors."""
+    best = run = 0
+    for (_, a), (_, b) in zip(floors, floors[1:]):
+        if b > a:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
 def series(rows, key):
     return [(r, num(r, key)) for r in rows if num(r, key) is not None]
 
@@ -106,6 +165,58 @@ def main(out_dir):
         report("FAIL", "load", "no load phase recorded — TURNA_LOAD_CMD produced nothing, so this run measures an idle process")
     if len(idle) < 4:
         report("WARN", "idle windows", f"only {len(idle)} idle samples; leak detection needs the idle floors")
+
+    # ── long runs: per day ──
+    #
+    # Reported before the halves comparison rather than instead of it, so a long
+    # run gets both readings. The halves number is what the archive is full of and
+    # dropping it would make a 72 h result incomparable with every 24 h one.
+    long_run = dur >= LONG_RUN_HOURS * 3600
+    if long_run and idle:
+        t0 = min(float(r.get("t", 0)) for r in idle)
+        print(f"  run is {dur/3600:.1f}h — per-day floors as well as halves\n")
+        for key, unit, scale in (("rss_kb", "MiB", 1024), ("fds", "fds", 1)):
+            floors = per_day_floors(idle, key, t0)
+            if len(floors) < 2:
+                continue
+            shown = ", ".join(
+                f"d{d}: {v/scale:.0f}" for d, v in floors
+            )
+            print(f"  {key} idle floor by day — {shown} {unit}")
+            rise = monotone_rise(floors)
+            possible = len(floors) - 1
+            first, last = floors[0][1], floors[-1][1]
+            total = (last - first) / first * 100 if first else 0
+            if len(floors) >= MONOTONE_MIN_BUCKETS and rise == possible:
+                report(
+                    "FAIL",
+                    f"{key} trend",
+                    f"rose in every one of {possible} day-to-day steps "
+                    f"({total:+.1f}% overall). A metric that grows every single day "
+                    f"is a leak whatever the total says, and this is what a halves "
+                    f"comparison cannot see.",
+                )
+            elif rise > 0:
+                report(
+                    "PASS",
+                    f"{key} trend",
+                    f"{rise} of {possible} steps rose, {total:+.1f}% overall — "
+                    f"not monotone",
+                )
+            else:
+                report("PASS", f"{key} trend", f"no rise between days, {total:+.1f}% overall")
+
+            # Stated because it is the case this test is weakest on: a leak that
+            # begins in the final bucket produces one rise out of two and passes.
+            # It needs either a longer run or the halves comparison below, which
+            # sees it when the second half is mostly leaking.
+            if rise > 0 and rise < possible and rise == 1 and possible == 2:
+                print(
+                    f"    note: the single rise is in the last day. A leak starting "
+                    f"late looks like this and would pass — a longer run would "
+                    f"separate them."
+                )
+        print()
 
     # ── RSS ──
     rss = series(idle, "rss_kb")

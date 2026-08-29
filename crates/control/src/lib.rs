@@ -22,6 +22,8 @@
 
 pub mod audit;
 pub mod grpc;
+pub mod rbac;
+pub mod revocation;
 pub mod turn_core_impl;
 
 pub use grpc::{
@@ -29,4 +31,6 @@ pub use grpc::{
     EventType, GrpcConfig, GrpcTlsConfig, ServerStatsInfo, TopTalkerInfo, TurnCore,
     UserLimitsUpdate,
 };
+pub use rbac::{Denial, Permission, RbacPolicy, KNOWN_PERMISSIONS};
+pub use revocation::{LoadError as RevocationLoadError, RevocationList};
 pub use turn_core_impl::TurnCoreImpl;

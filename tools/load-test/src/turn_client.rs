@@ -115,8 +115,48 @@ pub static BIND_IP: std::sync::OnceLock<std::net::IpAddr> = std::sync::OnceLock:
 /// a response to report, and the caller sees an error with no cause — which is exactly
 /// how an IPv6 run looked before this existed. It reported 10 setup errors and zero
 /// packets while the server logged nothing, because nothing ever reached it.
+/// How many distinct loopback source addresses to spread control sockets over.
+/// 1 (the default) means every client uses `127.0.0.1`, as before.
+pub static SOURCE_SPREAD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Round-robin position within the spread. One bump per control socket.
+static SPREAD_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Local address for a **control** socket, spread across `--source-ips`
+/// addresses in `127.0.0.0/8` when that flag is set.
+///
+/// Rotates rather than taking a client index, so no caller changes: each client
+/// binds its control socket exactly once, in `allocate_family`, and round-robin
+/// by call order distributes them the same way an index would.
+///
+/// This exists because the per-source-IP allocate limit is 32/s with a burst of
+/// 16 (`TieredLimits::allocate`), and every client sharing `127.0.0.1` means a
+/// load test measures that limiter rather than the server: 38 requested channels
+/// produced 122 refusals against 59 allocations.
+///
+/// A real deployment does not look like that. Clients arrive from many
+/// addresses, where the per-IP limit never binds and `per_prefix` (40 000/s) is
+/// the ceiling that matters. One source address is the everyone-behind-one-NAT
+/// case — worth testing deliberately, but not capacity.
+///
+/// `--bind-ip` wins when set: it exists for labs where the server is not on
+/// loopback and the source must be a specific address, and overriding it here
+/// would break those. IPv6 is not spread — `::2` is not local the way
+/// `127.0.0.2` is, and adding it needs interface configuration.
 pub fn control_bind_addr(server: SocketAddr) -> String {
-    peer_bind_addr(server.is_ipv6())
+    if BIND_IP.get().is_some() || server.is_ipv6() {
+        return peer_bind_addr(server.is_ipv6());
+    }
+    match SOURCE_SPREAD.get().copied().unwrap_or(1) {
+        0 | 1 => peer_bind_addr(false),
+        spread => {
+            // Capped at 250 to stay inside the last octet; a run needing more
+            // sources than that needs more than one host anyway.
+            let spread = spread.min(250);
+            let n = SPREAD_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % spread + 1;
+            format!("127.0.0.{n}:0")
+        }
+    }
 }
 
 pub fn peer_bind_addr(v6: bool) -> String {

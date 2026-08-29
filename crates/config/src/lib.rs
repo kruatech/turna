@@ -167,6 +167,61 @@ impl TurnaConfig {
             }
         }
 
+        // RBAC: the one configuration mistake here that has no benign reading is
+        // enabling it with no bindings, which denies every management request.
+        // Everything else warns — a typo in a role name should not stop a node,
+        // and on a fleet mid-upgrade a config naming a permission the older
+        // binary does not check is normal.
+        {
+            let r = &self.grpc.rbac;
+            if r.enabled && r.bindings.is_empty() {
+                errors.push(
+                    "[management.rbac] enabled = true with no bindings: every \
+                     management request would be denied, including the ones needed to \
+                     fix this. Add a binding or disable RBAC."
+                        .into(),
+                );
+            }
+            for (fp, roles) in &r.bindings {
+                if fp.len() != 64 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+                    tracing::warn!(
+                        fingerprint = %fp,
+                        "[grpc.rbac.bindings] does not look like a SHA-256 \
+                         fingerprint (64 hex characters, no colons). Get it with: \
+                         openssl x509 -in client.pem -noout -fingerprint -sha256 \
+                         | cut -d= -f2 | tr -d : | tr 'A-Z' 'a-z'"
+                    );
+                }
+                if roles.is_empty() {
+                    tracing::warn!(
+                        fingerprint = %fp,
+                        "[grpc.rbac.bindings] bound to no roles, so it can do nothing"
+                    );
+                }
+            }
+        }
+
+        // Syslog: a malformed endpoint disables export silently in the exporter,
+        // which is the wrong place to find out that security events are going
+        // nowhere.
+        if !self.turn.observability.syslog_endpoint.is_empty() {
+            let e = &self.turn.observability.syslog_endpoint;
+            let ok = e.starts_with("udp://") || e.starts_with("tcp://");
+            let has_port = e
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .is_some();
+            if !ok || !has_port {
+                errors.push(format!(
+                    "[observability] syslog_endpoint = {e:?} must be udp://host:port \
+                     or tcp://host:port. Refused here rather than at runtime: an \
+                     endpoint that silently fails to parse means security events go \
+                     nowhere and nothing says so."
+                ));
+            }
+        }
+
         // Check port conflicts
         let all_ports = [
             ("turn", self.turn.listen),
@@ -951,6 +1006,43 @@ pub struct RelayConfig {
     /// Per-user bandwidth + allocation count limits. Defaults are
     /// "no bandwidth limit, 100 allocations per username".
     pub quota: QuotaConfig,
+    /// Relayed packets/second this node can carry, from a measurement.
+    ///
+    /// 0 (the default) leaves the rate reported and not judged. Set it from
+    /// `scripts/verify/capacity-profile.sh` run on this hardware — a figure from
+    /// other hardware is worse than none, because it looks measured.
+    ///
+    /// The figure is in one-way traversals, the same unit a call's media consumes:
+    /// `channel-data` mode sends client -> relay -> peer, so the relay receives
+    /// each frame once and sends it once.
+    ///
+    /// An earlier version of this comment claimed a factor-of-two uncertainty, on
+    /// the reasoning that the profiler echoed frames back to the client. It does
+    /// not — the receive task listens on the peer socket. The `sent ~= recv`
+    /// equality that suggested a round trip is equally true of a one-way path, and
+    /// an equality consistent with two readings is evidence for neither.
+    #[serde(default)]
+    pub max_packets_per_sec: u64,
+    /// Percent of `max_packets_per_sec` at which `/capacity` reports DEGRADED.
+    ///
+    /// 60 by default, lower than the allocation threshold because the failure
+    /// shapes differ. Allocations degrade gracefully; packet rate is a cliff —
+    /// measured, clean at 112 000 pps and shedding a million frames at 128 000.
+    /// Seven percent between the two, so the warning sits further back.
+    #[serde(default = "default_rate_soft")]
+    pub rate_soft_percent: u64,
+    /// Percent at which `/capacity` reports SATURATED. 80 by default.
+    #[serde(default = "default_rate_hard")]
+    pub rate_hard_percent: u64,
+    /// How long to wait for allocations to end on shutdown, seconds.
+    ///
+    /// The node stops accepting immediately and then waits for existing
+    /// allocations. Raise it to let long calls finish; lower it to roll a
+    /// cluster faster. Measured: a node holding allocations whose clients had
+    /// vanished took the full timeout, because nothing was going to expire
+    /// inside it — see the stall detection in `relay::server::drain`, which now
+    /// cuts that case short without shortening the wait for live traffic.
+    pub drain_timeout_secs: u64,
 }
 
 impl Default for RelayConfig {
@@ -960,6 +1052,11 @@ impl Default for RelayConfig {
             max_port: 65535,
             max_allocations: 10000,
             quota: QuotaConfig::default(),
+            // The value this was hard-coded to before it became configurable.
+            max_packets_per_sec: 0,
+            rate_soft_percent: 60,
+            rate_hard_percent: 80,
+            drain_timeout_secs: 30,
         }
     }
 }
@@ -1039,9 +1136,123 @@ impl SignalingConfig {
 
 // ── Observability ─────────────────────────────────────────────────────────────
 
+/// serde cannot express `default = true` for a bool inline.
+/// 256 entries: a rolling upgrade's worth of transitions, and no more.
+fn default_node_audit_entries() -> usize {
+    256
+}
+
+/// 60 % — see `rate_soft_percent`. The curve, not a convention.
+fn default_rate_soft() -> u64 {
+    60
+}
+
+/// 80 % — far enough below the measured cliff to leave room to react.
+fn default_rate_hard() -> u64 {
+    80
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {
+    /// Syslog collector for security events, RFC 5424.
+    ///
+    /// `udp://host:514` or `tcp://host:601`. Empty disables export.
+    ///
+    /// One string rather than host, port and protocol as three keys: three keys
+    /// admit a config where the protocol says TCP and the port is a UDP
+    /// convention, and that misconfiguration produces a collector which accepts
+    /// the connection and stores nothing.
+    ///
+    /// Only security-relevant events are sent — authentication failures,
+    /// authorisation denials, peer refusals, rate-limit trips, audit entries,
+    /// readiness transitions. Not relayed traffic. A SIEM billed per event that
+    /// receives a line per frame gets switched off, and a switched-off SIEM
+    /// catches nothing.
+    #[serde(default)]
+    pub syslog_endpoint: String,
+    /// Hash client addresses before sending them to the collector.
+    ///
+    /// Off by default: a SIEM is inside the operator's trust boundary and an
+    /// authentication-failure event without a source is not actionable. Turning
+    /// it on loses the ability to correlate one attacker across events, which is
+    /// most of what a SIEM is for — a real trade, not a free improvement.
+    #[serde(default)]
+    pub syslog_redact_addresses: bool,
+    /// Log client IP addresses on the **allocation** lines.
+    ///
+    /// Named for its scope rather than for the general idea, because the general
+    /// idea would be a promise this does not keep. It covers three INFO lines in
+    /// the relay — allocation created, TCP allocation created, allocation migrated
+    /// — and nothing else.
+    ///
+    /// **Default true**, which is the existing behaviour. Those three are
+    /// per-allocation, so a busy node writes one line containing a client's
+    /// address for every allocation it grants: 13.7 million of them in this
+    /// project's own 3-hour soak. The default is not the privacy-forward choice
+    /// and that is deliberate — `src` on the allocation line is the field an
+    /// operator correlates a complaint against, and removing it silently in an
+    /// upgrade breaks what logs are used for.
+    ///
+    /// Set false and they log as `ip-<12 hex>` under a per-process salt:
+    /// traceable within one node's lifetime, not recoverable from the log.
+    ///
+    /// # What this does not cover, and why not
+    ///
+    /// Ten WARN lines in the TURNS, QUIC and SCTP transports also carry an
+    /// address. They are outside this switch on purpose, and the reason is that
+    /// they are a different kind of line:
+    ///
+    /// - All ten are **refusals** — a per-IP cap, a rate limit, a session
+    ///   ceiling. A node relaying happily writes none of them, so the volume is
+    ///   bounded by attacks rather than by traffic.
+    /// - The address is the **most useful part**. "Who is being refused" is the
+    ///   question, and a refusal with no subject cannot be acted on.
+    /// - They are what the syslog layer forwards to a SIEM. Hashing them would
+    ///   send refusal events with no actionable subject, which is most of what a
+    ///   SIEM is for.
+    ///
+    /// A deployment that must log no client address anywhere cannot get that from
+    /// configuration today — it would have to raise the transport log level above
+    /// WARN, which silences things it wants. See
+    /// `docs/security/log-data-audit-2026-08-27.md`.
+    #[serde(default = "default_true")]
+    pub log_allocation_addresses: bool,
+    /// Entries the node keeps in its own in-memory audit ring.
+    ///
+    /// Separate from the control plane's, because a hash chain assumes one writer
+    /// and two processes appending to one can each claim the same predecessor.
+    ///
+    /// **In memory, so it does not survive a restart.** That is a real limit and
+    /// it decides what belongs here: drain transitions, certificate rotations, a
+    /// listener that failed — things that happen while the process lives and are
+    /// worth reading soon after. Start and stop events are about restarts and are
+    /// therefore useless here; they go to `syslog_endpoint`, which is off the
+    /// host.
+    ///
+    /// 256 by default. Large enough to hold a rolling upgrade's worth of
+    /// transitions, small enough to cost nothing.
+    #[serde(default = "default_node_audit_entries")]
+    pub node_audit_entries: usize,
+    /// Where the node writes its audit chain. Empty keeps it in memory only.
+    ///
+    /// With a path, `AuditLog::open` replays and **verifies** the existing chain
+    /// on startup and fails closed on a break, resuming `seq` across rotation
+    /// boundaries. That is what makes start and stop events worth recording here
+    /// rather than only in syslog: they survive the restart they describe, and
+    /// they are tamper-evident, which syslog is not.
+    ///
+    /// An earlier version of this comment said the log was memory-only and that
+    /// lifecycle events therefore belonged in syslog alone. That was wrong — I
+    /// found `new(capacity)`, saw a ring buffer, and did not read the two
+    /// constructors below it.
+    #[serde(default)]
+    pub node_audit_path: String,
+
     /// OTLP gRPC endpoint.  Set to empty string to disable tracing.
     /// Example: "http://otel-collector:4317"
     pub otlp_endpoint: String,
@@ -1057,8 +1268,13 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            otlp_endpoint: String::new(), // disabled by default
-            trace_sample_rate: 0.01,      // 1%
+            otlp_endpoint: String::new(),
+            syslog_endpoint: String::new(),
+            syslog_redact_addresses: false,
+            log_allocation_addresses: true,
+            node_audit_entries: 256,
+            node_audit_path: String::new(), // disabled by default
+            trace_sample_rate: 0.01,        // 1%
             json_logs: false,
             max_spans_per_second: 1000,
         }
@@ -1906,9 +2122,73 @@ impl Default for ManagementConfig {
 /// validator rejects `tls_mode = "disabled"` unless `management.listen`
 /// is bound to `127.0.0.1` / `::1`, and rejects missing paths when a
 /// non-disabled mode is selected.
+/// Role-based access control for the management plane.
+///
+/// Off by default, and enabling is **default-deny**: an identity with no binding
+/// can do nothing. That means turning this on for a running deployment locks out
+/// every existing client until each is bound, which is why it is opt-in rather
+/// than a default somebody discovers during an incident.
+///
+/// ```toml
+/// [management.rbac]
+/// enabled = true
+///
+/// # Optional. Extends and can override the built-in viewer/operator/admin.
+/// [management.rbac.roles]
+/// oncall = ["node:drain", "stats:read", "allocations:read"]
+///
+/// # Certificate SHA-256 fingerprints, lower-case hex, no colons.
+/// #   openssl x509 -in client.pem -noout -fingerprint -sha256 \
+/// #     | cut -d= -f2 | tr -d : | tr 'A-Z' 'a-z'
+/// [management.rbac.bindings]
+/// "3fa1...c9" = ["admin"]
+/// "7bd2...04" = ["oncall"]
+/// ```
+///
+/// Bindings are by fingerprint rather than by a field inside the certificate.
+/// Reading a role from the OU would be less configuration and would hand
+/// authorisation to whoever signs certificates — for a private CA often the same
+/// person, but not always, and the moment it is not, the separation is the point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(Default)]
+pub struct RbacSection {
+    /// Enforce roles. Default-deny when true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Extra roles, merged over the built-ins. A name that matches a built-in
+    /// replaces it, so a deployment that finds `operator` too broad can narrow
+    /// it rather than inventing a parallel name.
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, Vec<String>>,
+    /// Certificate fingerprint to role names.
+    #[serde(default)]
+    pub bindings: std::collections::HashMap<String, Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GrpcConfigSection {
+    /// Role-based access control. See [`RbacSection`].
+    #[serde(default)]
+    pub rbac: RbacSection,
+    /// File listing client-certificate fingerprints that may not be used.
+    ///
+    /// One SHA-256 fingerprint per line, `#` for comments. Colons and upper case
+    /// are accepted because that is what `openssl x509 -fingerprint` emits.
+    ///
+    /// **Not RFC 5280 CRL.** No CA-signed list, no freshness rule — a local
+    /// deny-list checked when an RPC arrives, so a revoked client completes the
+    /// TLS handshake and is refused on its first call. That trade buys what CRL
+    /// cannot have here: it works with no route off the host, which is the
+    /// deployment that most needs revocation. See
+    /// `docs/security/mtls-revocation.md`.
+    ///
+    /// **Fail-closed.** A path that cannot be read stops the node from starting,
+    /// because a list that is configured and unread looks like protection.
+    #[serde(default)]
+    pub revocation_list: String,
+
     /// One of: `"disabled"` (default), `"tls"`, `"mtls"`.
     pub tls_mode: String,
     /// Path to PEM with the server certificate. Required when
@@ -1925,6 +2205,8 @@ pub struct GrpcConfigSection {
 impl Default for GrpcConfigSection {
     fn default() -> Self {
         Self {
+            rbac: RbacSection::default(),
+            revocation_list: String::new(),
             tls_mode: "disabled".into(),
             tls_cert: String::new(),
             tls_key: String::new(),

@@ -28,3 +28,9 @@ bench/results/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# working artifacts, not part of the project
+patches/
+node_modules/
+air-gap-*/
+enterprise-*/

@@ -12,7 +12,7 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 
 ## Status
 
-**Production GA (`0.3.1`).** The default **Tokio datapath** is the primary supported path:
+**Production GA (`0.4.0`).** The default **Tokio datapath** is the primary supported path:
 STUN binding, the TURN allocation lifecycle, long-term-credential and JWT auth,
 Prometheus/OpenTelemetry, config validation, durable runtime configuration,
 per-subject limits, and graceful drain.
@@ -137,7 +137,8 @@ live in [bench/README.md](bench/README.md).
 | Allocation released when its TCP/DTLS/QUIC connection closes | Supported (not left to TTL)     |
 | mTLS for TURNS clients                         | Opt-in (`[tls] client_ca`); no CRL/OCSP by design |
 | IPv6 relayed transport                         | Opt-in via `[turn] external_ip6`; 440 when unset. Relayed media and coturn interop verified on routable addresses |
-| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS only with `[turn.dtls] demux = true` |
+| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS only with `[turn.dtls] demux = true`. Verified under load: 0 → 1, no failures, 36 021 frames relayed with zero errors across the swap |
+| Shared-secret rotation without restart         | **Not supported.** `SIGHUP` is not handled and `UpdateConfig` carries allocation limits, not the secret — `[turn.auth] shared_secret` changes only with a restart. Ephemeral credentials derived from it expire on their own; the secret does not. See R13 in [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) |
 | Multi-node ownership/state failover            | Experimental / limited scope                  |
 | Transparent active-session (media) failover    | Out of GA scope                               |
 
@@ -297,7 +298,7 @@ Workspace crates can be consumed via a git dependency:
 
 ```toml
 [dependencies]
-turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.3.1" }
+turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.4.0" }
 ```
 
 ## Development

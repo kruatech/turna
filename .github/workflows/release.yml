@@ -187,6 +187,18 @@ jobs:
 
       - name: Build release binaries
         run: |
+          # Strip the build directory out of the binary. Panic messages and debug
+          # info otherwise carry the absolute path, so the same source built in
+          # /home/runner/work/turna and /build produces different bytes — and a
+          # user checking the published binary against the published source
+          # cannot, which is the whole point of the property.
+          #
+          # Set here rather than in an `env:` block: Actions assigns env values
+          # literally, so a `$HOME` there would reach rustc as four characters.
+          export RUSTFLAGS="--remap-path-prefix=$PWD= --remap-path-prefix=$HOME/.cargo="
+          # Honoured by build scripts that stamp a date. Deterministic per commit
+          # rather than per build.
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           cargo build --locked --release \
             --bin turna-node \
             --bin turna-control-plane \

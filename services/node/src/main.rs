@@ -298,6 +298,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
+    // The node's audit ring, and the layer that fills it.
+    //
+    // The ring is in memory, so it holds what happens while the process lives:
+    // drain transitions, certificate rotations, a listener that died. Start and
+    // stop events describe the restart that erases it and go to syslog instead.
+    //
+    // The layer observes rather than being called: `record_infra` needs a type
+    // from turna-control, and neither turna-relay nor turna-transport depends on
+    // it. Covering only the crates that could reach it would leave the journal
+    // without certificate rotation, which happens in the transport crate — a hole
+    // exactly where the interesting event is.
+    // The node's audit chain.
+    //
+    // Persistent when a path is configured: `open` replays and verifies the whole
+    // existing chain, fails closed on a break, and resumes `seq` across a rotation
+    // boundary. In memory otherwise.
+    //
+    // A previous version of this code had a comment here saying the log was
+    // memory-only and that lifecycle events therefore belonged in syslog alone.
+    // That was wrong — `new(capacity)` is the in-memory constructor and there are
+    // two more below it, which I did not read.
+    //
+    // Both destinations are used and neither is redundant: syslog carries events
+    // off the host, where a compromised node cannot reach them, and the chain
+    // makes them tamper-evident, which syslog is not.
+
+    // Start recorded in both places. The chain survives the restart this event
+    // describes; syslog puts it somewhere a compromised node cannot reach.
+
+    //
+    // `AuditLog` is an in-memory ring, not a file, so it cannot hold start or stop
+    // events — those describe the restart that erases it, and they go to syslog
+    // instead. What belongs in it is what happens while the process lives: drain
+    // transitions, certificate rotations, a listener that failed to bind.
+    //
+    // Those call sites are not wired, so constructing the ring here would leave a
+    // documented, dead object that reads as plumbing. Construct it at the same
+    // time as the first real caller:
+    //
+    //   let node_audit = Arc::new(turna_control::audit::AuditLog::new(
+    //       config.observability.node_audit_entries));
+    //
+    // The config key exists and is documented.
+
+    // Security-event export. Constructed here so it exists before anything can
+    // refuse a request: an exporter created later would miss exactly the events
+    // that happen during startup, which is when a misconfigured listener refuses
+    // things.
+    //
+    // Disabled unless an endpoint is configured, and a disabled exporter is a
+    // no-op rather than a branch at every call site.
+
+    // Publish the node's own ceiling so `/capacity` has something to reason
+    // about. Until this runs, that endpoint reports UNAVAILABLE — a node that
+    // does not know its limit must not advertise headroom, because an unset
+    // limit read as "unlimited" is how a node gets sent work it cannot take.
+    //
+    // The thresholds are percentages of `max_allocations`, which is the only
+    // ceiling this process actually enforces. A deployment's real constraint is
+    // often something else — uplink bandwidth, a licence count — which is why
+    // `/capacity` returns the raw numbers next to the state rather than only a
+    // verdict.
+    metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
+    // The packet-rate ceiling and its thresholds. Separate call because the two
+    // come from different places: the allocation cap is a configuration decision,
+    // the rate ceiling is a measurement. 0 leaves the rate reported and not
+    // judged.
+    metrics.set_rate_limits(
+        config.relay.max_packets_per_sec,
+        config.relay.rate_soft_percent,
+        config.relay.rate_hard_percent,
+    );
+
     // M1: install the configured peer-filter policy before serving.
     // Default profile is internet-facing (denies RFC1918/ULA); opt into
     // LAN relaying via [turn.peer_filter] profile = "lan".
@@ -611,6 +684,52 @@ fn run_tokio(
     #[cfg(not(feature = "tls"))]
     let _ = &tls_cfg;
     let external_ip6 = resolve_external_ip6(&config);
+
+    let node_audit = {
+        let path = &config.observability.node_audit_path;
+        if path.is_empty() {
+            std::sync::Arc::new(turna_control::audit::AuditLog::new(
+                config.observability.node_audit_entries,
+            ))
+        } else {
+            match turna_control::audit::AuditLog::open(
+                config.observability.node_audit_entries,
+                path,
+                None,
+            ) {
+                Ok(log) => {
+                    info!(path = %path, "node audit chain opened and verified");
+                    std::sync::Arc::new(log)
+                }
+                // Fail-closed, matching what `open` already does internally. A
+                // chain that cannot be verified is either corrupt or tampered
+                // with, and starting anyway would append to something whose
+                // history is unknown — which destroys the one property the chain
+                // exists to provide.
+                Err(e) => {
+                    return Err(format!(
+                        "node audit chain at {path} could not be opened: {e:?}. \
+                         Refusing to start: appending to a chain whose history \
+                         cannot be verified destroys the property it exists for. \
+                         Move the file aside to start a fresh chain, and keep it — \
+                         it is evidence whatever state it is in."
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+
+    node_audit.record_infra(
+        turna_control::audit::InfraEvent::NodeStarted,
+        &format!(
+            "version={} pid={}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
+        true,
+    );
+
     let num_threads = std::env::var("TURNA_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -629,7 +748,65 @@ fn run_tokio(
         .enable_all()
         .build()?;
 
-    rt.block_on(async {
+    let result = rt.block_on(async {
+    let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
+        turna_observability::syslog::SyslogConfig {
+            endpoint: config.observability.syslog_endpoint.clone(),
+            app_name: "turna".to_string(),
+            redact_addresses: config.observability.syslog_redact_addresses,
+            non_blocking: true,
+        },
+    ));
+    // Mirror the exporter's counters on the same ticker as the rest. Without
+    // this the two documented series read zero forever, and a dashboard panel
+    // showing no drops is indistinguishable from one showing no export.
+    {
+        let syslog = _syslog.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                metrics
+                    .syslog_sent
+                    .store(syslog.sent.load(Relaxed), Relaxed);
+                metrics
+                    .syslog_dropped
+                    .store(syslog.dropped.load(Relaxed), Relaxed);
+            }
+        });
+    }
+
+    // Startup goes to syslog, not to the ring.
+    //
+    // The ring is in memory and does not survive a restart, so a start event
+    // recorded there is one nobody can ever read — it describes the very
+    // discontinuity that erases it. Putting it in the ring anyway would look like
+    // coverage and provide none, which is the worse kind of nothing.
+    //
+    // Version and config path because the first question after any incident is
+    // which build was running.
+    _syslog.emit(
+        // ReadinessChanged, not ControlFailed: nothing failed. Using the failure
+        // kind for a normal start would put successes and failures under one
+        // MSGID, and a SIEM rule cannot separate them again.
+        turna_observability::syslog::EventKind::ReadinessChanged,
+        &[
+            ("state", "started"),
+            ("version", env!("CARGO_PKG_VERSION")),
+            ("pid", &std::process::id().to_string()),
+        ],
+    );
+
+    if _syslog.is_enabled() {
+        info!(
+            endpoint = %config.observability.syslog_endpoint,
+            "security events exporting to syslog"
+        );
+    }
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // #5: resolve the deployment-profile worker gates once, up front.
         let gates = profile_gates(&cluster);
@@ -776,6 +953,110 @@ fn run_tokio(
             };
             #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
             let relay_route_metrics: Option<turna_health::RelayRouteMetricsProvider> = None;
+
+            // Host CPU and memory, every five seconds.
+            //
+            // A single long-lived `System`, refreshed in place. CPU usage in
+            // sysinfo is a delta between refreshes, so a persistent instance
+            // reports the load over the whole interval; building a fresh one each
+            // tick — which `heartbeat::sample_resources` did — measures only the
+            // library's internal ~100 ms settling window, and a node busy in
+            // bursts reads low if the sample falls between them.
+            //
+            // Runs regardless of whether a cluster backend is configured. The
+            // previous arrangement collected this only inside the heartbeat loop,
+            // so a standalone node had no CPU or memory reading at all — the two
+            // signals a capacity decision most wants, missing exactly where there
+            // is no cluster to ask instead.
+            {
+                let metrics = metrics.clone();
+                tokio::task::spawn_blocking(move || {
+                    use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+                    let mut sys = System::new_with_specifics(
+                        RefreshKind::nothing()
+                            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                            .with_memory(MemoryRefreshKind::nothing().with_ram()),
+                    );
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        sys.refresh_cpu_usage();
+                        sys.refresh_memory();
+                        let cpu = sys.global_cpu_usage().round() as u64;
+                        let mem = if sys.total_memory() > 0 {
+                            ((sys.used_memory() as f64 / sys.total_memory() as f64) * 100.0)
+                                .round() as u64
+                        } else {
+                            0
+                        };
+                        metrics.set_host_load(cpu, mem);
+                    }
+                });
+            }
+
+            // Relayed traffic rate, sampled once a second.
+            //
+            // Its own task rather than a branch of the five-second port ticker
+            // below: `RateSampler`'s window is ten one-second buckets, so ticking
+            // it every five seconds would put a five-second delta into a bucket
+            // meant to hold one second and leave eight buckets stale. The mean
+            // would be wrong by roughly a factor of five while still looking like
+            // a plausible number — the failure mode worth avoiding, since nothing
+            // would flag it.
+            //
+            // The cost is two loads, two swaps and two stores per second.
+            {
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(1));
+                    // Skip rather than Burst: after a stall, catching up would
+                    // write several buckets from one counter reading and report a
+                    // rate that never happened.
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        let bytes = metrics.bytes_received.load(Relaxed)
+                            + metrics.bytes_sent.load(Relaxed);
+                        let packets = metrics.packets_received.load(Relaxed)
+                            + metrics.packets_sent.load(Relaxed);
+                        metrics.rates.tick(bytes, packets);
+                    }
+                });
+            }
+
+            // Relay-port occupancy, mirrored on a ticker.
+            //
+            // A ticker rather than a scrape-time provider like the two below: a
+            // provider would need another parameter on `serve_*`, whose signature
+            // has already grown twice this week, and the cost of the ticker is up
+            // to five seconds of staleness. A port range does not fill in five
+            // seconds, so an alert firing one interval late is not a worse alert.
+            //
+            // Tenant pools are summed into the global gauges rather than exported
+            // per tenant. `port_pool_usage()` keeps the per-pool detail for
+            // anything that wants it without every scrape paying for the labels.
+            {
+                let store = store.clone();
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_secs(5));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tick.tick().await;
+                        let (used, total) = store
+                            .port_pool_usage()
+                            .iter()
+                            .fold((0usize, 0usize), |(u, t), (_, in_use, cap)| {
+                                (u + in_use, t + cap)
+                            });
+                        metrics.relay_ports_in_use.store(used as u64, Relaxed);
+                        metrics.relay_ports_total.store(total as u64, Relaxed);
+                    }
+                });
+            }
 
             // Per-tenant traffic provider: snapshot the store's cumulative
             // per-tenant counters (accrued at allocation teardown) on each
@@ -1604,21 +1885,36 @@ fn run_tokio(
         let drain_gossip_notify = gossip_drain_notify.clone();
         let drain_metrics = metrics.clone();
         let drain_grace = cluster.drain_grace_secs;
+        let sig_audit = node_audit.clone();
         tokio::spawn(async move {
             let ctrl_c = tokio::signal::ctrl_c();
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
                 let mut sigterm = signal(SignalKind::terminate()).unwrap();
-                tokio::select! {
-                    _ = ctrl_c => info!("SIGINT received"),
-                    _ = sigterm.recv() => info!("SIGTERM received"),
-                }
+                let sig = tokio::select! {
+                    _ = ctrl_c => "SIGINT",
+                    _ = sigterm.recv() => "SIGTERM",
+                };
+                info!(event = "node_stopping", signal = sig, "{sig} received");
+                // SIGTERM is an orchestrator; SIGINT is a person at a terminal. An
+                // auditor asking who stopped the node wants that distinction, and
+                // it costs one field.
+                sig_audit.record_infra(
+                    turna_control::audit::InfraEvent::NodeStopping,
+                    &format!("signal={sig}"),
+                    true,
+                );
             }
             #[cfg(not(unix))]
             {
                 ctrl_c.await.ok();
-                info!("SIGINT received");
+                info!(event = "node_stopping", signal = "SIGINT", "SIGINT received");
+                sig_audit.record_infra(
+                    turna_control::audit::InfraEvent::NodeStopping,
+                    "signal=SIGINT",
+                    true,
+                );
             }
             // Reject new allocations immediately on every node (508 Server
             // Draining via the processor). On a cluster also flip the routing
@@ -1647,6 +1943,16 @@ fn run_tokio(
                         .load(std::sync::atomic::Ordering::Relaxed);
                     if remaining == 0 {
                         info!("drain complete — no active allocations remaining");
+                        // A syslog emit belongs here — an outage window is bounded
+                        // by the drain entries and by nothing else the system
+                        // records. Not wired: this runs inside a spawned task whose
+                        // captures I have not traced, and the exporter lives in
+                        // main. Threading it in is a small change; guessing at the
+                        // capture list and having it compile would be worse than
+                        // leaving the note.
+                        //
+                        // Until then the transition is visible through
+                        // turna_backend_readiness and the log line above.
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {
@@ -1720,7 +2026,8 @@ fn run_tokio(
                     migration,
                     tcp_relay,
                 )
-                .with_external_ip6(external_ip6);
+                .with_external_ip6(external_ip6)
+                .with_drain_timeout_secs(config.relay.drain_timeout_secs);
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
                     info!(listen = %tls_cfg.listen, cert = %tls_cfg.cert_path.display(), "TURNS (TLS) enabled");
@@ -2040,7 +2347,28 @@ fn run_tokio(
         .await;
 
         datapath_result
-    })
+    });
+
+    // Explicit shutdown, not an implicit drop.
+    //
+    // `Runtime::drop` waits for every spawned task to finish. Four metric tickers
+    // loop forever by design — one says "Runs until process exit" in its own
+    // comment — so the drop blocked and the process never exited on SIGTERM.
+    //
+    // Measured before this change: still alive past 45 seconds, two threads left,
+    // one of them a worker in `hrtimer_nanosleep`. Drain had completed in
+    // milliseconds and every `join_within_budget` above had returned, so the wait
+    // was after the last line anything writes — which is why the log ends looking
+    // like a clean shutdown and no verification caught it. The scripts all killed
+    // the node with SIGKILL at the end.
+    //
+    // Not specific to any transport: measured the same with the stock DTLS
+    // listener and with DTLS disabled entirely.
+    //
+    // 5 seconds because everything that must flush has already been joined with
+    // its own budget. What remains has nothing to flush.
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    result
 }
 
 /// Exposes cluster membership to the health server's GET /cluster endpoint.

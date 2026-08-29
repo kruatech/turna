@@ -1,0 +1,1041 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "turna \u2014 TURN/STUN relay",
+  "uid": "turna-overview",
+  "description": "Ordered by the question an operator asks first. Panel descriptions carry what a number means rather than restating its name \u2014 a dashboard that needs a runbook open beside it is half a dashboard.",
+  "tags": [
+    "turna",
+    "turn",
+    "webrtc"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(turna_active_allocations, instance)",
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Is it serving?",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Readiness",
+      "description": "0 starting, 1 ready, 2 degraded, 3 draining. A node stuck at 0 never finished starting \u2014 check the backend before anything else here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2
+              },
+              {
+                "color": "blue",
+                "value": 3
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_backend_readiness",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "Active allocations",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_active_allocations",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Relay ports in use",
+      "description": "The blind spot until 2026-08-26. A range fills silently and the first symptom is Allocate failing. Alert here, not on allocation count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_relay_ports_utilization_percent",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "Capacity state",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_active_allocations / turna_relay_ports_total * 100",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "id": 5
+    },
+    {
+      "type": "row",
+      "title": "Traffic",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "Packets relayed",
+      "description": "Measured ceiling on a 32-thread Threadripper: 112k pps over loopback, and the failure above it is a cliff not a slope \u2014 7% higher sheds a million frames in two minutes. See docs/capacity/.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_packets_received[5m])",
+          "legendFormat": "received",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(turna_packets_sent[5m])",
+          "legendFormat": "sent",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes relayed",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_bytes_received[5m])*8",
+          "legendFormat": "in",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(turna_bytes_sent[5m])*8",
+          "legendFormat": "out",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Send queue drops",
+      "description": "Non-zero means the node discarded media before sending it. The client cannot see this \u2014 it is the signal that a clean-looking loss figure is wrong. Any sustained value is a capacity problem.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_send_queue_dropped_total[5m])",
+          "legendFormat": "dropped/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Allocation churn",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_total_allocations[5m])",
+          "legendFormat": "created/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "id": 10
+    },
+    {
+      "type": "row",
+      "title": "Refusals \u2014 expected, until the rate changes",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Auth failures",
+      "description": "A baseline is normal: clients retry with stale credentials. A step change is the signal, which is why this is a rate and not a counter.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_auth_failures[5m])",
+          "legendFormat": "/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate limited",
+      "description": "TieredLimits: 32 allocations/s per source IP with a burst of 16. Load tests from a single address hit this and read it as a server limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_rate_limited[5m])",
+          "legendFormat": "/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "id": 13
+    },
+    {
+      "type": "timeseries",
+      "title": "Peer refused",
+      "description": "SSRF protection. Includes the v4-embedding v6 prefixes \u2014 NAT64, 6to4, Teredo \u2014 through which every IPv4 rule was bypassable.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_peer_rejected[5m])",
+          "legendFormat": "/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "id": 14
+    },
+    {
+      "type": "timeseries",
+      "title": "Quota exceeded",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_quota_exceeded[5m])",
+          "legendFormat": "/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "id": 15
+    },
+    {
+      "type": "timeseries",
+      "title": "Parser rejections and malformed",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_parser_rejections[5m])",
+          "legendFormat": "rejected",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(turna_malformed_packets[5m])",
+          "legendFormat": "malformed",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "id": 16
+    },
+    {
+      "type": "row",
+      "title": "Transports",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      },
+      "id": 17
+    },
+    {
+      "type": "timeseries",
+      "title": "TURNS connections",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_tls_active_connections",
+          "legendFormat": "active",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 18
+    },
+    {
+      "type": "timeseries",
+      "title": "TURNS refusals",
+      "description": null,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_tls_rejected_per_ip_total[5m])",
+          "legendFormat": "per-IP cap",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(turna_tls_rejected_rate_limit_total[5m])",
+          "legendFormat": "rate limit",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "DTLS accept timeouts",
+      "description": "On an idle listener this is one per accept_timeout and means nothing. webrtc-dtls runs the handshake inside accept(), so a timeout cannot distinguish an idle listener from a stalled peer.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_dtls_accept_timeouts_total[5m])",
+          "legendFormat": "/s",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 56
+      },
+      "id": 20
+    },
+    {
+      "type": "timeseries",
+      "title": "SCTP associations",
+      "description": "Refused under production = true. These series exist because the listener shipped with none \u2014 a listener that had stopped accepting looked identical to an idle one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_sctp_active_associations",
+          "legendFormat": "active",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 56
+      },
+      "id": 21
+    },
+    {
+      "type": "row",
+      "title": "Per-tenant \u2014 capped, and the cap is visible",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      },
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Tenant bytes",
+      "description": "Top 100 tenants are emitted individually; the rest aggregate into __other. Ten thousand tenants would otherwise be fifty thousand series per scrape.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "topk(10, rate(turna_tenant_bytes_relayed_total[5m]))",
+          "legendFormat": "{{tenant}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      },
+      "id": 23
+    },
+    {
+      "type": "stat",
+      "title": "Tenants aggregated away",
+      "description": "Non-zero means some tenants are inside __other rather than named. Not a fault \u2014 but if you are looking for a specific tenant and cannot find it, this is why.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "turna_tenant_series_omitted",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 73
+      },
+      "id": 24
+    }
+  ]
+}

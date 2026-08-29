@@ -42,7 +42,9 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use turna_config::TurnaConfig;
-use turna_control::{start_grpc_server, GrpcConfig, GrpcTlsConfig, TurnCoreImpl};
+use turna_control::{
+    start_grpc_server, GrpcConfig, GrpcTlsConfig, RbacPolicy, RevocationList, TurnCoreImpl,
+};
 use turna_state_backend::{create_backend, now_ms, Backend, BackendConfig, CommandLogRetention};
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
@@ -174,13 +176,73 @@ async fn main() -> Result<(), AnyError> {
         rx.changed().await.ok();
     };
 
+    // Built before the server so a policy that would lock everyone out is
+    // refused at startup rather than on the first request. `validate()` returns
+    // warnings and errors separately: a typo in a role name is a warning because
+    // a fleet mid-upgrade legitimately has configs naming permissions the older
+    // binary does not check, while an enabled policy with no bindings is an error
+    // because there is no reading of it that anybody meant.
+    let rbac = {
+        let r = &cfg.grpc.rbac;
+        let roles = r
+            .roles
+            .iter()
+            .map(|(name, perms)| (name.clone(), perms.iter().cloned().collect()))
+            .collect();
+        let policy = RbacPolicy::new(r.enabled, roles, r.bindings.clone());
+        let (warnings, errors) = policy.validate();
+        for w in &warnings {
+            warn!("rbac: {w}");
+        }
+        if !errors.is_empty() {
+            for e in &errors {
+                tracing::error!("rbac: {e}");
+            }
+            return Err(format!("rbac configuration is unusable: {}", errors.join("; ")).into());
+        }
+        if policy.is_enabled() {
+            info!(
+                identities = r.bindings.len(),
+                roles = r.roles.len() + 3,
+                "RBAC enforcing"
+            );
+        } else {
+            // Said out loud, because the alternative is an operator believing
+            // roles are being enforced when the section is present but disabled.
+            warn!(
+                "RBAC is not enabled: every client with a valid certificate has \
+                 full management access"
+            );
+        }
+        Arc::new(policy)
+    };
+
+    let revoked = {
+        let path = &cfg.grpc.revocation_list;
+        if path.is_empty() {
+            Arc::new(RevocationList::empty())
+        } else {
+            match RevocationList::load(path) {
+                Ok(list) => {
+                    info!(path = %path, revoked = list.len(),
+                          "certificate revocation list loaded");
+                    Arc::new(list)
+                }
+                // Refusing at deploy time is loud and happens when somebody is
+                // looking. A list that is configured and silently empty looks
+                // like protection and is not.
+                Err(e) => return Err(format!("{e}").into()),
+            }
+        }
+    };
+
     let config = GrpcConfig {
         listen_addr: grpc_addr,
         tls,
         ..Default::default()
     };
 
-    if let Err(e) = start_grpc_server(config, core, metrics, shutdown_fut).await {
+    if let Err(e) = start_grpc_server(config, core, metrics, rbac, revoked, shutdown_fut).await {
         tracing::error!(%e, "gRPC server error");
     }
 

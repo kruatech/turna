@@ -54,6 +54,15 @@ pub struct TelemetryConfig {
     pub prometheus_addr: String,
     pub log_filter: String,
     pub json_logs: bool,
+    /// Syslog collector for security events. `udp://host:514` or `tcp://host:601`.
+    /// Empty disables export.
+    ///
+    /// Duplicated from the node's config rather than shared: this crate does not
+    /// depend on `turna-config`, and adding that dependency to make one string
+    /// travel would invert the direction the crates point in.
+    pub syslog_endpoint: String,
+    /// Hash client addresses before sending them to the collector.
+    pub syslog_redact_addresses: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +88,8 @@ impl Default for TelemetryConfig {
             prometheus_addr: "0.0.0.0:9090".into(),
             log_filter: "info,turna=debug".into(),
             json_logs: false,
+            syslog_endpoint: String::new(),
+            syslog_redact_addresses: false,
         }
     }
 }
@@ -277,17 +288,51 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         };
     }
 
+    // The security-event layer, added to whichever branch runs below.
+    //
+    // Constructed from the same config the node uses for the exporter, so there is
+    // one endpoint rather than two that can disagree. Disabled when the endpoint
+    // is empty, and a disabled layer returns from `on_event` immediately.
+    let syslog_layer = {
+        let exporter = std::sync::Arc::new(crate::syslog::SyslogExporter::new(
+            crate::syslog::SyslogConfig {
+                endpoint: config.syslog_endpoint.clone(),
+                app_name: config.service_name.clone(),
+                redact_addresses: config.syslog_redact_addresses,
+                non_blocking: true,
+            },
+        ));
+        crate::syslog_layer::SyslogLayer::new(exporter)
+    };
+
     if otlp_enabled {
         let (otel_layer, provider) = build_otel_layer(&config)?;
         guard_provider = Some(provider);
         // Registry → OTel → EnvFilter → fmt
-        let base = tracing_subscriber::registry().with(otel_layer).with(filter);
+        let base = tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(filter)
+            .with(syslog_layer.clone());
         try_init_with_fmt!(base)?;
     } else {
-        info!("OTLP endpoint not configured — distributed tracing disabled");
+        // No log here: the subscriber is installed on the next line, and anything
+        // emitted before it exists is discarded. This message used to live here
+        // and had therefore never appeared in a log — found when an air-gap check
+        // looked for it and a correctly-behaving node failed the check. It now
+        // goes out below, with the other startup line.
+        //
         // Registry → EnvFilter → fmt
-        let base = tracing_subscriber::registry().with(filter);
+        let base = tracing_subscriber::registry()
+            .with(filter)
+            .with(syslog_layer.clone());
         try_init_with_fmt!(base)?;
+    }
+
+    if !otlp_enabled {
+        // Stated explicitly rather than left to be inferred from the empty
+        // `otlp=` field below. An operator verifying that a deployment sends
+        // nothing outward should find a sentence saying so, not an absence.
+        info!("distributed tracing disabled (no OTLP endpoint configured)");
     }
 
     info!(

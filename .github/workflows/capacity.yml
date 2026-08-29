@@ -1,0 +1,78 @@
+# Capacity regression, on a self-hosted runner.
+#
+# NOT wired to pull_request, and that is the substance of this file rather than an
+# omission.
+#
+# A packet-rate measurement on GitHub's hosted runners — shared two-core VMs —
+# varies between runs by more than any regression worth catching. A gate like that
+# fails half the time for reasons unrelated to the code, and people learn to
+# re-run it until it passes. That consumes attention and produces no signal, which
+# is worse than having no gate: an absent check is honest about what it does not
+# know.
+#
+# So: a self-hosted runner, weekly, on the machine whose baseline is committed.
+# Plus manual dispatch, which is what will actually get used before a release.
+#
+# If there is no self-hosted runner, this workflow will not run and that is the
+# correct outcome. Do not "fix" it by removing `runs-on: self-hosted` — it would
+# then produce numbers, and numbers from a shared VM are worse than none because
+# they look like measurements.
+
+name: capacity
+
+on:
+  schedule:
+    # Sunday 03:00 UTC, alongside the mutation run. Both are long and neither
+    # blocks anything, so they share the quiet window.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      accept:
+        description: 'Record a new baseline instead of comparing'
+        type: boolean
+        default: false
+      max_pps:
+        description: 'Upper bound for the climb'
+        default: '200000'
+
+jobs:
+  regression:
+    # No hosted fallback on purpose. See the header.
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show what we are measuring on
+        run: |
+          echo "cpu:    $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-)"
+          echo "cores:  $(nproc)"
+          echo "kernel: $(uname -r)"
+          echo "load:   $(cat /proc/loadavg)"
+          # Printed because a capacity figure moves with anything competing for
+          # cores. A load average above ~1 here means the number that follows is
+          # about a busy machine, not about the code.
+
+      - name: Compare against the baseline
+        if: ${{ github.event.inputs.accept != 'true' }}
+        run: |
+          scripts/verify/capacity-regression.sh \
+            --profile-args "--phase-secs 120 --max-pps ${{ github.event.inputs.max_pps || '200000' }}"
+
+      - name: Record a new baseline
+        if: ${{ github.event.inputs.accept == 'true' }}
+        run: |
+          scripts/verify/capacity-regression.sh --accept \
+            --profile-args "--phase-secs 120 --max-pps ${{ github.event.inputs.max_pps || '200000' }}"
+          git diff --stat docs/capacity/baselines.tsv || true
+          echo
+          echo "The baseline file changed. Commit it — the diff in review is where"
+          echo "somebody decides whether a moved ceiling was intended."
+
+      - name: Keep the profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-profile
+          path: capacity-*/
+          retention-days: 90

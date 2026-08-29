@@ -11,6 +11,34 @@ from facts rather than re-derived.
 
 ## Decisions
 
+### 0. Hot rotation of the shared secret — opened 2026-08-28
+
+There is none. Measured: `SIGHUP` is not handled, and `UpdateConfig` carries
+allocation limits rather than the secret. `[turn.auth] shared_secret` changes only
+with a restart.
+
+That matters because the shared secret is the credential a leak would force you to
+change, and changing it means restarting every node. Certificate rotation is hot
+and verified under load; this is not.
+
+*Mitigating:* ephemeral credentials derived from it carry a TTL, so ones already
+issued expire on their own.
+
+Three options, in rough order of cost:
+
+- **Document it and leave it.** A rolling restart is a supported operation and a
+  compromised secret is rare. Cheapest, and honest as long as it is written where a
+  customer sees it — which it now is, as R13.
+- **Add the secret to `UpdateConfig`.** The machinery exists: idempotency keys,
+  optimistic concurrency, an audit trail. The question is whether a credential
+  should travel over the management API at all, given that anyone who can call it
+  can already mint sessions.
+- **Accept two secrets during a rotation window.** What a deployment actually
+  wants: the node honours credentials signed by either while the fleet catches up.
+  Correct, and the most work.
+
+Not decided. Recorded so that it is a choice rather than a gap nobody noticed.
+
 ### 1. Lift the `production = true` gate on RFC 6062 TCP relay? — lifted 2026-08-25
 
 **Established.** Interop is recorded (`docs/interop/transports-2026-08-19.md`): Allocate
@@ -38,7 +66,35 @@ the feature is unavailable to everyone. What remains genuinely missing is IPv6 o
 this path — an IPv6 `Connect` is refused with 440 — which is recorded in
 `docs/protocol-gap.md`.
 
-### 2. Flip `[turn.dtls] demux` to `true` by default?
+### 2. Flip `[turn.dtls] demux` to `true` by default? — evidence gathered 2026-08-28
+
+`scripts/verify/dtls-demux.sh`, **nine checks of nine**:
+
+- relays 21 612 frames across 12 concurrent sessions, zero errors
+- certificate hot-reload live: 0 → 1, no reload failures
+- per-IP handshake rate limiter: **15 handshakes refused** before any DTLS state
+  was created
+- drain releases the listener; node exits in 12 s with status 0, UDP port freed
+
+Both of those are §7 P0 requirements, and neither is available on the stock path
+for structural reasons rather than missing work: `listen()` owns the socket and
+fixes its configuration at bind time, and the handshake completes below `accept()`
+where nothing can rate-limit it. Config validation already refuses the two keys
+unless `demux = true`, and says why.
+
+**What is still missing: a 24-hour run.** The stock path holds the default because
+one exists for it. The soak script has no DTLS parameters, so this needs the script
+extended first — and that extension is itself unverified work, a poor thing to add
+immediately before a release.
+
+**No longer an argument against it.** An earlier reading of this verification
+concluded the demux path fails to release its socket and segfaults. Neither was
+true: `kill -0` succeeds on a zombie, so the check watched an already-dead process
+for 45 seconds, and the only core on the host was bash's from an interrupted run.
+The real defect was the runtime not shutting down — see R12 in
+`docs/PRODUCTION_READINESS.md` — and it affected every path equally.
+
+### 2-old. The original framing, superseded
 
 **Established.** Both paths carry an allocation and relay media
 (`docs/interop/transports-2026-08-19.md`). `demux = true` adds concurrent handshakes,

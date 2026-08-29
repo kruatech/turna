@@ -97,6 +97,17 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # Build the node binary explicitly: the hermetic integration harness looks
       # for target/<profile>/turna-node and then starts it on ephemeral ports.
+      - name: Install protoc (turna-control build.rs)
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. Every job that builds the node
+        # needs protoc; this one did not have it.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew list protobuf >/dev/null 2>&1 || brew install protobuf
+          fi
       - run: cargo build -p turna-node --locked
       - name: Run TURN integration tests against hermetic node
         env:
@@ -178,6 +189,19 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install protoc for the feature matrix
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. That dependency is new — the node
+        # gained it for AuditLog and InfraEvent — so this step is too. Five other
+        # jobs already install protoc; this matrix was the one that did not, and
+        # every turna-node entry in it failed on "Could not find protoc".
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew install protobuf
+          fi
       - name: Install AF_XDP native build dependencies
         if: runner.os == 'Linux' && contains(matrix.features, 'af-xdp')
         run: |
@@ -199,6 +223,17 @@ jobs:
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.15.4
+      - name: Install protoc (turna-control build.rs)
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. Every job that builds the node
+        # needs protoc; this one did not have it.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew list protobuf >/dev/null 2>&1 || brew install protobuf
+          fi
       - name: Helm lint
         run: helm lint deploy/helm/turna
       - name: Render Helm config and parse with turna-config
@@ -290,6 +325,17 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: fuzz
+      - name: Install protoc (turna-control build.rs)
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. Every job that builds the node
+        # needs protoc; this one did not have it.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew list protobuf >/dev/null 2>&1 || brew install protobuf
+          fi
       - run: cargo install cargo-fuzz
       - run: cd fuzz && cargo +nightly fuzz build
       # короткий smoke-прогон каждой цели, 30 секунд
@@ -363,6 +409,17 @@ jobs:
       # Loom exhaustively explores thread interleavings for the lock-free
       # primitives. Gated behind --cfg loom so it is never part of a normal
       # build. LOOM_MAX_PREEMPTIONS bounds the state space for CI wall-clock.
+      - name: Install protoc (turna-control build.rs)
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. Every job that builds the node
+        # needs protoc; this one did not have it.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew list protobuf >/dev/null 2>&1 || brew install protobuf
+          fi
       - name: cargo test --cfg loom
         env:
           LOOM_MAX_PREEMPTIONS: "3"
@@ -392,6 +449,17 @@ jobs:
       #    pipe the script in via `tt connect`/console rather than as the entrypoint.
       #  * Auth: if init.lua provisions the `turna_app` role with a password,
       #    set TARANTOOL_USER / TARANTOOL_PASSWORD below to match.
+      - name: Install protoc (turna-control build.rs)
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. Every job that builds the node
+        # needs protoc; this one did not have it.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew list protobuf >/dev/null 2>&1 || brew install protobuf
+          fi
       - name: Start Tarantool with turna schema
         run: |
           docker run -d --name turna-tnt -p 3301:3301 \
