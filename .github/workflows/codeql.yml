@@ -46,7 +46,7 @@ jobs:
         language: [rust, javascript-typescript]
     steps:
       # SHA-pinned to match the repo's pinned-actions policy (same pin as ci.yml).
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # SHA-pinned. Resolve/update with:
       #   git ls-remote https://github.com/github/codeql-action refs/tags/v3.37.3
