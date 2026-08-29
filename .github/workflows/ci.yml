@@ -178,6 +178,19 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install protoc for the feature matrix
+        # turna-node depends on turna-control, whose build.rs compiles
+        # management.proto through prost-build. That dependency is new — the node
+        # gained it for AuditLog and InfraEvent — so this step is too. Five other
+        # jobs already install protoc; this matrix was the one that did not, and
+        # every turna-node entry in it failed on "Could not find protoc".
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew install protobuf
+          fi
       - name: Install AF_XDP native build dependencies
         if: runner.os == 'Linux' && contains(matrix.features, 'af-xdp')
         run: |
