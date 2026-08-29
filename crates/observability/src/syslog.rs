@@ -189,7 +189,7 @@ pub struct SyslogExporter {
 impl SyslogExporter {
     pub fn new(config: SyslogConfig) -> Self {
         let hostname = hostname_or_dash();
-        let salt = format!("{:x}", nanos_now());
+        let salt = process_salt();
 
         let sink = if config.endpoint.is_empty() {
             Sink::Disabled
@@ -358,6 +358,40 @@ fn looks_like_address(key: &str) -> bool {
     )
 }
 
+/// Eight random bytes, once per process.
+///
+/// Was the process start time in nanoseconds. That is unpredictable in the small
+/// and narrow in the large: a restart time is often visible from outside — a
+/// rolling upgrade, a status page, a gap in the metrics — which leaves far less
+/// entropy than an address space of four billion needs.
+///
+/// Read straight from /dev/urandom rather than through `rand`, which lives in
+/// turna-crypto: pulling that in would link crypto into every binary that logs,
+/// for one salt.
+///
+/// Falls back to the clock if the read fails. A syslog exporter that refuses to
+/// start over its label salt would be worse than one with a weaker label, and the
+/// failure is loud enough to find in a log.
+fn process_salt() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read /dev/urandom for the address-label salt; \
+                 falling back to the clock, which is weaker"
+            );
+            format!("{:x}", nanos_now())
+        }
+    }
+}
+
+/// FNV-1a parameters. Not secrets and not a salt — these are the algorithm.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+
 /// Stable label for an address, salted per process.
 ///
 /// FNV-1a, not a cryptographic hash. Pulling `turna_crypto` into this crate for
@@ -369,10 +403,10 @@ fn looks_like_address(key: &str) -> bool {
 /// That is true of SHA-256 here too: the input space is four billion. If that
 /// matters, use `--strip-addresses` and accept losing correlation.
 fn hash_address(salt: &str, v: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h: u64 = FNV_OFFSET_BASIS;
     for b in salt.bytes().chain(v.bytes()) {
         h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
+        h = h.wrapping_mul(FNV_PRIME);
     }
     format!("ip-{h:012x}")
 }
