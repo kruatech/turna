@@ -976,7 +976,14 @@ fn effective_credentials() -> (String, String) {
                 eprintln!("[DEBUG] auth mode = SharedSecret (time-limited)");
                 eprintln!("[DEBUG]   secret_len = {}", secret.len());
                 eprintln!("[DEBUG]   username   = {u:?}");
-                eprintln!("[DEBUG]   password   = {p:?}");
+                // Length and prefix, not the value. The line above prints
+                // secret_len for the same reason; this one printed the derived
+                // password in full, which is a working credential in a CI log.
+                eprintln!(
+                    "[DEBUG]   password   = {} chars, starts {:?}",
+                    p.len(),
+                    &p[..p.len().min(6)]
+                );
             }
             (u, p)
         }
@@ -1698,7 +1705,8 @@ mod tests {
         assert_eq!(
             pass.len(),
             28,
-            "expected 28-char base64 password, got {pass:?}"
+            "expected 28-char base64 password, got {} chars",
+            pass.len()
         );
     }
 
