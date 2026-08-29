@@ -253,7 +253,55 @@ if [ "$ALLOC_CONCURRENCY" -ge "$USABLE_PORTS" ]; then
 signal this soak is looking for."
 fi
 
-mkdir -p "$OUT_DIR" || die "cannot create $OUT_DIR"
+mkdir -p "$OUT_DIR"
+
+# Refuse now rather than at hour 12.
+#
+# The first 24-hour attempt filled the disk after 13 minutes and produced nothing
+# usable. A day of wall-clock time lost to a check that costs a second is the worst
+# trade in this repository, so this is a hard refusal and not a warning.
+#
+# Budget: 300 MB per hour at INFO, which is roughly what was observed once the log
+# level was fixed, plus a 2 GB floor for the artifacts. Deliberately generous — an
+# overestimate costs a refusal that a flag overrides, and an underestimate costs
+# the day this exists to protect.
+MIN_FREE_MB="${MIN_FREE_MB:-$(( DURATION_SECS / 3600 * 300 + 2048 ))}"
+FREE_MB=$(df -Pm . | awk 'NR==2 {print $4}')
+if [ "${FREE_MB:-0}" -lt "$MIN_FREE_MB" ]; then
+  cat >&2 <<EOF
+FATAL: ${FREE_MB} MB free, and this run wants at least ${MIN_FREE_MB} MB.
+
+A soak that fills the disk halfway through costs a day and produces nothing. The
+first 24-hour attempt here wrote 4.3 GB of node.stdout in 13 minutes, because the
+node logs at DEBUG by default; that is fixed, but the budget still has to be
+checked because the log grows with duration and load.
+
+  * free space, or
+  * lower DURATION_SECS, or
+  * set MIN_FREE_MB explicitly if you know better than this estimate
+EOF
+  exit 1
+fi
+say "disk: ${FREE_MB} MB free, budget ${MIN_FREE_MB} MB for ${DURATION_SECS}s"
+
+# And a cap, so even a correct estimate cannot be defeated by an unexpected log
+# rate. Truncation loses the middle of the log, which is better than losing the
+# run — rotation would be better still and needs more than a shell script.
+LOG_CAP_MB="${LOG_CAP_MB:-4096}"
+(
+  while sleep 300; do
+    [ -f "$OUT_DIR/node.stdout" ] || continue
+    sz=$(( $(stat -c%s "$OUT_DIR/node.stdout" 2>/dev/null || echo 0) / 1048576 ))
+    if [ "$sz" -gt "$LOG_CAP_MB" ]; then
+      printf '\n--- truncated at %s MB, %s ---\n' "$sz" "$(date -u +%FT%TZ)" \
+        >> "$OUT_DIR/node.stdout"
+      : > "$OUT_DIR/node.stdout"
+      printf '[%s] node.stdout exceeded %s MB and was truncated\n' \
+        "$(date -u +%H:%M:%S)" "$LOG_CAP_MB" >> "$OUT_DIR/soak.log"
+    fi
+  done
+) &
+LOG_WATCHER=$! || die "cannot create $OUT_DIR"
 
 # ── host facts worth recording: a soak result without them is not comparable ──
 {
@@ -375,12 +423,23 @@ log "config validated; resolved form in $OUT_DIR/config-resolved.txt"
 # `PacketProcessor::new` — TURNA_RATE_LIMIT_*, TURNA_ALLOCATE_*, etc.), which is
 # why they are set here and recorded in environment.txt rather than appearing in
 # the generated TOML.
-"$NODE_BIN" "$CONFIG" > "$OUT_DIR/node.stdout" 2> "$OUT_DIR/node.stderr" &
+# RUST_LOG=info, not the built-in default.
+#
+# `TelemetryConfig::default()` is "info,turna=debug" — every turna module at
+# DEBUG, which is right for development and wrong for a run measured in days. At
+# 400 allocations/second it produced 4.3 GB in 13 minutes: a 24-hour run would
+# need about 470 GB, and the first attempt died at 91% disk.
+#
+# Overridable, because a soak chasing a specific bug may want DEBUG and a shorter
+# duration.
+RUST_LOG="${RUST_LOG:-info}" "$NODE_BIN" "$CONFIG" \
+  > "$OUT_DIR/node.stdout" 2> "$OUT_DIR/node.stderr" &
 NODE_PID=$!
 log "node started, pid $NODE_PID"
 
 cleanup() {
   local rc=$?
+  kill -KILL "${LOG_WATCHER:-0}" 2>/dev/null
   if kill -0 "$NODE_PID" 2>/dev/null; then
     log "sending SIGTERM (drain path is part of what is under test)"
     kill -TERM "$NODE_PID" 2>/dev/null
