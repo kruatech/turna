@@ -35,6 +35,9 @@ on:
         description: 'Upper bound for the climb'
         default: '200000'
 
+permissions:
+  contents: read
+
 jobs:
   regression:
     # No hosted fallback on purpose. See the header.
