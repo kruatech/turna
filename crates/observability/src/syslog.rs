@@ -437,7 +437,6 @@ fn hostname_or_dash() -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-
 /// RFC 3339 with microseconds, which is what 5424 wants for TIMESTAMP.
 fn rfc3339_now() -> String {
     let d = SystemTime::now()
