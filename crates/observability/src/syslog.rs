@@ -189,7 +189,17 @@ pub struct SyslogExporter {
 impl SyslogExporter {
     pub fn new(config: SyslogConfig) -> Self {
         let hostname = hostname_or_dash();
-        let salt = process_salt();
+        // Redaction is only on if a salt could be obtained. Without one the
+        // addresses go out verbatim, which is visible, rather than under a label
+        // that implies protection it does not have.
+        // Redaction requires a salt. Without one the flag is turned off here, in
+        // the config the exporter keeps — not in a local, because the hashing path
+        // reads `self.config.redact_addresses` and a second value would simply be
+        // ignored. Which is what happened in the first attempt at this.
+        let mut config = config;
+        let salt = salt_or_disable();
+        config.redact_addresses = config.redact_addresses && salt.is_some();
+        let salt = salt.unwrap_or_default();
 
         let sink = if config.endpoint.is_empty() {
             Sink::Disabled
@@ -358,32 +368,38 @@ fn looks_like_address(key: &str) -> bool {
     )
 }
 
-/// Eight random bytes, once per process.
+/// Eight random bytes, once per process — or `None`.
 ///
-/// Was the process start time in nanoseconds. That is unpredictable in the small
-/// and narrow in the large: a restart time is often visible from outside — a
-/// rolling upgrade, a status page, a gap in the metrics — which leaves far less
-/// entropy than an address space of four billion needs.
+/// `None` means redaction cannot be done safely, and the caller turns it off
+/// rather than substituting something weaker.
+///
+/// The first version fell back to the process start time. CodeQL traced that and
+/// was right to: a restart time is often visible from outside — a rolling upgrade,
+/// a status page, a gap in the metrics — so the search space collapses against an
+/// address space of four billion.
+///
+/// The trap is that such a label *looks* like a hash. It is `ip-<12 hex>`, it is
+/// stable within a process, and nothing in the log distinguishes it from a
+/// properly salted one. A control that appears to work and does not is worse than
+/// an absent one, because nobody goes looking.
 ///
 /// Read straight from /dev/urandom rather than through `rand`, which lives in
 /// turna-crypto: pulling that in would link crypto into every binary that logs,
 /// for one salt.
-///
-/// Falls back to the clock if the read fails. A syslog exporter that refuses to
-/// start over its label salt would be worse than one with a weaker label, and the
-/// failure is loud enough to find in a log.
-fn process_salt() -> String {
+fn salt_or_disable() -> Option<String> {
     use std::io::Read;
     let mut buf = [0u8; 8];
     match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
-        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Ok(()) => Some(buf.iter().map(|b| format!("{b:02x}")).collect()),
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 error = %e,
-                "could not read /dev/urandom for the address-label salt; \
-                 falling back to the clock, which is weaker"
+                "could not read /dev/urandom, so client addresses will NOT be \
+                 redacted in syslog events — they are sent verbatim. A label \
+                 derived from anything predictable would look like a hash and \
+                 protect nothing, so none is produced."
             );
-            format!("{:x}", nanos_now())
+            None
         }
     }
 }
