@@ -18,3 +18,9 @@ target/
 
 # Local archives / scratch
 *.zip
+
+# Test credentials for the test suite. Not secret, but they have no business in
+# an image: nothing in a running container reads them, and a file named .env in a
+# container invites someone to assume it is configuration.
+.env.test
+.env
