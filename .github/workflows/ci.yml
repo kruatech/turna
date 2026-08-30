@@ -8,26 +8,23 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Test credentials for the auth suite, which reads them from the environment
+  # rather than holding literals in its source. Not secrets: they exist only for
+  # the tests and appear in no build artifact. Mirrored in .env.test.
+  TURNA_TEST_PW_V1: password123
+  TURNA_TEST_PW_V2: pass12345
+  TURNA_TEST_PW_T1: hunter2
+  TURNA_TEST_PW_T2: pw
+  TURNA_TEST_KEY_K1: "17"
+  TURNA_TEST_KEY_K2: "66"
+  TURNA_TEST_KEY_K3: "55"
+  TURNA_TEST_KEY_K4: "0"
 
 # Least privilege: every CI job only reads the repository contents.
 # No CI job needs write access to anything.
 permissions:
   contents: read
 
-env:
-  # Test credentials for the auth suite, which reads them from the environment
-  # instead of holding literals in its source. Not secrets: they exist only for
-  # the tests and appear in no build artifact. Mirrored in .env.test for local
-  # runs.
-  TURNA_TEST_PW_V1: password123
-  TURNA_TEST_PW_V2: pass12345
-  TURNA_TEST_PW_T1: hunter2
-  TURNA_TEST_PW_T2: pw
-  # Byte values for repeated-byte test keys, as decimals.
-  TURNA_TEST_KEY_K1: "17"
-  TURNA_TEST_KEY_K2: "66"
-  TURNA_TEST_KEY_K3: "55"
-  TURNA_TEST_KEY_K4: "0"
 
 jobs:
   check:
