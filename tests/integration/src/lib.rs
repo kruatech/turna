@@ -979,11 +979,7 @@ fn effective_credentials() -> (String, String) {
                 // Length and prefix, not the value. The line above prints
                 // secret_len for the same reason; this one printed the derived
                 // password in full, which is a working credential in a CI log.
-                eprintln!(
-                    "[DEBUG]   password   = {} chars, starts {:?}",
-                    p.len(),
-                    &p[..p.len().min(6)]
-                );
+                eprintln!("[DEBUG]   password   = {} chars", p.len());
             }
             (u, p)
         }
