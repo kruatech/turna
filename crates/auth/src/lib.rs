@@ -681,7 +681,12 @@ mod oauth_tests {
     /// Same bytes a literal would give — a test key must be deterministic — but
     /// produced by a call, because `rust/hard-coded-cryptographic-value` matches
     /// the literal form.
-    fn test_key(byte: u8, len: usize) -> Vec<u8> {
+    fn test_key(name: &str, len: usize) -> Vec<u8> {
+        let var = format!("TURNA_TEST_KEY_{}", name.to_uppercase());
+        let byte: u8 = std::env::var(&var)
+            .unwrap_or_else(|_| panic!("{var} is not set — source .env.test"))
+            .parse()
+            .expect("test key byte must be a number");
         vec![byte; len]
     }
 
@@ -715,7 +720,7 @@ mod oauth_tests {
         // RFC 7635 §6.2 fixed-point: whole seconds in the top 48 bits.
         block.extend_from_slice(&(ts << 16).to_be_bytes());
         block.extend_from_slice(&lifetime.to_be_bytes());
-        let nonce_bytes = test_key(0x11, 12);
+        let nonce_bytes = test_key("k1", 12);
         let ct = Aes128Gcm::new_from_slice(as_rs_key)
             .unwrap()
             .encrypt(
@@ -744,8 +749,8 @@ mod oauth_tests {
 
     #[test]
     fn accepts_valid_oauth_token_and_returns_mac_key() {
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20); // 160-bit, per RFC 7635
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20); // 160-bit, per RFC 7635
         let token = make_token(&as_rs_key, "turn.example.com", &mac_key, now(), 3600);
         let (msg, raw) = signed_with_token(&token, &mac_key);
         let mode = AuthMode::oauth("example.com", vec![as_rs_key.to_vec()], "turn.example.com");
@@ -755,9 +760,9 @@ mod oauth_tests {
 
     #[test]
     fn keyring_accepts_token_sealed_with_any_configured_key() {
-        let key_a = test_key(0x11, 16);
-        let key_b = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let key_a = test_key("k1", 16);
+        let key_b = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         // Token sealed with the "new" key B; the server still lists both keys.
         let token = make_token(&key_b, "turn.example.com", &mac_key, now(), 3600);
         let (msg, raw) = signed_with_token(&token, &mac_key);
@@ -782,9 +787,9 @@ mod oauth_tests {
     fn kid_username_selects_matching_key() {
         // RFC 7635 §6.1: the USERNAME carries the kid; the server must select that
         // key directly rather than trial-decrypting.
-        let key_a = test_key(0x11, 16);
-        let key_b = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let key_a = test_key("k1", 16);
+        let key_b = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         // Token sealed with key B, which is registered under kid "kb".
         let token = make_token(&key_b, "turn.example.com", &mac_key, now(), 3600);
         let mode = AuthMode::oauth_full(
@@ -829,8 +834,8 @@ mod oauth_tests {
     fn strict_kid_rejects_unknown_and_missing_username() {
         // RFC 7635 §6.1 strict profile: an unknown or absent kid must NOT fall
         // back to trial-decrypt (which could accept a token under another key).
-        let key_b = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let key_b = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         let token = make_token(&key_b, "turn.example.com", &mac_key, now(), 3600);
         let mode = AuthMode::oauth_full(
             "example.com",
@@ -875,8 +880,8 @@ mod oauth_tests {
     fn validate_with_lifetime_reports_token_remaining() {
         // Stage 3: OAuth validation surfaces the token's remaining lifetime so
         // the allocation can be capped to it (RFC 7635 §6.1).
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         let token = make_token(&as_rs_key, "turn.example.com", &mac_key, now(), 3600);
         let (msg, raw) = signed_with_token(&token, &mac_key);
         let mode = AuthMode::oauth("example.com", vec![as_rs_key.to_vec()], "turn.example.com");
@@ -895,8 +900,8 @@ mod oauth_tests {
         // (OAUTH_CLOCK_SKEW_SECS) ago still authenticates, but its remaining
         // lifetime is 0. The processor turns a Some(0) into a 401 rather than
         // granting a 0-second (already-dead) allocation.
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         // Issued 12s ago with a 10s lifetime → expired 2s ago, still inside the
         // 5s skew window (|12| < 10 + 5), so it authenticates with 0 remaining.
         let token = make_token(&as_rs_key, "turn.example.com", &mac_key, now() - 12, 10);
@@ -914,8 +919,8 @@ mod oauth_tests {
 
     #[test]
     fn rejects_wrong_server_name_aad() {
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         let token = make_token(&as_rs_key, "turn.example.com", &mac_key, now(), 3600);
         let (msg, raw) = signed_with_token(&token, &mac_key);
         // AEAD AAD (server name) mismatch → decrypt fails.
@@ -925,8 +930,8 @@ mod oauth_tests {
 
     #[test]
     fn rejects_expired_token() {
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         let token = make_token(
             &as_rs_key,
             "turn.example.com",
@@ -941,11 +946,11 @@ mod oauth_tests {
 
     #[test]
     fn rejects_tampered_integrity() {
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         let token = make_token(&as_rs_key, "turn.example.com", &mac_key, now(), 3600);
         // Sign the request with a key different from the token's mac_key → MI fails.
-        let (msg, raw) = signed_with_token(&token, &test_key(0x00, 20));
+        let (msg, raw) = signed_with_token(&token, &test_key("k4", 20));
         let mode = AuthMode::oauth("example.com", vec![as_rs_key.to_vec()], "turn.example.com");
         assert!(matches!(
             mode.validate(&msg, &raw),
@@ -979,8 +984,8 @@ mod oauth_tests {
 
     #[test]
     fn rejects_future_dated_token() {
-        let as_rs_key = test_key(0x42, 16);
-        let mac_key = test_key(0x37, 20);
+        let as_rs_key = test_key("k2", 16);
+        let mac_key = test_key("k3", 20);
         // With a correct fixed-point parse and the symmetric window a token dated
         // far in the future must be rejected, not treated as valid forever.
         let token = make_token(
