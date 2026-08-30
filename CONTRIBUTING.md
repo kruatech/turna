@@ -4,8 +4,14 @@ Thanks for your interest in contributing! `turna` is a high-performance
 TURN/STUN server written in Rust. This guide covers how to build, test, and
 submit changes.
 
-> **Status:** `turna` is alpha. APIs, config keys, and crate boundaries may
-> still change between pre-releases. See the
+> **Status:** `turna` runs in production, and its interfaces are still `0.x`.
+> Under semver that means config keys, crate boundaries and Rust APIs may change
+> in any minor release — 0.4.0 added twenty-three config keys, and a config
+> written for it will not parse on 0.3.1, because `deny_unknown_fields` names the
+> unknown key rather than ignoring it. The wire protocol is the exception: the
+> management API is versioned (`turna.management.v1`) with a CI gate on field
+> numbers, and STUN/TURN conformance is checked against three browser engines and
+> coturn. See the
 > [status matrix](README.md#status) for what is supported vs experimental.
 
 ## Reporting security issues
