@@ -2,16 +2,18 @@
 
 ## Supported Versions
 
-`turna` is pre-1.0 and is currently published as alpha pre-releases. Only the
-latest released version receives security fixes.
+`turna` runs in production and is pre-1.0: interfaces may change in any minor
+release — 0.4.0 added twenty-three config keys — and only the latest released
+version receives security fixes.
 
 | Version         | Supported                |
 |-----------------|--------------------------|
-| `0.3.0`         | ✅ (current, GA)          |
-| `< 0.2.0`       | ❌                       |
+| `0.4.0`         | ✅ current                |
+| `< 0.4.0`       | ❌ superseded            |
 
-Once a stable line is released, this table will track the supported minor
-versions.
+Only the newest release is supported: there is no LTS line, and adding one is a
+commitment rather than a table entry — the options are priced in
+`docs/SUPPORT-POLICY-OPTIONS.md`.
 
 ## Reporting a Vulnerability
 
