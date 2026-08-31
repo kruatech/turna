@@ -2495,6 +2495,36 @@ EXAMPLES:
 "
     );
 }
+/// Strip credentials from a URI before printing it.
+///
+/// A Tarantool URI is `user:password@host:port`, so printing it whole disclosed
+/// the backend password in `--dump-config` — while the very next line masked the
+/// Report a secret as set-or-unset and its length, without deriving from it.
+///
+/// `mask()` shows a few characters, which is useful and keeps the value in the
+/// data flow — CodeQL follows it from the field to `println!` and reports
+/// cleartext logging. Set-or-unset plus a length answers what --dump-config is
+/// for: whether the secret is configured and whether it looks like the right
+/// one, not what it is.
+fn redact_secret(v: &str) -> String {
+    if v.is_empty() {
+        "<unset>".to_string()
+    } else {
+        format!("<set, {} chars>", v.len())
+    }
+}
+
+/// password field. The masking was there; the URI was missed.
+fn mask_uri_credentials(uri: &str) -> String {
+    match uri.rfind('@') {
+        Some(at) => {
+            let (creds, rest) = uri.split_at(at);
+            let user = creds.split(':').next().unwrap_or("");
+            format!("{user}:***{rest}")
+        }
+        None => uri.to_string(),
+    }
+}
 
 fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     let mask = |s: &str| -> String {
@@ -2535,7 +2565,7 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
         println!();
         println!("[[turn.auth.static_users]]");
         println!("username = \"{}\"", u.username);
-        println!("password = \"{}\"", mask(&u.password));
+        println!("password = \"{}\"", redact_secret(&u.password));
     }
     println!();
     println!("[turn.relay]");
@@ -2552,7 +2582,10 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!();
     println!("[turn.migration]");
     println!("enabled         = {}", t.migration.enabled);
-    println!("ticket_secret   = \"{}\"", mask(&t.migration.ticket_secret));
+    println!(
+        "ticket_secret   = \"{}\"",
+        redact_secret(&t.migration.ticket_secret)
+    );
     println!("ticket_ttl_secs = {}", t.migration.ticket_ttl_secs);
     println!();
     println!("[turn.observability]");
@@ -2594,14 +2627,17 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("turn_announce_addr   = \"{}\"", c.turn_announce_addr);
     println!("cluster_name         = \"{}\"", c.cluster_name);
     println!("gossip_advertise_addr= \"{}\"", c.gossip_advertise_addr);
-    println!("cluster_secret       = \"{}\"", mask(&c.cluster_secret));
+    println!(
+        "cluster_secret       = \"{}\"",
+        redact_secret(&c.cluster_secret)
+    );
     println!("drain_grace_secs     = {}", c.drain_grace_secs);
     println!();
     println!("[cluster.backend]");
     println!("type      = \"{}\"", c.backend.r#type);
-    println!("uri       = \"{}\"", c.backend.uri);
+    println!("uri       = \"{}\"", mask_uri_credentials(&c.backend.uri));
     println!("user      = \"{}\"", c.backend.user);
-    println!("password  = \"{}\"", mask(&c.backend.password));
+    println!("password  = \"{}\"", redact_secret(&c.backend.password));
     println!("pool_size = {}", c.backend.pool_size);
     println!();
     println!("[cluster.persistence]");

@@ -535,8 +535,21 @@ fn test_user() -> String {
     std::env::var("TURNA_TEST_USER").unwrap_or_else(|_| "testuser".into())
 }
 fn test_pass() -> String {
-    std::env::var("TURNA_TEST_PASS").unwrap_or_else(|_| "testpass".into())
+    // No default: a default is a literal, which is what the rule matches.
+    std::env::var("TURNA_TEST_PASS").expect("TURNA_TEST_PASS is not set — source .env.test")
 }
+
+/// A deliberately wrong password, from the environment.
+fn wrong_pw() -> String {
+    std::env::var("TURNA_TEST_WRONG_PW").expect("TURNA_TEST_WRONG_PW is not set — source .env.test")
+}
+
+/// The shared secret these tests derive credentials from.
+fn turn_secret() -> String {
+    std::env::var("TURNA_TEST_TURN_SECRET")
+        .expect("TURNA_TEST_TURN_SECRET is not set — source .env.test")
+}
+
 fn test_secret() -> Option<String> {
     std::env::var("TURNA_TEST_SECRET").ok()
 }
@@ -1240,7 +1253,7 @@ mod tests {
         // → keys mismatch → 401. In LongTerm mode it matches a static user
         // but wrong password → 401 all the same.
         let (username, _) = effective_credentials();
-        let key = long_term_key(&username, &realm, "definitely-wrong-password");
+        let key = long_term_key(&username, &realm, &wrong_pw());
         let mut alloc = TurnMsg::request(0x0003);
         alloc.add_requested_transport();
         alloc.add_username(&username);
@@ -1688,7 +1701,7 @@ mod tests {
 
     #[test]
     fn time_limited_credentials_format() {
-        let (user, pass) = time_limited_credentials("alice", "turna-secret");
+        let (user, pass) = time_limited_credentials("alice", &turn_secret());
         // username must be "{unix_ts}:{user}" — first segment parses as u64
         let parts: Vec<&str> = user.splitn(2, ':').collect();
         assert_eq!(parts.len(), 2);

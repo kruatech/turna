@@ -19,6 +19,12 @@ env:
   TURNA_TEST_KEY_K2: "66"
   TURNA_TEST_KEY_K3: "55"
   TURNA_TEST_KEY_K4: "0"
+  TURNA_TEST_PW_T3: correct-pass
+  TURNA_TEST_PW_T4: wrong-pass
+  TURNA_TEST_NONCE_SECRET: test-secret
+  TURNA_TEST_PASS: testpass
+  TURNA_TEST_WRONG_PW: definitely-wrong-password
+  TURNA_TEST_TURN_SECRET: turna-secret
 
 # Least privilege: every CI job only reads the repository contents.
 # No CI job needs write access to anything.

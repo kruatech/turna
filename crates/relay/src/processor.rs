@@ -2435,7 +2435,9 @@ mod a3_send_indication_tests {
         let store = Arc::new(AllocationStore::new(49152, 65535, 1000));
         let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
             realm: "turna".into(),
-            secret: b"test-secret".to_vec(),
+            secret: std::env::var("TURNA_TEST_NONCE_SECRET")
+                .expect("TURNA_TEST_NONCE_SECRET is not set — source .env.test")
+                .into_bytes(),
         }));
         PacketProcessor::new(
             store,
