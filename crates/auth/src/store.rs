@@ -458,9 +458,9 @@ mod tests {
     #[test]
     fn wrong_password_rejected() {
         let s = store();
-        s.register("frank", "frank@a.com", "correct-pass", None)
+        s.register("frank", "frank@a.com", &test_pw("t3"), None)
             .unwrap();
-        let err = s.login("frank", "wrong-pass").unwrap_err();
+        let err = s.login("frank", &test_pw("t4")).unwrap_err();
         assert!(matches!(err, UserAuthError::InvalidPassword));
     }
 
