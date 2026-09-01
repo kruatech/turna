@@ -161,6 +161,7 @@ fn allocation_store_arc_no_leak() {
     let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
         realm: "turna-soak".into(),
         secret: b"soak-test-secret".to_vec(),
+        previous: None,
     }));
 
     // ── Create allocations ───────────────────────────────────────────────────
@@ -247,6 +248,7 @@ fn processor_actually_processes_packets() {
     let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
         realm: "turna-soak".into(),
         secret: b"key".to_vec(),
+        previous: None,
     }));
 
     let processor = PacketProcessor::new(
@@ -283,6 +285,7 @@ fn full_soak_10k_allocs_1m_packets() {
     let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
         realm: "turna-soak".into(),
         secret: b"soak-secret".to_vec(),
+        previous: None,
     }));
 
     for i in 0..N_ALLOCS {

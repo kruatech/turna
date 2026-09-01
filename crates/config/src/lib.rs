@@ -899,6 +899,24 @@ pub struct AuthConfig {
     /// they exist locks them out.
     pub require_sha256: bool,
     pub shared_secret: String,
+    /// Accepted alongside `shared_secret` during a rotation window.
+    ///
+    /// Rotating the shared secret used to mean an outage or a low-traffic window:
+    /// changing it invalidates every credential already issued. With this set,
+    /// credentials signed with either secret validate, so a rotation is:
+    ///
+    /// 1. new secret into `shared_secret`, old one here;
+    /// 2. restart the fleet a node at a time;
+    /// 3. wait out `token_ttl` — issued credentials expire on their own;
+    /// 4. remove this and restart again.
+    ///
+    /// Watch `turna_auth_previous_secret_total` flatten before step 4. Removing
+    /// the old secret while clients still use it is the outage this exists to
+    /// avoid, and the counter is the only way to know.
+    ///
+    /// Empty (the default) means one secret and the old behaviour.
+    #[serde(default)]
+    pub previous_shared_secret: String,
     pub token_ttl: u64,
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
@@ -911,6 +929,7 @@ impl Default for AuthConfig {
             // Off: it would lock out every client that predates RFC 8489.
             require_sha256: false,
             shared_secret: DEFAULT_SHARED_SECRET.into(),
+            previous_shared_secret: String::new(),
             token_ttl: 86400,
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
@@ -2083,6 +2102,15 @@ pub struct TenantConfig {
     /// coturn-style time-limited credentials secret. Empty → use `static_users`.
     #[serde(default)]
     pub shared_secret: String,
+    /// Accepted alongside `shared_secret` during a rotation window.
+    ///
+    /// Same mechanism as `[turn.auth] previous_shared_secret`: set the new secret
+    /// in `shared_secret` and the old one here, restart, wait out the credential
+    /// TTL, then remove this. Credentials signed with either validate meanwhile.
+    ///
+    /// Watch `turna_auth_previous_secret_total` flatten before removing it.
+    #[serde(default)]
+    pub previous_shared_secret: String,
     /// Static long-term users for this tenant.
     #[serde(default)]
     pub static_users: Vec<StaticUser>,
@@ -3332,6 +3360,7 @@ mod tests {
             realm: "t1realm".into(),
             relay_port_range: [50000, 50100],
             shared_secret: DEFAULT_SHARED_SECRET.into(),
+            previous_shared_secret: String::new(),
             static_users: Vec::new(),
             max_allocations: 0,
             quota: QuotaConfig::default(),

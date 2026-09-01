@@ -61,6 +61,7 @@ scrape_configs:
 | `turna_bytes_received` | counter | Bytes received. |
 | `turna_bytes_sent` | counter | Bytes sent. |
 | `turna_auth_failures` | counter | Auth failures. |
+| `turna_auth_previous_secret_total` | counter | Requests that validated against `previous_shared_secret`. **Not a failure.** Nonzero only during a rotation window, and expected to fall as issued credentials expire. Zero means either no rotation is in progress or nobody is still using the old secret — watch it flatten before removing `previous_shared_secret`, because removing it while clients still sign with it is the outage the two-secret window exists to avoid. |
 | `turna_rate_limited` | counter | Rate-limited requests. |
 | `turna_zero_copy_forwards` | counter | Zero-copy forwards. |
 | `turna_draining` | gauge | `1` while draining, else `0`. |

@@ -228,6 +228,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         AuthMode::SharedSecret {
             realm: config.realm.clone(),
             secret: config.auth.shared_secret.as_bytes().to_vec(),
+            // Empty means one secret, which is the default and the old behaviour.
+            previous: (!config.auth.previous_shared_secret.is_empty())
+                .then(|| config.auth.previous_shared_secret.as_bytes().to_vec()),
         }
     } else {
         AuthMode::long_term(
@@ -249,6 +252,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AuthMode::SharedSecret {
                     realm: t.realm.clone(),
                     secret: t.shared_secret.as_bytes().to_vec(),
+                    previous: (!t.previous_shared_secret.is_empty())
+                        .then(|| t.previous_shared_secret.as_bytes().to_vec()),
                 }
             } else {
                 AuthMode::long_term(
@@ -780,6 +785,13 @@ fn run_tokio(
                 metrics
                     .syslog_dropped
                     .store(syslog.dropped.load(Relaxed), Relaxed);
+                // Requests that validated against previous_shared_secret. Lives in
+                // a static inside turna-auth because the check happens inside
+                // validate(), which has no Metrics handle — same reason the syslog
+                // counters are mirrored rather than written directly.
+                metrics
+                    .auth_previous_secret
+                    .store(turna_auth::previous_secret_uses(), Relaxed);
             }
         });
     }
