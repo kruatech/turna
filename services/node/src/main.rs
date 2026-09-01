@@ -360,6 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // often something else — uplink bandwidth, a licence count — which is why
     // `/capacity` returns the raw numbers next to the state rather than only a
     // verdict.
+    // Refuse MD5 long-term keys when the operator has closed that path. Off by
+    // default: most deployed TURN clients predate RFC 8489 and send only
+    // MESSAGE-INTEGRITY, so turning it on where they exist locks them out.
+    turna_auth::set_require_sha256(config.auth.require_sha256);
+
     metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
     // The packet-rate ceiling and its thresholds. Separate call because the two
     // come from different places: the allocation cap is a configuration decision,

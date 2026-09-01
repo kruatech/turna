@@ -65,6 +65,17 @@ impl UserKeys {
     }
 }
 
+/// Set once at startup from `[turn.auth] require_sha256`.
+///
+/// Process-wide rather than a field on `AuthMode`: the enum has three variants
+/// with different shapes and this applies to all of them.
+static REQUIRE_SHA256: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse clients that can only do MD5 long-term keys. Called once before serving.
+pub fn set_require_sha256(v: bool) {
+    REQUIRE_SHA256.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// TURN authentication mode.
 pub enum AuthMode {
     /// Long-term credentials. Users are stored as pre-derived keys (Variant B:
@@ -124,6 +135,15 @@ impl AuthMode {
 
         let server_realm = self.realm();
         let has_sha256 = msg.get_message_integrity_sha256().is_some();
+
+        // Refuse the MD5 path when the operator has closed it.
+        //
+        // Before the key is derived, so no MD5 computation happens at all rather
+        // than happening and being discarded — the difference matters to anyone
+        // reading this to answer "is MD5 reachable in our deployment".
+        if !has_sha256 && REQUIRE_SHA256.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AuthError::InvalidCredentials);
+        }
 
         // Resolve the verification key for the digest the client actually used.
         //

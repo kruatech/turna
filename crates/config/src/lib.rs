@@ -887,6 +887,17 @@ fn validate_cidr(s: &str) -> std::result::Result<(), String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
+    /// Refuse clients that can only do MD5 long-term keys.
+    ///
+    /// RFC 5389 §15.4 derives the key as `MD5(username:realm:password)`; RFC 8489
+    /// added SHA-256. turna already prefers SHA-256 whenever the client presents
+    /// MESSAGE-INTEGRITY-SHA256, but the fallback to MD5 is silent — a deployment
+    /// cannot tell whether the weak path is still in use.
+    ///
+    /// **Off by default, and not an oversight.** Most deployed TURN clients
+    /// predate RFC 8489 and send only MESSAGE-INTEGRITY; turning this on where
+    /// they exist locks them out.
+    pub require_sha256: bool,
     pub shared_secret: String,
     pub token_ttl: u64,
     pub static_users: Vec<StaticUser>,
@@ -897,6 +908,8 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
+            // Off: it would lock out every client that predates RFC 8489.
+            require_sha256: false,
             shared_secret: DEFAULT_SHARED_SECRET.into(),
             token_ttl: 86400,
             static_users: Vec::new(),
