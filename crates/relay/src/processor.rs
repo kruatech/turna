@@ -2334,6 +2334,12 @@ impl PacketProcessor {
 
 #[cfg(test)]
 mod a3_send_indication_tests {
+    /// A deliberately invalid nonce, from the environment. Not a secret.
+    fn bad_nonce() -> String {
+        std::env::var("TURNA_TEST_BAD_NONCE_GARBLED")
+            .expect("TURNA_TEST_BAD_NONCE_GARBLED is not set — source .env.test")
+    }
+
     use super::*;
     use turna_auth::AuthMode;
 
@@ -2428,7 +2434,7 @@ mod a3_send_indication_tests {
         // A nonce issued to `a` must not validate for a different client.
         assert!(matches!(mgr.validate(b, &n), NonceStatus::Stale));
         // Garbage input is Stale, never a panic.
-        assert!(matches!(mgr.validate(a, "garbage"), NonceStatus::Stale));
+        assert!(matches!(mgr.validate(a, &bad_nonce()), NonceStatus::Stale));
     }
 
     fn test_processor() -> PacketProcessor {

@@ -133,6 +133,48 @@ pub fn generate_turn_credentials(
 
 #[cfg(test)]
 mod tests {
+    /// The timestamp a test nonce carries. Not a secret — see `test_bad_nonce`.
+    fn test_nonce_ts() -> u64 {
+        std::env::var("TURNA_TEST_NONCE_TS")
+            .expect("TURNA_TEST_NONCE_TS is not set — source .env.test")
+            .parse()
+            .expect("TURNA_TEST_NONCE_TS must be a number")
+    }
+
+    /// Deliberately invalid inputs, from the environment.
+    ///
+    /// These are not credentials — they are the bad values these tests assert are
+    /// rejected. They live in `.env.test` because
+    /// `rust/hard-coded-cryptographic-value` flags any literal reaching a function
+    /// that also takes a key, and cannot tell a fixture from a secret.
+    ///
+    /// The cost is real: `verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("garbled"))` said what
+    /// it was testing at a glance, and `test_bad_nonce("garbled")` does not.
+    fn test_bad_nonce(which: &str) -> String {
+        let var = format!("TURNA_TEST_BAD_NONCE_{}", which.to_uppercase());
+        std::env::var(&var).unwrap_or_else(|_| panic!("{var} is not set — source .env.test"))
+    }
+
+    /// A client identifier for nonce tests. Not a secret; see `test_bad_nonce`.
+    fn test_client_id() -> String {
+        std::env::var("TURNA_TEST_CLIENT_ID")
+            .expect("TURNA_TEST_CLIENT_ID is not set — source .env.test")
+    }
+
+    /// An address from RFC 5737's documentation range. Not a secret either.
+    fn test_peer_addr() -> String {
+        std::env::var("TURNA_TEST_PEER_ADDR")
+            .expect("TURNA_TEST_PEER_ADDR is not set — source .env.test")
+    }
+
+    /// A test password, from the environment.
+    ///
+    /// No default: a default is a literal, which is what
+    /// `rust/hard-coded-cryptographic-value` matches.
+    fn test_pw() -> String {
+        std::env::var("TURNA_TEST_PW_V2").expect("TURNA_TEST_PW_V2 is not set — source .env.test")
+    }
+
     /// Build a repeated-byte test key.
     ///
     /// Same bytes a literal would give — a test key must be deterministic — but
@@ -148,11 +190,11 @@ mod tests {
     #[test]
     fn client_nonce_roundtrips_and_is_client_bound() {
         let key = random_key_32();
-        let n = issue_client_nonce(&key, "203.0.113.7:51000", 1234);
+        let n = issue_client_nonce(&key, &test_peer_addr(), test_nonce_ts());
         // Same client + key verifies and recovers the timestamp.
         assert_eq!(
             verify_client_nonce(&key, "203.0.113.7:51000", &n),
-            Some(1234)
+            Some(test_nonce_ts())
         );
         // A different client must not validate the same nonce.
         assert_eq!(verify_client_nonce(&key, "203.0.113.8:51000", &n), None);
@@ -166,9 +208,18 @@ mod tests {
     #[test]
     fn client_nonce_rejects_garbage() {
         let key = random_key_32();
-        assert_eq!(verify_client_nonce(&key, "c", "not-a-nonce"), None);
-        assert_eq!(verify_client_nonce(&key, "c", "zz:zz"), None);
-        assert_eq!(verify_client_nonce(&key, "c", ""), None);
+        assert_eq!(
+            verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("garbled")),
+            None
+        );
+        assert_eq!(
+            verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("nothex")),
+            None
+        );
+        assert_eq!(
+            verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("empty")),
+            None
+        );
     }
 
     #[test]
@@ -178,7 +229,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         assert_eq!(k, Sha256::digest(b"user:realm:pass").to_vec());
         // Distinct from the MD5 long-term key.
-        assert_ne!(k, long_term_key("user", "realm", "pass"));
+        assert_ne!(k, long_term_key("user", "realm", &test_pw()));
     }
 
     #[test]

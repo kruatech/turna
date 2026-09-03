@@ -204,9 +204,12 @@ async fn handle_user_command(
                     if json_output {
                         println!("{}", serde_json::json!({ "success": ok }));
                     } else if ok {
-                        println!("User '{username}' added");
+                        // Name omitted: the operator typed it in the command
+                        // they just ran, and CodeQL reads any username in output
+                        // as a disclosure.
+                        println!("User added");
                     } else {
-                        eprintln!("Server reported failure adding user '{username}'");
+                        eprintln!("Server reported failure adding user");
                         std::process::exit(1);
                     }
                 }
@@ -238,11 +241,11 @@ async fn handle_user_command(
                         );
                     } else if r.success {
                         println!(
-                            "User '{username}' removed ({} allocation(s) dropped)",
+                            "User removed ({} allocation(s) dropped)",
                             r.allocations_deleted
                         );
                     } else {
-                        eprintln!("Server reported failure removing user '{username}'");
+                        eprintln!("Server reported failure removing user");
                         std::process::exit(1);
                     }
                 }

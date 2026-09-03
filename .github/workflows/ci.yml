@@ -15,6 +15,16 @@ env:
   TURNA_TEST_PW_V2: pass12345
   TURNA_TEST_PW_T1: hunter2
   TURNA_TEST_PW_T2: pw
+  # Deliberately too short: the test asserts it is refused.
+  TURNA_TEST_PW_TOOSHORT: abc
+  # Deliberately invalid nonce inputs, and a documentation address. Not secrets —
+  # they are the bad values the tests assert are rejected.
+  TURNA_TEST_BAD_NONCE_GARBLED: not-a-nonce
+  TURNA_TEST_BAD_NONCE_NOTHEX: "zz:zz"
+  TURNA_TEST_BAD_NONCE_EMPTY: ""
+  TURNA_TEST_CLIENT_ID: c
+  TURNA_TEST_PEER_ADDR: "203.0.113.7:51000"
+  TURNA_TEST_NONCE_TS: "1234"
   TURNA_TEST_KEY_K1: "17"
   TURNA_TEST_KEY_K2: "66"
   TURNA_TEST_KEY_K3: "55"

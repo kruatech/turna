@@ -988,7 +988,7 @@ fn effective_credentials() -> (String, String) {
             if test_debug() {
                 eprintln!("[DEBUG] auth mode = SharedSecret (time-limited)");
                 eprintln!("[DEBUG]   secret_len = {}", secret.len());
-                eprintln!("[DEBUG]   username   = {u:?}");
+                eprintln!("[DEBUG]   username   = {} chars", u.len());
                 // Length and prefix, not the value. The line above prints
                 // secret_len for the same reason; this one printed the derived
                 // password in full, which is a working credential in a CI log.
@@ -1707,7 +1707,7 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert!(
             parts[0].parse::<u64>().is_ok(),
-            "username prefix not a timestamp: {user:?}"
+            "username prefix not a timestamp (value omitted)"
         );
         assert_eq!(parts[1], "alice");
         // password is base64(20-byte HMAC-SHA1) → 28 chars with padding
