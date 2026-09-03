@@ -887,7 +887,36 @@ fn validate_cidr(s: &str) -> std::result::Result<(), String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
+    /// Refuse clients that can only do MD5 long-term keys.
+    ///
+    /// RFC 5389 §15.4 derives the key as `MD5(username:realm:password)`; RFC 8489
+    /// added SHA-256. turna already prefers SHA-256 whenever the client presents
+    /// MESSAGE-INTEGRITY-SHA256, but the fallback to MD5 is silent — a deployment
+    /// cannot tell whether the weak path is still in use.
+    ///
+    /// **Off by default, and not an oversight.** Most deployed TURN clients
+    /// predate RFC 8489 and send only MESSAGE-INTEGRITY; turning this on where
+    /// they exist locks them out.
+    pub require_sha256: bool,
     pub shared_secret: String,
+    /// Accepted alongside `shared_secret` during a rotation window.
+    ///
+    /// Rotating the shared secret used to mean an outage or a low-traffic window:
+    /// changing it invalidates every credential already issued. With this set,
+    /// credentials signed with either secret validate, so a rotation is:
+    ///
+    /// 1. new secret into `shared_secret`, old one here;
+    /// 2. restart the fleet a node at a time;
+    /// 3. wait out `token_ttl` — issued credentials expire on their own;
+    /// 4. remove this and restart again.
+    ///
+    /// Watch `turna_auth_previous_secret_total` flatten before step 4. Removing
+    /// the old secret while clients still use it is the outage this exists to
+    /// avoid, and the counter is the only way to know.
+    ///
+    /// Empty (the default) means one secret and the old behaviour.
+    #[serde(default)]
+    pub previous_shared_secret: String,
     pub token_ttl: u64,
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
@@ -897,7 +926,10 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
+            // Off: it would lock out every client that predates RFC 8489.
+            require_sha256: false,
             shared_secret: DEFAULT_SHARED_SECRET.into(),
+            previous_shared_secret: String::new(),
             token_ttl: 86400,
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
@@ -1917,13 +1949,26 @@ pub struct DtlsSection {
     pub max_sessions_per_ip: usize,
     /// Use the owned UDP demultiplexer instead of `webrtc_dtls::listen()`.
     ///
-    /// Off by default. `listen()` runs handshakes serially inside `accept()`
-    /// (webrtc-rs/webrtc#614), which forces three compromises: admission control
-    /// can only happen *after* the crypto, there is nowhere to put a handshake
-    /// rate limit, and the certificate is fixed at bind time. The demux path
-    /// fixes all three at once — but it replaces the code path that has recorded
-    /// verification behind it, so it stays opt-in until its own interop run is on
-    /// record (`docs/verification/encrypted-transports.md`).
+    /// **Default since 2026-09-01.** `listen()` runs handshakes serially inside
+    /// `accept()` (webrtc-rs/webrtc#614), which forces three compromises:
+    /// admission control can only happen *after* the crypto, there is nowhere to
+    /// put a handshake rate limit, and the certificate is fixed at bind time. Two
+    /// of those are §7 P0 requirements, and they are not missing work on the stock
+    /// path — they are unreachable there.
+    ///
+    /// This was opt-in until its own run was on record. It now is, both halves:
+    ///
+    /// - correctness — `scripts/verify/dtls-demux.sh`, 9 checks of 9, including the
+    ///   per-IP handshake limiter refusing 15 handshakes before any DTLS state was
+    ///   created;
+    /// - stability — `docs/soak/soak-24h-dtls-2026-09-01.md`, 24 hours across
+    ///   eleven DTLS cycles identical to three significant figures, a spread of 16
+    ///   frames in 1.7 million, zero egress drops.
+    ///
+    /// Set `false` for the stock listener. `cert_reload_secs` and
+    /// `max_handshakes_per_sec_per_ip` then have to come out as well — validation
+    /// refuses them, because on that path they read as protection that is not
+    /// there.
     pub demux: bool,
     /// Per-source-IP handshake **rate** limit, handshakes/second (0 = unlimited).
     /// Requires `demux = true`; on the stock path the handshake runs below
@@ -1962,7 +2007,7 @@ impl Default for DtlsSection {
             outbound_queue_capacity: 1024,
             max_sessions_per_ip: 0,
             accept_timeout_secs: 10,
-            demux: false,
+            demux: true,
             max_handshakes_per_sec_per_ip: 0,
             handshake_burst_per_ip: 0,
             cert_reload_secs: 0,
@@ -2070,6 +2115,15 @@ pub struct TenantConfig {
     /// coturn-style time-limited credentials secret. Empty → use `static_users`.
     #[serde(default)]
     pub shared_secret: String,
+    /// Accepted alongside `shared_secret` during a rotation window.
+    ///
+    /// Same mechanism as `[turn.auth] previous_shared_secret`: set the new secret
+    /// in `shared_secret` and the old one here, restart, wait out the credential
+    /// TTL, then remove this. Credentials signed with either validate meanwhile.
+    ///
+    /// Watch `turna_auth_previous_secret_total` flatten before removing it.
+    #[serde(default)]
+    pub previous_shared_secret: String,
     /// Static long-term users for this tenant.
     #[serde(default)]
     pub static_users: Vec<StaticUser>,
@@ -3319,6 +3373,7 @@ mod tests {
             realm: "t1realm".into(),
             relay_port_range: [50000, 50100],
             shared_secret: DEFAULT_SHARED_SECRET.into(),
+            previous_shared_secret: String::new(),
             static_users: Vec::new(),
             max_allocations: 0,
             quota: QuotaConfig::default(),

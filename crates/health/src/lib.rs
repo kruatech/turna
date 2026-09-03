@@ -285,6 +285,12 @@ pub struct Metrics {
     // ── Auth reason codes ──────────────────────────────────────────────────────
     // Reason-coded auth failures (each is also counted in `auth_failures`),
     // keyed by the turna_auth::AuthError variant the validator returned.
+    /// Requests that validated against `previous_shared_secret`.
+    ///
+    /// Not an error: during a rotation window this is expected and falling. It is
+    /// the signal that says when removing the old secret is safe — without it,
+    /// step four of a rotation is a guess.
+    pub auth_previous_secret: AtomicU64,
     pub auth_fail_missing_credentials: AtomicU64,
     pub auth_fail_invalid_credentials: AtomicU64,
     pub auth_fail_expired: AtomicU64,
@@ -506,6 +512,7 @@ impl Metrics {
             user_limits_conflicts_total: AtomicU64::new(0),
             user_limits_failures_total: AtomicU64::new(0),
             user_limits_over_limit_subjects: AtomicU64::new(0),
+            auth_previous_secret: AtomicU64::new(0),
             auth_fail_missing_credentials: AtomicU64::new(0),
             auth_fail_invalid_credentials: AtomicU64::new(0),
             auth_fail_expired: AtomicU64::new(0),
@@ -714,6 +721,11 @@ impl Metrics {
     /// scrapes have a stable series set.
     fn render_auth_reason_metrics(&self) -> String {
         format!(
+            "# HELP turna_auth_previous_secret_total Requests that validated against previous_shared_secret (expected and falling during a rotation window; watch it flatten before removing the old secret)\n\
+             # TYPE turna_auth_previous_secret_total counter\n\
+             turna_auth_previous_secret_total {}\n",
+            self.auth_previous_secret.load(Ordering::Relaxed)
+        ) + &format!(
             "# HELP turna_auth_failures_by_reason_total Auth failures by AuthError reason\n\
              # TYPE turna_auth_failures_by_reason_total counter\n\
              turna_auth_failures_by_reason_total{{reason=\"missing_credentials\"}} {}\n\

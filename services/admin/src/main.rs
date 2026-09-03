@@ -107,9 +107,64 @@ impl Config {
     }
 }
 
+/// The health plane's address, parsed once at startup.
+///
+/// Held as parts rather than as a string so that every request is assembled from
+/// them plus a fixed path. A prefix check on a string did not satisfy the
+/// request-forgery rule, and rightly: a check is something you can forget to
+/// call, while parts you have to assemble.
+#[derive(Clone)]
+struct Upstream {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl Upstream {
+    /// Parse `http://host:port` or `https://host:port`.
+    fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim_end_matches('/');
+        let (scheme, rest) = raw
+            .split_once("://")
+            .ok_or_else(|| format!("upstream address needs a scheme: {raw}"))?;
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "upstream scheme must be http or https, not {scheme}"
+            ));
+        }
+        if rest.contains('@') || rest.contains('/') {
+            return Err(format!(
+                "upstream address must be host:port with no path or credentials: {rest}"
+            ));
+        }
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (
+                h,
+                p.parse::<u16>()
+                    .map_err(|_| format!("upstream port is not a number: {p}"))?,
+            ),
+            None => (rest, if scheme == "https" { 443 } else { 80 }),
+        };
+        if host.is_empty() {
+            return Err("upstream host is empty".to_string());
+        }
+        Ok(Self {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    /// Build a URL for one of this module's fixed paths.
+    fn url(&self, path: &str) -> String {
+        debug_assert!(path.starts_with('/'), "paths are literals in this crate");
+        format!("{}://{}:{}{}", self.scheme, self.host, self.port, path)
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
-    turna_addr: String,
+    upstream: Upstream,
     http: reqwest::Client,
     grpc_channel: tonic::transport::Channel,
     auth_token: Option<String>,
@@ -144,7 +199,7 @@ fn check_auth(headers: &HeaderMap, token: &Option<String>) -> bool {
 // ── read-only handlers ────────────────────────────────────────────────────────
 
 async fn api_status(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_json(&st.http, &format!("{}/status", st.turna_addr)).await {
+    match proxy::fetch_json(&st.http, &st.upstream.url("/status")).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             tracing::warn!(error=%e, "GET /api/status");
@@ -153,7 +208,7 @@ async fn api_status(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_metrics(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_text(&st.http, &format!("{}/metrics", st.turna_addr)).await {
+    match proxy::fetch_text(&st.http, &st.upstream.url("/metrics")).await {
         Ok(t) => (StatusCode::OK, Json(prometheus::parse(&t))).into_response(),
         Err(e) => {
             tracing::warn!(error=%e, "GET /api/metrics");
@@ -162,7 +217,7 @@ async fn api_metrics(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_health(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_status_code(&st.http, &format!("{}/health", st.turna_addr)).await {
+    match proxy::fetch_status_code(&st.http, &st.upstream.url("/health")).await {
         Ok(code) => StatusCode::from_u16(code)
             .unwrap_or(StatusCode::OK)
             .into_response(),
@@ -173,7 +228,7 @@ async fn api_health(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_ready(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_status_code(&st.http, &format!("{}/ready", st.turna_addr)).await {
+    match proxy::fetch_status_code(&st.http, &st.upstream.url("/ready")).await {
         Ok(code) => StatusCode::from_u16(code)
             .unwrap_or(StatusCode::OK)
             .into_response(),
@@ -184,7 +239,7 @@ async fn api_ready(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_cluster(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_json(&st.http, &format!("{}/cluster", st.turna_addr)).await {
+    match proxy::fetch_json(&st.http, &st.upstream.url("/cluster")).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(_) => (StatusCode::OK, Json(serde_json::json!([]))).into_response(),
     }
@@ -306,13 +361,17 @@ async fn main() -> anyhow::Result<()> {
         warn!("no auth token — mutations unauthenticated (loopback-only, acceptable for dev)");
     }
 
+    // Parsed here so a bad address stops startup with a clear message instead of
+    // failing on the first request.
+    let upstream =
+        Upstream::parse(&cfg.turna_addr).map_err(|e| anyhow::anyhow!("[turna_addr] {e}"))?;
     let turna_addr = cfg.turna_addr.trim_end_matches('/').to_string();
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.upstream_timeout))
         .build()?;
 
     let state = Arc::new(AppState {
-        turna_addr: turna_addr.clone(),
+        upstream,
         http,
         grpc_channel,
         auth_token: cfg.auth_token.clone(),

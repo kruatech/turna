@@ -228,6 +228,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         AuthMode::SharedSecret {
             realm: config.realm.clone(),
             secret: config.auth.shared_secret.as_bytes().to_vec(),
+            // Empty means one secret, which is the default and the old behaviour.
+            previous: (!config.auth.previous_shared_secret.is_empty())
+                .then(|| config.auth.previous_shared_secret.as_bytes().to_vec()),
         }
     } else {
         AuthMode::long_term(
@@ -249,6 +252,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 AuthMode::SharedSecret {
                     realm: t.realm.clone(),
                     secret: t.shared_secret.as_bytes().to_vec(),
+                    previous: (!t.previous_shared_secret.is_empty())
+                        .then(|| t.previous_shared_secret.as_bytes().to_vec()),
                 }
             } else {
                 AuthMode::long_term(
@@ -360,6 +365,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // often something else — uplink bandwidth, a licence count — which is why
     // `/capacity` returns the raw numbers next to the state rather than only a
     // verdict.
+    // Refuse MD5 long-term keys when the operator has closed that path. Off by
+    // default: most deployed TURN clients predate RFC 8489 and send only
+    // MESSAGE-INTEGRITY, so turning it on where they exist locks them out.
+    turna_auth::set_require_sha256(config.auth.require_sha256);
+
     metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
     // The packet-rate ceiling and its thresholds. Separate call because the two
     // come from different places: the allocation cap is a configuration decision,
@@ -775,6 +785,13 @@ fn run_tokio(
                 metrics
                     .syslog_dropped
                     .store(syslog.dropped.load(Relaxed), Relaxed);
+                // Requests that validated against previous_shared_secret. Lives in
+                // a static inside turna-auth because the check happens inside
+                // validate(), which has no Metrics handle — same reason the syslog
+                // counters are mirrored rather than written directly.
+                metrics
+                    .auth_previous_secret
+                    .store(turna_auth::previous_secret_uses(), Relaxed);
             }
         });
     }

@@ -2438,6 +2438,7 @@ mod a3_send_indication_tests {
             secret: std::env::var("TURNA_TEST_NONCE_SECRET")
                 .expect("TURNA_TEST_NONCE_SECRET is not set — source .env.test")
                 .into_bytes(),
+            previous: None,
         }));
         PacketProcessor::new(
             store,

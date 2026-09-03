@@ -65,6 +65,32 @@ impl UserKeys {
     }
 }
 
+/// Set once at startup from `[turn.auth] require_sha256`.
+///
+/// Process-wide rather than a field on `AuthMode`: the enum has three variants
+/// with different shapes and this applies to all of them.
+static REQUIRE_SHA256: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse clients that can only do MD5 long-term keys. Called once before serving.
+pub fn set_require_sha256(v: bool) {
+    REQUIRE_SHA256.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Requests that validated against `previous_shared_secret`.
+///
+/// The feature is only half of a rotation mechanism without this. Step four of a
+/// rotation is removing the old secret, and an operator cannot know that is safe
+/// unless they can see whether anything still uses it.
+static PREVIOUS_SECRET_USES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many requests have validated against the previous shared secret.
+///
+/// Exported as `turna_auth_previous_secret_total`. Watch it fall to a flat line
+/// before removing `previous_shared_secret`.
+pub fn previous_secret_uses() -> u64 {
+    PREVIOUS_SECRET_USES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// TURN authentication mode.
 pub enum AuthMode {
     /// Long-term credentials. Users are stored as pre-derived keys (Variant B:
@@ -75,7 +101,20 @@ pub enum AuthMode {
         users: Arc<DashMap<String, UserKeys>>,
     },
     /// Time-limited credentials with shared secret.
-    SharedSecret { realm: String, secret: Vec<u8> },
+    SharedSecret {
+        realm: String,
+        secret: Vec<u8>,
+        /// Accepted alongside `secret` during a rotation window.
+        ///
+        /// Rotation without an outage: put the new secret in `secret` and the old
+        /// one here, restart the fleet a node at a time, wait out `token_ttl`, then
+        /// remove this and restart again. Credentials signed with either validate
+        /// in the meantime.
+        ///
+        /// `turna_auth_previous_secret_total` counts what still uses the old one,
+        /// which is how an operator knows the last step is safe.
+        previous: Option<Vec<u8>>,
+    },
     /// RFC 7635 third-party (OAuth 2.0) authorization. The client presents an
     /// ACCESS-TOKEN; the server shares the long-term AS-RS key with the
     /// authorization server and uses it to AEAD-decrypt the self-contained
@@ -125,6 +164,15 @@ impl AuthMode {
         let server_realm = self.realm();
         let has_sha256 = msg.get_message_integrity_sha256().is_some();
 
+        // Refuse the MD5 path when the operator has closed it.
+        //
+        // Before the key is derived, so no MD5 computation happens at all rather
+        // than happening and being discarded — the difference matters to anyone
+        // reading this to answer "is MD5 reachable in our deployment".
+        if !has_sha256 && REQUIRE_SHA256.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(AuthError::InvalidCredentials);
+        }
+
         // Resolve the verification key for the digest the client actually used.
         //
         // LongTerm (Variant B): both long-term keys are pre-derived at user
@@ -161,7 +209,9 @@ impl AuthMode {
                 }
             }
             AuthMode::OAuth { .. } => unreachable!("OAuth handled by early dispatch above"),
-            AuthMode::SharedSecret { secret, .. } => {
+            AuthMode::SharedSecret {
+                secret, previous, ..
+            } => {
                 // TURN REST API (coturn-compatible): username is
                 // "<unix_expiry>:<userid>". The credential is only valid until
                 // the embedded timestamp; without this check a leaked
@@ -180,16 +230,54 @@ impl AuthMode {
 
                 use hmac::{Hmac, Mac};
                 use sha1::Sha1;
-                let mut mac = Hmac::<Sha1>::new_from_slice(secret).unwrap();
-                mac.update(username.as_bytes());
-                let password = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    mac.finalize().into_bytes(),
-                );
-                if has_sha256 {
-                    turna_crypto::long_term_key_sha256(username, server_realm, &password)
-                } else {
-                    turna_crypto::long_term_key(username, server_realm, &password)
+
+                // Derive the key the client would have used, for one secret.
+                let derive = |s: &[u8]| -> Vec<u8> {
+                    let mut mac = Hmac::<Sha1>::new_from_slice(s).unwrap();
+                    mac.update(username.as_bytes());
+                    let password = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        mac.finalize().into_bytes(),
+                    );
+                    if has_sha256 {
+                        turna_crypto::long_term_key_sha256(username, server_realm, &password)
+                    } else {
+                        turna_crypto::long_term_key(username, server_realm, &password)
+                    }
+                };
+
+                let primary = derive(secret);
+
+                // During a rotation window, a credential signed with the previous
+                // secret is still valid. Try the primary first and fall back, so
+                // the common path costs one derivation.
+                //
+                // Integrity is checked below, once, against whichever key this
+                // returns — so the fallback has to decide here rather than there.
+                // Which method depends on has_sha256, the same condition that
+                // picks the derivation above.
+                let ok = |k: &[u8]| -> bool {
+                    if has_sha256 {
+                        msg.verify_integrity_sha256(raw, k)
+                    } else {
+                        msg.verify_integrity(raw, k)
+                    }
+                };
+
+                match previous {
+                    Some(prev) if !ok(&primary) => {
+                        let old = derive(prev);
+                        if ok(&old) {
+                            PREVIOUS_SECRET_USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            old
+                        } else {
+                            // Neither matched. Return the primary so the failure
+                            // below reports against the current secret, which is
+                            // the one an operator will look at.
+                            primary
+                        }
+                    }
+                    _ => primary,
                 }
             }
         };
