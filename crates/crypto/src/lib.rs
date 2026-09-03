@@ -133,6 +133,14 @@ pub fn generate_turn_credentials(
 
 #[cfg(test)]
 mod tests {
+    /// The timestamp a test nonce carries. Not a secret — see `test_bad_nonce`.
+    fn test_nonce_ts() -> u64 {
+        std::env::var("TURNA_TEST_NONCE_TS")
+            .expect("TURNA_TEST_NONCE_TS is not set — source .env.test")
+            .parse()
+            .expect("TURNA_TEST_NONCE_TS must be a number")
+    }
+
     /// Deliberately invalid inputs, from the environment.
     ///
     /// These are not credentials — they are the bad values these tests assert are
@@ -182,11 +190,11 @@ mod tests {
     #[test]
     fn client_nonce_roundtrips_and_is_client_bound() {
         let key = random_key_32();
-        let n = issue_client_nonce(&key, &test_peer_addr(), 1234);
+        let n = issue_client_nonce(&key, &test_peer_addr(), test_nonce_ts());
         // Same client + key verifies and recovers the timestamp.
         assert_eq!(
             verify_client_nonce(&key, "203.0.113.7:51000", &n),
-            Some(1234)
+            Some(test_nonce_ts())
         );
         // A different client must not validate the same nonce.
         assert_eq!(verify_client_nonce(&key, "203.0.113.8:51000", &n), None);
