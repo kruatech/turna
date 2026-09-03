@@ -567,7 +567,9 @@ mod tests {
     #[test]
     fn short_password_rejected() {
         let s = store();
-        let err = s.register("h", "h@a.com", "short", None).unwrap_err();
+        let err = s
+            .register("h", "h@a.com", &test_pw("tooshort"), None)
+            .unwrap_err();
         assert!(matches!(err, UserAuthError::PasswordError(_)));
     }
 

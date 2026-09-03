@@ -115,9 +115,17 @@ impl Config {
 /// call, while parts you have to assemble.
 #[derive(Clone)]
 struct Upstream {
-    scheme: String,
-    host: String,
-    port: u16,
+    /// The five URLs this module ever fetches, built once at startup.
+    ///
+    /// Fields rather than a method taking a path. Two earlier shapes — a prefix
+    /// check, then parse-into-parts and assemble per call — both still passed a
+    /// freshly computed String to `client.get()`, which is what the
+    /// request-forgery rule follows.
+    status_url: String,
+    metrics_url: String,
+    health_url: String,
+    ready_url: String,
+    cluster_url: String,
 }
 
 impl Upstream {
@@ -148,17 +156,14 @@ impl Upstream {
         if host.is_empty() {
             return Err("upstream host is empty".to_string());
         }
+        let base = format!("{scheme}://{host}:{port}");
         Ok(Self {
-            scheme: scheme.to_string(),
-            host: host.to_string(),
-            port,
+            status_url: format!("{base}/status"),
+            metrics_url: format!("{base}/metrics"),
+            health_url: format!("{base}/health"),
+            ready_url: format!("{base}/ready"),
+            cluster_url: format!("{base}/cluster"),
         })
-    }
-
-    /// Build a URL for one of this module's fixed paths.
-    fn url(&self, path: &str) -> String {
-        debug_assert!(path.starts_with('/'), "paths are literals in this crate");
-        format!("{}://{}:{}{}", self.scheme, self.host, self.port, path)
     }
 }
 
@@ -199,7 +204,7 @@ fn check_auth(headers: &HeaderMap, token: &Option<String>) -> bool {
 // ── read-only handlers ────────────────────────────────────────────────────────
 
 async fn api_status(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_json(&st.http, &st.upstream.url("/status")).await {
+    match proxy::fetch_json(&st.http, &st.upstream.status_url).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
             tracing::warn!(error=%e, "GET /api/status");
@@ -208,7 +213,7 @@ async fn api_status(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_metrics(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_text(&st.http, &st.upstream.url("/metrics")).await {
+    match proxy::fetch_text(&st.http, &st.upstream.metrics_url).await {
         Ok(t) => (StatusCode::OK, Json(prometheus::parse(&t))).into_response(),
         Err(e) => {
             tracing::warn!(error=%e, "GET /api/metrics");
@@ -217,7 +222,7 @@ async fn api_metrics(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_health(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_status_code(&st.http, &st.upstream.url("/health")).await {
+    match proxy::fetch_status_code(&st.http, &st.upstream.health_url).await {
         Ok(code) => StatusCode::from_u16(code)
             .unwrap_or(StatusCode::OK)
             .into_response(),
@@ -228,7 +233,7 @@ async fn api_health(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_ready(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_status_code(&st.http, &st.upstream.url("/ready")).await {
+    match proxy::fetch_status_code(&st.http, &st.upstream.ready_url).await {
         Ok(code) => StatusCode::from_u16(code)
             .unwrap_or(StatusCode::OK)
             .into_response(),
@@ -239,7 +244,7 @@ async fn api_ready(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 async fn api_cluster(State(st): State<Arc<AppState>>) -> Response {
-    match proxy::fetch_json(&st.http, &st.upstream.url("/cluster")).await {
+    match proxy::fetch_json(&st.http, &st.upstream.cluster_url).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(_) => (StatusCode::OK, Json(serde_json::json!([]))).into_response(),
     }

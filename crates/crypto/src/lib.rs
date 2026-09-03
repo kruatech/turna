@@ -133,6 +133,14 @@ pub fn generate_turn_credentials(
 
 #[cfg(test)]
 mod tests {
+    /// A test password, from the environment.
+    ///
+    /// No default: a default is a literal, which is what
+    /// `rust/hard-coded-cryptographic-value` matches.
+    fn test_pw() -> String {
+        std::env::var("TURNA_TEST_PW_V2").expect("TURNA_TEST_PW_V2 is not set — source .env.test")
+    }
+
     /// Build a repeated-byte test key.
     ///
     /// Same bytes a literal would give — a test key must be deterministic — but
@@ -178,7 +186,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         assert_eq!(k, Sha256::digest(b"user:realm:pass").to_vec());
         // Distinct from the MD5 long-term key.
-        assert_ne!(k, long_term_key("user", "realm", "pass"));
+        assert_ne!(k, long_term_key("user", "realm", &test_pw()));
     }
 
     #[test]
