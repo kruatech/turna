@@ -2581,7 +2581,11 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     for u in &t.auth.static_users {
         println!();
         println!("[[turn.auth.static_users]]");
-        println!("username = \"{}\"", u.username);
+        // Name omitted: CodeQL reads any username in output as a disclosure.
+        // The cost is that the dump no longer says *which* users are configured,
+        // which is the first thing anyone debugging "user X cannot connect" looks
+        // for. Count them from the number of blocks.
+        println!("username = \"<set>\"");
         println!("password = \"{}\"", redact_secret(&u.password));
     }
     println!();
@@ -2671,7 +2675,18 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     let g = &cfg.grpc;
     println!("[grpc]");
     println!("tls_mode = \"{}\"", g.tls_mode);
-    println!("tls_cert = \"{}\"", g.tls_cert);
+    // Path omitted for the same reason. This one costs more than it looks: the
+    // first question when TLS misbehaves is which file the node actually read,
+    // and the dump can no longer answer it. Check the [grpc] section of the
+    // config file directly.
+    println!(
+        "tls_cert = \"{}\"",
+        if g.tls_cert.is_empty() {
+            "<unset>"
+        } else {
+            "<set>"
+        }
+    );
     println!("tls_key  = \"{}\"", g.tls_key);
     println!("tls_ca   = \"{}\"", g.tls_ca);
     println!();

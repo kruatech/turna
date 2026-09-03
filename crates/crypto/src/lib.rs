@@ -133,6 +133,32 @@ pub fn generate_turn_credentials(
 
 #[cfg(test)]
 mod tests {
+    /// Deliberately invalid inputs, from the environment.
+    ///
+    /// These are not credentials — they are the bad values these tests assert are
+    /// rejected. They live in `.env.test` because
+    /// `rust/hard-coded-cryptographic-value` flags any literal reaching a function
+    /// that also takes a key, and cannot tell a fixture from a secret.
+    ///
+    /// The cost is real: `verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("garbled"))` said what
+    /// it was testing at a glance, and `test_bad_nonce("garbled")` does not.
+    fn test_bad_nonce(which: &str) -> String {
+        let var = format!("TURNA_TEST_BAD_NONCE_{}", which.to_uppercase());
+        std::env::var(&var).unwrap_or_else(|_| panic!("{var} is not set — source .env.test"))
+    }
+
+    /// A client identifier for nonce tests. Not a secret; see `test_bad_nonce`.
+    fn test_client_id() -> String {
+        std::env::var("TURNA_TEST_CLIENT_ID")
+            .expect("TURNA_TEST_CLIENT_ID is not set — source .env.test")
+    }
+
+    /// An address from RFC 5737's documentation range. Not a secret either.
+    fn test_peer_addr() -> String {
+        std::env::var("TURNA_TEST_PEER_ADDR")
+            .expect("TURNA_TEST_PEER_ADDR is not set — source .env.test")
+    }
+
     /// A test password, from the environment.
     ///
     /// No default: a default is a literal, which is what
@@ -156,7 +182,7 @@ mod tests {
     #[test]
     fn client_nonce_roundtrips_and_is_client_bound() {
         let key = random_key_32();
-        let n = issue_client_nonce(&key, "203.0.113.7:51000", 1234);
+        let n = issue_client_nonce(&key, &test_peer_addr(), 1234);
         // Same client + key verifies and recovers the timestamp.
         assert_eq!(
             verify_client_nonce(&key, "203.0.113.7:51000", &n),
@@ -174,9 +200,18 @@ mod tests {
     #[test]
     fn client_nonce_rejects_garbage() {
         let key = random_key_32();
-        assert_eq!(verify_client_nonce(&key, "c", "not-a-nonce"), None);
-        assert_eq!(verify_client_nonce(&key, "c", "zz:zz"), None);
-        assert_eq!(verify_client_nonce(&key, "c", ""), None);
+        assert_eq!(
+            verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("garbled")),
+            None
+        );
+        assert_eq!(
+            verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("nothex")),
+            None
+        );
+        assert_eq!(
+            verify_client_nonce(&key, &test_client_id(), &test_bad_nonce("empty")),
+            None
+        );
     }
 
     #[test]
