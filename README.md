@@ -137,7 +137,7 @@ live in [bench/README.md](bench/README.md).
 | Allocation released when its TCP/DTLS/QUIC connection closes | Supported (not left to TTL)     |
 | mTLS for TURNS clients                         | Opt-in (`[tls] client_ca`); no CRL/OCSP by design |
 | IPv6 relayed transport                         | Opt-in via `[turn] external_ip6`; 440 when unset. Relayed media and coturn interop verified on routable addresses |
-| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS only with `[turn.dtls] demux = true`. Verified under load: 0 → 1, no failures, 36 021 frames relayed with zero errors across the swap |
+| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS on the demux path, which is the default since 0.4.1 (`demux = false` gives the stock listener and no hot reload). Verified under load: 0 → 1, no failures, 36 021 frames relayed with zero errors across the swap |
 | Shared-secret rotation without restart         | **Not supported.** `SIGHUP` is not handled and `UpdateConfig` carries allocation limits, not the secret — `[turn.auth] shared_secret` changes only with a restart. Ephemeral credentials derived from it expire on their own; the secret does not. See R13 in [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) |
 | Multi-node ownership/state failover            | Experimental / limited scope                  |
 | Transparent active-session (media) failover    | Out of GA scope                               |

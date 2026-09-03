@@ -66,7 +66,11 @@ the feature is unavailable to everyone. What remains genuinely missing is IPv6 o
 this path — an IPv6 `Connect` is refused with 440 — which is recorded in
 `docs/protocol-gap.md`.
 
-### 2. Flip `[turn.dtls] demux` to `true` by default? — evidence gathered 2026-08-28
+### 2. Flip `[turn.dtls] demux` to `true` by default? — **flipped 2026-09-01**
+
+Both halves of the evidence are on record. Correctness: nine checks of nine below. Stability: 24 hours in `docs/soak/soak-24h-dtls-2026-09-01.md`, eleven DTLS cycles identical to three significant figures.
+
+The stock listener held the default because it was the path with a recorded long run, not because it was better — two §7 P0 requirements are unreachable there rather than unimplemented. `demux = false` still selects it.
 
 `scripts/verify/dtls-demux.sh`, **nine checks of nine**:
 

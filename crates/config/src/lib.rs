@@ -1949,13 +1949,26 @@ pub struct DtlsSection {
     pub max_sessions_per_ip: usize,
     /// Use the owned UDP demultiplexer instead of `webrtc_dtls::listen()`.
     ///
-    /// Off by default. `listen()` runs handshakes serially inside `accept()`
-    /// (webrtc-rs/webrtc#614), which forces three compromises: admission control
-    /// can only happen *after* the crypto, there is nowhere to put a handshake
-    /// rate limit, and the certificate is fixed at bind time. The demux path
-    /// fixes all three at once — but it replaces the code path that has recorded
-    /// verification behind it, so it stays opt-in until its own interop run is on
-    /// record (`docs/verification/encrypted-transports.md`).
+    /// **Default since 2026-09-01.** `listen()` runs handshakes serially inside
+    /// `accept()` (webrtc-rs/webrtc#614), which forces three compromises:
+    /// admission control can only happen *after* the crypto, there is nowhere to
+    /// put a handshake rate limit, and the certificate is fixed at bind time. Two
+    /// of those are §7 P0 requirements, and they are not missing work on the stock
+    /// path — they are unreachable there.
+    ///
+    /// This was opt-in until its own run was on record. It now is, both halves:
+    ///
+    /// - correctness — `scripts/verify/dtls-demux.sh`, 9 checks of 9, including the
+    ///   per-IP handshake limiter refusing 15 handshakes before any DTLS state was
+    ///   created;
+    /// - stability — `docs/soak/soak-24h-dtls-2026-09-01.md`, 24 hours across
+    ///   eleven DTLS cycles identical to three significant figures, a spread of 16
+    ///   frames in 1.7 million, zero egress drops.
+    ///
+    /// Set `false` for the stock listener. `cert_reload_secs` and
+    /// `max_handshakes_per_sec_per_ip` then have to come out as well — validation
+    /// refuses them, because on that path they read as protection that is not
+    /// there.
     pub demux: bool,
     /// Per-source-IP handshake **rate** limit, handshakes/second (0 = unlimited).
     /// Requires `demux = true`; on the stock path the handshake runs below
@@ -1994,7 +2007,7 @@ impl Default for DtlsSection {
             outbound_queue_capacity: 1024,
             max_sessions_per_ip: 0,
             accept_timeout_secs: 10,
-            demux: false,
+            demux: true,
             max_handshakes_per_sec_per_ip: 0,
             handshake_burst_per_ip: 0,
             cert_reload_secs: 0,
