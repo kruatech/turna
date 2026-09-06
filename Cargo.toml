@@ -92,7 +92,7 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # feature, password-hash forwards it, and until the rand 0.10 update it happened
 # to be switched on transitively by the old rand — so the import worked by
 # accident. Requesting it here says out loud what the code depends on.
-argon2 = { version = "0.5", features = ["password-hash"] }
+argon2 = { version = "0.6", features = ["password-hash"] }
 password-hash = { version = "0.5", features = ["getrandom"] }
 uuid = { version = "1", features = ["v4"] }
 
