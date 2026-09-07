@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::{rand_core::OsRng, SaltString};
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::phc::{PasswordHash, SaltString};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use dashmap::DashMap;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -176,9 +176,10 @@ impl UserStore {
             ));
         }
 
-        let salt = SaltString::generate(&mut OsRng);
+        // generate() no longer takes an RNG: it reads from getrandom itself.
+        let salt = SaltString::generate();
         let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password_with_salt(password.as_bytes(), salt.as_ref().as_bytes())
             .map_err(|e| UserAuthError::PasswordError(e.to_string()))?
             .to_string();
 
@@ -632,5 +633,27 @@ mod tests {
         assert_eq!(cfg.jwt_secret, b"a-proper-32-byte-long-secret!!!!");
 
         std::env::remove_var("TURNA_JWT_SECRET");
+    }
+    /// A hash written by argon2 0.5.3 must still verify.
+    ///
+    /// The rest of the suite hashes and verifies with the same code, so it would
+    /// pass even if the format had changed between versions. The failure that
+    /// would hide behind that is every existing user unable to log in, discovered
+    /// in production rather than here.
+    #[test]
+    fn accepts_a_hash_written_by_argon2_0_5() {
+        use argon2::password_hash::phc::PasswordHash;
+        use argon2::{Argon2, PasswordVerifier};
+
+        // Produced by argon2 0.5.3.
+        let old = "$argon2id$v=19$m=19456,t=2,p=1$uYCvBfbTHtNELxjPWUw25Q$3OUauqBCh2zwGwzW2GauhwDjOjjMLXzLTNJIi2zrpWs";
+        let parsed = PasswordHash::new(old).expect("0.5-era hash must still parse");
+        assert!(
+            Argon2::default()
+                .verify_password(b"pass12345", &parsed)
+                .is_ok(),
+            "a hash written by the previous version no longer verifies — upgrading \
+             would lock out every existing user"
+        );
     }
 }
