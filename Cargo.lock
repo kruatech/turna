@@ -4159,6 +4159,7 @@ name = "turna-auth"
 version = "0.4.0"
 dependencies = [
  "aes-gcm 0.11.1",
+ "arc-swap",
  "argon2",
  "base64 0.23.1",
  "dashmap",

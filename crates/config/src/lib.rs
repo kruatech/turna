@@ -911,13 +911,20 @@ pub struct AuthConfig {
     /// credentials signed with either secret validate, so a rotation is:
     ///
     /// 1. new secret into `shared_secret`, old one here;
-    /// 2. restart the fleet a node at a time;
+    /// 2. `kill -HUP` each node — no restart, and a config that fails validation
+    ///    changes nothing rather than half-applying;
     /// 3. wait out `token_ttl` — issued credentials expire on their own;
-    /// 4. remove this and restart again.
+    /// 4. remove this and SIGHUP again.
     ///
     /// Watch `turna_auth_previous_secret_total` flatten before step 4. Removing
     /// the old secret while clients still use it is the outage this exists to
     /// avoid, and the counter is the only way to know.
+    ///
+    /// SIGHUP re-reads only the SharedSecret backends from this file; every other
+    /// key in it is ignored by the reload. A realm cannot be rotated (it is
+    /// hashed into every long-term key), and a tenant added since startup is not
+    /// created — both are refused and logged rather than half-applied. On a
+    /// non-unix target there is no SIGHUP and rotation still needs a restart.
     ///
     /// Empty (the default) means one secret and the old behaviour.
     #[serde(default)]
@@ -2121,6 +2128,11 @@ pub struct TenantConfig {
     #[serde(default)]
     pub shared_secret: String,
     /// Accepted alongside `shared_secret` during a rotation window.
+    ///
+    /// Since the SIGHUP reload, a rotation no longer needs a restart between its
+    /// steps: edit both keys, `kill -HUP` the node, watch
+    /// `turna_auth_previous_secret_total` flatten, drop the old secret, SIGHUP
+    /// again. A reload that fails validation changes nothing.
     ///
     /// Same mechanism as `[turn.auth] previous_shared_secret`: set the new secret
     /// in `shared_secret` and the old one here, restart, wait out the credential
