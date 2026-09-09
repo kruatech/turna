@@ -186,19 +186,19 @@ section "Every exported metric is described in docs/OBSERVABILITY.md"
 # builds a dashboard on.
 OBS=docs/OBSERVABILITY.md
 if [ -f "$HEALTH" ] && [ -f "$OBS" ]; then
-  # ── Documentation debt, explicit rather than silent ──
+  # ── Documentation debt: now empty, and meant to stay that way ──
   #
-  # These families were already undocumented when this check was written (47
-  # series across five subsystems). They are listed instead of skipped quietly,
-  # because a silent skip is precisely the failure mode this whole script exists
-  # to prevent — and the list is meant to shrink.
+  # This list once held five families (turna_afxdp_, turna_uring_,
+  # turna_command_log_, turna_relay_route_, turna_user_limits_) — 46 series that
+  # predated the check. They are described in docs/OBSERVABILITY.md and the
+  # prefixes are gone, so those families get real coverage now.
   #
-  # KNOWN LIMITATION: this is a prefix allowlist, so a *new* metric added inside
-  # one of these families also slips through. Removing a family from the list is
-  # the only way to get real coverage for it. Do that as each one gets documented;
-  # do not add prefixes here to silence a new subsystem.
-  DEBT_PREFIXES="turna_afxdp_ turna_uring_ turna_command_log_ turna_relay_route_ turna_user_limits_"
-  DEBT_SINGLES="turna_processor_panics_total turna_management_readiness"
+  # KNOWN LIMITATION, kept here because it is the reason the list is empty: this
+  # is a *prefix* allowlist, so listing a family also hides any NEW metric added
+  # inside it. That is what let series ship undocumented in the first place. Do
+  # not add a prefix here to silence a new subsystem — document the metric.
+  DEBT_PREFIXES=""
+  DEBT_SINGLES=""
 
   UNDOC=""
   DEBT_COUNT=0
