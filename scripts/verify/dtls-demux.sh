@@ -380,7 +380,12 @@ else
     bad "exited in ${WAITED}s with status $NODE_RC — it did release the socket, but not cleanly. Check node.log."
   fi
   sleep 1
-  if ss -uln 2>/dev/null | grep -q ":$DTLS_PORT "; then
+  # Here-string, not `ss | grep -q`: under `pipefail`, grep -q's early exit kills
+  # ss with SIGPIPE and the pipeline reports failure, which lands in the `else`
+  # branch and prints "port released" over a port that is still bound. A false
+  # pass is the worst outcome for this check. Same bug that made
+  # check-proto-compat.sh flake.
+  if grep -q ":$DTLS_PORT " <<<"$(ss -uln 2>/dev/null)"; then
     bad "UDP $DTLS_PORT is still bound after exit"
   else
     ok "UDP $DTLS_PORT released"

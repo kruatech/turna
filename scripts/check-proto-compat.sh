@@ -80,12 +80,31 @@ fi
 
 # Changed or vanished: present in the baseline, absent now, matched by
 # message+number. That is exactly the case a client cannot detect.
+#
+# Here-strings, NOT `printf ... | grep -q`. With `pipefail` set, `grep -q` exits
+# on its first match and closes the pipe; `printf` then dies of SIGPIPE and the
+# pipeline status becomes 141, so `! pipeline` reads TRUE and an unchanged field
+# is reported as broken.
+#
+# Measured on Linux before the fix: PIPESTATUS came back as (141 0) — printf
+# killed, grep successful — on 10 of 5580 comparison iterations, i.e. once per
+# 558. One run does 93 of them, which predicts 1-(1-1/558)^93 = 15% of runs
+# failing; observed 17 of 100. NOT reproduced on macOS (0 of 60); the timing
+# depends on stdio buffering and scheduling, and I did not chase down which.
+# CI is ubuntu-latest, so the failing environment is the one that gates merges.
+#
+# The signature is a message whose "was" and "now" values are identical, on a
+# field that changes from run to run. A gate that fails at random is worse than
+# no gate: it trains reviewers to re-run until green.
+#
+# Beware when measuring this: `rc=$?` clobbers PIPESTATUS, so copy the array
+# first (`ps=( "${PIPESTATUS[@]}" )`) or the evidence disappears.
 BROKEN=""
 while read -r msg num name typ; do
   [ -z "$msg" ] && continue
-  if ! printf '%s\n' "$CURRENT" | grep -qxF "$msg $num $name $typ"; then
-    now=$(printf '%s\n' "$CURRENT" | awk -v m="$msg" -v n="$num" \
-          '$1==m && $2==n {$1="";$2="";print}' | tr -s ' ' | sed 's/^ //')
+  if ! grep -qxF "$msg $num $name $typ" <<<"$CURRENT"; then
+    now=$(awk -v m="$msg" -v n="$num" \
+          '$1==m && $2==n {$1="";$2="";print}' <<<"$CURRENT" | tr -s ' ' | sed 's/^ //')
     if [ -z "$now" ]; then
       BROKEN="$BROKEN\n  $msg field $num ($name $typ) removed — reserve the number instead"
     else
@@ -96,6 +115,10 @@ done <<EOF
 $(cat "$BASELINE")
 EOF
 
+# `grep -v` exits 1 when it selects nothing, which is the normal "no additions"
+# case; `wc` ends the pipeline so the count is still right, and the status is
+# discarded by the assignment. Kept as a pipeline deliberately: grep reads all of
+# its input here, so there is no early exit and no SIGPIPE window.
 ADDED=$(printf '%s\n' "$CURRENT" | grep -vxF -f "$BASELINE" | wc -l | tr -d ' ')
 
 if [ -n "$BROKEN" ]; then
@@ -117,4 +140,4 @@ HELP
   exit 1
 fi
 
-echo "check-proto-compat: OK — $(printf '%s\n' "$CURRENT" | wc -l | tr -d ' ') fields unchanged, $ADDED added"
+echo "check-proto-compat: OK — $(wc -l <<<"$CURRENT" | tr -d ' ') fields unchanged, $ADDED added"
