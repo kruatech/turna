@@ -348,6 +348,102 @@ window at a time.
 follows whether its socket is bound, so `2` means that listener died while the
 process kept running — worth alerting on, because `/ready` may still be green.
 
+### Datapath metrics
+
+`render_transport_metrics()` emits the AF_XDP and io_uring series unconditionally,
+like the encrypted-transport ones: they read `0` when the feature is not compiled
+in or the backend is not selected, so a dashboard built once stays valid. The
+relay-route block is the exception — it is omitted entirely on builds with no
+route table (see below).
+
+#### AF_XDP datapath (`af-xdp` feature)
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_afxdp_readiness` | gauge | Datapath readiness, same encoding as the listener gauges (`0`=starting, `1`=ready, `2`=degraded, `3`=draining). Reads `starting` when AF_XDP is not the selected backend, so `0` here does **not** mean a stuck datapath unless you have actually selected AF_XDP. |
+| `turna_afxdp_rx_frames_total` / `turna_afxdp_rx_bytes_total` | counter | Frames taken off the RX queue, and TURN payload bytes within them. |
+| `turna_afxdp_tx_frames_total` / `turna_afxdp_tx_bytes_total` | counter | Frames and bytes sent. |
+| `turna_afxdp_tx_drops_total` | counter | Send failures. A sustained rate is packet loss the client will see. |
+| `turna_afxdp_tx_inflight` | gauge | Frames pushed to the TX ring but not yet completed. A value that climbs and does not fall means completions are not being reaped. |
+| `turna_afxdp_umem_free_frames` | gauge | Free UMEM frames left for RX/TX. Approaching `0` is the exhaustion signal — RX will start dropping before anything else reports an error. |
+| `turna_afxdp_parse_drops_total` | counter | Received frames matching no TURN or relay port. Steady background noise is normal on a shared NIC; a spike correlated with client complaints means relay-port registration is lagging. |
+| `turna_afxdp_relay_ports_registered` | gauge | Relay ports currently demuxed by the datapath. Compare against `turna_allocations_active` — a persistent gap is the previous line's cause. |
+| `turna_afxdp_neighbor_unresolved` | gauge | `1` = the next-hop TX MAC is still the zero placeholder and **TX will not deliver**; `0` = resolved. This is a hard outage indicator, not a warning. |
+| `turna_afxdp_neighbor_cache_entries` | gauge | Resolved next-hop MAC entries cached. |
+| `turna_afxdp_arp_replies_total` | counter | ARP replies the datapath sent for its own IP. |
+| `turna_afxdp_ndp_replies_total` | counter | IPv6 Neighbour Advertisements sent for its own IP. |
+
+Operator response for these lives in `docs/runbooks/af-xdp.md`.
+
+#### io_uring datapath (`io-uring` feature)
+
+Unless noted, these are summed across workers, so they scale with
+`turna_uring_workers` and should be read as a pool-wide figure.
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_uring_workers` | gauge | Worker threads in the pool. The denominator for every other series here. |
+| `turna_uring_sq_len` / `turna_uring_sq_capacity` | gauge | Last-sampled submission-queue occupancy against total capacity. Sustained `sq_len` near `sq_capacity` is the saturation signal. |
+| `turna_uring_sq_push_failed_total` | counter | Submission pushes rejected because the SQ was full. Non-zero means work was refused, not merely delayed. |
+| `turna_uring_cq_len` | gauge | Last-sampled completion-queue occupancy. |
+| `turna_uring_cqe_drained_total` | counter | Completion entries drained. |
+| `turna_uring_cqe_batches_total` | counter | Drain iterations that pulled at least one CQE. `cqe_drained_total / cqe_batches_total` is the mean batch size — a value near `1` means the ring is being polled harder than the traffic justifies. |
+| `turna_uring_cqe_max_batch` | gauge | Largest single drain observed. Unlike the rest of this table this is a **max** over workers, not a sum. |
+| `turna_uring_buffers_available` | gauge | Free registered RX buffers. Approaching `0` is RX-side backpressure. |
+| `turna_uring_inflight_send_slots` | gauge | Occupied send slots, main plus relay. |
+| `turna_uring_send_slot_stalled_total` | counter | Main send slots seen stalled over 5s with no `SendMsg` completion. Those slots are **not reused**, so this counter rising means usable send capacity is shrinking. |
+| `turna_uring_relay_capacity_exhausted_total` | counter | Relay allocations refused because the per-worker relay `msghdr` pool was full. |
+
+#### Relay routing (io_uring builds only)
+
+This block is **omitted from `/metrics` entirely** when no route table exists —
+that is, on builds without the io_uring datapath. Its absence is expected there
+and is not a scrape failure. `turna_relay_route_forwarded_ratio` is derived per
+scrape as `forwarded / (local + forwarded)`.
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_relay_route_send_local_total` | counter | Relay sends handled by the owning worker itself — the cheap path. |
+| `turna_relay_route_send_forwarded_total` | counter | Sends forwarded to the owning worker after a reshard. |
+| `turna_relay_route_forwarded_ratio` | gauge | The two above as a ratio: the per-scrape cost of migration. Should decay toward `0` after a reshard settles; a plateau means ownership never converged. |
+| `turna_relay_route_send_forward_failed_total` | counter | Forwarded sends that failed to reach the owner. Lost media. |
+| `turna_relay_route_send_stale_total` | counter | Forwarded sends dropped because the owner's `(allocation, generation)` no longer matched. Expected in a small burst during a reshard; sustained means a stale route table. |
+| `turna_relay_route_miss_total` | counter | Relay sends with no route at all — the port is owned by no worker. |
+| `turna_relay_route_owner_cleanup_stale_total` | counter | Conditional cleanups skipped because the port had already been re-owned. Benign by design: it records a race that was correctly refused. |
+
+### Worker and management-plane health
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_processor_panics_total` | counter | Packet-processing panics caught by the per-worker `catch_unwind` guard. The offending packet is dropped and the worker keeps running, so this never shows up as a crash — which is exactly why it needs an alert. Any non-zero value is a bug worth a bug report. |
+| `turna_management_readiness` | gauge | Management-plane readiness, same encoding as the listener gauges (`0`=starting, `1`=ready, `2`=degraded, `3`=draining). Deliberately **separate** from the dataplane `turna_readiness`: a bounded command-log migration holds the management plane not-ready while TURN itself keeps serving. A node with no management role leaves this at `ready`, since it has nothing to gate. |
+
+### Command-log and user-limit metrics
+
+`render_command_log_metrics()` runs on every scrape, so these series exist even
+with no durable backend configured — they simply stay at `0`.
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_command_log_terminal_remaining` | gauge | Terminal command rows still present after the last GC sweep. Growth without bound means GC is not keeping up with command volume. |
+| `turna_command_log_oldest_unfinished_ms` | gauge | Age of the oldest non-terminal command. This is the one to alert on: a command that never reaches a terminal state is a management operation that silently did not happen. |
+| `turna_command_log_gc_deleted_commands_total` | counter | Command rows deleted by GC. |
+| `turna_command_log_gc_deleted_idempotency_total` | counter | Idempotency records deleted by GC. |
+| `turna_command_log_gc_errors_total` | counter | Failed GC sweeps. |
+| `turna_command_log_idempotency_lookup_errors_total` | counter | Idempotency lookup errors. Non-zero puts exactly-once command replay at risk. |
+| `turna_command_log_migration_processed_total` | counter | Legacy command rows normalized by the bounded migration. |
+| `turna_command_log_migration_errors_total` | counter | Backend errors during that migration. |
+| `turna_command_log_migration_completed` | gauge | Completion marker for the migration. |
+
+| metric | type | meaning |
+|--------|------|---------|
+| `turna_user_limits_applied_total` | counter | User-limit updates that changed state. |
+| `turna_user_limits_noop_total` | counter | Updates that matched the current state. Normal under retry. |
+| `turna_user_limits_conflicts_total` | counter | Version conflicts — a concurrent writer won. |
+| `turna_user_limits_failures_total` | counter | Updates that failed outright. |
+| `turna_user_limits_over_limit_subjects` | gauge | Subjects currently above their allocation limit. Non-zero after a limit is lowered is expected until existing allocations expire; non-zero with no recent limit change is not. |
+
+
 ## Starter alerts
 
 A maintained starter rules file lives at `docs/alerts/turna.yml`. Install it as
@@ -391,18 +487,19 @@ per-alert operator response in `docs/runbooks/encrypted-transports.md`.
 
 ### Series not yet described here
 
-`scripts/check-doc-claims.sh` asserts that every metric the health crate exports
-appears in this file, and reports **47 series that predate that check**, across five
-families: `turna_afxdp_*`, `turna_uring_*`, `turna_command_log_*`,
-`turna_relay_route_*`, `turna_user_limits_*`, plus `turna_processor_panics_total`
-and `turna_management_readiness`. They are exported and scrapeable; they are simply
-undocumented, so treat a `0` from any of them as "not described here" rather than
-"nothing happening".
+None. `scripts/check-doc-claims.sh` asserts that every metric the health crate
+exports appears in this file, and the allowlist it used to carry is now empty.
 
-They sit on an explicit allowlist in that script rather than being skipped quietly.
-The allowlist is by prefix, which means a *new* metric inside one of those families
-would also pass unnoticed — so remove a family from the list as it gets documented,
-and do not add prefixes to silence a new subsystem.
+That allowlist held 46 series across five families — `turna_afxdp_*`,
+`turna_uring_*`, `turna_command_log_*`, `turna_relay_route_*`,
+`turna_user_limits_*` — which predated the check. They are documented above and
+the prefixes have been removed from the script, so those families now get real
+coverage: a new metric added to any of them fails the check until it is described
+here.
+
+Do not reintroduce a prefix to silence a new subsystem. The allowlist was by
+prefix, which is exactly why a new metric inside a listed family could ship
+unnoticed; that is the failure mode this check exists to prevent.
 
 ## Structured logs
 

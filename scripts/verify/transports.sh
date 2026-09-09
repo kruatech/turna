@@ -17,10 +17,29 @@
 #   scripts/verify/transports.sh
 #
 # ~3 minutes. Everything lands in transports-<timestamp>/.
+#
+# PHASES selects which transports run (space-separated: udp turns dtls quic wt).
+# The default is all of them; CI uses a subset so QUIC/WebTransport get an
+# end-to-end gate on every PR without paying for the full matrix:
+#
+#   PHASES="quic wt" scripts/verify/transports.sh
+#
+# An unknown phase name is a hard error, not a silent no-op — a typo that runs
+# zero checks and exits 0 is the worst outcome a verification script can have.
 
 set -uo pipefail
 
 OUT="${OUT:-transports-$(date +%Y%m%d-%H%M%S)}"
+ALL_PHASES="udp turns dtls quic wt"
+PHASES="${PHASES:-$ALL_PHASES}"
+for _p in $PHASES; do
+  case " $ALL_PHASES " in
+    *" $_p "*) ;;
+    *) echo "unknown phase '$_p' — valid: $ALL_PHASES" >&2; exit 1 ;;
+  esac
+done
+# Space-padded substring match, so "quic" never matches inside another name.
+want() { case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO" || exit 1
 mkdir -p "$OUT"
@@ -133,6 +152,7 @@ run() { # name, log-suffix, command...
 }
 
 # ── 1. UDP: conformance, IPv6 control plane and IPv6 media ──────────────────
+if want udp; then
 say "phase 1: UDP, conformance and IPv6"
 # `external_ip6` is a key inside [turn], not a section, hence the second argument.
 gen_config "$(printf '[turn.tcp_relay]\nenabled = true\n')" 'external_ip6 = "::1"'
@@ -144,8 +164,10 @@ if start_node udp; then
     channel-data --channels 10 --pps 50 --payload 160 --family v6
 fi
 stop_node
+fi
 
 # ── 2. TURNS ────────────────────────────────────────────────────────────────
+if want turns; then
 say "phase 2: TURNS"
 gen_config "$(printf '[turn.tcp_relay]\nenabled = true\n\n[tls]\nenabled = true\nlisten = "0.0.0.0:5349"\ncert_path = "%s"\nkey_path = "%s"\n' "$OUT/cert.pem" "$OUT/key.pem")"
 if start_node turns; then
@@ -165,8 +187,10 @@ if start_node turns; then
     "$LOAD" --server 127.0.0.1:5349 --secret "$SECRET" tcp-relay-check --pipelined
 fi
 stop_node
+fi
 
 # ── 3. DTLS, both listener paths ────────────────────────────────────────────
+if want dtls; then
 for DEMUX in false true; do
   say "phase 3: DTLS (demux = $DEMUX)"
   gen_config "$(printf '[turn.dtls]\nenabled = true\nlisten = "0.0.0.0:5350"\ncert_path = "%s"\nkey_path = "%s"\ndemux = %s\n' "$OUT/cert.pem" "$OUT/key.pem" "$DEMUX")"
@@ -176,8 +200,10 @@ for DEMUX in false true; do
   fi
   stop_node
 done
+fi
 
 # ── 4. QUIC, then WebTransport (mutually exclusive on one listener) ─────────
+if want quic; then
 say "phase 4: raw QUIC"
 gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:3479"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = false\n' "$OUT/cert.pem" "$OUT/key.pem")"
 if start_node quic; then
@@ -185,7 +211,9 @@ if start_node quic; then
     "$LOAD" --server 127.0.0.1:3479 --secret "$SECRET" quic-check
 fi
 stop_node
+fi
 
+if want wt; then
 say "phase 5: WebTransport"
 gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:3479"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = true\n' "$OUT/cert.pem" "$OUT/key.pem")"
 if start_node wt; then
@@ -193,11 +221,12 @@ if start_node wt; then
     "$LOAD" --secret "$SECRET" wt-check --url https://localhost:3479/
 fi
 stop_node
+fi
 
 # ── summary ─────────────────────────────────────────────────────────────────
 {
   echo
-  echo "**$PASS passed, $FAIL failed.**"
+  echo "**$PASS passed, $FAIL failed.** Phases run: \`$PHASES\`."
   echo
   echo "Not covered here: OAuth (needs a real authorization server), AF_XDP (needs a"
   echo "dedicated NIC and root), and sustained load on anything but TURNS — the soak"
@@ -209,4 +238,11 @@ stop_node
 say "done — $PASS passed, $FAIL failed. Summary: $SUMMARY"
 echo
 cat "$SUMMARY"
+# A run that executed nothing is a failure, not a pass: it means every selected
+# phase failed to start its node, and exiting 0 there would make the CI gate
+# green while proving nothing.
+if [ "$((PASS + FAIL))" -eq 0 ]; then
+  say "no checks ran at all — treating as failure"
+  exit 1
+fi
 [ "$FAIL" -eq 0 ]
