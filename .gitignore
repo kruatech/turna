@@ -19,6 +19,9 @@ bench/*.json
 # Local environment files — never commit secrets
 .env
 .env.*
+# ...except the tracked template. Its values are test fixtures, published in
+# ci.yml's env: block, and without them a fresh clone cannot run cargo test.
+!.env.test.example
 *.pem
 *.key
 

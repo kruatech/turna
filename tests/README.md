@@ -6,11 +6,35 @@ Workspace test crates that exercise turna beyond the per-crate unit tests:
   and a live end-to-end lifecycle driven against a running `turna-node`.
 - `tests/soak` (`turna-soak`) — resource/leak and throughput checks.
 
+## Before the first run: test fixtures
+
+The auth and processor suites read their fixtures from the environment instead of
+holding literals in source, so a clean checkout fails five `turna-relay` tests
+with `... is not set — source .env.test` until they are exported. `.env.test`
+itself is gitignored; copy the tracked template:
+
+```bash
+cp .env.test.example .env.test
+set -a && source .env.test && set +a
+```
+
+CI does not need this — the same values are in the `env:` block of
+`.github/workflows/ci.yml`, and `scripts/check-doc-claims.sh` fails if the two
+copies drift apart.
+
 Run everything in the workspace:
 
 ```bash
-cargo test --workspace --all-features
+cargo test --workspace --locked
 ```
+
+This is the command CI runs, on Linux and macOS alike. Note what it does **not**
+say: `--all-features` enables the AF_XDP dependency graph, and
+`crates/transport/build.rs` refuses to build that on a non-Linux target — the
+panic names the reason, but only after a long compile. On Linux it additionally
+needs clang, libelf and the other native inputs the `all-features-linux` job
+installs, and that job runs `cargo check`, not `cargo test`: AF_XDP has no
+hermetic test, it needs a real NIC and kernel setup.
 
 ## `turna-integration-tests`
 

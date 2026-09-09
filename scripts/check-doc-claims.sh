@@ -286,6 +286,66 @@ if [ -n "$FEATURE_MANIFESTS" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+section "tests/README.md tells people the command CI actually runs"
+# ---------------------------------------------------------------------------
+
+# The README said `cargo test --workspace --all-features`. That enables the
+# AF_XDP dependency graph, which crates/transport/build.rs refuses to build on a
+# non-Linux target — so the documented way to run the suite ended in a panic on
+# macOS, after a long compile. On Linux it needs native inputs the plain test job
+# does not install, and CI only ever `check`s that configuration, never tests it.
+TREADME=tests/README.md
+CI_YML=.github/workflows/ci.yml
+if [ -f "$TREADME" ] && [ -f "$CI_YML" ]; then
+  # The `test` job's command, whatever it currently is.
+  CI_TEST_CMD=$(grep -oE 'cargo test --workspace[^"]*' "$CI_YML" | head -1)
+  if [ -z "$CI_TEST_CMD" ]; then
+    fail "no 'cargo test --workspace' command found in $CI_YML" \
+      "The extraction broke, so this check would pass over any drift. Fix the grep, not the workflow."
+  elif grep -qF "$CI_TEST_CMD" "$TREADME"; then
+    pass "$TREADME documents the CI command ($CI_TEST_CMD)"
+  else
+    fail "$TREADME does not document the command CI runs" \
+      "CI runs '$CI_TEST_CMD'. Make the README match it — a contributor who follows the README must get the same result as the gate."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section "Test fixtures: ci.yml and .env.test.example agree"
+# ---------------------------------------------------------------------------
+
+# The auth and processor suites read their fixtures from the environment. The
+# canonical values live in ci.yml's `env:` block, so CI was green while a fresh
+# clone failed five turna-relay tests with "is not set — source .env.test" — and
+# `.env.test` is gitignored and never generated, so the error message pointed at
+# a file nobody could obtain. `.env.test.example` is the tracked copy that closes
+# that, and this check keeps the two from drifting: a value added to CI but not
+# to the example puts the repository straight back into the state above.
+EXAMPLE=.env.test.example
+if [ -f "$EXAMPLE" ] && [ -f .github/workflows/ci.yml ]; then
+  # Normalised separately on purpose. The ci.yml form is `  NAME: value`, so the
+  # FIRST colon is the separator — sed replaces one occurrence, which keeps
+  # values that themselves contain a colon (a host:port, a malformed nonce)
+  # intact. The example form is already `NAME=value` and must NOT go through that
+  # substitution, or the colon inside the value would be eaten.
+  CI_ENV=$(sed -n '/^env:/,/^[^ #]/p' .github/workflows/ci.yml |
+    grep -E '^  TURNA_TEST_[A-Z0-9_]+:' |
+    sed -E 's/^[[:space:]]+//; s/:[[:space:]]*/=/' |
+    sed -E 's/="(.*)"$/=\1/' | sort)
+  EX_ENV=$(grep -E '^TURNA_TEST_[A-Z0-9_]+=' "$EXAMPLE" |
+    sed -E 's/="(.*)"$/=\1/' | sort)
+  if [ -z "$CI_ENV" ]; then
+    fail "no TURNA_TEST_* variables found in ci.yml's env: block" \
+      "The parser found nothing, so this check would pass over any drift. Fix the extraction rather than the workflow."
+  elif [ "$CI_ENV" = "$EX_ENV" ]; then
+    pass "every CI test fixture is mirrored in $EXAMPLE ($(grep -c '^TURNA_TEST_' "$EXAMPLE") variables)"
+  else
+    fail "ci.yml and $EXAMPLE disagree about the test fixtures" \
+      "Run: diff <(sed -n '/^env:/,/^[^ #]/p' .github/workflows/ci.yml | grep -E '^  TURNA_TEST_') $EXAMPLE — then make the example match CI. A fixture only in CI means a fresh clone cannot run the suite."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 section "Management proto: field numbers keep their meaning"
 # ---------------------------------------------------------------------------
 
