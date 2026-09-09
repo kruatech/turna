@@ -732,6 +732,11 @@ pub struct TurnConfig {
     /// an IPv6 literal, but that only changes what is advertised for *v4-family*
     /// allocations. Relaying over IPv6 needs its own advertised address, and the
     /// relay socket is bound in the requested family.
+    ///
+    /// One exception, and it is not about this key: a v6 literal in `external_ip`
+    /// makes RFC 6062 TCP allocations answer 440. The TCP relay's listener binds
+    /// `0.0.0.0`, so advertising a v6 relayed address would hand the client an
+    /// address nothing serves. See `handle_allocate_tcp` in turna-relay.
     pub external_ip6: String,
     pub realm: String,
     /// Transport backend preference. Default `tokio` (safest); `io_uring`,

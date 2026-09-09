@@ -1489,10 +1489,36 @@ impl PacketProcessor {
         // RFC 6062 TCP allocations stay IPv4-only even when `external_ip6` is set:
         // the TCP relay datapath has no v6 path yet, so an IPv6 family request is
         // refused with 440 rather than accepted and then unable to CONNECT.
-        if matches!(
+        //
+        // Two ways a v6 family can arrive here, and BOTH have to be refused:
+        //
+        //  1. the client asks for it (REQUESTED-ADDRESS-FAMILY = IPv6);
+        //  2. the operator configured `[turn] external_ip` as a v6 literal, which
+        //     `config::validate()` accepts and nothing downstream ties to
+        //     `tcp_relay`. The client sends no family attribute, so case 1 never
+        //     fires — yet `relay_addr` below is built from `self.external_ip` and
+        //     would advertise a v6 XOR-RELAYED-ADDRESS while the relayed listener
+        //     binds `0.0.0.0`. The Allocate would SUCCEED and peer-initiated
+        //     connections (RFC 6062 §4.4) could never arrive at the address the
+        //     client was just handed, with nothing logged and no error anywhere.
+        //
+        // Case 2 is the dangerous one precisely because it looks like it worked.
+        // Refusing with the same 440 keeps the observable behaviour equal to what
+        // docs/feature-support.md already promises ("an IPv6 TCP allocation answers
+        // 440") instead of splitting it by how the family was chosen.
+        let requested_v6 = matches!(
             msg.get_requested_address_family(),
             Some(turna_proto_stun::attribute::AddressFamily::Ipv6)
-        ) {
+        );
+        if requested_v6 || self.external_ip.is_ipv6() {
+            if !requested_v6 {
+                warn!(
+                    external_ip = %self.external_ip,
+                    "RFC 6062: refusing TCP allocation because [turn] external_ip is IPv6 \
+                     and the TCP relay datapath is IPv4-only; the relayed listener would \
+                     bind 0.0.0.0 and never receive peer-initiated connections"
+                );
+            }
             return self.encode_error(msg, src, 440, "Address Family not Supported");
         }
 

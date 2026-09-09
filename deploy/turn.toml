@@ -45,6 +45,9 @@ external_ip = "${TURNA_EXTERNAL_IP:-}"
 # NOTE: this is NOT the same as putting an IPv6 literal in external_ip above.
 # That only changes what is advertised for v4-family allocations.
 # NOTE: RFC 6062 TCP relay allocations stay IPv4-only regardless of this key.
+# They are also refused (440) when `external_ip` above is an IPv6 literal: the
+# relayed listener binds 0.0.0.0, so a v6 relayed address would be advertised and
+# never served. Use a v4 `external_ip` on any node with [turn.tcp_relay] enabled.
 external_ip6 = "${TURNA_EXTERNAL_IP6:-}"
 realm       = "${TURNA_REALM:-turna}"
 # Transport backend: tokio | io_uring | af_xdp | auto.
