@@ -57,6 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Cloned before the match below moves `config_path`. The SIGHUP handler
+    // re-reads this exact file to pick up a rotated shared secret. `None`
+    // (defaults, no file) means there is nothing to re-read.
+    let reload_path: Option<String> = config_path.clone();
     let (
         config,
         cluster,
@@ -267,6 +271,137 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(registry)
     };
+
+    // ── #6: shared-secret rotation on SIGHUP ────────────────────────────────
+    //
+    // Secrets used to be readable only at startup, so rotating one meant a fleet
+    // restart. SIGHUP re-reads the SAME config file and republishes only the
+    // SharedSecret backends; nothing else from the reloaded file is applied.
+    //
+    // Deliberately a signal and not a management RPC. The secret never leaves the
+    // host: it is not carried over the control channel, cannot land in an audit
+    // record, and needs no proto change. It is the same shape as the TLS
+    // certificate reload, which watches its files rather than accepting material
+    // over gRPC.
+    //
+    // Rotation is still the two-secret window, unchanged: put the new secret in
+    // `shared_secret`, the old one in `previous_shared_secret`, SIGHUP, wait for
+    // `turna_auth_previous_secret_total` to flatten, drop the old one, SIGHUP
+    // again. What is gone is the restart between those steps.
+    //
+    // A reload that fails validation changes NOTHING and is logged. Half-applying
+    // a rejected config would be worse than not reloading: the operator would
+    // believe the rotation landed.
+    #[cfg(unix)]
+    {
+        if let Some(path) = reload_path.clone() {
+            let rotate_auth = auth.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sighup = match signal(SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(%e, "cannot install SIGHUP handler; secret rotation needs a restart");
+                        return;
+                    }
+                };
+                info!(
+                    config = %path,
+                    "SIGHUP will reload shared secrets from this file (no restart needed)"
+                );
+                loop {
+                    sighup.recv().await;
+                    let root = match TurnaConfig::load(&path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // Keep serving the secrets already in memory.
+                            warn!(
+                                event = "secret_reload_failed",
+                                config = %path, %e,
+                                "SIGHUP: config did not load or validate; secrets unchanged"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let mut rotated = 0usize;
+                    let mut skipped = 0usize;
+
+                    // Base realm. Only a SharedSecret backend is rotated: a realm with
+                    // static users is LongTerm and its credentials are managed through
+                    // the user API, not this file.
+                    if root.turn.auth.static_users.is_empty() && !root.turn.auth.oauth.enabled {
+                        let new_base = AuthMode::SharedSecret {
+                            realm: root.turn.realm.clone(),
+                            secret: root.turn.auth.shared_secret.as_bytes().to_vec(),
+                            previous: (!root.turn.auth.previous_shared_secret.is_empty())
+                                .then(|| root.turn.auth.previous_shared_secret.as_bytes().to_vec()),
+                        };
+                        // `replace_base` refuses a realm change: the realm is hashed
+                        // into every long-term key, so swapping it would invalidate
+                        // credentials rather than rotate a secret.
+                        if rotate_auth.replace_base(new_base) {
+                            rotated += 1;
+                        } else {
+                            skipped += 1;
+                            warn!(
+                                event = "secret_reload_rejected",
+                                realm = %root.turn.realm,
+                                "SIGHUP: base realm changed in the config; a realm cannot be \
+                                 rotated under live clients. Base secret left unchanged."
+                            );
+                        }
+                    } else {
+                        skipped += 1;
+                    }
+
+                    // Tenants, matched by realm against what this registry actually
+                    // holds. A tenant added to the file since startup is NOT created
+                    // here — that is a restart, not a rotation — and is reported so
+                    // the operator does not assume otherwise.
+                    let known: std::collections::HashSet<String> =
+                        rotate_auth.tenant_realms().into_iter().collect();
+                    for t in &root.tenants {
+                        if !t.static_users.is_empty() {
+                            skipped += 1;
+                            continue;
+                        }
+                        if !known.contains(&t.realm) {
+                            warn!(
+                                event = "secret_reload_skipped",
+                                tenant = %t.id, realm = %t.realm,
+                                "SIGHUP: tenant is not registered on this node; adding a tenant \
+                                 needs a restart. Not rotated."
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                        let new_tenant = AuthMode::SharedSecret {
+                            realm: t.realm.clone(),
+                            secret: t.shared_secret.as_bytes().to_vec(),
+                            previous: (!t.previous_shared_secret.is_empty())
+                                .then(|| t.previous_shared_secret.as_bytes().to_vec()),
+                        };
+                        if rotate_auth.replace_tenant(&t.realm, new_tenant) {
+                            rotated += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+
+                    // Never log the secrets, nor a hash of them: a hash of a
+                    // low-entropy secret is a crackable record of it.
+                    info!(
+                        event = "secret_reloaded",
+                        rotated, skipped, "SIGHUP: shared secrets republished"
+                    );
+                }
+            });
+        }
+    }
+    // `reload_path` is unused on non-unix targets, where there is no SIGHUP.
+    #[cfg(not(unix))]
+    let _ = &reload_path;
 
     let store = Arc::new({
         let mut s = AllocationStore::new(

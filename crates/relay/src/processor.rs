@@ -2304,6 +2304,8 @@ impl PacketProcessor {
         // RFC 7635 §6.1: when the base realm uses OAuth, advertise the
         // authorization server in the 401 so a token-less client learns where to
         // obtain a token; otherwise send the standard credential challenge.
+        // Owned `String` since the registry's backend moved behind an ArcSwap;
+        // `as_id.as_bytes()` below is unchanged.
         let resp = match self.auth.base_oauth_identity() {
             Some(as_id) => turn::build_oauth_challenge(
                 msg.method,
