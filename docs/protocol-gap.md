@@ -275,7 +275,9 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   and `init.lua` carries an explicit "change one place, change both" coupling with
   the Rust script. Full analysis, per-option edit lists, the test list and the
   ordering argument: [docs/design/additional-address-family.md](design/additional-address-family.md).
-- **Absent**: IPv6 for RFC 6062 TCP relay (still 440 there — the TCP relay datapath
+- **Absent**: IPv6 for RFC 6062 TCP relay. 440 is returned both when the client asks
+  for the v6 family and when `[turn] external_ip` is a v6 literal; the latter would
+  otherwise advertise a relayed address the `0.0.0.0` listener never serves. (The TCP relay datapath
   has no v6 path).
 - **Verified 2026-08-18** (`docs/interop/conformance-2026-08-18.md`): the control
   plane, in both configurations — 440 with `external_ip6` unset, an IPv6 relayed
