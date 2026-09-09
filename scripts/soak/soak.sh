@@ -230,8 +230,12 @@ fi
 # hours with `channeldata` instead of `channel-data`.
 if [ -z "$LOAD_CMD" ]; then
   _HELP="$("$LOAD_BIN" --help 2>&1 || true)"
+  # Here-string, not `printf ... | grep -q`: under `pipefail`, grep -q's early exit
+  # kills printf with SIGPIPE and the pipeline reports failure, so a subcommand
+  # that exists would abort the soak before it starts. Same bug that made
+  # check-proto-compat.sh flake.
   for _m in allocate binding channel-data; do
-    printf '%s' "$_HELP" | grep -q -- "$_m" \
+    grep -q -- "$_m" <<<"$_HELP" \
       || die "$LOAD_BIN has no '$_m' subcommand. Its CLI changed; fix the rotation in
 this script rather than letting the phase silently produce nothing."
   done

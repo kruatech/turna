@@ -270,8 +270,12 @@ if [ -n "$FEATURE_MANIFESTS" ]; then
   DECLARED=$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /=/ {print $1}' \
     $FEATURE_MANIFESTS | sort -u)
   UNKNOWN=""
+  # Here-string, not `printf ... | grep -q`: with `pipefail` set, grep -q exits at
+  # its first match and printf dies of SIGPIPE (141), which pipefail turns into a
+  # failed pipeline — so a feature that IS declared gets reported as unknown, at
+  # random. Same bug that made check-proto-compat.sh flake.
   for f in io-uring af-xdp web-transport dtls sctp tls quic; do
-    printf '%s\n' "$DECLARED" | grep -qx "$f" || UNKNOWN="$UNKNOWN $f"
+    grep -qx "$f" <<<"$DECLARED" || UNKNOWN="$UNKNOWN $f"
   done
   if [ -n "$UNKNOWN" ]; then
     fail "docs reference Cargo features that no manifest declares:$UNKNOWN" \

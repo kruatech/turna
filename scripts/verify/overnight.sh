@@ -106,8 +106,15 @@ command -v openssl >/dev/null || die "openssl required"
 
 # A health port held by something else is not a warning, it is a run that measures the
 # wrong process for a day. Checked before the build so it costs seconds.
-if curl -fsS --max-time 2 "http://127.0.0.1:$HEALTH_PORT/metrics" 2>/dev/null | grep -q .; then
-  if curl -fsS --max-time 2 "http://127.0.0.1:$HEALTH_PORT/metrics" 2>/dev/null | grep -q '^turna_'; then
+#
+# Capture once, then match against the variable. Piping curl into `grep -q` under
+# `pipefail` lets grep exit at the first line, curl die of SIGPIPE, and the
+# pipeline report failure — which skips this guard entirely, i.e. fails in exactly
+# the direction the guard exists to prevent. Same bug that made
+# check-proto-compat.sh flake. One fetch instead of two is a side benefit.
+_PORT_METRICS="$(curl -fsS --max-time 2 "http://127.0.0.1:$HEALTH_PORT/metrics" 2>/dev/null || true)"
+if [ -n "$_PORT_METRICS" ]; then
+  if grep -q '^turna_' <<<"$_PORT_METRICS"; then
     die "something is already serving turna metrics on 127.0.0.1:$HEALTH_PORT.
 Another node is running; stop it or set HEALTH_PORT."
   fi
