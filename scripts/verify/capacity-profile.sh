@@ -203,7 +203,12 @@ try:
     d = json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])
 except Exception:
     print("0 0 1 100.0 FAIL"); sys.exit(0)
-sent, recv, errs = d.get("sent", 0), d.get("recv", 0), d.get("errs", 0)
+# `errs` required, not defaulted to 0: a missing field must not read as "no
+# errors" and let a phase pass unmeasured. The unreadable-JSON path above already
+# fails closed; this closes the readable-but-changed one.
+if "errs" not in d:
+    print("0 0 1 100.0 FAIL"); sys.exit(0)
+sent, recv, errs = d.get("sent", 0), d.get("recv", 0), d["errs"]
 loss = ((sent - recv) / sent * 100) if sent else 100.0
 # recv can exceed sent: the counters are not sampled at the same instant, so
 # frames still in flight arrive after `sent` is read. That gives a negative loss,
@@ -278,9 +283,20 @@ while [ "$pps" -le "$MAX_PPS" ]; do
     # Drops are read per phase, not once at the end. A total taken after the
     # failing phases includes their drops, which made a passing ceiling look as
     # though it had shed a million frames.
+    # No `|| echo 0`: an unreadable /status used to yield 0, which made
+    # `drops_phase` negative, and a negative is not `-gt 0`, so the phase kept its
+    # PASS. The ceiling would then be set from a phase whose drops were never
+    # measured. Unreadable is now its own outcome.
     drops_now=$(curl -fsS --max-time 3 "http://127.0.0.1:$HEALTH_PORT/status" 2>/dev/null |
-      python3 -c 'import json,sys; print(json.load(sys.stdin).get("send_queue_dropped",0))' 2>/dev/null || echo 0)
-    drops_phase=$(( drops_now - ${drops_prev:-0} ))
+      python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["send_queue_dropped"] if "send_queue_dropped" in d else "")' 2>/dev/null)
+    if [ -z "$drops_now" ]; then
+      say "  -> FAIL  could not read send_queue_dropped at $pps pps — the phase is unmeasured, not clean"
+      verdict=FAIL
+      drops_phase=0
+      drops_now="${drops_prev:-0}"
+    else
+      drops_phase=$(( drops_now - ${drops_prev:-0} ))
+    fi
     drops_prev="$drops_now"
     say "  -> $verdict  sent=$sent recv=$recv errs=$errs loss=${loss}% skew=${skew:-0} queue_drops=$drops_phase"
     if [ "$verdict" = "PASS" ] && [ "$drops_phase" -gt 0 ]; then

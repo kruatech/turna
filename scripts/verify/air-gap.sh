@@ -202,9 +202,12 @@ RELAYED=$(python3 - "$OUT/load.json" <<'PY'
 import json, sys
 try:
     d = json.loads(open(sys.argv[1]).read().strip().splitlines()[-1])
-    print(f"{d.get('recv',0)} {d.get('sent',0)} {d.get('errs',0)}")
+    # errs defaults to 1, not 0. A missing field means unmeasured, and the
+    # caller below treats 0 as "no errors" — which would pass this check on a
+    # JSON that never reported any.
+    print(f"{d.get('recv',0)} {d.get('sent',0)} {d.get('errs',1)}")
 except Exception:
-    print("0 0 0")
+    print("0 0 1")
 PY
 )
 RECV=$(echo "$RELAYED" | cut -d' ' -f1)
