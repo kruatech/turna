@@ -185,8 +185,15 @@ class Turna:
         )
 
     def allocations(self, *, limit: int = 100) -> list:
+        """One page of allocations.
+
+        The wire field is `page_size`, not `limit`; the keyword here is kept for
+        callers. `ListAllocationsResponse` also carries `next_page_token`, which
+        this does not follow — so a node with more allocations than `limit`
+        returns a page, not everything.
+        """
         r = self._call(
-            self._stub.ListAllocations, pb.ListAllocationsRequest(limit=limit)
+            self._stub.ListAllocations, pb.ListAllocationsRequest(page_size=limit)
         )
         return list(r.allocations)
 
@@ -212,25 +219,33 @@ class Turna:
 
     # ── changing ────────────────────────────────────────────────────────────
 
-    def drain(self, *, reason: str = "") -> None:
+    def drain(self, *, node_id: str = "") -> None:
         """Stop accepting new allocations; let existing ones finish.
 
         Returns as soon as the node accepts the instruction, not when draining
         completes. Use :meth:`wait_drained` for that — a rolling upgrade that
         proceeds on the acknowledgement rather than on the outcome is how two
         nodes end up draining at once.
+
+        There is no `reason` on the wire: `SetDrainingRequest` carries
+        `draining`, `node_id` and `idempotency_key` only. This used to pass one,
+        which raised `ValueError` from protobuf before the call left the process.
+        Record the reason in your own change log; the node's audit entry is keyed
+        by the correlation id this client already sends.
         """
         self._call(
             self._stub.SetDraining,
             pb.SetDrainingRequest(
-                draining=True, reason=reason, idempotency_key=self._idem()
+                draining=True, node_id=node_id, idempotency_key=self._idem()
             ),
         )
 
-    def undrain(self) -> None:
+    def undrain(self, *, node_id: str = "") -> None:
         self._call(
             self._stub.SetDraining,
-            pb.SetDrainingRequest(draining=False, idempotency_key=self._idem()),
+            pb.SetDrainingRequest(
+                draining=False, node_id=node_id, idempotency_key=self._idem()
+            ),
         )
 
     def wait_drained(self, *, timeout: float = 60.0, poll: float = 2.0) -> bool:
@@ -249,20 +264,81 @@ class Turna:
         return False
 
     def delete_allocation(self, allocation_id: str, *, reason: str = "") -> None:
+        """Delete one allocation. The wire field is `id`, not `allocation_id`."""
         self._call(
             self._stub.DeleteAllocation,
             pb.DeleteAllocationRequest(
-                allocation_id=allocation_id,
+                id=allocation_id,
                 reason=reason,
                 idempotency_key=self._idem(),
             ),
         )
 
-    def set_user_limits(self, username: str, **limits) -> None:
+    def set_user_limits(
+        self,
+        username: str,
+        *,
+        expected_version: int,
+        node_id: str = "",
+        realm: str = "",
+        tenant: str = "",
+        max_allocations: "int | None" = None,
+        max_bytes_per_sec_per_allocation: "int | None" = None,
+        max_lifetime_secs: "int | None" = None,
+    ) -> None:
+        """Set per-user limits.
+
+        The flat request this used to build no longer exists: field numbers 1-4
+        (`username`, `max_allocations`, `max_bandwidth_bps`, `max_lifetime`) are
+        `reserved` in management.proto, retired rather than reassigned. Passing
+        `username=` raised `ValueError` from protobuf, so this method could not
+        have worked against any node built from that proto.
+
+        The current shape is a `target` (scope + identifiers) plus a `patch` of
+        tri-state limits. Only the limits you name are sent; the rest keep
+        whatever they had, which is what makes this a patch rather than a
+        replacement.
+
+        `expected_version` is required for the same reason it is on
+        :meth:`update_config`: without it the call is a blind write, and two
+        operators editing during an incident is the normal case.
+
+        To *remove* a limit rather than change it, pass the mode explicitly —
+        `LIMIT_MODE_UNLIMITED` or `LIMIT_MODE_DISABLED` — by building the patch
+        yourself; the keyword arguments here always mean `LIMIT_MODE_VALUE`.
+        """
+        patch = pb.UserLimitsPatch()
+        if max_allocations is not None:
+            patch.max_allocations.CopyFrom(
+                pb.UInt32Limit(mode=pb.LIMIT_MODE_VALUE, value=max_allocations)
+            )
+        if max_bytes_per_sec_per_allocation is not None:
+            patch.max_bytes_per_sec_per_allocation.CopyFrom(
+                pb.UInt64Limit(
+                    mode=pb.LIMIT_MODE_VALUE,
+                    value=max_bytes_per_sec_per_allocation,
+                )
+            )
+        if max_lifetime_secs is not None:
+            patch.max_lifetime_secs.CopyFrom(
+                pb.UInt32Limit(mode=pb.LIMIT_MODE_VALUE, value=max_lifetime_secs)
+            )
         self._call(
             self._stub.SetUserLimits,
             pb.SetUserLimitsRequest(
-                username=username, idempotency_key=self._idem(), **limits
+                node_id=node_id,
+                target=pb.UserLimitTarget(
+                    # Scope 0 is UNSPECIFIED and is always rejected server-side,
+                    # deliberately: a client that forgets it must not perform a
+                    # GLOBAL policy change by omission.
+                    scope=pb.USER_LIMIT_SCOPE_USER,
+                    tenant=tenant,
+                    realm=realm,
+                    username=username,
+                ),
+                patch=patch,
+                idempotency_key=self._idem(),
+                expected_version=expected_version,
             ),
         )
 
