@@ -9,6 +9,14 @@ for beta.
 green while the remaining multiplicity is tracked here rather than ignored
 silently.
 
+> **Since (paste is gone).** The `paste` half of the note below no longer applies.
+> `netlink-packet-core 0.8.1` was the only package in the lock that pulled it;
+> `rtnetlink 0.23` requires `netlink-packet-core ^0.9`, which has no dependencies
+> at all, so bumping `crates/transport` removed RUSTSEC-2024-0436 from the tree
+> and its `deny.toml` ignore with it. One `[advisories] ignore` entry remains
+> (`bincode` via `dtls`). The note is kept as written because it records a dated
+> scope change, and editing that to match later code would destroy its point.
+
 > **Scope change (2026-08-13).** `deny.toml` now sets `all-features = true`.
 > Previously cargo-deny resolved only the *default* feature graph, which is why
 > both `[advisories] ignore` entries reported `advisory-not-detected` — the crates

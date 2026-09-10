@@ -97,7 +97,7 @@ datapath validated live (IPv4+IPv6):
   Solicited+Override, `icmpv6_checksum`). Unit tests cover build/parse/checksum.
 - **shipped+validated (hw)** ring-pending: `turna_afxdp_tx_inflight` gauge.
 - **shipped+validated (hw)** netlink-neighbor: async resolver (`crate::neighbor`,
-  rtnetlink 0.21 / netlink-packet-route 0.30) does target -> next-hop (kernel LPM)
+  rtnetlink 0.23 / netlink-packet-route 0.33) does target -> next-hop (kernel LPM)
   -> neighbour MAC, maintains a shared `NeighborCache`; send paths resolve
   per-target with a fallback to the static `dst_mac` and queue an async resolve
   on a cache miss. Standalone `examples/neigh_probe` validates resolution.
