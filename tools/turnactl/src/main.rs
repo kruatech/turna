@@ -1,19 +1,52 @@
 //! turnactl — CLI for Turna server management.
 //!
-//! Usage:
-//!   turnactl status                     # node status
-//!   turnactl failover status            # failover takeover counters
-//!   turnactl allocations list           # list allocations
-//!   turnactl allocations count          # count allocations
-//!   turnactl allocations get 50000      # get allocation by relay port
-//!   turnactl allocations kill 50000     # force-remove allocation
-//!   turnactl drain                      # enable drain mode
-//!   turnactl undrain                    # disable drain mode
-//!   turnactl ping                       # health check
-//!   turnactl rooms list                 # list rooms
+//! # Which commands actually reach a server
+//!
+//! `ManagementClient::send` splits on the command name. Four are plain GETs
+//! against the health server, which `turna-node` really does run:
+//!
+//!   turnactl ping                       # GET /health
+//!   turnactl status                     # GET /status
+//!   turnactl allocations count          # GET /metrics
+//!   turnactl cluster nodes              # GET /cluster
+//!
+//! Two go over gRPC to `turna-control-plane`, and work when it is running:
+//!
+//!   turnactl user add <u> <p> [--org O]
+//!   turnactl user remove <u> [--force]
+//!
+//! **Everything else POSTs to `/manage`, and nothing serves that path.** The
+//! health server routes `/capacity /cluster /health /metrics /ready /status` and
+//! no more; the `("POST", "/manage")` handler in `turna_management` belongs to a
+//! server (`turna_management::integration::serve`) that has no callers anywhere
+//! in the workspace; and `services/admin` serves `/api/manage`, a different path
+//! on a different port over a different protocol. So these fail against a
+//! correctly running node:
+//!
+//!   turnactl failover status            # POST /manage — no server
+//!   turnactl drain                      # POST /manage — no server
+//!   turnactl undrain                    # POST /manage — no server
+//!   turnactl allocations list           # POST /manage — no server
+//!   turnactl allocations get 50000      # POST /manage — no server
+//!   turnactl allocations kill 50000     # POST /manage — no server
+//!   turnactl rooms list                 # POST /manage — no server
+//!
+//! The failure is misleading, which is the worst part: the error reads "Is
+//! turna-node running with management API on 127.0.0.1:9090?", sending the
+//! operator to look for a fault in their deployment. There is no such server to
+//! run. Note also that the client's own comment says the server would live on
+//! 9091 while `--addr` defaults to 9090, so the two never agreed either.
+//!
+//! `rooms list` is doubly dead: it reaches `StoreHandler::list_rooms`, and
+//! `StoreHandler` has no implementation in the workspace.
+//!
+//! Wire the HTTP management server or delete it in favour of the gRPC control
+//! plane — recorded in `docs/OPEN-DECISIONS.md`. Documented here rather than
+//! quietly, because the header used to list all eleven as if they worked.
 //!
 //! Options:
-//!   --addr HOST:PORT    management API address (default: 127.0.0.1:9090)
+//!   --addr HOST:PORT    health-server address (default: 127.0.0.1:9090)
+//!   --grpc-addr URL     control-plane gRPC (default: http://127.0.0.1:5350)
 //!   --json              output raw JSON
 
 use std::net::SocketAddr;

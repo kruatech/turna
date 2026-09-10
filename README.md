@@ -193,6 +193,20 @@ The chart keeps the TURN secret in a Kubernetes Secret, runs as a hardened
 non-root pod, and separates the public TURN service from an internal
 health/metrics service. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
+**Scope:** the chart configures **plain UDP TURN only**. Its ConfigMap has no
+`[tls]`, `[turn.dtls]` or `[turn.quic]` section and no override hook, so TURNS,
+DTLS and QUIC/WebTransport — which the node supports and CI exercises end to end
+— are not reachable through it. Certificate material needs Secret mounting and a
+rotation story the chart does not have yet. Use your own ConfigMap for those.
+
+**No ops API in the chart either.** It deploys `turna-node` and nothing else:
+there is no `turna-control-plane` workload, no Service for the management port,
+and the ConfigMap sets `[management] enabled = false` on loopback. `turnactl` and
+the admin console therefore cannot reach a chart deployment — they assume the
+single-host topology in [docs/admin/README.md](docs/admin/README.md), with the
+control plane on `127.0.0.1:5350`. `deploy/docker-compose.yml` runs the node
+alone for the same reason.
+
 ## Configuration
 
 Minimal `turn.toml`:

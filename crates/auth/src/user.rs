@@ -1,4 +1,8 @@
 //! User model for platform authentication.
+//!
+//! **UNWIRED.** No caller outside this crate. Used only by `store` and `jwt`,
+//! both of which are also unwired. See the crate root.
+//!
 
 use serde::{Deserialize, Serialize};
 

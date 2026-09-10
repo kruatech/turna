@@ -1,4 +1,9 @@
 //! JWT tokens for platform authentication.
+//!
+//! **UNWIRED.** No caller outside this crate — none of its 5 public items is
+//! referenced anywhere else. Used only by `store`, which is also unwired. See the
+//! crate root.
+//!
 
 use jsonwebtoken::{
     decode, encode, errors::Error as JwtError, Algorithm, DecodingKey, EncodingKey, Header,

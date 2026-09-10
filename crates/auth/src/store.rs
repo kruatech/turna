@@ -1,5 +1,11 @@
 //! In-memory user store with Argon2 password hashing and JWT issuance.
 //!
+//! **UNWIRED.** No caller outside this crate — none of its 3 public items is
+//! referenced from `crates/`, `services/`, `tools/` or `tests/`. `TURNA_JWT_SECRET`,
+//! which `try_from_env` requires, is set nowhere for the same reason. See the
+//! crate root for the full picture and `docs/OPEN-DECISIONS.md` for the decision.
+//!
+//!
 //! Thread-safe via DashMap. For cluster deployments, back this with
 //! Tarantool (turna_users space) — same pattern as AllocationStore.
 

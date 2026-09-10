@@ -1,13 +1,41 @@
-//! turna-auth — TURN credential validation + platform user authentication.
+//! turna-auth — TURN credential validation, plus four modules nothing calls.
 //!
-//! # TURN auth (existing)
-//! [`AuthMode`] validates STUN messages for TURN allocations.
-//! [`rotation`] handles credential rotation without dropping sessions.
+//! # Wired
 //!
-//! # User auth (Phase 2)
-//! [`store::UserStore`] — in-memory user store (Argon2 + JWT).
-//! [`user::User`]       — platform user model.
-//! [`jwt::Claims`]      — JWT token claims.
+//! [`AuthMode`] validates STUN messages for TURN allocations, and
+//! [`tenant::AuthRegistry`] resolves the tenant from the authenticated realm.
+//! Those two are the crate: `turna-relay` uses them on every request.
+//!
+//! # UNWIRED — read this before believing the list below
+//!
+//! `store` (659 lines), `rotation` (403), `jwt` (184) and `user` (64) have **no
+//! callers anywhere outside this crate**. Checked by taking every `pub` item in
+//! each module and grepping `crates/`, `services/`, `tools/` and `tests/` for it:
+//! 0 of 3, 0 of 6, 0 of 5 and 0 of 3 respectively. They reference each other and
+//! nothing else. Their unit tests pass and test code nothing runs.
+//!
+//! This header previously advertised them as "User auth (Phase 2)", which is how
+//! a reader concludes that turna has user registration, login, Argon2 password
+//! hashing, JWT signing and token revocation. It has the code for those. It does
+//! not use it.
+//!
+//! Two practical consequences, so this is not merely tidy-mindedness:
+//!
+//! * `TURNA_JWT_SECRET` is read by [`store::UserStoreConfig::try_from_env`] and
+//!   is set nowhere — not in the Helm chart, not in any shipped config, not in
+//!   the docs. That is consistent: nothing calls the constructor that reads it.
+//! * An audit item asked for hot rotation of "the shared secret and the JWT
+//!   secret". The first is now implemented. The second would have been rotating a
+//!   secret for a subsystem with no callers.
+//!
+//! The same situation as `turna_relay::node_migration`, and it gets the same
+//! treatment: say so here rather than let the next reader find out. Wire it or
+//! delete it is a product decision — recorded in `docs/OPEN-DECISIONS.md`.
+//!
+//! - [`store::UserStore`] — in-memory user store (Argon2 + JWT). **Unwired.**
+//! - [`user::User`]       — platform user model. **Unwired.**
+//! - [`jwt::Claims`]      — JWT token claims. **Unwired.**
+//! - [`rotation`]         — per-allocation credential rotation. **Unwired.**
 
 pub mod jwt;
 pub mod rotation;

@@ -114,8 +114,11 @@ pcall(function()
 end)
 
 -- ── 2. Spaces ────────────────────────────────────────────────────────────────
--- These match the Rust-side INIT_SCRIPT in crates/state-backend/src/tarantool.rs.
--- If you change one place, change both.
+-- The Rust-side INIT_SCRIPT constant this used to mirror no longer exists.
+-- This file is the ONLY definition of the schema. The note here said "change one
+-- place, change both" long after that constant was deleted, and the
+-- ADDITIONAL-ADDRESS-FAMILY migration plan was costed for two files because of
+-- it. The Rust backend calls the `turna_init_schema` stored function below.
 
 box.schema.space.create("turna_allocations", { if_not_exists = true })
 box.space.turna_allocations:format({
