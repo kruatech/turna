@@ -11,33 +11,33 @@ from facts rather than re-derived.
 
 ## Decisions
 
-### 0. Hot rotation of the shared secret — opened 2026-08-28
+### 0. Hot rotation of the shared secret — opened 2026-08-28, **DECIDED**
 
-There is none. Measured: `SIGHUP` is not handled, and `UpdateConfig` carries
-allocation limits rather than the secret. `[turn.auth] shared_secret` changes only
-with a restart.
+**Resolved: SIGHUP re-reads the config file and republishes the SharedSecret
+backends.** No restart, no proto change.
 
-That matters because the shared secret is the credential a leak would force you to
-change, and changing it means restarting every node. Certificate rotation is hot
-and verified under load; this is not.
+Of the three options recorded when this was opened, the second — putting the
+secret in `UpdateConfig` — was rejected on the question it raised itself: a
+credential should not travel over the management API. Over that channel it can
+land in an audit record, and the machinery that made it attractive (idempotency,
+optimistic concurrency) buys nothing for a value that is simply replaced. SIGHUP
+keeps the secret on the host, and matches how the TLS certificate already
+reloads: by re-reading its own files, not by accepting material over gRPC.
 
-*Mitigating:* ephemeral credentials derived from it carry a TTL, so ones already
-issued expire on their own.
+The third option — two secrets during the window — was already implemented
+(`previous_shared_secret`); what it lacked was a way to move between the steps
+without restarting, which is exactly what this adds.
 
-Three options, in rough order of cost:
+The reload publishes a whole `AuthMode` rather than mutating bytes, so `secret`
+and `previous` move together and no request sees the new secret paired with the
+wrong previous one. A config that fails validation changes nothing. A realm
+change and a tenant added since startup are refused and logged rather than
+half-applied.
 
-- **Document it and leave it.** A rolling restart is a supported operation and a
-  compromised secret is rare. Cheapest, and honest as long as it is written where a
-  customer sees it — which it now is, as R13.
-- **Add the secret to `UpdateConfig`.** The machinery exists: idempotency keys,
-  optimistic concurrency, an audit trail. The question is whether a credential
-  should travel over the management API at all, given that anyone who can call it
-  can already mint sessions.
-- **Accept two secrets during a rotation window.** What a deployment actually
-  wants: the node honours credentials signed by either while the fleet catches up.
-  Correct, and the most work.
-
-Not decided. Recorded so that it is a choice rather than a gap nobody noticed.
+Verified under load by `scripts/verify/rotation-under-load.sh`, whose secret
+phase was disabled until this existed — it used to SIGHUP a node that had no
+handler, killing it, after which every remaining assertion passed against a dead
+process.
 
 ### 1. Lift the `production = true` gate on RFC 6062 TCP relay? — lifted 2026-08-25
 
@@ -125,7 +125,7 @@ Full analysis, per-option edit lists and the test list:
 | | Option | Cost |
 |---|---|---|
 | 1 | Second port inside the `data` blob | No schema migration — `serde(default)` is the established pattern here. But the v6 port has no index, so port-collision detection and `pool_states` cover half the allocation. An existing test (`rehydrate_double_port_conflict`) would keep passing while covering only the v4 half. |
-| 3 | Composite primary key | Correct model, both ports indexed, quota counting unaffected. Needs a migration for live data, and `init.lua` plus the Rust `INIT_SCRIPT` must move together. |
+| 3 | Composite primary key | Correct model, both ports indexed, quota counting unaffected. Needs a migration for live data — in `deploy/tarantool/init.lua` only. An earlier version of this row said `init.lua` plus a Rust `INIT_SCRIPT` "must move together"; that constant does not exist, so the migration is one file, not two. |
 
 **Recommended:** option 3 if a schema migration is acceptable in this release, otherwise
 option 1 with the halved guarantee written down at the call site rather than discovered
@@ -174,6 +174,75 @@ a coding one.
 
 Worth knowing: the documentation used to claim the codec was complete. That false claim
 is what hid the `ATTR_ALTERNATE_SERVER` wire bug for as long as it did.
+
+### 7. `turna-auth`'s user/JWT subsystem — wire it or delete it?
+
+`store.rs` (659 lines), `rotation.rs` (403), `jwt.rs` (184) and `user.rs` (64) —
+1 310 lines implementing user registration, login, Argon2 password hashing, JWT
+signing, token revocation and a blacklist — have **no callers outside the auth
+crate**. Verified by taking every `pub` item in each module and grepping
+`crates/`, `services/`, `tools/` and `tests/`: 0 of 3, 0 of 6, 0 of 5, 0 of 3.
+They reference each other and nothing else.
+
+The crate header used to present them as "User auth (Phase 2)", which is how a
+reader concludes turna has platform user auth. It has the code. It does not run
+it. Both are now marked unwired, in the crate root and in each module.
+
+Two things this explains rather than merely tidies:
+
+- `TURNA_JWT_SECRET` is required by `UserStoreConfig::try_from_env` and is set
+  nowhere — not in the Helm chart, not in a shipped config, not in the docs.
+  Consistent: nothing calls the constructor that reads it.
+- The audit item asking for hot rotation of "the shared secret and the JWT
+  secret" is half-answerable. The shared secret is done; rotating the JWT secret
+  would be rotating a secret for a subsystem with no callers.
+
+**Wiring** means deciding what platform user auth is *for* here — the management
+plane already has mTLS and RBAC, and the TURN dataplane has long-term
+credentials. Neither obviously wants a second identity system.
+
+**Deleting** is straightforward: four modules, their tests, and the `argon2`,
+`jsonwebtoken` and `uuid` dependencies they are the only users of.
+
+Not decided. Same shape as decision 4 (`node_migration.rs`) and recorded the same
+way, so it cannot quietly start looking supported.
+### 8. The HTTP management surface — wire it or delete it?
+
+`turnactl`'s header documented eleven commands. Seven of them POST to `/manage`,
+and nothing in the workspace serves that path:
+
+- the health server routes `/capacity /cluster /health /metrics /ready /status`
+  and no more, and `--addr` defaults to its port (9090);
+- the `("POST", "/manage")` handler in `turna_management` belongs to
+  `integration::serve`, which has **no callers** — `turna-management` is depended
+  on only by `turnactl`, and only for its client half;
+- `services/admin` serves `/api/manage`, a different path on a different port
+  over gRPC underneath.
+
+So `failover status`, `drain`, `undrain`, `allocations list|get|kill` and
+`rooms list` fail against a correctly running node, with an error that reads
+"Is turna-node running with management API on 127.0.0.1:9090?" — sending the
+operator to debug a deployment that is fine. The client's own comment says the
+server would be on 9091 while the default address is 9090, so the two halves
+never agreed even in intent.
+
+`StoreHandler`, the trait those commands need, has no implementation anywhere.
+`rooms.list` reaches `StoreHandler::list_rooms`, and there is no rooms feature —
+there is no `turna-signaling` binary either (`docs/QUICKSTART.md` says so).
+
+**Wiring** means starting `integration::serve` from the node, implementing
+`StoreHandler` over `AllocationStore`, fixing the port disagreement, and then
+owning a second management surface next to the gRPC control plane — which already
+does allocations, drain, users and config, with authentication, RBAC and an audit
+trail that this HTTP one has none of.
+
+**Deleting** means removing the server half of `turna-management` (~620 lines) and
+reducing `turnactl` to what works: the four health GETs and the two gRPC user
+commands. Or pointing `turnactl` at the control plane for the rest, which is the
+same surface the admin console already uses.
+
+Not decided. The header now says which commands work, so nothing claims otherwise
+in the meantime.
 
 ---
 
