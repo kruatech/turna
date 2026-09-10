@@ -1,5 +1,10 @@
 //! Credential Rotation — обновление credentials без разрыва сессий
 //!
+//! **UNWIRED.** No caller outside this crate — none of its 6 public items is
+//! referenced from `crates/`, `services/`, `tools/` or `tests/`. Its tests pass and
+//! exercise coordination nothing runs. See the crate root.
+//!
+//!
 //! - Grace period: старые credentials действуют ещё N секунд после истечения
 //! - Overlap: при ротации и старые, и новые принимаются
 //! - Уведомление signaling о скором истечении через callback

@@ -22,11 +22,19 @@
 //!
 //! # Tarantool setup
 //!
-//! Run the init script once after starting Tarantool:
+//! Run the init script once against the Tarantool host:
 //! ```bash
-//! tarantoolctl connect 127.0.0.1:3301 < deploy/tarantool_init.lua
+//! tt connect 127.0.0.1:3301 < deploy/tarantool/init.lua
 //! ```
-//! The init script is embedded in `tarantool::INIT_SCRIPT`.
+//! It creates the spaces and indexes, the stored functions, and the `turna_app`
+//! role with per-function execute grants. `TarantoolBackend::init_schema()` then
+//! calls the `turna_init_schema` stored function that script defines — it does
+//! not carry a schema of its own.
+//!
+//! There is **no** `tarantool::INIT_SCRIPT`. This doc comment named one, and the
+//! path it gave (`deploy/tarantool_init.lua`) does not exist either — the file is
+//! `deploy/tarantool/init.lua`. Anyone following these two lines got "No such
+//! file" and then went looking for a Rust constant that was deleted.
 
 pub mod memory;
 #[cfg(feature = "tarantool")]

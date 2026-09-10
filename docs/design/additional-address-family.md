@@ -1,6 +1,8 @@
 # `ADDITIONAL-ADDRESS-FAMILY` (RFC 8656 §7.2) — design
 
-**Status:** not started. Blocked on one decision (§3) and one prerequisite (§7).
+**Status:** not started. Blocked on one decision (§3). The §7 prerequisite is
+**largely satisfied** and no longer the reason to defer — see §7, which was written
+before the IPv6 path had been exercised and has since been overtaken.
 
 One Allocate asks for a relayed address in **both** families and gets two, in a
 single allocation. This is what a dual-stack WebRTC client wants, and it is the
@@ -45,8 +47,9 @@ processor: **one allocation owns exactly one relay port**.
 
 ## 3. The decision: where the second port lives
 
-`turna_allocations` (both `deploy/tarantool/init.lua` and the Rust `INIT_SCRIPT` —
-they carry an explicit "change one place, change both" comment) is:
+`turna_allocations` (defined once, in `deploy/tarantool/init.lua`; the Rust
+`INIT_SCRIPT` this used to name no longer exists, so a migration touches one file
+and not two) is:
 
 ```
 relay_port    unsigned   ← PRIMARY KEY
@@ -98,10 +101,12 @@ with `relay_port` demoted to a secondary unique index.
 
 - Correct model: both ports indexed, one tuple per allocation, quota counting
   unaffected.
-- **Cost:** a schema migration on live data, and `init.lua` plus the Rust
-  `INIT_SCRIPT` must move together. Migration itself is mechanical (`create_index`
-  with a new name, backfill family = v4 for existing rows, drop the old index), but
-  it needs a documented procedure and a rollback that does not strand rows.
+- **Cost:** a schema migration on live data, in `deploy/tarantool/init.lua` alone
+  (this used to say "plus the Rust `INIT_SCRIPT`" — that constant does not exist,
+  so this option is cheaper than it was costed at). Migration itself is mechanical
+  (`create_index` with a new name, backfill family = v4 for existing rows, drop the
+  old index), but it needs a documented procedure and a rollback that does not
+  strand rows.
 
 ### Recommendation
 
@@ -161,14 +166,39 @@ over-permissive shortcut would hide.
   are marked used in the pool.
 - Refresh and remove affect both ports atomically.
 
-## 7. Prerequisite: verify plain IPv6 first
+## 7. Prerequisite: verify plain IPv6 first — LARGELY SATISFIED
 
-The single-family v6 path shipped without any runtime verification — no allocation
-has ever relayed media over IPv6. AAF is a layer on top of it. Building it now
-doubles the unverified surface and makes the first failure ambiguous: base v6 or the
-pairing?
+> **Corrected.** As written below, this section said the v6 path "shipped without
+> any runtime verification — no allocation has ever relayed media over IPv6". That
+> stopped being true on 2026-08-19 and this document was not updated, so the
+> prerequisite has been reading as a hard blocker on evidence that already exists.
+> The original reasoning is kept because it is still the right reasoning; only its
+> premise was stale.
 
-So the order is: Tier 2 of `docs/verification/interop-plan.md` (bidirectional media
-to a real external v6 peer, `443` in both directions, `EVEN-PORT` on v6), **then**
-this. On a verified base this is one focused change; on an unverified one it is two
-overlapping investigations.
+The argument stands: AAF is a layer on the single-family v6 path, and building it
+on an unverified base makes the first failure ambiguous — base v6, or the pairing?
+What has changed is that the base is now largely verified.
+
+**Done**, against Tier 2 of `docs/verification/interop-plan.md`:
+
+- **Relayed media on routable global addresses** —
+  `docs/interop/relayed-media-2026-08-19.md` §"Routable IPv6, 2026-08-23": node on
+  `2a0c:db40:0:82fe::3`, peer on `::2`, 6 010 of 6 010 frames returned, zero loss,
+  p99 0.5 ms, peer filter in `lan` profile with **no** `allow_loopback_peers`. An
+  earlier loopback run (20 000 of 20 000) is the weaker one it replaced.
+- **`443` in both directions** — `docs/interop/conformance-2026-08-18.md`: a v6
+  peer on a v4 allocation and a v4 peer on a v6 allocation both refused.
+
+**Still open**, and neither is a reason to hold AAF:
+
+- **Routing between different hosts.** Both addresses in the 08-23 run belong to
+  one machine, so the frames cross the v6 stack and the v6 relay socket but not a
+  router. A genuinely off-host test needs a second machine with its own v6. This
+  bounds what the run proves about MTU and forwarding, not about the allocation
+  logic AAF builds on.
+- **`EVEN-PORT` on v6.** No recorded run. Worth doing, and independent of AAF:
+  EVEN-PORT is refused outright on a TCP allocation and is orthogonal to carrying
+  two families.
+
+So the order is no longer "verify, then this". It is: **decide §3**, which is the
+one thing genuinely outstanding, and treat the two items above as parallel work.

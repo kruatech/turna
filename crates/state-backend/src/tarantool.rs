@@ -94,10 +94,19 @@ use crate::*;
 
 // ── Schema init ───────────────────────────────────────────────────────────────
 
-// Legacy embedded schema script — kept for reference only.
-// **Not executed automatically.** Run `deploy/tarantool/init.lua` once on
-// the Tarantool host instead: it creates spaces, indexes, stored functions,
-// and the `turna_app` role with per-function execute grants.
+// There is no embedded schema script here, and there has not been one for a
+// while — this header is what remained after `INIT_SCRIPT` was removed.
+//
+// The schema lives in exactly ONE place: `deploy/tarantool/init.lua`. Run it once
+// on the Tarantool host; it creates spaces, indexes, stored functions, and the
+// `turna_app` role with per-function execute grants. `init_schema()` below calls
+// the `turna_init_schema` stored function that script defines.
+//
+// Said explicitly because the opposite was documented in four places: this
+// crate's `lib.rs`, the "change one place, change both" note in init.lua, and the
+// `ADDITIONAL-ADDRESS-FAMILY` migration plan in OPEN-DECISIONS and its design
+// doc. A migration plan that budgets for a second source of truth is planning
+// work that does not exist. If you add one back, update those too.
 
 // ── TarantoolBackend ──────────────────────────────────────────────────────────
 

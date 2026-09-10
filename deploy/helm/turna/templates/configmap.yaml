@@ -6,6 +6,25 @@ metadata:
     app.kubernetes.io/name: turna
     app.kubernetes.io/instance: {{ .Release.Name }}
 data:
+  # SCOPE — what this chart can and cannot configure.
+  #
+  # Nine sections, listed below. There is no `[tls]`, `[turn.dtls]` or
+  # `[turn.quic]` here and no `extraConfig` escape hatch, so **a Helm deployment
+  # serves plain UDP TURN only**. TURNS, DTLS and QUIC/WebTransport are
+  # implemented and tested in the node; they are simply not reachable through
+  # this chart, because certificate material needs Secret mounting and a rotation
+  # story that has not been designed here yet. Enabling them means forking the
+  # chart or supplying your own ConfigMap.
+  #
+  # `[turn.peer_filter]` is absent deliberately and safely: its defaults are
+  # `profile = "internet-facing"` and `allow_loopback_peers = false`, i.e. private
+  # and loopback peers denied. Omitting the section does not weaken it.
+  #
+  # `[management]` is present but disabled on loopback, and there is no
+  # turna-control-plane workload in this chart and no Service for the management
+  # port — so there is **no ops API** in a chart deployment, and turnactl and the
+  # admin console cannot reach it. That is the single-host topology documented in
+  # docs/admin/README.md, which this chart does not implement.
   turn.toml: |
     production = {{ .Values.production }}
 

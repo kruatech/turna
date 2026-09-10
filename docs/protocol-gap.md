@@ -255,9 +255,9 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **Absent — and blocked on a schema decision, not on protocol work**:
   `ADDITIONAL-ADDRESS-FAMILY` (RFC 8656 §7.2 — one Allocate asking for both
   families, which is what a dual-stack WebRTC client wants). The protocol side is
-  small; the state side is not. `turna_allocations` in both
-  `deploy/tarantool/init.lua` and the Rust `INIT_SCRIPT` uses **`relay_port` as the
-  primary key**, so one allocation cannot hold two relay ports without choosing
+  small; the state side is not. `turna_allocations` (defined once, in
+  `deploy/tarantool/init.lua` — there is no Rust-side `INIT_SCRIPT`, whatever
+  older notes here said) uses **`relay_port` as the primary key**, so one allocation cannot hold two relay ports without choosing
   one of:
   1. keep `relay_port` as the v4 port and carry the v6 port inside the `data` blob
      — no schema change, but the v6 port loses its index, so port-collision

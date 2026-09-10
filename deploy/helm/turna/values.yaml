@@ -9,6 +9,14 @@ image:
 
 turn:
   realm: "turna"
+  # NOTE: this chart configures plain UDP TURN only. There are no TURNS
+  # (`[tls]`), DTLS or QUIC/WebTransport settings, and no extraConfig hook — see
+  # the SCOPE note at the top of templates/configmap.yaml. Those transports work
+  # in the node; reaching them from Kubernetes needs your own ConfigMap.
+  #
+  # There is also no ops API: the chart deploys turna-node only, with no
+  # turna-control-plane workload and no Service for managementPort below, so
+  # turnactl and the admin console cannot reach it.
   listenPort: 3478
   healthPort: 9090
   managementPort: 5350
