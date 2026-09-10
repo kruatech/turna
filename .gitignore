@@ -35,5 +35,20 @@ __pycache__/
 # working artifacts, not part of the project
 patches/
 node_modules/
+# Output directories written by scripts/verify/* into the repository root. Only
+# air-gap-*/ was listed, so running any of the other ten left untracked
+# directories in `git status` — noise at best, and at worst something swept into
+# a commit by `git add -A` during an incident, which is exactly when these get
+# run.
 air-gap-*/
+afxdp-*/
+coturn-interop-*/
+dtls-demux-*/
+mixed-load-*/
+mtls-*/
+overnight-*/
+rotation-*/
+transport-load-*/
+transports-*/
+upgrade-*/
 enterprise-*/

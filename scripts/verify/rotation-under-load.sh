@@ -174,24 +174,22 @@ PY
 fi
 
 # ── shared secret ─────────────────────────────────────────────────────────
-# The secret half is disabled, because the mechanism it tested does not exist.
+# ENABLED. This half was disabled for a long time, and the reason is worth
+# keeping because it is the trap this section now guards against.
 #
-# It sent SIGHUP to reload the config. The node does not handle SIGHUP — zero
-# references in services/node/src/main.rs — so it died, and the next check ("the
-# old secret no longer grants allocations") passed against a dead node. It would
-# have passed against any dead node.
+# It sent SIGHUP to reload the config. The node did not handle SIGHUP — zero
+# references in services/node/src/main.rs — so the default disposition applied
+# and it DIED. The next check ("the old secret no longer grants allocations")
+# then passed against a corpse. It would have passed against any dead node, for
+# any reason, which made it worse than no check at all.
 #
-# There is no hot rotation of shared_secret by any route: UpdateConfig carries
-# max_allocations, max_allocations_per_user and max_bytes_per_sec_per_allocation,
-# and not the secret.
+# The node now handles SIGHUP and republishes the SharedSecret backends without
+# restarting. So the assertions below can pass honestly — but only if the node is
+# still alive to answer them, which is why LIVENESS IS CHECKED FIRST and a dead
+# node fails the whole phase instead of quietly satisfying the rest.
 #
-# So §7's "credential rotation without downtime" holds for certificates —
-# verified above, 0 -> 1 with media uninterrupted — and does not hold for the
-# shared secret, which needs a restart. That is recorded in
-# docs/verification/ rather than tested by a check that cannot pass honestly.
-#
-# Set ROTATE_SECRET=1 to run it anyway, once a mechanism exists.
-if [ "${ROTATE_SECRET:-0}" = "1" ] && { [ "$ONLY" = "both" ] || [ "$ONLY" = "secret" ]; }; then
+# Set ROTATE_SECRET=0 to skip this phase (e.g. on a build that predates SIGHUP).
+if [ "${ROTATE_SECRET:-1}" = "1" ] && { [ "$ONLY" = "both" ] || [ "$ONLY" = "secret" ]; }; then
   say "secret rotation: starting $DURATION s of media on the old secret"
   "$REPO/$LOAD" --server "127.0.0.1:$TURN_PORT" --secret "$SECRET_OLD" \
     --source-ips 32 --duration "$DURATION" --warmup 10 --json \
@@ -205,6 +203,38 @@ if [ "${ROTATE_SECRET:-0}" = "1" ] && { [ "$ONLY" = "both" ] || [ "$ONLY" = "sec
   kill -HUP "$NODE_PID" 2>/dev/null
   sleep 5
 
+  # ── the guard that was missing ──
+  #
+  # Before this existed, an unhandled SIGHUP killed the node and every assertion
+  # below passed *because* it was dead: no allocation succeeds against a corpse,
+  # so "the old secret no longer works" reads as a pass. Check liveness first and
+  # skip the rest outright if it failed — a rotation that kills the process is
+  # not a rotation, and reporting it as three passes and one failure would bury
+  # the only fact that matters.
+  SECRET_PHASE_OK=1
+  if ! kill -0 "$NODE_PID" 2>/dev/null; then
+    bad "the node DIED on SIGHUP. Every check below would pass against a dead node, so they are skipped."
+    tail -20 "$OUT/node.log" | tee -a "$OUT/run.log"
+    SECRET_PHASE_OK=0
+  elif ! curl -fsS --max-time 3 "http://127.0.0.1:$HEALTH_PORT/ready" >/dev/null 2>&1; then
+    bad "the node survived SIGHUP but stopped being ready. The reload disturbed something it should not have."
+    SECRET_PHASE_OK=0
+  else
+    ok "node alive and ready after SIGHUP"
+  fi
+
+  # The node must also SAY it reloaded. Without this, a SIGHUP that was received
+  # and ignored looks identical to one that worked, as long as the secret happened
+  # to be accepted for another reason.
+  if [ "$SECRET_PHASE_OK" = 1 ]; then
+    if grep -q 'secret_reloaded' "$OUT/node.log"; then
+      ok "node logged event=secret_reloaded"
+    else
+      bad "no 'secret_reloaded' in node.log — SIGHUP was not acted on, whatever the credential checks below say."
+      SECRET_PHASE_OK=0
+    fi
+  fi
+
   # A live allocation must survive. The credential was checked at Allocate; the
   # allocation stands on its own after that.
   wait "$LOAD_PID" 2>/dev/null
@@ -217,14 +247,17 @@ except Exception:
     print(0, 1)
 PY
 )"
-  if [ "${ERRS:-1}" = "0" ] && [ "${RECV:-0}" -gt 0 ]; then
-    ok "existing sessions survived the secret rotation ($RECV frames)"
-  else
-    bad "existing sessions broke: $RECV frames, $ERRS errors. A rotation must not invalidate an allocation already granted."
+  if [ "$SECRET_PHASE_OK" = 1 ]; then
+    if [ "${ERRS:-1}" = "0" ] && [ "${RECV:-0}" -gt 0 ]; then
+      ok "existing sessions survived the secret rotation ($RECV frames)"
+    else
+      bad "existing sessions broke: $RECV frames, $ERRS errors. A rotation must not invalidate an allocation already granted."
+    fi
   fi
 
   # And the old secret must stop working for *new* allocations. Without this half
   # a rotation that changed nothing would pass the test above.
+  if [ "$SECRET_PHASE_OK" = 1 ]; then
   say "secret rotation: the old secret must now be refused"
   if "$REPO/$LOAD" --server "127.0.0.1:$TURN_PORT" --secret "$SECRET_OLD" \
       --duration 8 --json channel-data --channels 1 --pps 2 --payload 100 \
@@ -262,6 +295,7 @@ except Exception:
     fi
   else
     bad "new secret rejected: rotation left the node accepting neither credential"
+  fi
   fi
 fi
 

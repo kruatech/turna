@@ -324,24 +324,21 @@ and never reaches the nodes.
   active allocations on the serving node); periodic refresh propagates
   additions/updates, not deletions.
 
-### R13 — the shared secret cannot be rotated without a restart
+### R13 — shared-secret rotation — RESOLVED
 
-Measured 2026-08-28: `SIGHUP` is not handled (zero references in
-`services/node/src/main.rs`), and `UpdateConfig` carries `max_allocations`,
-`max_allocations_per_user` and `max_bytes_per_sec_per_allocation` — not the secret.
+**Superseded.** This entry recorded, from a 2026-08-28 measurement, that `SIGHUP`
+was not handled and that `UpdateConfig` carried allocation limits rather than the
+secret, so `[turn.auth] shared_secret` changed only with a restart.
 
-So `[turn.auth] shared_secret` changes only with a restart. Certificate rotation
-*is* hot and verified under load (0 → 1, no failures, 36 021 frames relayed with
-zero errors across the swap); the secret is not.
+`SIGHUP` is now handled: the node re-reads its config file and republishes the
+SharedSecret backends without restarting. A rotation is: new secret into
+`shared_secret`, old one into `previous_shared_secret`, SIGHUP each node, wait for
+`turna_auth_previous_secret_total` to flatten, remove the old secret, SIGHUP
+again. `UpdateConfig` still does not carry the secret, deliberately — see
+`docs/OPEN-DECISIONS.md` §0 for why the management API was the wrong channel.
 
-This matters because the shared secret is the credential a leak would force you to
-change, and changing it means a rolling restart of every node.
-
-*Mitigating:* ephemeral credentials derived from it carry a TTL, so ones already
-issued expire on their own. The secret itself still needs the restart.
-
-*Action:* plan secret rotation as a rolling upgrade, not as a config reload. Three
-possible fixes are recorded in `docs/OPEN-DECISIONS.md`.
+*Action:* none. Rotation is a config reload, not a rolling upgrade. On a non-unix
+target there is no SIGHUP and the restart still applies.
 
 ## Metrics to watch first
 
