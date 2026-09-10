@@ -68,10 +68,24 @@ io-uring = { version = "0.7", optional = true }
 # Umem::new / Socket::new return shapes and the queue methods
 # (fill / poll_and_consume / produce_and_wakeup / consume) are version-sensitive.
 xsk-rs = { version = "0.6", optional = true }
-# Per-destination neighbor resolution (feature: af-xdp). rtnetlink 0.21 pulls
-# netlink-packet-route 0.30 — pin the same to avoid type-version skew.
-rtnetlink = { version = "0.21", optional = true }
-netlink-packet-route = { version = "0.30", optional = true }
+# Per-destination neighbor resolution (feature: af-xdp). rtnetlink 0.23 pulls
+# netlink-packet-route 0.33 — pin the same to avoid type-version skew.
+#
+# Bumped from 0.21/0.30 to drop RUSTSEC-2024-0436: netlink-packet-core 0.8.1 was
+# the only package in the lock that pulled `paste`, and 0.9.0 (which rtnetlink
+# 0.23 requires) has no dependencies at all. The advisory left deny.toml's ignore
+# list as a result.
+#
+# The API this crate uses did not move. Verified by diffing the published sources
+# rather than by assumption: NeighbourAddress, NeighbourAttribute::{Destination,
+# LinkLayerAddress}, NeighbourState::{Incomplete,Failed,Noarp}, RouteAddress,
+# RouteAttribute::Gateway, RouteMessageBuilder::{destination_prefix,build},
+# IpVersion, new_connection, Connection::socket_mut and
+# Socket::set_netlink_get_strict_chk are unchanged across both bumps, so
+# neighbor.rs needed no edit. netlink-packet-route 0.33 adds a `zerocopy`
+# dependency, which is already in the lock via other crates.
+rtnetlink = { version = "0.23", optional = true }
+netlink-packet-route = { version = "0.33", optional = true }
 futures-util = { version = "0.3", optional = true }
 # 1.1: embedded XDP program load/attach + xskmap/ports maps. libxdp-sys already
 # enters the tree transitively via xsk-rs; declaring it directly exposes its FFI

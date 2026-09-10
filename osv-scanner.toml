@@ -13,6 +13,7 @@
 id = "RUSTSEC-2025-0141"
 reason = "bincode unmaintained: no upstream path exists. Transitive via webrtc-dtls, and every published webrtc-dtls release through 0.12.0 depends on bincode ^1. The advisory sets patched = [] with no unaffected range, so bincode 2.x/3.x would not clear it either. Recheck when webrtc-rs changes serializer."
 
-[[IgnoredVulns]]
-id = "RUSTSEC-2024-0436"
-reason = "paste unmaintained: no upstream path exists. Transitive via rtnetlink -> netlink-packet-core; rtnetlink 0.21.0 is the latest release and netlink-packet-core 0.8.1 (also latest) still declares paste ^1 as a non-optional dependency. Recheck when netlink-packet-core migrates to pastey."
+# RUSTSEC-2024-0436 (paste) was here and is gone, not silenced: rtnetlink 0.23
+# pulls netlink-packet-core 0.9, which has no dependencies, so paste left the
+# tree. Removed from deny.toml at the same time — this file states that the two
+# are kept in sync, and check-doc-claims.sh now asserts it.

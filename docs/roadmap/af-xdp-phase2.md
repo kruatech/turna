@@ -7,7 +7,7 @@
 > It has already caused one wrong conclusion. Read as a status document it says
 > IPv6, netlink neighbour resolution and ring metrics are outstanding — all three
 > are in the code (`build_eth_ipv6_udp`, `maybe_ndp_reply`, `crate::neighbor` with
-> rtnetlink 0.21, `turna_afxdp_tx_inflight`), and `send_to` resolves the next hop
+> rtnetlink 0.23, `turna_afxdp_tx_inflight`), and `send_to` resolves the next hop
 > per destination rather than using a single static MAC. If you are asking "what is
 > left for AF_XDP", the answer is **not code**: it is recorded evidence on the
 > target NIC, plus per-queue metric labels once multi-queue binding exists.

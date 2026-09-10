@@ -26,18 +26,13 @@ targets = [
 # апгрейдом этих стеков. Убирать записи по мере апгрейдов.
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained: no upstream path exists. Transitive via webrtc-dtls, and every published webrtc-dtls release through 0.12.0 depends on bincode ^1 (re-verified against index.crates.io: 0.10.0, 0.11.0 and 0.12.0 all declare bincode ^1, and 0.12.0 is still the latest). The advisory sets patched = [] with no unaffected range, so bincode 2.x/3.x would not clear it either. Recheck when webrtc-rs changes serializer." },
-    # RECHECK CONDITION HAS FIRED — this ignore is now removable, and the entry is
-    # kept only until the version bump lands. Verified against index.crates.io:
-    # netlink-packet-core 0.9.0 declares NO dependencies at all (0.8.1 declared
-    # paste ^1 as required), and rtnetlink 0.23.0 depends on netlink-packet-core
-    # ^0.9. netlink-packet-core 0.8.1 is the only package in Cargo.lock that pulls
-    # paste, so the bump removes it from the tree outright.
-    #
-    # The bump is not free: rtnetlink 0.21 -> 0.23 also moves netlink-packet-route
-    # 0.30 -> 0.33 and thiserror 1 -> 2, and crates/transport/src/neighbor.rs
-    # imports four types from netlink-packet-route. Do it as its own change, with
-    # the af-xdp feature actually built, rather than as a drive-by.
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: reachable only via netlink-packet-core 0.8.1 (af-xdp feature). REMOVABLE — netlink-packet-core 0.9.0 has no dependencies and rtnetlink 0.23.0 requires ^0.9; pending the rtnetlink 0.21 -> 0.23 bump, which also moves netlink-packet-route 0.30 -> 0.33 and needs neighbor.rs revalidated." },
+    # RUSTSEC-2024-0436 (paste unmaintained) was here and is GONE, not silenced.
+    # netlink-packet-core 0.8.1 was the only package in the lock that pulled
+    # paste; rtnetlink 0.23 requires netlink-packet-core ^0.9, which has no
+    # dependencies at all, so the bump in crates/transport/Cargo.toml removed the
+    # advisory from the tree. Do not re-add this entry — if paste comes back,
+    # something re-introduced an old netlink-packet-core and that is the thing to
+    # fix.
 ]
 
 [licenses]

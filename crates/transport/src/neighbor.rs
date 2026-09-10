@@ -7,7 +7,7 @@
 //!   next-hop IP --(neighbour table)--> MAC
 //! It runs as an async task maintaining a shared cache that the (blocking)
 //! datapath reads without awaiting. netlink wire-format is intricate, so this
-//! is grounded against rtnetlink 0.21 / netlink-packet-route 0.30 and exercised
+//! is grounded against rtnetlink 0.23 / netlink-packet-route 0.33 and exercised
 //! on a lab via the `neigh_probe` example before being wired into the hot path.
 #![cfg(all(target_os = "linux", feature = "af-xdp"))]
 
