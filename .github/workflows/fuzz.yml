@@ -63,6 +63,22 @@ jobs:
           targets="$(cargo +nightly fuzz list)"
           echo "Discovered targets:"
           echo "$targets"
+          # An empty list is a green job that fuzzed nothing: the run loop below
+          # skips blank lines and exits 0, so a cargo-fuzz whose `list` output
+          # changed, or a workspace it could not read, would look like a clean
+          # nightly forever. Cross-checked against the [[bin]] entries in
+          # fuzz/Cargo.toml so a target dropped from the manifest is noticed too.
+          found=$(printf '%s\n' "$targets" | grep -c '[^[:space:]]' || true)
+          declared=$(grep -c '^\[\[bin\]\]' fuzz/Cargo.toml)
+          echo "found=$found declared=$declared"
+          if [ "$found" -eq 0 ]; then
+            echo "::error::cargo fuzz list returned nothing — refusing to report a clean run"
+            exit 1
+          fi
+          if [ "$found" -ne "$declared" ]; then
+            echo "::error::cargo fuzz list found $found target(s), fuzz/Cargo.toml declares $declared"
+            exit 1
+          fi
           {
             echo "list<<EOF"
             echo "$targets"
@@ -85,8 +101,10 @@ jobs:
           secs="${PER_TARGET_SECONDS}"
           echo "Fuzzing each target for ${secs}s"
           rc=0
+          ran=0
           while IFS= read -r target; do
             [ -z "$target" ] && continue
+            ran=$((ran + 1))
             echo "::group::fuzz ${target}"
             # -max_total_time bounds wall-clock; -timeout flags a single slow
             # input as a hang. RUST_BACKTRACE for readable crash reports.
@@ -97,6 +115,14 @@ jobs:
             fi
             echo "::endgroup::"
           done <<< "${{ steps.targets.outputs.list }}"
+          # Belt and braces: the guard in the previous step checks what was
+          # discovered, this checks what actually executed. Zero here means the
+          # loop never entered its body, whatever the list said.
+          echo "targets fuzzed: ${ran}"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no fuzz target ran — a green result here would mean nothing"
+            exit 1
+          fi
           exit "$rc"
 
       - name: Upload crashes

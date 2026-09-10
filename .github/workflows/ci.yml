@@ -270,6 +270,51 @@ jobs:
           python3 scripts/extract_helm_config.py /tmp/turna-rendered.yaml /tmp/turn.toml
           TURNA_SHARED_SECRET=ci-smoke-secret TURNA_CONFIG_TEST_FILE=/tmp/turn.toml \
             cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
+      - name: Parse the scenario example configs with turna-config
+        # The audit asked for worked examples (public / corporate / cluster). An
+        # example config that does not load is worse than none: it is copied,
+        # edited, and the failure is blamed on the edit. Each is loaded through
+        # the real validator with `production = true`, which is the strict branch
+        # — placeholder-secret refusal, the unlimited-bandwidth rule, cluster mode
+        # requiring a shared backend, a non-loopback management listener.
+        run: |
+          set -euo pipefail
+          found=$(ls deploy/examples/*.toml 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no example configs found — refusing to report a clean check"
+            exit 1
+          fi
+          for f in deploy/examples/*.toml; do
+            echo "::group::$f"
+            TURNA_EXTERNAL_IP=203.0.113.10 \
+            TURNA_SHARED_SECRET=ci-example-secret-not-the-placeholder \
+            TURNA_PREVIOUS_SHARED_SECRET= \
+            TURNA_USER_BRIDGE_PASSWORD=ci-bridge-pw \
+            TURNA_USER_PHONES_PASSWORD=ci-phones-pw \
+            TURNA_NODE_ID=ci-node-0 \
+            TURNA_GOSSIP_ADVERTISE=10.0.0.1:7946 \
+            TURNA_CLUSTER_SECRET=ci-cluster-secret \
+            TURNA_BACKEND_URI=127.0.0.1:3301 \
+            TURNA_BACKEND_PASSWORD=ci-backend-pw \
+            TURNA_CONFIG_TEST_FILE="$f" \
+              cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
+            echo "::endgroup::"
+          done
+          echo "parsed $found example config(s)"
+      - name: Render production-example Helm config and parse it too
+        # values-production.example.yaml was rendered only for kubeconform, which
+        # validates Kubernetes schema and knows nothing about turn.toml. So the
+        # file operators are told to copy produced a config that nothing ever
+        # parsed, and `production = true` is exactly the branch the default render
+        # does not exercise: placeholder-secret refusal, the unlimited-bandwidth
+        # rule, write_behind-on-memory, a non-loopback management listener.
+        run: |
+          helm template turna deploy/helm/turna \
+            -f deploy/helm/turna/values-production.example.yaml \
+            > /tmp/turna-rendered-prod.yaml
+          python3 scripts/extract_helm_config.py /tmp/turna-rendered-prod.yaml /tmp/turn-prod.toml
+          TURNA_SHARED_SECRET=ci-smoke-secret TURNA_CONFIG_TEST_FILE=/tmp/turn-prod.toml \
+            cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
       - name: Docker build
         run: docker build -f deploy/Dockerfile -t turna:ci .
       - name: Docker build (admin)
@@ -369,9 +414,26 @@ jobs:
       # короткий smoke-прогон каждой цели, 30 секунд
       - run: |
           cd fuzz
-          for t in fuzz_stun fuzz_turn fuzz_stun_semantic fuzz_turn_lifecycle fuzz_encode; do
-            cargo +nightly fuzz run $t -- -max_total_time=30
+          # Derived from the manifest, not hardcoded. The list used to be five
+          # names written out here, so a new fuzz target got built by the step
+          # above and never smoke-run by this one — silently, because nothing
+          # compared the two. The guard also refuses an empty list: a green run
+          # that fuzzed nothing is worse than a red one.
+          targets="$(cargo +nightly fuzz list)"
+          found=$(printf '%s\n' "$targets" | grep -c '[^[:space:]]' || true)
+          declared=$(grep -c '^\[\[bin\]\]' Cargo.toml)
+          echo "targets: found=$found declared=$declared"
+          if [ "$found" -eq 0 ] || [ "$found" -ne "$declared" ]; then
+            echo "::error::cargo fuzz list found $found target(s), Cargo.toml declares $declared"
+            exit 1
+          fi
+          ran=0
+          for t in $targets; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=30
+            ran=$((ran + 1))
           done
+          echo "smoke-ran $ran target(s)"
+          [ "$ran" -eq "$declared" ]
 
   miri:
     name: miri (UB in pure-memory unsafe)
@@ -501,6 +563,37 @@ jobs:
             fi
             sleep 1
           done
+      - name: Run the Tarantool stored-procedure test suites
+        # Three Lua suites pin the CAS semantics the failover claim depends on:
+        # migration idempotency, the exact-u64 parser, and the runtime /
+        # user-limits CAS round-trip including rollback on an injected write
+        # failure. GA_FINAL_REPORT.md documented how to run them by hand, and
+        # nothing ever did — so the contract they pin was unenforced, in the one
+        # place where getting CAS wrong loses allocations silently.
+        #
+        # A separate throwaway container on purpose: init.lua calls
+        # box.cfg{listen=3301} as the instance script, and the container above is
+        # already listening on it. Each suite ends with
+        # `os.exit(test:check() and 0 or 1)`, so a failure fails this step —
+        # checked before wiring it up, because a suite that prints FAIL and exits
+        # 0 would have made this a green step that proves nothing.
+        run: |
+          set -euo pipefail
+          expected=$(ls deploy/tarantool/tests/*_test.lua | wc -l | tr -d ' ')
+          [ "$expected" -gt 0 ] || { echo "::error::no *_test.lua found"; exit 1; }
+          ran=0
+          for t in deploy/tarantool/tests/*_test.lua; do
+            name=$(basename "$t")
+            echo "::group::$name"
+            docker run --rm -e TURNA_PASSWORD=turna \
+              -v "$PWD/deploy/tarantool:/opt/turna:ro" \
+              tarantool/tarantool:2 \
+              tarantool -e "dofile('/opt/turna/init.lua'); dofile('/opt/turna/tests/${name}')"
+            ran=$((ran + 1))
+            echo "::endgroup::"
+          done
+          echo "lua suites run: $ran of $expected"
+          [ "$ran" -eq "$expected" ]
       - name: Run backend + failover integration tests
         env:
           TARANTOOL_URI: 127.0.0.1:3301
@@ -576,7 +669,7 @@ jobs:
   # structure/schema, not semantic policy (e.g. hostPort collisions) — those are
   # covered by the production values' required podAntiAffinity, not by this gate.
   helm-validate:
-    name: helm lint + render + kubeconform
+    name: offline manifest + rule validation (helm, kubeconform, promtool)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -589,8 +682,17 @@ jobs:
           KC_VER=v0.6.7
           curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KC_VER}/kubeconform-linux-amd64.tar.gz" | tar xz kubeconform
           sudo mv kubeconform /usr/local/bin/kubeconform
+          # promtool, for the alert rules. Kubernetes manifests were validated
+          # offline here; the 73 Prometheus rules in docs/alerts/ were not
+          # validated by anything at all, so a malformed expression surfaced when
+          # an operator loaded it into their own Prometheus. Same idea, same job.
+          PROM_VER=2.53.2
+          curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz" \
+            | tar xz "prometheus-${PROM_VER}.linux-amd64/promtool"
+          sudo mv "prometheus-${PROM_VER}.linux-amd64/promtool" /usr/local/bin/promtool
           helm version
           kubeconform -v
+          promtool --version
       - name: helm lint
         run: helm lint deploy/helm/turna
       - name: Render + validate (default values)
@@ -602,3 +704,19 @@ jobs:
           helm template turna deploy/helm/turna \
             -f deploy/helm/turna/values-production.example.yaml \
             | kubeconform -strict -summary -kubernetes-version 1.29.0
+      - name: Validate Prometheus alert rules
+        # `check-doc-claims.sh` already asserts every metric these rules name is
+        # exported. It cannot tell whether the PromQL around those names parses —
+        # an unbalanced paren, an unknown function, a bad duration. promtool can,
+        # offline, in seconds.
+        run: |
+          set -euo pipefail
+          found=$(ls docs/alerts/*.yml 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no rule files under docs/alerts/ — refusing to report a clean check"
+            exit 1
+          fi
+          for f in docs/alerts/*.yml; do
+            promtool check rules "$f"
+          done
+          echo "validated $found rule file(s)"
