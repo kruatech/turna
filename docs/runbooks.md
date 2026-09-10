@@ -7,6 +7,22 @@ Anything an operator must decide (thresholds, target numbers, alert routing) is
 marked `TODO(operator)` rather than guessed. Port/endpoint defaults below reflect
 `deploy/turn.toml` and the Helm values; confirm against your own config.
 
+## Companion runbooks
+
+This file holds the symptom-driven incident procedures (RB-1 onward). Longer
+procedures live beside it:
+
+- `docs/runbooks/kubernetes-tarantool.md` — deploying on Kubernetes with the
+  Tarantool backend: provisioning order, what the chart does **not** do (no ops
+  API, no TURNS, no Tarantool), and the two settings that refuse to start.
+- `docs/runbooks/tarantool-backup.md` — backup, restart and recovery of Tarantool.
+- `docs/runbooks/tarantool-schema-migration.md` — upgrading the schema (re-run
+  `init.lua`; it is idempotent, and what that does **not** cover), the stored
+  functions the CAS semantics live in, and the command-log backfill that gates
+  the management plane on startup.
+- `docs/runbooks/disaster-recovery.md`, `docs/runbooks/incidents.md`,
+  `docs/runbooks/af-xdp.md`, `docs/runbooks/encrypted-transports.md`.
+
 ## Reference: ports & endpoints (defaults)
 
 - TURN/STUN listener: `3478` (UDP/TCP), TLS `5349` (TCP)

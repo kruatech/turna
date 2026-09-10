@@ -286,6 +286,517 @@ if [ -n "$FEATURE_MANIFESTS" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+section "Helm chart scope: transports it cannot configure are declared"
+# ---------------------------------------------------------------------------
+
+# The chart's ConfigMap has nine sections and no escape hatch, so a Helm install
+# serves plain UDP TURN — no TURNS, DTLS or QUIC. That is a defensible scope; it
+# was just written nowhere, while the README presented the chart as *the*
+# Kubernetes path. An operator who needs TURNS in Kubernetes found out by reading
+# the template.
+#
+# Two-way: if the chart gains a `[tls]` section the scope notes must go, or they
+# become the false claim instead.
+CM=deploy/helm/turna/templates/configmap.yaml
+if [ -f "$CM" ] && [ -f README.md ] && [ -f deploy/helm/turna/values.yaml ]; then
+  # `sysctls` contains the substring "tls" — match the section header, not the
+  # word, or this passes on a chart that has no TLS at all.
+  if grep -qE '^\s*\[(tls|turn\.dtls|turn\.quic)\]' "$CM"; then
+    if grep -q 'plain UDP TURN only' README.md; then
+      fail "the chart now configures an encrypted transport, but README still says 'plain UDP TURN only'" \
+        "Remove the scope note — it has become the inaccurate claim."
+    else
+      pass "chart configures encrypted transports and no scope note contradicts it"
+    fi
+  else
+    MISSING=""
+    grep -q 'plain UDP TURN only' README.md || MISSING="$MISSING README.md(transports)"
+    grep -q 'plain UDP TURN only' deploy/helm/turna/values.yaml || MISSING="$MISSING values.yaml(transports)"
+    grep -q 'SCOPE' "$CM" || MISSING="$MISSING configmap.yaml(transports)"
+    # Second limit, same class: the chart deploys turna-node alone, so turnactl
+    # and the admin console cannot reach it. Checked against the templates rather
+    # than trusted: if a control-plane workload ever appears, the note must go.
+    #
+    # Matches non-comment lines only. The first version grepped the name anywhere
+    # and tripped on the SCOPE comment that explains the absence — a note saying
+    # "there is no control plane here" read as a control plane being here. The
+    # same shape as the INIT_SCRIPT check two sections down, and it caught me the
+    # same way.
+    if ! grep -rqE '^[^#]*turna-control-plane' deploy/helm/turna/templates/ 2>/dev/null; then
+      grep -q 'No ops API in the chart' README.md || MISSING="$MISSING README.md(ops-api)"
+      grep -q 'no ops API' "$CM" || MISSING="$MISSING configmap.yaml(ops-api)"
+    else
+      grep -q 'No ops API in the chart' README.md && \
+        MISSING="$MISSING README.md(stale-ops-api-note)"
+    fi
+    if [ -n "$MISSING" ]; then
+      fail "the chart cannot configure TURNS/DTLS/QUIC and these do not say so:$MISSING" \
+        "The README offers the chart as the Kubernetes path. Someone deploying TURNS there needs to learn this before the install, not from the template."
+    else
+      pass "chart is UDP-only and all three places say so"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section "turna-auth: unwired modules stay labelled as unwired"
+# ---------------------------------------------------------------------------
+
+# store.rs, rotation.rs, jwt.rs and user.rs — 1310 lines of user registration,
+# Argon2 hashing, JWT signing and token revocation — have no callers outside the
+# auth crate, and the crate header used to advertise them as a feature. The same
+# shape as node_migration.rs, and it gets the same guard: if a module gains a real
+# caller the label must go, and if it does not, the label must stay.
+AUTH_SRC=crates/auth/src
+if [ -d "$AUTH_SRC" ]; then
+  AUTH_BAD=""
+  for m in store rotation jwt user; do
+    f="$AUTH_SRC/$m.rs"
+    [ -f "$f" ] || continue
+    # Every `pub` item this module exports, looked for outside the auth crate.
+    WIRED=0
+    #
+    # Matched by MODULE PATH, not by type name. Two heuristics were tried and both
+    # broke on the same thing: `User` is too generic. A bare `grep -w User` hit
+    # state-backend's own types, and narrowing it to "files that also mention
+    # turna_auth" still hit turna-health — because it renders a metric called
+    # `turna_auth_previous_secret_total` and a HELP string containing the word
+    # "User". A module path cannot be produced by coincidence.
+    #
+    # `lib.rs` re-exports only `tenant`, so any external use of these four has to
+    # spell the module: `turna_auth::store::X` or `use turna_auth::{store, ...}`.
+    if grep -rlE "turna_auth::(\\{[^}]*\\b$m\\b|$m\\b)" --include='*.rs' \
+         crates services tools tests 2>/dev/null | grep -qv "^$AUTH_SRC/"; then
+      WIRED=1
+    fi
+    LABELLED=0
+    head -20 "$f" | grep -q 'UNWIRED' && LABELLED=1
+    if [ "$WIRED" = 1 ] && [ "$LABELLED" = 1 ]; then
+      AUTH_BAD="$AUTH_BAD $m(now-wired-but-still-labelled)"
+    elif [ "$WIRED" = 0 ] && [ "$LABELLED" = 0 ]; then
+      AUTH_BAD="$AUTH_BAD $m(unwired-and-unlabelled)"
+    fi
+  done
+  if [ -n "$AUTH_BAD" ]; then
+    fail "turna-auth module labels disagree with reality:$AUTH_BAD" \
+      "A module with no callers must say UNWIRED in its header; one that gained a caller must stop saying it. See docs/OPEN-DECISIONS.md decision 7."
+  else
+    pass "turna-auth unwired modules are labelled, wired ones are not"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section "deny.toml and osv-scanner.toml ignore the same advisories"
+# ---------------------------------------------------------------------------
+
+# osv-scanner.toml opens by stating it is "kept in sync with the
+# [advisories].ignore list in deny.toml", and nothing enforced that. Removing an
+# advisory from one and not the other leaves the two tools disagreeing about what
+# is accepted — cargo-deny drives CI, OSSF Scorecard's Vulnerabilities check reads
+# only osv-scanner.toml. Whichever way they drift, one of them is lying about the
+# project's risk posture. This happened during the rtnetlink bump.
+if [ -f deny.toml ] && [ -f osv-scanner.toml ]; then
+  ADV_DIFF=$(python3 - <<'ADVPY'
+import sys, tomllib
+try:
+    deny = tomllib.load(open("deny.toml", "rb"))
+    osv = tomllib.load(open("osv-scanner.toml", "rb"))
+except Exception as e:
+    print("PARSE " + str(e)); raise SystemExit(0)
+a = sorted(e["id"] for e in deny.get("advisories", {}).get("ignore", []) if isinstance(e, dict))
+b = sorted(e["id"] for e in osv.get("IgnoredVulns", []))
+only_deny = [x for x in a if x not in b]
+only_osv = [x for x in b if x not in a]
+out = []
+if only_deny: out.append("deny-only:" + ",".join(only_deny))
+if only_osv: out.append("osv-only:" + ",".join(only_osv))
+print(" ".join(out))
+ADVPY
+)
+  case "$ADV_DIFF" in
+    PARSE*) fail "could not parse the advisory files (${ADV_DIFF#PARSE })" \
+              "Fix the TOML; the check cannot compare them." ;;
+    "") pass "both advisory ignore lists hold the same ids" ;;
+    *) fail "deny.toml and osv-scanner.toml disagree about ignored advisories: $ADV_DIFF" \
+         "cargo-deny gates CI from the first, Scorecard reads only the second. An id in one and not the other means one of them misstates what this project accepts." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+section "Tarantool schema has one source of truth"
+# ---------------------------------------------------------------------------
+
+# `tarantool::INIT_SCRIPT` was deleted, and five places kept referring to it: this
+# crate's lib.rs said the init script "is embedded" in it, init.lua carried a
+# "change one place, change both" note, and the ADDITIONAL-ADDRESS-FAMILY
+# migration plan — in OPEN-DECISIONS, the design doc and protocol-gap — budgeted
+# for updating both. A plan that budgets for a second source of truth is planning
+# work that does not exist, and the migration was costed higher than it is.
+#
+# Fails only when a doc asserts the constant exists while the code has none. Text
+# that says it does NOT exist is what this check produced and must not trip it.
+SB=crates/state-backend/src/tarantool.rs
+if [ -f "$SB" ]; then
+  if grep -qE '^\s*(pub )?(const|static) INIT_SCRIPT' "$SB"; then
+    pass "INIT_SCRIPT exists in $SB; references to it are legitimate"
+  else
+    PHANTOM=""
+    for f in $(grep -rl 'INIT_SCRIPT' docs crates deploy --include='*.md' --include='*.rs' --include='*.lua' 2>/dev/null); do
+      # A line that denies the constant is the correction, not the claim. The
+      # match is per LINE, so a denial split across two lines does not exempt the
+      # one naming INIT_SCRIPT — keep the denial and the name together.
+      #
+      # The negation must sit NEXT TO the name, within the same sentence. A list of
+      # bare keywords matched anywhere on the line was tried and was useless: English
+      # prose contains "not" constantly, so every assertion got exempted and the check
+      # silently stopped checking. Verified both ways: the eight real mentions are
+      # exempted, and four historical assertions are all caught.
+      if grep 'INIT_SCRIPT' "$f" |
+         grep -qivE '(\bno\b|\bnot\b|never|deleted|removed|gone|phantom|used to)[^.]{0,80}INIT_SCRIPT|INIT_SCRIPT[^.]{0,80}(no longer|not exist|deleted|removed|gone|phantom|used to)'; then
+        PHANTOM="$PHANTOM $f"
+      fi
+    done
+    if [ -n "$PHANTOM" ]; then
+      fail "no INIT_SCRIPT in $SB, but these still refer to it as if it exists:$PHANTOM" \
+        "The Tarantool schema is defined once, in deploy/tarantool/init.lua. Either restore the constant or fix the reference — a migration plan that expects two files budgets for work that does not exist."
+    else
+      pass "no INIT_SCRIPT in the code, and nothing claims otherwise"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section "turnactl: POST /manage has a server, or the header says it does not"
+# ---------------------------------------------------------------------------
+
+# Seven of turnactl's eleven documented commands POST to /manage, and nothing
+# serves that path: the health server routes six GETs and no /manage, and the
+# `("POST", "/manage")` handler in turna_management belongs to a server with no
+# callers. The failure text sends the operator to debug their deployment.
+#
+# Two-way. If somebody starts that server, the header's warning becomes the false
+# claim and has to go.
+TURNACTL=tools/turnactl/src/main.rs
+if [ -f "$TURNACTL" ] && [ -f "$HEALTH" ]; then
+  # A real caller means `integration::serve` or ManagementServer referenced from
+  # outside the management crate, on a non-comment line — the same distinction the
+  # Helm control-plane check needed, for the same reason.
+  SERVED=0
+  if grep -rqE '^[^/]*\b(ManagementServer|integration::serve)\b' \
+       --include='*.rs' services crates tools 2>/dev/null \
+     && ! grep -rlE '^[^/]*\b(ManagementServer|integration::serve)\b' \
+       --include='*.rs' services crates tools 2>/dev/null |
+       grep -qxv 'crates/management/src/lib.rs'; then
+    SERVED=0
+  fi
+  grep -qE '"/manage"' "$HEALTH" && SERVED=1
+  if [ "$SERVED" = 1 ]; then
+    if grep -q 'nothing serves that path' "$TURNACTL"; then
+      fail "/manage now has a server, but turnactl's header still says nothing serves it" \
+        "Remove the warning — it has become the inaccurate claim."
+    else
+      pass "/manage is served and the turnactl header does not deny it"
+    fi
+  else
+    if grep -q 'nothing serves that path' "$TURNACTL"; then
+      pass "no /manage server, and turnactl's header says which commands work"
+    else
+      fail "turnactl documents commands that POST to /manage, which nothing serves" \
+        "Seven of its eleven commands fail against a healthy node, with an error blaming the deployment. Say so in the header, or start the server. See docs/OPEN-DECISIONS.md decision 8."
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+section "Admin UI sends only commands the admin service handles"
+# ---------------------------------------------------------------------------
+
+# The UI and the service meet over JSON — `POST /api/manage` with a command name
+# — so nothing compiles the two together. A renamed command is a button that
+# returns an error at runtime and nowhere else. Same boundary that let the Python
+# SDK drift, minus a compiler on either side.
+#
+# Commands only. Their PARAMETERS are deliberately not checked here: the service
+# reads some through helpers (`u32_limit(params, "max_allocations")`) rather than
+# `params["..."]`, and an extractor that missed those reported a false positive
+# on the first attempt. A gate that cries wolf gets ignored, which is worse than
+# the gap it covers. The frontend's TypeScript already makes the required ones
+# non-optional.
+ADMIN_RS=services/admin/src/grpc_client.rs
+ADMIN_FE=services/admin/frontend/src
+if [ -f "$ADMIN_RS" ] && [ -d "$ADMIN_FE" ]; then
+  ADMIN_BAD=$(python3 - "$ADMIN_RS" "$ADMIN_FE" <<'ADMINPY'
+import glob, os, re, sys
+rs, fe_dir = sys.argv[1], sys.argv[2]
+handled = set(re.findall(r'^\s+"([a-z_]+\.[a-z_]+|ping)" =>', open(rs).read(), re.M))
+fe = "".join(open(f, encoding="utf-8").read()
+             for f in glob.glob(os.path.join(fe_dir, "**", "*.ts*"), recursive=True))
+sent = set(re.findall(r"postManage(?:<[^>]*>)?\(\s*'([a-z_.]+)'", fe))
+if not handled or not sent:
+    print("PARSER handled=%d sent=%d" % (len(handled), len(sent))); raise SystemExit(0)
+print(" ".join(sorted(sent - handled)))
+ADMINPY
+)
+  case "$ADMIN_BAD" in
+    PARSER*) fail "the admin command extractor is broken (${ADMIN_BAD#PARSER })" \
+               "It found nothing on one side, so this check would pass over any drift. Fix the extractor." ;;
+    "") pass "every command the admin UI sends is handled by the service" ;;
+    *) fail "the admin UI sends commands the service does not handle:$ADMIN_BAD" \
+         "These are buttons that fail at runtime. Rename on one side or add the handler. (The reverse — a handler with no button — is fine: the API is allowed to be wider than the UI.)" ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+section "Python SDK matches management.proto"
+# ---------------------------------------------------------------------------
+
+# The SDK is shipped for operators and nothing compiled it against the proto, so
+# it drifted silently: `ListAllocations` was sent `limit` (the field is
+# `page_size`), `SetDraining` a `reason` it has no field for, `DeleteAllocation`
+# an `allocation_id` (the field is `id`), and `SetUserLimits` a `username` that is
+# `reserved` — retired when that request was restructured. Four of its methods
+# raised ValueError from protobuf before the call left the process.
+#
+# AST-based, not grep: a nested `pb.UserLimitTarget(...)` inside a request
+# constructor has its own field set, and a flat regex reports its keywords as
+# belonging to the outer message. That false positive cost a round here.
+SDK=tools/sdk/python/turna_sdk.py
+PROTO_FILE=crates/control/proto/management.proto
+if [ -f "$SDK" ] && [ -f "$PROTO_FILE" ]; then
+  SDK_BAD=$(python3 - "$SDK" "$PROTO_FILE" <<'SDKPY'
+import ast, re, sys
+sdk_path, proto_path = sys.argv[1], sys.argv[2]
+proto = open(proto_path).read()
+msgs, reserved = {}, {}
+for m in re.finditer(r"message (\w+)\s*\{(.*?)\n\}", proto, re.S):
+    body = m.group(2)
+    msgs[m.group(1)] = set(re.findall(r"(?:optional\s+|repeated\s+)?[\w.]+\s+(\w+)\s*=\s*\d+", body))
+    reserved[m.group(1)] = set(re.findall(r'"(\w+)"', " ".join(re.findall(r"reserved[^;]*;", body))))
+for m in re.finditer(r"message (\w+)\s*\{([^{}]*)\}", proto):
+    msgs.setdefault(m.group(1), set())
+    msgs[m.group(1)] |= set(re.findall(r"(?:optional\s+|repeated\s+)?[\w.]+\s+(\w+)\s*=\s*\d+", m.group(2)))
+enums = set()
+for m in re.finditer(r"enum \w+\s*\{(.*?)\n\}", proto, re.S):
+    enums |= set(re.findall(r"(\w+)\s*=\s*\d+", m.group(1)))
+rpcs = set(re.findall(r"rpc (\w+)\(", proto))
+if len(msgs) < 10 or not rpcs:
+    print("PARSER proto yielded %d messages / %d rpcs" % (len(msgs), len(rpcs))); raise SystemExit(0)
+try:
+    tree = ast.parse(open(sdk_path).read())
+except SyntaxError as e:
+    print("SYNTAX %s" % e); raise SystemExit(0)
+bad = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+       and isinstance(node.func.value, ast.Name) and node.func.value.id == "pb":
+        typ = node.func.attr
+        if typ not in msgs:
+            continue
+        for k in node.keywords:
+            if not k.arg:
+                continue
+            if k.arg not in msgs[typ]:
+                bad.append("L%d:%s.%s(absent)" % (node.lineno, typ, k.arg))
+            elif k.arg in reserved.get(typ, set()):
+                bad.append("L%d:%s.%s(reserved)" % (node.lineno, typ, k.arg))
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+       and node.value.id == "pb" and node.attr.isupper():
+        if node.attr not in enums and node.attr not in msgs:
+            bad.append("L%d:pb.%s(no such enum)" % (node.lineno, node.attr))
+for node in ast.walk(tree):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute) \
+       and node.value.attr == "_stub" and node.attr not in rpcs:
+        bad.append("L%d:rpc %s" % (node.lineno, node.attr))
+print(" ".join(sorted(set(bad))))
+SDKPY
+)
+  case "$SDK_BAD" in
+    PARSER*) fail "the proto extractor for the SDK check is broken (${SDK_BAD#PARSER })" \
+               "It parsed too little to judge anything, so this check would pass over real drift." ;;
+    SYNTAX*) fail "$SDK is not valid Python (${SDK_BAD#SYNTAX })" "Fix the file; the check cannot inspect it." ;;
+    "") pass "every pb field, enum and rpc the SDK names exists in the proto" ;;
+    *) fail "the SDK names proto fields/rpcs that do not exist:$SDK_BAD" \
+         "protobuf raises ValueError on an unknown field, so these methods fail before the call leaves the process. A 'reserved' field was retired deliberately — read the comment on it in $PROTO_FILE." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+section "Grafana dashboard panels reference metrics that exist"
+# ---------------------------------------------------------------------------
+
+# The alert rules already get this check. The dashboard did not, and it is the
+# artefact an operator imports and then trusts: a panel whose metric was renamed
+# does not error, it draws an empty graph. "No data" and "nothing happening" look
+# identical on a wall display.
+DASH=deploy/grafana/turna-overview.json
+if [ -f "$DASH" ] && [ -f "$HEALTH" ]; then
+  DASH_MISSING=$(python3 - "$DASH" "$HEALTH" <<'DASHPY'
+import json, re, sys
+dash, health = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(dash))
+except Exception as e:
+    print("UNPARSEABLE " + str(e)); raise SystemExit(0)
+exprs = []
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == "expr" and isinstance(v, str):
+                exprs.append(v)
+            else:
+                walk(v)
+    elif isinstance(o, list):
+        for i in o:
+            walk(i)
+walk(d)
+if not exprs:
+    print("NOEXPRS"); raise SystemExit(0)
+src = open(health).read()
+names = set()
+for e in exprs:
+    names |= set(re.findall(r"\bturna_[a-z0-9_]+", e))
+missing = []
+for n in names:
+    # A histogram panel references _bucket/_sum/_count; the crate exports the base.
+    base = re.sub(r"_(bucket|sum|count)$", "", n)
+    if base not in src:
+        missing.append(n)
+print(" ".join(sorted(missing)))
+DASHPY
+)
+  case "$DASH_MISSING" in
+    UNPARSEABLE*) fail "$DASH is not valid JSON" "Grafana will refuse the import. ${DASH_MISSING#UNPARSEABLE }" ;;
+    NOEXPRS) fail "no PromQL expressions found in $DASH" "The extractor found nothing, so this check would pass over any drift. Fix the extractor, not the dashboard." ;;
+    "") pass "every dashboard metric is exported by turna-health" ;;
+    *) fail "dashboard panels reference metrics that do not exist:$DASH_MISSING" \
+         "Rename them in $DASH or restore the metric. A stale panel draws an empty graph, which reads as 'nothing happening'." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+section "Shipped configs use only keys the config structs declare"
+# ---------------------------------------------------------------------------
+
+# `TurnaConfig` and its sections are `#[serde(deny_unknown_fields)]`, so a key
+# that no longer exists is not ignored — the node refuses to start. A stale key in
+# a shipped config or an example is therefore a startup failure waiting for
+# whoever copies it, and nothing else here would catch it.
+CFG_SRC=crates/config/src/lib.rs
+if [ -f "$CFG_SRC" ]; then
+  # The Helm ConfigMap is included as a pseudo-config: its keys are literal in the
+  # template even though its values are Go-template expressions, so they can be
+  # checked without rendering. CI renders and parses it for real (default AND
+  # production-example values), but only on the packaging job — this catches a bad
+  # key in the fast gate, and on a machine with no helm.
+  CFG_BAD=$(python3 - "$CFG_SRC" turn.toml deploy/turn.toml bench/turna.toml bench/smoke-tarantool.toml \
+    deploy/examples/public-turn.toml deploy/examples/corporate.toml deploy/examples/cluster.toml <<'CFGPY'
+import os, re, sys, tomllib
+src = open(sys.argv[1]).read()
+known = set()
+for m in re.finditer(r"pub struct \w+\s*\{(.*?)\n\}", src, re.S):
+    body = m.group(1)
+    for fm in re.finditer(r'(?:#\[serde\(rename\s*=\s*"([^"]+)"\)\][^\n]*\n\s*)?pub (?:r#)?(\w+)\s*:', body):
+        known.add(fm.group(1) or fm.group(2))
+if len(known) < 50:
+    print("PARSER only " + str(len(known)) + " fields extracted"); raise SystemExit(0)
+
+def keys(d):
+    out = set()
+    for k, v in d.items():
+        out.add(k)
+        if isinstance(v, dict):
+            out |= keys(v)
+        elif isinstance(v, list):
+            for it in v:
+                if isinstance(it, dict):
+                    out |= keys(it)
+    return out
+
+bad = []
+
+# The Helm ConfigMap: keys are literal, values are Go-template expressions, so it
+# cannot be parsed as TOML. Check the key names directly instead of skipping it —
+# it is the production deployment path.
+HELM_TPL = "deploy/helm/turna/templates/configmap.yaml"
+if os.path.isfile(HELM_TPL):
+    tpl = open(HELM_TPL).read()
+    # A missing marker is a FAILURE, not a skip. The first version of this treated
+    # "turn.toml: |" being absent as "nothing to check" and passed — so renaming
+    # the ConfigMap key would have silently disabled the check instead of failing
+    # it. Same shape as every other bug this script exists to catch.
+    if "turn.toml: |" not in tpl:
+        bad.append(HELM_TPL + "(no 'turn.toml: |' block — extractor or template changed)")
+    else:
+        block = tpl.split("turn.toml: |", 1)[1]
+        names = set(re.findall(r"^\s{4,}([a-z_][a-z0-9_]*)\s*=", block, re.M))
+        for s in re.findall(r"^\s{4,}\[\[?([a-z_.]+)\]\]?", block, re.M):
+            names |= set(s.split("."))
+        if not names:
+            bad.append(HELM_TPL + "(extracted no keys)")
+        for k in sorted(names - known):
+            bad.append(HELM_TPL + ":" + k)
+
+for path in sys.argv[2:]:
+    if not os.path.isfile(path):
+        continue
+    raw = open(path).read()
+    # ${VAR:-default} placeholders are not TOML; substitute so the file parses.
+    raw = re.sub(r"\$\{[A-Za-z0-9_]+(?::-([^}]*))?\}", lambda m: m.group(1) or "x", raw)
+    try:
+        d = tomllib.loads(raw)
+    except Exception as e:
+        bad.append(path + "(unparseable: " + str(e) + ")")
+        continue
+    for k in sorted(keys(d) - known):
+        bad.append(path + ":" + k)
+print(" ".join(bad))
+CFGPY
+)
+  case "$CFG_BAD" in
+    PARSER*) fail "the config-struct field extractor is broken (${CFG_BAD#PARSER })" \
+               "It found too few fields to judge anything, so this check would pass over real drift." ;;
+    "") pass "shipped configs use only declared keys" ;;
+    *) fail "shipped configs carry keys no config struct declares:$CFG_BAD" \
+         "deny_unknown_fields makes these fatal at startup, not ignored. Remove the key or restore the field." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+section "SIGHUP: docs must not deny a handler the node has"
+# ---------------------------------------------------------------------------
+
+# Four documents stated, from a dated measurement, that SIGHUP was not handled
+# and that the shared secret therefore needed a restart. When the handler landed
+# those became false in the direction that costs an operator real work: planning
+# a rolling restart for something that is now a config reload.
+#
+# Direction matters. This fails only when the code HAS a handler and a doc still
+# denies it. A dated verification run may keep its original wording — that is what
+# a run report is — provided it carries a marker saying the finding was later
+# fixed, which is why runs-*.md is exempted by that marker rather than by name.
+NODE_MAIN=services/node/src/main.rs
+if [ -f "$NODE_MAIN" ]; then
+  if grep -q 'SignalKind::hangup()' "$NODE_MAIN"; then
+    STALE=""
+    for d in $(grep -rl 'SIGHUP' docs --include='*.md' 2>/dev/null); do
+      # Exempt a report that already flags itself as superseded.
+      grep -q 'FIXED SINCE' "$d" && continue
+      if grep -qE 'does not handle SIGHUP|SIGHUP. is not handled|SIGHUP is not handled' "$d"; then
+        STALE="$STALE $d"
+      fi
+    done
+    if [ -n "$STALE" ]; then
+      fail "the node handles SIGHUP, but these docs still say it does not:$STALE" \
+        "Update them. An operator reading this plans a rolling restart for what is now a config reload."
+    else
+      pass "no doc denies the SIGHUP handler the node has"
+    fi
+  else
+    pass "no SIGHUP handler in the node; nothing for docs to contradict"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 section "tests/README.md tells people the command CI actually runs"
 # ---------------------------------------------------------------------------
 
