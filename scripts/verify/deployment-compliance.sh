@@ -165,9 +165,19 @@ if READY=$(curl -fsS --max-time 3 "http://$HEALTH/ready" 2>/dev/null); then
       *) warn "capacity state: $STATE" "Not an error, but not a node you would send new work to." ;;
     esac
   fi
+  # No `|| echo 0`. That turned every way of failing to read the field — curl
+  # down, malformed JSON, the key renamed — into the number zero, and zero here
+  # prints "no egress queue drops". A check that passes because it could not
+  # measure is worse than no check. An absent key is now reported as absent.
   DROPS=$(curl -fsS --max-time 3 "http://$HEALTH/status" 2>/dev/null |
-    python3 -c 'import json,sys; print(json.load(sys.stdin).get("send_queue_dropped",0))' 2>/dev/null || echo 0)
-  if [ "${DROPS:-0}" -gt 0 ]; then
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["send_queue_dropped"] if "send_queue_dropped" in d else "missing")' 2>/dev/null)
+  if [ -z "$DROPS" ]; then
+    warn "could not read send_queue_dropped from /status" \
+      "Not the same as zero. The endpoint answered /capacity a moment ago, so this is malformed JSON or a transport hiccup — re-run before concluding anything about egress drops."
+  elif [ "$DROPS" = "missing" ]; then
+    warn "/status has no send_queue_dropped field" \
+      "The field was renamed or removed. This check has been reporting 'no egress queue drops' on its default ever since; fix the reader."
+  elif [ "$DROPS" -gt 0 ]; then
     warn "send_queue_dropped is $DROPS" \
       "The node has discarded media before sending it. Clients cannot see this, so a clean-looking loss measurement is not evidence against it."
   else

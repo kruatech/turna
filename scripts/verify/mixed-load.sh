@@ -235,8 +235,11 @@ wait "$TLS_PID" 2>/dev/null
 # Read before stopping the node: the queue and port counters are gone afterwards.
 PORTS=$(curl -fsS --max-time 3 "http://127.0.0.1:$HEALTH_PORT/metrics" 2>/dev/null |
   awk '/^turna_relay_ports_in_use/{print $2}' | head -1)
+# Reported, not asserted on — but `|| echo 0` still made the `${DROPS:-unknown}`
+# fallback below unreachable, so an unreadable /status was printed as a confident
+# "0". Left empty on failure so "unknown" can actually appear.
 DROPS=$(curl -fsS --max-time 3 "http://127.0.0.1:$HEALTH_PORT/status" 2>/dev/null |
-  python3 -c 'import json,sys; print(json.load(sys.stdin).get("send_queue_dropped",0))' 2>/dev/null || echo 0)
+  python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["send_queue_dropped"] if "send_queue_dropped" in d else "")' 2>/dev/null)
 stop_node
 
 read -r UDP_MIX_LOSS UDP_MIX_RECV UDP_MIX_ERRS <<<"$(loss_of "$OUT/udp-mixed.json")"

@@ -294,7 +294,15 @@ try:
 except Exception as e:
     print(f"  FAIL  {label}: JSON unreadable ({e})")
     sys.exit(1)
-sent, recv, errs = d.get("sent", 0), d.get("recv", 0), d.get("errs", 0)
+# `errs` is NOT defaulted to 0. A missing field would then read as "no errors"
+# and this assertion would pass because it could not measure, which is the
+# failure mode these scripts exist to catch. Three sibling scripts already
+# default it to 1; here it is required outright, so a renamed field is loud.
+if "errs" not in d:
+    print(f"  FAIL  {label}: the load tool emitted no 'errs' field. "
+          f"Not 'zero errors' — unmeasured. Its JSON shape changed; fix this reader.")
+    sys.exit(1)
+sent, recv, errs = d.get("sent", 0), d.get("recv", 0), d["errs"]
 if sent == 0:
     print(f"  FAIL  {label}: nothing sent ({errs} errors) — the phase did not run")
     sys.exit(1)
