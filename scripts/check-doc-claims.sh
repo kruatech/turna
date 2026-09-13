@@ -111,6 +111,46 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "Every .rs under a crate's src/ is reachable as a module"
+# ---------------------------------------------------------------------------
+
+# A file with no `mod` declaration is not unwired -- it is INVISIBLE. cargo never
+# compiles it, clippy never lints it, `cargo test` never runs its tests, and no
+# amount of reading `lib.rs` reveals that it is there. graceful.rs (FD passing +
+# memfd state handover, 302 lines) sat in crates/relay/src in exactly that state.
+# The unwired-module gates above each name one module; this one needs no list, so
+# the next such file is caught the day it lands.
+#
+# The lookup is deliberately loose -- `mod <name>;` anywhere in the same crate's
+# src tree counts, under any cfg -- because a false positive here blocks CI on a
+# legitimate layout, while a miss only costs what we already had.
+
+ORPHANS=""
+for SRCDIR in crates/*/src crates/*/*/src services/*/src; do
+  [ -d "$SRCDIR" ] || continue
+  while IFS= read -r RSFILE; do
+    [ -n "$RSFILE" ] || continue
+    MODNAME=$(basename "$RSFILE" .rs)
+    case "$MODNAME" in
+      lib | main | mod) continue ;;
+    esac
+    if ! grep -rqE "^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?mod[[:space:]]+$MODNAME[[:space:]]*;" \
+      "$SRCDIR" 2>/dev/null; then
+      ORPHANS="$ORPHANS $RSFILE"
+    fi
+  done <<EOF
+$(find "$SRCDIR" -type f -name '*.rs' 2>/dev/null)
+EOF
+done
+
+if [ -z "$ORPHANS" ]; then
+  pass "every .rs under crates/*/src and services/*/src is declared as a module"
+else
+  fail "source files that no mod declaration reaches:$ORPHANS" \
+    "cargo does not compile these at all. Declare them (pub mod <name>;) or delete them -- an undeclared file cannot even be known to build."
+fi
+
+# ---------------------------------------------------------------------------
 section "Every metric named in docs/alerts exists in turna-health"
 # ---------------------------------------------------------------------------
 
