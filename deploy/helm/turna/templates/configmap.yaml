@@ -50,10 +50,15 @@ data:
     [turn.relay]
     min_port = {{ .Values.turn.relayPortRange.min }}
     max_port = {{ .Values.turn.relayPortRange.max }}
-    max_allocations = {{ .Values.turn.maxAllocations }}
+    max_allocations = {{ .Values.turn.maxAllocations | int64 }}
 
     [turn.relay.quota]
-    max_bytes_per_sec_per_allocation = {{ .Values.turn.quota.maxBytesPerSecPerAllocation }}
+    # `int64`: Helm parses values.yaml numbers into float64, so a plain
+    # {{ "{{" }} . {{ "}}" }} renders 2000000 as `2e+06` — valid YAML, not a valid TOML
+    # integer, and turna-config refuses it with "invalid type: floating point".
+    # Only fields that can exceed ~1e6 are affected; ports and second-counts
+    # render fine, which is why this went unnoticed.
+    max_bytes_per_sec_per_allocation = {{ .Values.turn.quota.maxBytesPerSecPerAllocation | int64 }}
     max_per_user = {{ .Values.turn.quota.maxPerUser }}
     {{- if .Values.turn.quota.allowUnlimitedBandwidth }}
     allow_unlimited_bandwidth = true
