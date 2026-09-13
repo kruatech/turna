@@ -4,7 +4,6 @@
 //! - `RelayServer`: async, uses tokio Transport (all platforms)
 //! - `RelayHandler`: sync, implements `PacketHandler` for io_uring workers (Linux)
 
-pub mod node_migration;
 pub mod peer_filter;
 pub mod processor;
 pub mod server;

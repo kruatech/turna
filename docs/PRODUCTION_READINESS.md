@@ -457,7 +457,7 @@ authoritative per-feature register is `docs/protocol-gap.md`.
 | SCTP, OAuth | Refused in production (R9) |
 | RFC 6062 TCP relay | Beta, no longer refused — gate lifted 2026-08-25 (R9) |
 | IPv6 relayed transport | Opt-in; conformance **and relayed media** recorded, loopback only (R10) |
-| Mobility (RFC 8016) | Partial — same-node only; cross-node migration is unwired (`node_migration.rs` has no callers) |
+| Mobility (RFC 8016) | Partial — same-node only; cross-node migration is not implemented (the placeholder module was removed) |
 | NAT discovery (RFC 5780) | Not implemented — no codec; would also need a 2×IP/2×port topology |
 | ALPN (RFC 7443) | Partial — no strict/compatible mode, unverified over DTLS |
 | Multi-node cluster / failover | Experimental — see the HA boundary below |
