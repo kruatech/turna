@@ -444,6 +444,154 @@ fn occupied_health_port_is_fatal_and_says_why() {
     );
 }
 
+/// The node starts with a config file and STAYS UP.
+///
+/// Every other test here that spawns the real binary asserts it *refuses* to
+/// start — occupied health port, oauth in production, AF_XDP ring sizes that
+/// would be ignored. All of them are satisfied by the process exiting, so a
+/// panic on startup is indistinguishable from the refusal they check for. The
+/// tests that exercise a live node run it in-process, where a Tokio runtime
+/// already exists.
+///
+/// Between those two shapes there was no test for the ordinary case, and a
+/// `tokio::spawn` added to `main`'s synchronous prologue therefore shipped: it
+/// panicked with "there is no reactor running" for every start with a config
+/// file, which is every real deployment, while `cargo build`, `cargo test` and
+/// the whole doc-truth gate stayed green. It was found by running
+/// `scripts/verify/rotation-under-load.sh` by hand.
+///
+/// So: give the binary a valid config, wait for `/ready`, and check it is still
+/// alive. Deliberately boring, and it is the assertion that was missing.
+#[test]
+fn node_starts_with_a_config_file_and_stays_up() {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: {bin:?} not built — run `cargo build -p turna-node`");
+        return;
+    }
+
+    // A stale binary gives this test a confidently wrong verdict: it reports the
+    // bug it was written for while the fix is sitting in the source tree. That
+    // happened on the very first run — the fix had been built `--release`, and
+    // `cargo test` runs debug. The neighbouring test only warns; here it is fatal,
+    // because a wrong answer from a stale artefact is the thing this whole file
+    // exists to prevent.
+    if let (Ok(bin_time), Ok(src_time)) = (
+        std::fs::metadata(&bin).and_then(|m| m.modified()),
+        std::fs::metadata("../../services/node/src/main.rs")
+            .or_else(|_| std::fs::metadata("services/node/src/main.rs"))
+            .and_then(|m| m.modified()),
+    ) {
+        assert!(
+            bin_time >= src_time,
+            "{bin:?} is older than services/node/src/main.rs. This test exercises \
+             the binary on disk, so it would report the state of the last build \
+             rather than of the source. Run `cargo build -p turna-node` first \
+             (debug — `cargo test` does not use the release artefact)."
+        );
+    }
+
+    let turn_port = free_port(true);
+    let health_port = free_port(false);
+
+    let dir = std::env::temp_dir().join(format!("turna-starts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cfg_path = dir.join("turn.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             external_ip = \"127.0.0.1\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [turn.auth]\n\
+             shared_secret = \"starts-up-test-secret\"\n\
+             [turn.relay]\n\
+             min_port = 24600\n\
+             max_port = 24700\n\
+             max_allocations = 64\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n"
+        ),
+    )
+    .expect("write config");
+
+    let mut child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn node");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut ready = false;
+    let mut died_early = None;
+    while std::time::Instant::now() < deadline {
+        // An early exit is the failure this test exists for. Report it as such
+        // rather than waiting out the deadline and blaming readiness.
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            died_early = Some(status);
+            break;
+        }
+        let ok = std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{health_port}").parse().expect("addr"),
+            std::time::Duration::from_millis(200),
+        )
+        .is_ok();
+        if ok {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Bound is not the same as up. Give it a moment and confirm the process is
+    // still there — a task spawned after the listener binds can still panic.
+    let mut still_alive = false;
+    if ready && died_early.is_none() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        still_alive = child.try_wait().expect("try_wait").is_none();
+    }
+
+    let mut out = String::new();
+    let mut err = String::new();
+    if died_early.is_some() || !ready || !still_alive {
+        use std::io::Read;
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_string(&mut out);
+        }
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if let Some(status) = died_early {
+        panic!(
+            "the node exited with {status} instead of starting. A valid config must \
+             bring it up; this is the case no other binary-spawning test covers, \
+             because the others all assert a refusal.\n--- stdout ---\n{out}\n\
+             --- stderr ---\n{err}"
+        );
+    }
+    assert!(
+        ready,
+        "the node stayed alive but never bound its health port within 20 s.\n\
+         --- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+    assert!(
+        still_alive,
+        "the node bound its health port and then exited. Binding is not staying \
+         up: a task spawned after the listener can still bring the process down, \
+         and a test that stopped at the successful connect would call that a \
+         pass.\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+}
+
 fn boot_node() -> Result<(SocketAddr, std::process::Child), String> {
     let bin = node_binary();
     if !bin.exists() {
