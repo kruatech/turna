@@ -1,0 +1,67 @@
+# Scenario: corporate deployment behind a perimeter
+#
+# Named long-term accounts instead of derived credentials, TURNS on 5349 so the
+# media path survives a network that only lets 443/5349 out, and IPv6 relaying
+# for dual-stack clients.
+#
+# Loaded by CI through the real validator with production = true.
+
+production = true
+
+[turn]
+listen = "0.0.0.0:3478"
+external_ip = "${TURNA_EXTERNAL_IP}"
+# RFC 6156: the address advertised for IPv6-family allocations. Leave it empty
+# to stay IPv4-only — an IPv4 literal here is refused, because advertising a v4
+# address for a v6 allocation is the mismatch the 443 error exists to prevent.
+external_ip6 = "2001:db8::1"
+realm = "turn.corp.example"
+
+[turn.auth]
+# A shared secret is still required: it signs the time-limited credentials the
+# signaling service issues, and the static users below are a separate path.
+shared_secret = "${TURNA_SHARED_SECRET}"
+token_ttl = 3600
+
+# Long-term accounts for fixed infrastructure — a conferencing bridge and a
+# desk-phone gateway — which cannot fetch a fresh credential before each call.
+[[turn.auth.static_users]]
+username = "bridge"
+password = "${TURNA_USER_BRIDGE_PASSWORD}"
+
+[[turn.auth.static_users]]
+username = "phones"
+password = "${TURNA_USER_PHONES_PASSWORD}"
+
+[turn.relay]
+min_port = 49152
+max_port = 60000
+max_allocations = 5000
+
+[turn.relay.quota]
+max_bytes_per_sec_per_allocation = 4000000
+max_per_user = 8
+
+[tls]
+# TURNS. A client on a network that blocks UDP reaches the relay over TCP/TLS on
+# 5349; the relayed media path is unchanged.
+enabled = true
+listen = "0.0.0.0:5349"
+cert_path = "/etc/turna/tls/cert.pem"
+key_path = "/etc/turna/tls/key.pem"
+# Re-read the certificate every five minutes so a renewal lands without a
+# restart. 0 disables the poll.
+cert_reload_secs = 300
+enable_alpn = true
+
+[signaling]
+listen = "0.0.0.0:9001"
+turn_url = "turns:turn.corp.example:5349"
+turn_shared_secret = "${TURNA_SHARED_SECRET}"
+
+[health]
+listen = "0.0.0.0:8080"
+
+[management]
+listen = "127.0.0.1:9090"
+enabled = true

@@ -151,6 +151,32 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "Scenario example configs: present means CI must load them"
+# ---------------------------------------------------------------------------
+
+# deploy/examples/ was empty while ci.yml carried a step that loaded
+# deploy/examples/*.toml, so the step could only fail. It was removed rather
+# than softened -- a step passing on zero inputs is the green-run-that-checked-
+# nothing this repository refuses. This is the other half of that decision: the
+# day the examples are written, the step has to come back, or they ship
+# unvalidated and nobody finds out.
+
+EX_COUNT=$(find deploy/examples -maxdepth 1 -name '*.toml' 2>/dev/null | wc -l | tr -d ' ')
+CI_LOADS_EXAMPLES=0
+grep -q "deploy/examples/\*.toml" .github/workflows/ci.yml 2>/dev/null && CI_LOADS_EXAMPLES=1
+if [ "$EX_COUNT" -eq 0 ] && [ "$CI_LOADS_EXAMPLES" -eq 0 ]; then
+  pass "no example configs, and ci.yml does not pretend to load any"
+elif [ "$EX_COUNT" -gt 0 ] && [ "$CI_LOADS_EXAMPLES" -eq 1 ]; then
+  pass "$EX_COUNT example config(s), and ci.yml loads them"
+elif [ "$EX_COUNT" -gt 0 ]; then
+  fail "deploy/examples/ holds $EX_COUNT config(s) that CI never loads" \
+    "Restore the 'Parse the scenario example configs' step in .github/workflows/ci.yml. An example that does not load is worse than none: it is copied, edited, and the failure is blamed on the edit."
+else
+  fail "ci.yml loads deploy/examples/*.toml, but there are none" \
+    "Either write the examples or drop the step. A step with no inputs reports a clean check on nothing."
+fi
+
+# ---------------------------------------------------------------------------
 section "Every metric named in docs/alerts exists in turna-health"
 # ---------------------------------------------------------------------------
 
