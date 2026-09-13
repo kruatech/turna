@@ -5,6 +5,7 @@
 //! - io_uring (--features io-uring): io_uring for main socket + tokio for relay sockets
 
 mod af_xdp_listener;
+mod audit_layer;
 mod bulk_load;
 mod dtls_listener;
 mod failover;
@@ -61,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // re-reads this exact file to pick up a rotated shared secret. `None`
     // (defaults, no file) means there is nothing to re-read.
     let reload_path: Option<String> = config_path.clone();
+    // Reported after telemetry is up, not here. See the `None` arm below.
+    let used_defaults = reload_path.is_none();
     let (
         config,
         cluster,
@@ -87,8 +90,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         }
         None => {
-            turna_observability::init();
-            info!("no config file, using defaults");
+            // No `init()` and no `info!` here. Installing a subscriber at this
+            // point made the real `init_with_layer` below fail with "a global
+            // default subscriber is already set", and the fallback arm then
+            // failed the same way and panicked on its `expect` — so starting
+            // the node with no config file aborted the process. The message
+            // this replaced could not have been seen anyway from the branch
+            // that did NOT install a subscriber, which is the common one.
             let root = TurnaConfig::default();
             let runtime_validation_ctx = RuntimeValidationCtx::from_config(&root);
             let bootstrap_runtime = ConfigRuntimeSnapshot::from_config(&root);
@@ -124,14 +132,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    let _telemetry_guard =
-        turna_observability::init_with_config(telemetry_config).unwrap_or_else(|e| {
-            eprintln!("telemetry init failed: {e} — falling back to basic logging");
-            turna_observability::init();
-            turna_observability::init_with_config(Default::default())
-                .expect("fallback telemetry init")
-        });
+    // Installed now, armed later. A tracing layer can only join the chain while
+    // the subscriber is being built, and the audit log it writes to is opened
+    // further down, once the config naming its path has been validated. Until
+    // `arm` runs, the layer returns from `on_event` immediately.
+    //
+    // This is what covers turna-relay and turna-transport: neither depends on
+    // turna-control, so neither can call `record_infra`, and certificate
+    // rotation — which happens in transport's CertReloader — would otherwise be
+    // the one lifecycle event missing from the journal.
+    let audit_layer = audit_layer::AuditLayer::deferred();
 
+    let _telemetry_guard =
+        turna_observability::init_with_layer(telemetry_config, audit_layer.clone()).unwrap_or_else(
+            |e| {
+                eprintln!("telemetry init failed: {e} — falling back to basic logging");
+                // No bare `init()` before this. It installs a subscriber of its
+                // own, after which `try_init` below can only fail with "already
+                // set" and the `expect` panics — so the fallback path used to
+                // abort the process on the exact failure it exists to survive.
+                turna_observability::init_with_layer(Default::default(), audit_layer.clone())
+                    .expect("fallback telemetry init")
+            },
+        );
+
+    if used_defaults {
+        info!("no config file, using defaults");
+    }
     info!(listen = %config.listen, realm = %config.realm, "starting turna");
 
     // #3 (audit-2 §9.1): fail fast if DTLS is requested in config but this
@@ -272,137 +299,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(registry)
     };
 
-    // ── #6: shared-secret rotation on SIGHUP ────────────────────────────────
-    //
-    // Secrets used to be readable only at startup, so rotating one meant a fleet
-    // restart. SIGHUP re-reads the SAME config file and republishes only the
-    // SharedSecret backends; nothing else from the reloaded file is applied.
-    //
-    // Deliberately a signal and not a management RPC. The secret never leaves the
-    // host: it is not carried over the control channel, cannot land in an audit
-    // record, and needs no proto change. It is the same shape as the TLS
-    // certificate reload, which watches its files rather than accepting material
-    // over gRPC.
-    //
-    // Rotation is still the two-secret window, unchanged: put the new secret in
-    // `shared_secret`, the old one in `previous_shared_secret`, SIGHUP, wait for
-    // `turna_auth_previous_secret_total` to flatten, drop the old one, SIGHUP
-    // again. What is gone is the restart between those steps.
-    //
-    // A reload that fails validation changes NOTHING and is logged. Half-applying
-    // a rejected config would be worse than not reloading: the operator would
-    // believe the rotation landed.
-    #[cfg(unix)]
-    {
-        if let Some(path) = reload_path.clone() {
-            let rotate_auth = auth.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sighup = match signal(SignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!(%e, "cannot install SIGHUP handler; secret rotation needs a restart");
-                        return;
-                    }
-                };
-                info!(
-                    config = %path,
-                    "SIGHUP will reload shared secrets from this file (no restart needed)"
-                );
-                loop {
-                    sighup.recv().await;
-                    let root = match TurnaConfig::load(&path) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // Keep serving the secrets already in memory.
-                            warn!(
-                                event = "secret_reload_failed",
-                                config = %path, %e,
-                                "SIGHUP: config did not load or validate; secrets unchanged"
-                            );
-                            continue;
-                        }
-                    };
-
-                    let mut rotated = 0usize;
-                    let mut skipped = 0usize;
-
-                    // Base realm. Only a SharedSecret backend is rotated: a realm with
-                    // static users is LongTerm and its credentials are managed through
-                    // the user API, not this file.
-                    if root.turn.auth.static_users.is_empty() && !root.turn.auth.oauth.enabled {
-                        let new_base = AuthMode::SharedSecret {
-                            realm: root.turn.realm.clone(),
-                            secret: root.turn.auth.shared_secret.as_bytes().to_vec(),
-                            previous: (!root.turn.auth.previous_shared_secret.is_empty())
-                                .then(|| root.turn.auth.previous_shared_secret.as_bytes().to_vec()),
-                        };
-                        // `replace_base` refuses a realm change: the realm is hashed
-                        // into every long-term key, so swapping it would invalidate
-                        // credentials rather than rotate a secret.
-                        if rotate_auth.replace_base(new_base) {
-                            rotated += 1;
-                        } else {
-                            skipped += 1;
-                            warn!(
-                                event = "secret_reload_rejected",
-                                realm = %root.turn.realm,
-                                "SIGHUP: base realm changed in the config; a realm cannot be \
-                                 rotated under live clients. Base secret left unchanged."
-                            );
-                        }
-                    } else {
-                        skipped += 1;
-                    }
-
-                    // Tenants, matched by realm against what this registry actually
-                    // holds. A tenant added to the file since startup is NOT created
-                    // here — that is a restart, not a rotation — and is reported so
-                    // the operator does not assume otherwise.
-                    let known: std::collections::HashSet<String> =
-                        rotate_auth.tenant_realms().into_iter().collect();
-                    for t in &root.tenants {
-                        if !t.static_users.is_empty() {
-                            skipped += 1;
-                            continue;
-                        }
-                        if !known.contains(&t.realm) {
-                            warn!(
-                                event = "secret_reload_skipped",
-                                tenant = %t.id, realm = %t.realm,
-                                "SIGHUP: tenant is not registered on this node; adding a tenant \
-                                 needs a restart. Not rotated."
-                            );
-                            skipped += 1;
-                            continue;
-                        }
-                        let new_tenant = AuthMode::SharedSecret {
-                            realm: t.realm.clone(),
-                            secret: t.shared_secret.as_bytes().to_vec(),
-                            previous: (!t.previous_shared_secret.is_empty())
-                                .then(|| t.previous_shared_secret.as_bytes().to_vec()),
-                        };
-                        if rotate_auth.replace_tenant(&t.realm, new_tenant) {
-                            rotated += 1;
-                        } else {
-                            skipped += 1;
-                        }
-                    }
-
-                    // Never log the secrets, nor a hash of them: a hash of a
-                    // low-entropy secret is a crackable record of it.
-                    info!(
-                        event = "secret_reloaded",
-                        rotated, skipped, "SIGHUP: shared secrets republished"
-                    );
-                }
-            });
-        }
-    }
-    // `reload_path` is unused on non-unix targets, where there is no SIGHUP.
-    #[cfg(not(unix))]
-    let _ = &reload_path;
-
     let store = Arc::new({
         let mut s = AllocationStore::new(
             config.relay.min_port,
@@ -438,17 +334,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metrics = Arc::new(Metrics::new());
 
-    // The node's audit ring, and the layer that fills it.
-    //
-    // The ring is in memory, so it holds what happens while the process lives:
-    // drain transitions, certificate rotations, a listener that died. Start and
-    // stop events describe the restart that erases it and go to syslog instead.
-    //
-    // The layer observes rather than being called: `record_infra` needs a type
-    // from turna-control, and neither turna-relay nor turna-transport depends on
-    // it. Covering only the crates that could reach it would leave the journal
-    // without certificate rotation, which happens in the transport crate — a hole
-    // exactly where the interesting event is.
     // The node's audit chain.
     //
     // Persistent when a path is configured: `open` replays and verifies the whole
@@ -537,6 +422,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tls_cfg,
         runtime_validation_ctx,
         bootstrap_runtime,
+        reload_path,
+        audit_layer,
     )
 }
 
@@ -824,6 +711,16 @@ fn run_tokio(
     tls_cfg: turna_config::TlsConfig,
     runtime_validation_ctx: RuntimeValidationCtx,
     bootstrap_runtime: ConfigRuntimeSnapshot,
+    // Path to the config file, for the SIGHUP secret reload. `None` when the node
+    // was started with no file (defaults), which means there is nothing to
+    // re-read. Passed in rather than re-derived: `main` owns the argv parsing,
+    // and a second parse could disagree with the first.
+    reload_path: Option<String>,
+    // The audit layer `main` installed into the tracing subscriber, still
+    // unarmed. It is handed over rather than built here because a layer can only
+    // join the chain while the subscriber is being built, and that already
+    // happened in `main`; the audit log it writes to is opened below.
+    audit_layer: audit_layer::AuditLayer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `tls_cfg` is only consumed when the `tls` feature is enabled.
     #[cfg(not(feature = "tls"))]
@@ -865,6 +762,13 @@ fn run_tokio(
         }
     };
 
+    // The layer installed before telemetry now has somewhere to write. Every
+    // lifecycle event before this line was dropped, so it happens as early as
+    // the log's existence allows.
+    if !audit_layer.arm(Arc::clone(&node_audit)) {
+        warn!("audit layer was already armed; startup ran the wiring twice");
+    }
+
     node_audit.record_infra(
         turna_control::audit::InfraEvent::NodeStarted,
         &format!(
@@ -894,6 +798,150 @@ fn run_tokio(
         .build()?;
 
     let result = rt.block_on(async {
+    // MOVED HERE FROM `main`'s SYNCHRONOUS PROLOGUE. `tokio::spawn` needs a
+    // runtime, and there is none until `run_tokio` builds one a few lines above
+    // this — so spawning during config setup panicked with "there is no reactor
+    // running" the moment a config file was passed, which is every real
+    // deployment. `reload_path` is a parameter for the same reason: `main` owns
+    // the argv parsing and this function is where the runtime lives.
+    //
+    // The test suite did not catch it: the tests that run the node in-process
+    // already have a runtime, and the ones that spawn the binary are all tests
+    // asserting it REFUSES to start, so a panic-exit is indistinguishable from
+    // the refusal they check for. Found by scripts/verify/rotation-under-load.sh
+    // on the first real run.
+    // ── #6: shared-secret rotation on SIGHUP ────────────────────────────────
+    //
+    // Secrets used to be readable only at startup, so rotating one meant a fleet
+    // restart. SIGHUP re-reads the SAME config file and republishes only the
+    // SharedSecret backends; nothing else from the reloaded file is applied.
+    //
+    // Deliberately a signal and not a management RPC. The secret never leaves the
+    // host: it is not carried over the control channel, cannot land in an audit
+    // record, and needs no proto change. It is the same shape as the TLS
+    // certificate reload, which watches its files rather than accepting material
+    // over gRPC.
+    //
+    // Rotation is still the two-secret window, unchanged: put the new secret in
+    // `shared_secret`, the old one in `previous_shared_secret`, SIGHUP, wait for
+    // `turna_auth_previous_secret_total` to flatten, drop the old one, SIGHUP
+    // again. What is gone is the restart between those steps.
+    //
+    // A reload that fails validation changes NOTHING and is logged. Half-applying
+    // a rejected config would be worse than not reloading: the operator would
+    // believe the rotation landed.
+    #[cfg(unix)]
+    {
+        if let Some(path) = reload_path.clone() {
+        let rotate_auth = auth.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%e, "cannot install SIGHUP handler; secret rotation needs a restart");
+                    return;
+                }
+            };
+            info!(
+                config = %path,
+                "SIGHUP will reload shared secrets from this file (no restart needed)"
+            );
+            loop {
+                sighup.recv().await;
+                let root = match TurnaConfig::load(&path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // Keep serving the secrets already in memory.
+                        warn!(
+                            event = "secret_reload_failed",
+                            config = %path, %e,
+                            "SIGHUP: config did not load or validate; secrets unchanged"
+                        );
+                        continue;
+                    }
+                };
+
+                let mut rotated = 0usize;
+                let mut skipped = 0usize;
+
+                // Base realm. Only a SharedSecret backend is rotated: a realm with
+                // static users is LongTerm and its credentials are managed through
+                // the user API, not this file.
+                if root.turn.auth.static_users.is_empty() && !root.turn.auth.oauth.enabled {
+                    let new_base = AuthMode::SharedSecret {
+                        realm: root.turn.realm.clone(),
+                        secret: root.turn.auth.shared_secret.as_bytes().to_vec(),
+                        previous: (!root.turn.auth.previous_shared_secret.is_empty())
+                            .then(|| root.turn.auth.previous_shared_secret.as_bytes().to_vec()),
+                    };
+                    // `replace_base` refuses a realm change: the realm is hashed
+                    // into every long-term key, so swapping it would invalidate
+                    // credentials rather than rotate a secret.
+                    if rotate_auth.replace_base(new_base) {
+                        rotated += 1;
+                    } else {
+                        skipped += 1;
+                        warn!(
+                            event = "secret_reload_rejected",
+                            realm = %root.turn.realm,
+                            "SIGHUP: base realm changed in the config; a realm cannot be \
+                             rotated under live clients. Base secret left unchanged."
+                        );
+                    }
+                } else {
+                    skipped += 1;
+                }
+
+                // Tenants, matched by realm against what this registry actually
+                // holds. A tenant added to the file since startup is NOT created
+                // here — that is a restart, not a rotation — and is reported so
+                // the operator does not assume otherwise.
+                let known: std::collections::HashSet<String> =
+                    rotate_auth.tenant_realms().into_iter().collect();
+                for t in &root.tenants {
+                    if !t.static_users.is_empty() {
+                        skipped += 1;
+                        continue;
+                    }
+                    if !known.contains(&t.realm) {
+                        warn!(
+                            event = "secret_reload_skipped",
+                            tenant = %t.id, realm = %t.realm,
+                            "SIGHUP: tenant is not registered on this node; adding a tenant \
+                             needs a restart. Not rotated."
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    let new_tenant = AuthMode::SharedSecret {
+                        realm: t.realm.clone(),
+                        secret: t.shared_secret.as_bytes().to_vec(),
+                        previous: (!t.previous_shared_secret.is_empty())
+                            .then(|| t.previous_shared_secret.as_bytes().to_vec()),
+                    };
+                    if rotate_auth.replace_tenant(&t.realm, new_tenant) {
+                        rotated += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                }
+
+                // Never log the secrets, nor a hash of them: a hash of a
+                // low-entropy secret is a crackable record of it.
+                info!(
+                    event = "secret_reloaded",
+                    rotated, skipped,
+                    "SIGHUP: shared secrets republished"
+                );
+            }
+        });
+        }
+    }
+    // `reload_path` is unused on non-unix targets, where there is no SIGHUP.
+    #[cfg(not(unix))]
+    let _ = &reload_path;
+
     let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
         turna_observability::syslog::SyslogConfig {
             endpoint: config.observability.syslog_endpoint.clone(),

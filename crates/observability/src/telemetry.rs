@@ -254,24 +254,41 @@ impl Drop for TelemetryGuard {
 
 /// Initialise structured logging and (optionally) OTLP tracing.
 ///
-/// # Layer order
-///
-/// OTel layer must be applied to the bare `Registry` — before EnvFilter —
-/// because `OpenTelemetryLayer<S, T>` is implemented for `Layer<S>` where
-/// S must be the subscriber type at the point of application.  Applying
-/// EnvFilter first changes S from `Registry` to `Layered<EnvFilter, Registry>`,
-/// which no longer satisfies the trait bound.
+/// Installs no extra layer; see [`init_with_layer`] for the layer order and for
+/// the one hook a caller gets into the chain.
 pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
+    init_with_layer(config, tracing_subscriber::layer::Identity::new())
+}
+
+/// Same as [`init`], plus one caller-supplied layer applied to the bare
+/// `Registry` underneath everything else.
+///
+/// This exists because a layer can only be installed while the subscriber is
+/// being built, and a caller may not yet have what the layer writes to. The node
+/// installs its audit layer here and hands it the audit log later: the layer is
+/// in the chain from the first event, and drops events until it is armed.
+///
+/// `extra` sits below `EnvFilter`, so it observes events regardless of
+/// `RUST_LOG`. That is deliberate for an audit journal — a log-level setting
+/// should not be able to empty it — and means the layer must do its own
+/// filtering, which `AuditLayer` does by target and level.
+pub fn init_with_layer<L>(config: TelemetryConfig, extra: L) -> Result<TelemetryGuard>
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_filter));
 
-    // Build OTel layer first (needs bare Registry as subscriber type).
-    // Wrap in Option so we can choose whether to include it.
     let otlp_enabled = !config.otlp_endpoint.is_empty();
     let mut guard_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider> = None;
 
-    // FIX: apply layers in correct order — OTel → filter → fmt.
-    // This ensures the OTel layer sees Registry as its subscriber type.
+    // Layer order: Registry -> extra -> [OTel] -> EnvFilter -> syslog -> fmt.
+    //
+    // `OpenTelemetryLayer<S, T>` is a `Layer<S>` where S is the subscriber type
+    // AT THE POINT OF APPLICATION, so it cannot go after EnvFilter (S would be
+    // `Layered<EnvFilter, _>`). It used to have to be first for the same reason;
+    // `build_otel_layer` is now generic over S, so `extra` can sit under it and
+    // OTel still gets a type it accepts.
     macro_rules! try_init_with_fmt {
         ($base:expr) => {
             if config.json_logs {
@@ -306,10 +323,13 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
     };
 
     if otlp_enabled {
-        let (otel_layer, provider) = build_otel_layer(&config)?;
+        let (otel_layer, provider) = build_otel_layer::<
+            tracing_subscriber::layer::Layered<L, tracing_subscriber::Registry>,
+        >(&config)?;
         guard_provider = Some(provider);
-        // Registry → OTel → EnvFilter → fmt
+        // Registry → extra → OTel → EnvFilter → fmt
         let base = tracing_subscriber::registry()
+            .with(extra)
             .with(otel_layer)
             .with(filter)
             .with(syslog_layer.clone());
@@ -321,8 +341,9 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
         // looked for it and a correctly-behaving node failed the check. It now
         // goes out below, with the other startup line.
         //
-        // Registry → EnvFilter → fmt
+        // Registry → extra → EnvFilter → fmt
         let base = tracing_subscriber::registry()
+            .with(extra)
             .with(filter)
             .with(syslog_layer.clone());
         try_init_with_fmt!(base)?;
@@ -351,14 +372,29 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard> {
 
 /// Build a `tracing_opentelemetry` layer backed by an OTLP gRPC exporter.
 ///
-/// Returns a layer typed for `tracing_subscriber::Registry` — must be
-/// applied BEFORE any other layers in the subscriber chain.
-fn build_otel_layer(
+/// Generic over the subscriber it will be applied to. It used to return a layer
+/// pinned to the bare `Registry`, which forced OTel to be the FIRST layer in the
+/// chain and left no room for a caller-supplied one underneath it. `S` is
+/// inferred from the application site instead, so `init_with_layer` can put the
+/// caller's layer on the registry first and still satisfy
+/// `OpenTelemetryLayer<S, T>`.
+fn build_otel_layer<S>(
     config: &TelemetryConfig,
 ) -> Result<(
-    impl tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+    impl tracing_subscriber::Layer<S> + Send + Sync + 'static,
     opentelemetry_sdk::trace::SdkTracerProvider,
-)> {
+)>
+where
+    // `Send + Sync + 'static` are not decoration: `OpenTelemetryLayer<S, T>`
+    // stores a `PhantomData<S>`, so the auto traits on the returned layer are
+    // only satisfied when S carries them too. `Layered<L, Registry>` does,
+    // because `Registry` does and `init_with_layer` already requires it of `L`.
+    S: tracing::Subscriber
+        + for<'span> tracing_subscriber::registry::LookupSpan<'span>
+        + Send
+        + Sync
+        + 'static,
+{
     use opentelemetry_otlp::WithExportConfig;
 
     let resource = opentelemetry_sdk::Resource::builder()
