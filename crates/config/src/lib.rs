@@ -2410,15 +2410,37 @@ fn expand_env_vars(input: &str) -> Result<String> {
         .filter(|l| !l.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut result = stripped;
-
-    // Expand ${VAR} and ${VAR:-default}
-    while let Some(start) = result.find("${") {
-        let end = result[start..]
+    // Expand ${VAR} and ${VAR:-default} in ONE left-to-right pass.
+    //
+    // The previous loop restarted `find("${")` at the head of the whole string
+    // after every substitution, so a substituted VALUE was rescanned as if it
+    // were config text. A secret containing `${` was therefore expanded as a
+    // variable reference (or rejected with EnvVarNotSet / "unclosed ${" for a
+    // config the operator never wrote that way), and a variable whose value
+    // contains its own reference looped forever — config load hung with no
+    // diagnostic at all. Substituted text is now never re-examined.
+    //
+    // `$${` is the escape for a literal `${`; there was no way to write one.
+    let mut result = String::with_capacity(stripped.len());
+    let mut rest = stripped.as_str();
+    loop {
+        let Some(start) = rest.find("${") else {
+            result.push_str(rest);
+            break;
+        };
+        // A `$` immediately before is always inside the current `rest`: the
+        // slice only ever advances past a `}`, never between `$` and `${`.
+        if start > 0 && rest.as_bytes()[start - 1] == b'$' {
+            result.push_str(&rest[..start - 1]);
+            result.push_str("${");
+            rest = &rest[start + 2..];
+            continue;
+        }
+        let end = rest[start..]
             .find('}')
             .ok_or_else(|| ConfigError::ParseError("unclosed ${".into()))?
             + start;
-        let expr = &result[start + 2..end];
+        let expr = &rest[start + 2..end];
 
         let value = if let Some(sep) = expr.find(":-") {
             let var_name = &expr[..sep];
@@ -2428,7 +2450,9 @@ fn expand_env_vars(input: &str) -> Result<String> {
             std::env::var(expr).map_err(|_| ConfigError::EnvVarNotSet(expr.into()))?
         };
 
-        result = format!("{}{}{}", &result[..start], value, &result[end + 1..]);
+        result.push_str(&rest[..start]);
+        result.push_str(&value);
+        rest = &rest[end + 1..];
     }
 
     // Expand file:///path references

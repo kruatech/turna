@@ -417,8 +417,19 @@ async fn note_migration(
     // Move the admission slot with the client, or the old IP would stay charged
     // for a session it no longer owns and the new IP would be uncounted.
     if old.ip() != current.ip() {
-        release_admission(old, per_ip);
+        // Both halves under ONE lock. Taking it twice (release_admission, then
+        // the increment) leaves a window where the old IP is already credited
+        // back and the new one is not yet charged, so a concurrent
+        // admit_session on either IP decides against a count that never
+        // existed. The release body mirrors `release_admission`.
         if let Ok(mut m) = per_ip.lock() {
+            let old_ip = old.ip();
+            if let Some(n) = m.get_mut(&old_ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&old_ip);
+                }
+            }
             *m.entry(current.ip()).or_insert(0) += 1;
         }
     }

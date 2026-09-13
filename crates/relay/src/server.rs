@@ -153,7 +153,21 @@ pub(crate) fn spawn_relay_egress(
                                     // Route to a TURNS/DTLS/QUIC client if a sink is
                                     // registered, otherwise send_to over UDP.
                                     if let Some(sink) = client_sinks_relay.get(&target) {
-                                        let _ = sink.try_send(data.to_vec());
+                                        // A full sink means the DTLS/QUIC/TURNS
+                                        // session task is behind, and the frame
+                                        // is gone. Dropping is the right policy
+                                        // on the media path -- stalling the
+                                        // relay socket for one slow session
+                                        // would be worse -- but `let _ =` made
+                                        // it invisible: the operator saw a
+                                        // healthy node while peer->client media
+                                        // was being lost. Counted on the same
+                                        // metric as the egress queue below.
+                                        if sink.try_send(data.to_vec()).is_err() {
+                                            proc.metrics()
+                                                .send_queue_dropped
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                     } else {
                                         let _ = main_out.send_to(&data, target).await;
                                     }
@@ -184,6 +198,11 @@ pub fn new_client_sinks() -> ClientSinks {
 #[derive(Clone)]
 pub struct RelayEgress {
     tx: mpsc::Sender<OutMsg>,
+    /// Only so a dropped media frame is counted. `dispatch` documented the
+    /// drop-on-full policy and then discarded the `try_send` result, while the
+    /// identical action inside `RelayServer::run` counted it -- so the DTLS and
+    /// QUIC paths under-reported exactly the loss the metric exists for.
+    metrics: Arc<Metrics>,
 }
 
 impl RelayEgress {
@@ -204,12 +223,22 @@ impl RelayEgress {
                 target,
                 relay_port,
             } => {
-                // Media path: drop on a full queue rather than stall the session.
-                let _ = self.tx.try_send(OutMsg::Relay {
-                    port: relay_port,
-                    data,
-                    target,
-                });
+                // Media path: drop on a full queue rather than stall the
+                // session -- and count it, the way `RelayServer::run` does for
+                // the same action.
+                if self
+                    .tx
+                    .try_send(OutMsg::Relay {
+                        port: relay_port,
+                        data,
+                        target,
+                    })
+                    .is_err()
+                {
+                    self.metrics
+                        .send_queue_dropped
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             Action::RegisterRelay { port, socket, .. } => {
                 // Control-plane: must not be dropped — await for queue capacity.
@@ -284,6 +313,8 @@ pub fn start_relay_egress(
         });
     }
 
+    // Taken before `processor` is moved into the egress task below.
+    let metrics = processor.metrics().clone();
     let handle = spawn_relay_egress(
         rx,
         processor,
@@ -293,7 +324,7 @@ pub fn start_relay_egress(
         main_out,
         external_ip,
     );
-    (RelayEgress { tx }, handle)
+    (RelayEgress { tx, metrics }, handle)
 }
 
 // ── RelayServer ───────────────────────────────────────────────────────────────

@@ -175,6 +175,12 @@ fn encode_with_integrity_auto(
 /// agree, and a log where two lines carry an address and the third carries a hash
 /// is worse than either choice made consistently — a reader correlating them gets
 /// nothing and does not know why.
+///
+/// The two branches deliberately differ in granularity: verbatim is `ip:port`,
+/// the hash covers the IP ONLY. Two concurrent sessions from one host therefore
+/// share a label — `ip-<hash>` says so, and per-IP correlation across a client's
+/// reconnects is the point. An operator reading these lines is looking at hosts,
+/// not sessions; use `allocation_id` to tell sessions apart.
 fn loggable_addr(addr: &std::net::SocketAddr) -> String {
     use std::sync::OnceLock;
     static SALT: OnceLock<u64> = OnceLock::new();
@@ -2003,7 +2009,12 @@ impl PacketProcessor {
         self.metrics
             .bytes_sent
             .fetch_add(len as u64, Ordering::Relaxed);
-        info!(src = %loggable_addr(&src), %old_addr, %relay_addr, "allocation migrated (RFC 8016)");
+        info!(
+            src = %loggable_addr(&src),
+            old_addr = %loggable_addr(&old_addr),
+            %relay_addr,
+            "allocation migrated (RFC 8016)"
+        );
 
         let mut actions = vec![Action::Send {
             data: Bytes::copy_from_slice(&buf[..len]),

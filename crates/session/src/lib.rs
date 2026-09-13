@@ -2080,17 +2080,23 @@ impl AllocationStore {
     /// - [`SessionError::MigrationTargetInUse`] if `new_addr` already hosts a
     ///   *different* allocation (we refuse to clobber it).
     ///
-    /// Atomicity: this is not a single cross-shard transaction. For the
-    /// intended use — a single migrating client rebinding its own allocation
-    /// — there is no competing writer, so the brief window where `get(old)`
-    /// and `get(new)` both miss is benign (the client has, by definition, just
-    /// changed address). Concurrent migration of the *same* allocation is
-    /// prevented one level up (the processor's per-ticket guard, Заход 2).
+    /// Atomicity: this is not a single cross-shard transaction, but the target
+    /// slot IS claimed through `Entry`, so `new_addr` can never be clobbered by
+    /// a racing `create_for_identity` or a second `re_key` — the loser is
+    /// rolled back under `old_addr` and gets `MigrationTargetInUse`. What
+    /// remains non-atomic is the brief window where `get(old)` and `get(new)`
+    /// both miss; for the intended use — a single migrating client rebinding
+    /// its own allocation — that is benign, since the client has by definition
+    /// just changed address. Concurrent migration of the *same* allocation is
+    /// additionally prevented one level up (the processor's per-ticket guard,
+    /// Заход 2).
     pub fn re_key(
         &self,
         old_addr: &SocketAddr,
         new_addr: SocketAddr,
     ) -> Result<SocketAddr, SessionError> {
+        use dashmap::mapref::entry::Entry;
+
         // Idempotent no-op: refreshing from the same address is not a move.
         if *old_addr == new_addr {
             return self
@@ -2100,12 +2106,18 @@ impl AllocationStore {
                 .ok_or(SessionError::NotFound);
         }
 
-        // Refuse to overwrite a live allocation already sitting on the target.
-        if self.allocations.contains_key(&new_addr) {
-            return Err(SessionError::MigrationTargetInUse);
-        }
-
-        // Take ownership of the allocation out of the old slot.
+        // Take ownership of the allocation out of the old slot FIRST, then
+        // claim the target through `Entry` — never `contains_key` + `insert`.
+        // Those are two independent shard locks: a concurrent
+        // `create_for_identity` (which DOES gate on `Entry`, see B1) or a
+        // second `re_key` can land on `new_addr` between them and be silently
+        // clobbered by the `insert`, orphaning its relay port and socket until
+        // restart — exactly the failure B1 exists to prevent.
+        //
+        // Remove-then-claim also keeps at most ONE `allocations` shard lock
+        // held at a time. Claiming `new_addr` first and removing `old_addr`
+        // underneath that guard would deadlock whenever the two addresses hash
+        // to the same shard.
         let (_, mut alloc) = self
             .allocations
             .remove(old_addr)
@@ -2127,23 +2139,81 @@ impl AllocationStore {
         // map — the writer persists it so failover keeps anti-replay intact.
         let new_epoch = alloc.migration_epoch;
         let channels: Vec<u16> = alloc.channel_bindings.keys().copied().collect();
-        self.allocations.insert(new_addr, alloc);
 
-        // relay key is unchanged; only its value moves.
-        self.relay_to_client.insert(relay_addr, new_addr);
-        for ch in channels {
-            self.channel_to_client.insert((relay_port, ch), new_addr);
-        }
-        self.id_to_client.insert(allocation_id, new_addr);
-        if let Some(mut addrs) =
-            self.user_allocations
-                .get_mut(&(realm, tenant_id.clone(), username.clone()))
-        {
-            for a in addrs.iter_mut() {
-                if a == old_addr {
-                    *a = new_addr;
+        // Claim the target slot. On refusal the allocation is carried back out
+        // of the `match` in `rejected`, so the rollback below runs with no
+        // `allocations` guard held.
+        let rejected = match self.allocations.entry(new_addr) {
+            Entry::Occupied(_) => Some(alloc),
+            Entry::Vacant(slot) => {
+                // Secondary indices are rewritten while the slot is held, so
+                // the allocation becomes visible under `new_addr` only once
+                // every index already points at it (same discipline as
+                // `create_for_identity`). These are separate DashMaps, so
+                // there is no shard-lock conflict with the guard above.
+                self.relay_to_client.insert(relay_addr, new_addr);
+                for ch in &channels {
+                    self.channel_to_client.insert((relay_port, *ch), new_addr);
                 }
+                self.id_to_client.insert(allocation_id.clone(), new_addr);
+                if let Some(mut addrs) = self.user_allocations.get_mut(&(
+                    realm.clone(),
+                    tenant_id.clone(),
+                    username.clone(),
+                )) {
+                    for a in addrs.iter_mut() {
+                        if a == old_addr {
+                            *a = new_addr;
+                        }
+                    }
+                }
+                slot.insert(alloc);
+                None
             }
+        };
+
+        if let Some(mut alloc) = rejected {
+            // The target was taken between our `remove` and our claim. No index
+            // was touched, so undoing the epoch bump and putting the allocation
+            // back under `old_addr` restores the exact pre-call state; the
+            // caller sees the same `MigrationTargetInUse` as before.
+            alloc.client_addr = *old_addr;
+            alloc.migration_epoch = alloc.migration_epoch.wrapping_sub(1);
+            let orphan = match self.allocations.entry(*old_addr) {
+                Entry::Vacant(slot) => {
+                    slot.insert(alloc);
+                    None
+                }
+                Entry::Occupied(_) => Some(alloc),
+            };
+            if let Some(alloc) = orphan {
+                // Both keys lost: `old_addr` was re-created while the
+                // allocation sat outside the map, so it has nowhere to live.
+                // Tear it down the way `remove` does rather than dropping it
+                // here and leaking the relay port until restart. Runs with no
+                // `allocations` guard held.
+                self.release_counters(&alloc.realm, alloc.tenant_id.as_deref(), &alloc.username);
+                self.accrue_tenant_traffic(&alloc);
+                for ch in &channels {
+                    self.channel_to_client.remove(&(relay_port, *ch));
+                }
+                self.relay_to_client.remove(&relay_addr);
+                self.id_to_client.remove(&alloc.allocation_id);
+                if let Some(mut addrs) = self.user_allocations.get_mut(&(
+                    alloc.realm.clone(),
+                    alloc.tenant_id.clone(),
+                    alloc.username.clone(),
+                )) {
+                    addrs.retain(|a| a != old_addr);
+                }
+                self.pool_for_port(relay_port).release(relay_port);
+                self.emit_write(WriteOp::Remove { relay_port });
+                tracing::error!(
+                    %old_addr, %new_addr, %relay_addr,
+                    "re_key lost both keys concurrently; allocation torn down"
+                );
+            }
+            return Err(SessionError::MigrationTargetInUse);
         }
 
         self.emit_write(WriteOp::ReKey {
