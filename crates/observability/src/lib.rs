@@ -40,3 +40,12 @@ pub fn init() {
 pub fn init_with_config(config: TelemetryConfig) -> telemetry::Result<TelemetryGuard> {
     telemetry::init(config)
 }
+
+/// As [`init_with_config`], plus one caller-supplied layer applied to the bare
+/// `Registry` beneath every other layer. See [`telemetry::init_with_layer`].
+pub fn init_with_layer<L>(config: TelemetryConfig, extra: L) -> telemetry::Result<TelemetryGuard>
+where
+    L: tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync + 'static,
+{
+    telemetry::init_with_layer(config, extra)
+}

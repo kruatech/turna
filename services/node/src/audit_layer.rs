@@ -42,7 +42,7 @@
 //! is one nobody reads. The transition is audited; the progress is not.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -72,6 +72,15 @@ const WATCHED: &[&str] = &[
 /// notices; a certificate reload that fails is invisible, because the node
 /// correctly keeps serving on the old material. `outcome: false` is often the
 /// only trace that a control did not engage.
+/// `classify` returns the FIRST match, so a general needle placed above a
+/// specific one silences it. That is not hypothetical: `"certificate hot-reload"`
+/// sat here with `ok = true` above `"certificate hot-reload unavailable"` with
+/// `ok = false`, so a TURNS node that fell back to a static certificate — no
+/// rotation possible for the rest of its life — was journalled as a successful
+/// rotation. The rule was unreachable for two reasons at once, because nothing
+/// declared this module and the test that would have caught it never ran.
+///
+/// `no_general_rule_shadows_a_specific_one` now enforces the ordering.
 const RULES: &[(&str, InfraEvent, bool)] = &[
     // Taken from the messages these files actually write, not invented. Checked
     // against crates/relay/src/server.rs:644 and :837.
@@ -80,56 +89,23 @@ const RULES: &[(&str, InfraEvent, bool)] = &[
         InfraEvent::DrainStateChanged,
         true,
     ),
-    (
-        "drain complete",
-        InfraEvent::DrainStateChanged,
-        true,
-    ),
+    ("drain complete", InfraEvent::DrainStateChanged, true),
     (
         "SO_REUSEPORT bind failed",
         InfraEvent::SecurityControlFailed,
         false,
     ),
-    (
-        "bind failed",
-        InfraEvent::SecurityControlFailed,
-        false,
-    ),
+    ("bind failed", InfraEvent::SecurityControlFailed, false),
     (
         "listener bind failed",
         InfraEvent::SecurityControlFailed,
         false,
     ),
-    (
-        "certificate hot-reload",
-        InfraEvent::CertRotated,
-        true,
-    ),
-    (
-        "certificate reloaded",
-        InfraEvent::CertRotated,
-        true,
-    ),
-    (
-        "cert reload failed",
-        InfraEvent::CertRotated,
-        false,
-    ),
-    (
-        "configuration reloaded",
-        InfraEvent::ConfigReloaded,
-        true,
-    ),
-    (
-        "readiness",
-        InfraEvent::ReadinessChanged,
-        true,
-    ),
-    (
-        "degraded",
-        InfraEvent::ReadinessChanged,
-        false,
-    ),
+    ("certificate reloaded", InfraEvent::CertRotated, true),
+    ("cert reload failed", InfraEvent::CertRotated, false),
+    ("configuration reloaded", InfraEvent::ConfigReloaded, true),
+    ("readiness", InfraEvent::ReadinessChanged, true),
+    ("degraded", InfraEvent::ReadinessChanged, false),
     // ── added after cross-checking against the real messages ──────────────
     //
     // Nine were missed on the first pass, and several matter more than the rules
@@ -146,11 +122,7 @@ const RULES: &[(&str, InfraEvent, bool)] = &[
     // A successful rotation. Without this the audit recorded only failures, and
     // could not answer "did the rotation take effect" — which is the question
     // asked after an incident that followed one.
-    (
-        "TLS cert reloaded",
-        InfraEvent::CertRotated,
-        true,
-    ),
+    ("TLS cert reloaded", InfraEvent::CertRotated, true),
     (
         "certificate hot-reload disabled",
         InfraEvent::CertRotated,
@@ -165,39 +137,23 @@ const RULES: &[(&str, InfraEvent, bool)] = &[
     // stops relaying and remains a live process: health may still answer, the
     // port stays bound, and no allocation succeeds. An auditor asking why a node
     // went silent needs this entry to exist.
-    (
-        "datapath is dead",
-        InfraEvent::SecurityControlFailed,
-        false,
-    ),
+    ("datapath is dead", InfraEvent::SecurityControlFailed, false),
     // A listener or bridge task died. Same shape, smaller blast radius.
     (
         "exited unexpectedly",
         InfraEvent::SecurityControlFailed,
         false,
     ),
-    (
-        "worker stopping",
-        InfraEvent::SecurityControlFailed,
-        false,
-    ),
+    ("worker stopping", InfraEvent::SecurityControlFailed, false),
     // A transport draining, distinct from the relay's drain above.
-    (
-        "listener draining",
-        InfraEvent::DrainStateChanged,
-        true,
-    ),
+    ("listener draining", InfraEvent::DrainStateChanged, true),
     // Found on the second coverage pass, both in quic.rs. The same asymmetry
     // already fixed for TLS: the success was recorded and the failure was not.
     //
     // "rejected" as well as "failed" because WebTransport words it differently,
     // and a rule matching only one keeps missing the other. That is the whole
     // exposure of text matching in one line.
-    (
-        "certificate reload failed",
-        InfraEvent::CertRotated,
-        false,
-    ),
+    ("certificate reload failed", InfraEvent::CertRotated, false),
     (
         "certificate reload rejected",
         InfraEvent::CertRotated,
@@ -209,12 +165,31 @@ const RULES: &[(&str, InfraEvent, bool)] = &[
 /// can carry anything a developer found useful, and forwarding all of it would put
 /// unexamined values into a hash-chained log.
 const FORWARD: &[&str] = &[
-    "worker", "listen", "addr", "path", "cert", "reason", "error", "e",
-    "remaining", "state", "grace_secs", "max",
+    "worker",
+    "listen",
+    "addr",
+    "path",
+    "cert",
+    "reason",
+    "error",
+    "e",
+    "remaining",
+    "state",
+    "grace_secs",
+    "max",
 ];
 
 pub struct AuditLayer {
-    audit: Arc<AuditLog>,
+    /// Filled in by [`AuditLayer::arm`] once the node has opened its audit log.
+    ///
+    /// A tracing layer can only be installed while the subscriber is being
+    /// built, and that happens before the config which names the chain's path
+    /// has been validated. Holding the log behind a `OnceLock` lets the layer
+    /// join the chain at the first event and start writing the moment there is
+    /// somewhere to write: events before that are dropped, and the only ones in
+    /// that window are the telemetry banner and config lines, none of which are
+    /// lifecycle events.
+    audit: Arc<OnceLock<Arc<AuditLog>>>,
     /// Events from watched modules that matched no rule.
     ///
     /// Rising after a refactor means log wording moved and lifecycle events
@@ -223,11 +198,20 @@ pub struct AuditLayer {
 }
 
 impl AuditLayer {
-    pub fn new(audit: Arc<AuditLog>) -> Self {
+    /// Build an unarmed layer, ready to install before the audit log exists.
+    pub fn deferred() -> Self {
         Self {
-            audit,
+            audit: Arc::new(OnceLock::new()),
             unmatched_lifecycle: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Hand the layer its audit log. Returns `false` if it was already armed,
+    /// which would mean startup ran this twice — the second log would be
+    /// ignored, and a journal quietly writing to the wrong place is worth a
+    /// warning at the call site.
+    pub fn arm(&self, audit: Arc<AuditLog>) -> bool {
+        self.audit.set(audit).is_ok()
     }
 
     fn classify(message: &str) -> Option<(InfraEvent, bool)> {
@@ -311,6 +295,12 @@ impl Visit for Collector {
 
 impl<S: Subscriber> Layer<S> for AuditLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        // Unarmed: the audit log does not exist yet. Nothing to record and
+        // nothing to count — an unmatched-lifecycle tick here would describe the
+        // startup window rather than a gap in the rule set.
+        let Some(audit) = self.audit.get() else {
+            return;
+        };
         let meta = event.metadata();
         // INFO and above. A lifecycle event that only appears at DEBUG is not one
         // an auditor would be told about anyway.
@@ -332,7 +322,7 @@ impl<S: Subscriber> Layer<S> for AuditLayer {
                 } else {
                     format!("{} [{}]", c.message, c.detail.join(" "))
                 };
-                self.audit.record_infra(kind, &detail, ok);
+                audit.record_infra(kind, &detail, ok);
             }
             None => {
                 // Counted only at WARN and above. An unmatched INFO from a watched
@@ -357,9 +347,21 @@ mod tests {
         // messages would pass while the real ones went unmatched — which is the
         // failure mode of matching on text at all.
         let cases = [
-            ("shutdown signal received, draining...", InfraEvent::DrainStateChanged, true),
-            ("drain complete — no active allocations remaining", InfraEvent::DrainStateChanged, true),
-            ("SO_REUSEPORT bind failed, continuing with fewer workers", InfraEvent::SecurityControlFailed, false),
+            (
+                "shutdown signal received, draining...",
+                InfraEvent::DrainStateChanged,
+                true,
+            ),
+            (
+                "drain complete — no active allocations remaining",
+                InfraEvent::DrainStateChanged,
+                true,
+            ),
+            (
+                "SO_REUSEPORT bind failed, continuing with fewer workers",
+                InfraEvent::SecurityControlFailed,
+                false,
+            ),
         ];
         for (msg, kind, ok) in cases {
             assert_eq!(
@@ -388,7 +390,10 @@ mod tests {
     fn a_failed_reload_is_recorded_as_a_failure() {
         let (kind, ok) = AuditLayer::classify("cert reload failed: bad PEM").unwrap();
         assert_eq!(kind, InfraEvent::CertRotated);
-        assert!(!ok, "a failed rotation must not be recorded as outcome: true");
+        assert!(
+            !ok,
+            "a failed rotation must not be recorded as outcome: true"
+        );
     }
 
     /// The nine the first pass missed. Verbatim from the source, so a refactor of
@@ -397,14 +402,42 @@ mod tests {
     #[test]
     fn the_messages_a_first_pass_missed() {
         let cases = [
-            ("all allocations drained", InfraEvent::DrainStateChanged, true),
+            (
+                "all allocations drained",
+                InfraEvent::DrainStateChanged,
+                true,
+            ),
             ("TLS cert reloaded", InfraEvent::CertRotated, true),
-            ("cert reload failed; keeping previous certificate", InfraEvent::CertRotated, false),
-            ("all recv workers exited — datapath is dead", InfraEvent::SecurityControlFailed, false),
-            ("relay egress task exited — datapath is dead", InfraEvent::SecurityControlFailed, false),
-            ("TURNS bridge exited unexpectedly", InfraEvent::SecurityControlFailed, false),
-            ("cleanup/metrics task exited unexpectedly", InfraEvent::SecurityControlFailed, false),
-            ("recv error, worker stopping", InfraEvent::SecurityControlFailed, false),
+            (
+                "cert reload failed; keeping previous certificate",
+                InfraEvent::CertRotated,
+                false,
+            ),
+            (
+                "all recv workers exited — datapath is dead",
+                InfraEvent::SecurityControlFailed,
+                false,
+            ),
+            (
+                "relay egress task exited — datapath is dead",
+                InfraEvent::SecurityControlFailed,
+                false,
+            ),
+            (
+                "TURNS bridge exited unexpectedly",
+                InfraEvent::SecurityControlFailed,
+                false,
+            ),
+            (
+                "cleanup/metrics task exited unexpectedly",
+                InfraEvent::SecurityControlFailed,
+                false,
+            ),
+            (
+                "recv error, worker stopping",
+                InfraEvent::SecurityControlFailed,
+                false,
+            ),
         ];
         for (msg, kind, ok) in cases {
             assert_eq!(
@@ -428,10 +461,37 @@ mod tests {
             "WebTransport certificate reload rejected; keeping previous certificate",
             "TURNS certificate hot-reload unavailable; using static cert",
         ] {
-            let (kind, ok) = AuditLayer::classify(msg)
-                .unwrap_or_else(|| panic!("{msg:?} must classify"));
+            let (kind, ok) =
+                AuditLayer::classify(msg).unwrap_or_else(|| panic!("{msg:?} must classify"));
             assert_eq!(kind, InfraEvent::CertRotated, "{msg:?}");
             assert!(!ok, "{msg:?} must be recorded as outcome: false");
+        }
+    }
+
+    /// No rule may be silenced by a more general one above it.
+    ///
+    /// `classify` takes the first match, so if an earlier needle is contained in
+    /// a later one, the later rule can never fire — and if their verdicts differ,
+    /// the journal records the opposite of what happened. Ordering is invisible
+    /// at the call site and a new rule is naturally appended at the end, which is
+    /// exactly where it loses. This checks the table instead of trusting that.
+    #[test]
+    fn no_general_rule_shadows_a_specific_one() {
+        for (i, (general, gen_event, gen_ok)) in RULES.iter().enumerate() {
+            let g = general.to_lowercase();
+            for (specific, spec_event, spec_ok) in RULES.iter().skip(i + 1) {
+                let sp = specific.to_lowercase();
+                if !sp.contains(&g) {
+                    continue;
+                }
+                assert!(
+                    gen_event == spec_event && gen_ok == spec_ok,
+                    "{specific:?} can never match: {general:?} is above it and \
+                     contained in it, but classifies differently \
+                     ({gen_event:?}/{gen_ok} vs {spec_event:?}/{spec_ok}). \
+                     Move the specific rule above the general one."
+                );
+            }
         }
     }
 
@@ -443,8 +503,8 @@ mod tests {
             "QUIC certificate reloaded",
             "WebTransport certificate reloaded",
         ] {
-            let (kind, ok) = AuditLayer::classify(msg)
-                .unwrap_or_else(|| panic!("{msg:?} must classify"));
+            let (kind, ok) =
+                AuditLayer::classify(msg).unwrap_or_else(|| panic!("{msg:?} must classify"));
             assert_eq!(kind, InfraEvent::CertRotated, "{msg:?}");
             assert!(ok, "{msg:?} must be recorded as outcome: true");
         }
@@ -455,7 +515,8 @@ mod tests {
     /// process: the port is bound, health may answer, and nothing works.
     #[test]
     fn a_dead_datapath_is_recorded_as_a_failure() {
-        let (kind, ok) = AuditLayer::classify("all recv workers exited — datapath is dead").unwrap();
+        let (kind, ok) =
+            AuditLayer::classify("all recv workers exited — datapath is dead").unwrap();
         assert_eq!(kind, InfraEvent::SecurityControlFailed);
         assert!(!ok);
     }
