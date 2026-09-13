@@ -22,6 +22,16 @@ async function getLive(path: string): Promise<boolean> {
   return resp.ok
 }
 
+// The operator's admin token lives in sessionStorage: per-tab, gone when the tab
+// closes, and readable by any script running on this origin. That last part is
+// real and is accepted deliberately, because neither alternative is better here:
+// an in-memory variable is just as readable by an XSS that is already executing
+// (and it additionally loses the token on every page reload), while an httpOnly
+// cookie would need the node to issue Set-Cookie and defend against CSRF, and
+// the management endpoint authenticates on the X-Admin-Token HEADER. An XSS on
+// this origin can call /api/manage directly regardless of where the token sits.
+// If that ever stops being acceptable, the fix is a cookie + CSRF token on the
+// backend, not a different client-side hiding place.
 const ADMIN_TOKEN_KEY = 'turna_admin_token'
 
 export function getAdminToken(): string {
@@ -59,6 +69,11 @@ async function postManage<T = unknown>(command: string, params: Record<string, u
     if (entered && entered.trim()) {
       setAdminToken(entered.trim())
       try { resp = await send() } catch { throw new NodeUnreachable() }
+      // A token the node still rejects must NOT stay in sessionStorage. It would
+      // be replayed on every later mutation, each one failing and prompting
+      // again, and a typo would survive until the operator thought to close the
+      // tab. Drop it so the next attempt starts from an empty prompt.
+      if (resp.status === 401 || resp.status === 403) setAdminToken('')
     }
   }
   if (!resp.ok) {
