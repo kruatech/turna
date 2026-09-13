@@ -1,0 +1,55 @@
+# Scenario: public STUN/TURN service
+#
+# One node, open to the internet, no operator-managed accounts: clients get
+# coturn-style time-limited credentials derived from the shared secret, so
+# nothing per-user is stored here.
+#
+# Loaded by CI through the real validator with production = true. Every secret
+# comes from the environment: a literal in a file that ships with the repository
+# is a secret nobody can rotate.
+
+production = true
+
+[turn]
+listen = "0.0.0.0:3478"
+# The address handed to clients in XOR-RELAYED-ADDRESS. Behind a load balancer
+# or a cloud NAT this is the public address, not the one the socket is bound to.
+external_ip = "${TURNA_EXTERNAL_IP}"
+realm = "turn.example.net"
+
+[turn.auth]
+shared_secret = "${TURNA_SHARED_SECRET}"
+# The rotation window: put the outgoing secret here, wait for
+# turna_auth_previous_secret_total to flatten, then drop it. SIGHUP reloads both
+# without a restart.
+previous_shared_secret = "${TURNA_PREVIOUS_SHARED_SECRET:-}"
+token_ttl = 3600
+
+[turn.relay]
+min_port = 49152
+max_port = 65535
+# Below half the range: under worst-case EVEN-PORT reservations (RFC 8656 §7.2)
+# an allocation can take two ports, and a cap above half can exhaust the range
+# before the cap is reached.
+max_allocations = 8000
+
+[turn.relay.quota]
+# 2 MB/s is roughly one high-bitrate video stream. Unlimited is refused in
+# production because one authenticated client could then relay without bound.
+max_bytes_per_sec_per_allocation = 2000000
+max_per_user = 4
+
+[signaling]
+listen = "0.0.0.0:9001"
+turn_url = "turn:turn.example.net:3478"
+turn_shared_secret = "${TURNA_SHARED_SECRET}"
+
+[health]
+listen = "0.0.0.0:8080"
+
+[management]
+# Loopback. With grpc.tls_mode unset, production refuses a management listener
+# reachable from anywhere else — server-only TLS would encrypt the channel
+# without authenticating the caller, and these RPCs include shutdown.
+listen = "127.0.0.1:9090"
+enabled = true

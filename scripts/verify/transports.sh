@@ -81,8 +81,15 @@ cargo build --release -p turna-load-test \
   --features "tls,dtls,quic,web-transport" > "$OUT/build-load.log" 2>&1 || {
   echo "load-test build failed — see $OUT/build-load.log"; exit 1; }
 
+# `-addext subjectAltName`: rustls -- which both the node and every client here
+# use -- has never honoured CN as a name. A certificate with only `/CN=localhost`
+# matches nothing, so any probe that actually validates the name is refused. The
+# TLS/DTLS probes skip verification and never noticed; `wt-check` does not, which
+# is why it was the one that failed. Both loopback literals are listed so a probe
+# may address the node by name or by either IP.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout "$OUT/key.pem" -out "$OUT/cert.pem" -days 2 -subj "/CN=localhost" 2>/dev/null
+  -keyout "$OUT/key.pem" -out "$OUT/cert.pem" -days 2 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" 2>/dev/null
 
 # ── config generator ────────────────────────────────────────────────────────
 # `allow_loopback_peers` is on because every probe here relays to a peer on
@@ -215,7 +222,14 @@ fi
 
 if want wt; then
 say "phase 5: WebTransport"
-gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:3479"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = true\n' "$OUT/cert.pem" "$OUT/key.pem")"
+# `[::]` rather than `0.0.0.0`: `wt-check` addresses the node by name, and on a
+# host whose /etc/hosts maps `localhost` to ::1 first -- which GitHub's
+# ubuntu-latest does -- the client sends to [::1]:3479 while a 0.0.0.0 listener
+# hears only IPv4. The datagrams went nowhere, and the node's own counters said
+# so: after thirty seconds accepted=0 AND handshake_failures=0, i.e. not one
+# packet ever arrived. `quic-check` passed on the same port because it dials
+# 127.0.0.1 literally. A dual-stack socket accepts both.
+gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "[::]:3479"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = true\n' "$OUT/cert.pem" "$OUT/key.pem")"
 if start_node wt; then
   run "WebTransport / H3" wt-check \
     "$LOAD" --secret "$SECRET" wt-check --url https://localhost:3479/

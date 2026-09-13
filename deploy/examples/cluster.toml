@@ -1,0 +1,85 @@
+# Scenario: multi-node cluster on a shared Tarantool backend
+#
+# Nodes find each other over gossip and share allocation state, so a client
+# redirected to another node keeps working and a dead node's allocations are
+# reclaimed by a survivor.
+#
+# Three secrets must be IDENTICAL on every node: turn.auth.shared_secret (the
+# credentials one node issues are verified by another), cluster.cluster_secret
+# (unauthenticated gossip lets any host on the network inject nodes into the
+# ring), and turn.migration.ticket_secret (each node would otherwise derive an
+# independent random key and mobility tickets would not cross node boundaries).
+#
+# Loaded by CI through the real validator with production = true.
+
+production = true
+
+[turn]
+listen = "0.0.0.0:3478"
+external_ip = "${TURNA_EXTERNAL_IP}"
+realm = "turn.example.net"
+
+[turn.auth]
+shared_secret = "${TURNA_SHARED_SECRET}"
+token_ttl = 3600
+
+[turn.relay]
+min_port = 49152
+max_port = 65535
+max_allocations = 8000
+
+[turn.relay.quota]
+max_bytes_per_sec_per_allocation = 2000000
+max_per_user = 4
+
+[turn.migration]
+# RFC 8016 mobility: a client that changes address keeps its allocation instead
+# of re-allocating and losing the relay port.
+enabled = true
+ticket_secret = "${TURNA_CLUSTER_SECRET}"
+ticket_ttl_secs = 300
+
+[signaling]
+listen = "0.0.0.0:9001"
+turn_url = "turn:turn.example.net:3478"
+turn_shared_secret = "${TURNA_SHARED_SECRET}"
+
+[cluster]
+cluster_mode = true
+cluster_name = "turna-prod"
+# Per node. Keep it stable across restarts: it is the identity failover claims
+# allocations under.
+node_id = "${TURNA_NODE_ID}"
+cluster_secret = "${TURNA_CLUSTER_SECRET}"
+gossip_port = 7946
+# What peers should dial to reach this node's gossip — a routable address, not
+# the bind address, which may be 0.0.0.0 or a container-local IP.
+gossip_advertise_addr = "${TURNA_GOSSIP_ADVERTISE}"
+gossip_interval_secs = 2
+gossip_timeout_secs = 10
+seeds = []
+# Time a draining node keeps serving existing allocations before exit. Set the
+# orchestrator's terminationGracePeriodSeconds at or above the shutdown budget
+# the node logs at startup.
+drain_grace_secs = 30
+
+[cluster.backend]
+# Clustering cannot run on the in-memory backend: it is process-local, so
+# nothing would be shared. Refused by the validator regardless of production.
+type = "tarantool"
+uri = "${TURNA_BACKEND_URI}"
+user = "turna"
+password = "${TURNA_BACKEND_PASSWORD}"
+pool_size = 8
+
+[cluster.persistence]
+# Allocations are written behind the datapath rather than on it, so a node that
+# dies loses at most the in-flight window instead of adding latency per packet.
+mode = "write_behind"
+
+[health]
+listen = "0.0.0.0:8080"
+
+[management]
+listen = "127.0.0.1:9090"
+enabled = true

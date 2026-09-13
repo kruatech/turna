@@ -279,10 +279,9 @@ jobs:
         # requiring a shared backend, a non-loopback management listener.
         run: |
           set -euo pipefail
-          # `ls` on a glob that matches nothing exits 2, and under `pipefail`
-          # that killed the step before the check below could run — so the
-          # intended message never appeared and the job failed with a bare
-          # exit 2. Count with a shell glob, which cannot fail.
+          # A shell glob rather than `ls`: `ls` on a glob matching nothing exits
+          # 2, and under pipefail that killed the step before the check below
+          # could run — so the message never printed and the job failed bare.
           shopt -s nullglob
           examples=(deploy/examples/*.toml)
           found=${#examples[@]}
@@ -290,6 +289,10 @@ jobs:
             echo "::error::no example configs found in deploy/examples/ — refusing to report a clean check"
             exit 1
           fi
+          # Absolute path: `cargo test -p turna-config` runs from the crate
+          # directory, so a repo-relative path is looked up under crates/config
+          # and the file is simply not there. The Helm step above passes
+          # /tmp/turn.toml and never hit this.
           for f in "${examples[@]}"; do
             echo "::group::$f"
             TURNA_EXTERNAL_IP=203.0.113.10 \
@@ -302,7 +305,7 @@ jobs:
             TURNA_CLUSTER_SECRET=ci-cluster-secret \
             TURNA_BACKEND_URI=127.0.0.1:3301 \
             TURNA_BACKEND_PASSWORD=ci-backend-pw \
-            TURNA_CONFIG_TEST_FILE="$f" \
+            TURNA_CONFIG_TEST_FILE="$PWD/$f" \
               cargo test -p turna-config external_config_file_parses_when_requested -- --test-threads=1
             echo "::endgroup::"
           done
