@@ -781,6 +781,11 @@ impl InMemoryBackend {
     /// record is pruned only after its guarded command has completed and aged
     /// out, so a record never disappears before the command it guards.
     pub async fn gc_command_log(&self, r: CommandLogRetention, now_ms: u64) -> GcStats {
+        // ONE budget across both key spaces, not one each. `cap` is the sweep's
+        // advertised ceiling (batch * max_batches); applying it separately to
+        // commands and to idempotency records made the real ceiling 2 * cap, so
+        // a sweep sized for 10k deletions could do 20k. The per-space `deleted_`
+        // counters stay separate -- only the spending is shared.
         let cap = r.batch.saturating_mul(r.max_batches as usize).max(1);
         let mut stats = GcStats::default();
         let mut terminal_total: u64 = 0;
@@ -823,7 +828,7 @@ impl InMemoryBackend {
             let rec = e.value();
             if rec.completed_at_ms > 0
                 && now_ms.saturating_sub(rec.completed_at_ms) > r.idempotency_ms
-                && idem_remove.len() < cap
+                && to_remove.len() + idem_remove.len() < cap
             {
                 idem_remove.push(e.key().clone());
             }

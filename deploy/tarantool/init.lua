@@ -424,6 +424,22 @@ box.schema.func.create("turna_init_schema", {
         })
         box.space.turna_users:create_index("primary",
             { parts = { "username", "realm" }, if_not_exists = true })
+        -- Token revocation blacklist, kept in sync with the top-level schema
+        -- for the same reason as the command log below: a node that only calls
+        -- turna_init_schema must still get every space the stored functions
+        -- write to, or turna_revoke_token fails on a missing space and JWT
+        -- revocation silently stops working.
+        box.schema.space.create("turna_token_blacklist", { if_not_exists = true })
+        box.space.turna_token_blacklist:format({
+            { name = "jti",           type = "string"   },
+            { name = "sub",           type = "string"   },
+            { name = "revoked_at_ms", type = "unsigned" },
+            { name = "expires_at_ms", type = "unsigned" },
+        })
+        box.space.turna_token_blacklist:create_index("primary",
+            { parts = { "jti" }, if_not_exists = true })
+        box.space.turna_token_blacklist:create_index("by_expiry",
+            { parts = { "expires_at_ms" }, unique = false, if_not_exists = true })
         -- Command log + idempotency map (kept in sync with the top-level schema
         -- so a node that only calls turna_init_schema still gets them).
         box.schema.space.create("turna_commands", { if_not_exists = true })
@@ -581,12 +597,21 @@ box.schema.func.create("turna_find_by_node", {
 
 box.schema.func.create("turna_find_expired", {
     language = "LUA", is_sandboxed = false, setuid = true,
-    body = [[function(before_ms)
+    body = [[function(before_ms, max)
+        -- `max` is optional; 0 (and a missing argument, which is what the
+        -- current Rust caller sends) means unbounded, so behaviour is unchanged
+        -- until the caller opts in. It exists because tarantool.rs refuses a
+        -- response over 16 MiB and POISONS the pool slot: an unbounded sweep
+        -- after a mass expiry costs a reconnect instead of returning a page.
+        -- by_expiry is ascending, so a bounded page is the OLDEST expired set
+        -- and the remainder is picked up by the next sweep.
         local cutoff = tonumber(before_ms)
+        local cap = tonumber(max) or 0
         local res = {}
         for _,t in box.space.turna_allocations.index.by_expiry:pairs() do
             if t[4] >= cutoff then break end
             table.insert(res, t[5])
+            if cap > 0 and #res >= cap then break end
         end
         return res
     end]],
@@ -600,14 +625,22 @@ box.schema.func.create("turna_count_allocations", {
 box.schema.func.create("turna_list_allocations", {
     language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(offset, limit)
-        local off = tonumber(offset)
-        local lim = tonumber(limit)
+        -- The cap is checked BEFORE the insert. Checking after returns one row
+        -- for limit = 0, where the reference implementation
+        -- (memory.rs::list_allocations, `.take(limit)`) returns none. The
+        -- tonumber fallbacks keep a malformed argument from raising on a nil
+        -- comparison instead of returning an empty page.
+        local off = tonumber(offset) or 0
+        local lim = tonumber(limit) or 0
         local res = {}
+        if lim < 1 then return res end
         local i = 0
         for _,t in box.space.turna_allocations:pairs() do
             i = i + 1
-            if i > off then table.insert(res, t[5]) end
-            if #res >= lim then break end
+            if i > off then
+                table.insert(res, t[5])
+                if #res >= lim then break end
+            end
         end
         return res
     end]],
@@ -627,7 +660,11 @@ box.schema.func.create("turna_get_live_nodes", {
         local res = {}
         for _,t in box.space.turna_nodes:pairs() do
             local d = require('json').decode(t[2])
-            if d.last_seen_ms >= cutoff then table.insert(res, t[2]) end
+            -- Strictly greater, matching the reference implementation in
+            -- crates/state-backend/src/memory.rs::get_live_nodes. The two
+            -- backends must agree on the boundary or a node is live on one and
+            -- dead on the other for exactly one millisecond.
+            if d.last_seen_ms > cutoff then table.insert(res, t[2]) end
         end
         return res
     end]],
@@ -679,25 +716,41 @@ box.schema.func.create("turna_is_token_revoked", {
 
 box.schema.func.create("turna_cleanup_revoked_tokens", {
     language = "LUA", is_sandboxed = false, setuid = true,
-    body = [[function(before_ms)
+    body = [[function(before_ms, max)
+        -- Never mutate a space while iterating its own index: a TREE iterator
+        -- repositions after a delete and silently skips rows, so a single pass
+        -- left part of the expired set behind and under-reported the count.
+        -- Collect keys first, delete after, the same discipline as
+        -- turna_gc_command_log and turna_claim_commands. `max` is optional
+        -- (0 = unbounded) and bounds the implicit transaction; a caller that
+        -- passes it loops while the result equals the cap.
         local cutoff = tonumber(before_ms)
-        local deleted = 0
+        local cap = tonumber(max) or 0
+        local keys = {}
         for _, t in box.space.turna_token_blacklist.index.by_expiry:pairs() do
             if t[4] >= cutoff then break end
-            box.space.turna_token_blacklist:delete(t[1])
-            deleted = deleted + 1
+            table.insert(keys, t[1])
+            if cap > 0 and #keys >= cap then break end
         end
-        return deleted
+        for _, k in ipairs(keys) do
+            box.space.turna_token_blacklist:delete(k)
+        end
+        return #keys
     end]],
 })
 
 box.schema.func.create("turna_load_active_revocations", {
     language = "LUA", is_sandboxed = false, setuid = true,
     body = [[function(after_ms)
+        -- Seek by_expiry to the cutoff rather than scanning the whole space and
+        -- filtering: the index is ascending, so GE is exactly the wanted
+        -- suffix. turna_cleanup_revoked_tokens already uses the ordering for an
+        -- early break; this is the same property read from the other end.
         local cutoff = tonumber(after_ms)
         local res = {}
-        for _, t in box.space.turna_token_blacklist.index.by_expiry:pairs() do
-            if t[4] >= cutoff then table.insert(res, t[1] .. ":" .. tostring(t[4])) end
+        for _, t in box.space.turna_token_blacklist.index.by_expiry:pairs({ cutoff },
+                { iterator = 'GE' }) do
+            table.insert(res, t[1] .. ":" .. tostring(t[4]))
         end
         return res
     end]],
@@ -1027,38 +1080,51 @@ box.schema.func.create("turna_enqueue_command", {
         -- P0.3 durable idempotency conflict/outcome semantics. First request_id
         -- to claim a non-empty key is canonical. A later retry with the SAME key:
         --   same payload_hash  -> return the canonical id (genuine retry);
-        --   different hash      -> return (request_id, true) = CONFLICT.
+        --   different hash     -> return (request_id, true) = CONFLICT.
         -- The idem record is self-sufficient (carries hash + outcome) so it can
-        -- outlive the command under GC. A single CALL is atomic (box ops do not
-        -- yield), so check-then-insert cannot race. Returns (canonical, conflict).
+        -- outlive the command under GC. Returns (canonical, conflict).
+        --
+        -- A single CALL cannot RACE, since no box op here yields, but that is
+        -- not the same as all-or-nothing: a stored proc is NOT an implicit
+        -- transaction in memtx, so if the turna_commands insert raises, the
+        -- idempotency row is already durable and permanently guards a command
+        -- that does not exist. box.atomic makes both writes land or neither,
+        -- which is the rule turna_confirm_runtime_observed spells out. The
+        -- results travel through outer locals because box.atomic does not
+        -- reliably proxy a multi-value return (see turna_migration_idem_apply).
         local json = require('json')
         local d = json.decode(data)
         local key = d.idempotency_key
         local now = math.floor(require('clock').realtime() * 1000)
-        if key ~= nil and key ~= '' then
-            local existing = box.space.turna_command_idem:get(key)
-            if existing ~= nil then
-                -- Legacy (pre-2b) rows have no payload_hash (field 3 nil): never
-                -- treat as a conflict — fall back to prior dedup behaviour.
-                if existing[3] ~= nil and payload_hash ~= nil and payload_hash ~= ''
-                    and existing[3] ~= payload_hash then
-                    return request_id, true
+        local r_id, r_conflict = request_id, false
+        box.atomic(function()
+            if key ~= nil and key ~= '' then
+                local existing = box.space.turna_command_idem:get(key)
+                if existing ~= nil then
+                    -- Legacy (pre-2b) rows have no payload_hash (field 3 nil):
+                    -- never treat as a conflict, fall back to prior dedup.
+                    if existing[3] ~= nil and payload_hash ~= nil and payload_hash ~= ''
+                        and existing[3] ~= payload_hash then
+                        r_id, r_conflict = request_id, true
+                        return
+                    end
+                    if existing[2] ~= request_id then
+                        r_id, r_conflict = existing[2], false
+                        return
+                    end
+                else
+                    box.space.turna_command_idem:insert({
+                        key, request_id, payload_hash or '', '', '', now, 0
+                    })
                 end
-                if existing[2] ~= request_id then
-                    return existing[2], false
-                end
-            else
-                box.space.turna_command_idem:insert({
-                    key, request_id, payload_hash or '', '', '', now, 0
+            end
+            if box.space.turna_commands:get(request_id) == nil then
+                box.space.turna_commands:insert({
+                    request_id, target_node_id, data, d.status, d.updated_at_ms or now
                 })
             end
-        end
-        if box.space.turna_commands:get(request_id) == nil then
-            box.space.turna_commands:insert({
-                request_id, target_node_id, data, d.status, d.updated_at_ms or now
-            })
-        end
-        return request_id, false
+        end)
+        return r_id, r_conflict
     end]],
 })
 
@@ -1148,36 +1214,46 @@ box.schema.func.create("turna_complete_command", {
         -- BOTH claimed_by and the per-claim claim_token match. A stale claimant
         -- (lease expired, row reclaimed with a new token) is rejected even if its
         -- node id matches. Returns true iff applied, false otherwise.
-        local t = box.space.turna_commands:get(request_id)
-        if t == nil then return false end
-        local json = require('json')
-        local d = json.decode(t[3])
-        if d.status == 'in_progress'
-            and d.claimed_by == claimed_by
-            and d.claim_token == claim_token then
-            local now = math.floor(require('clock').realtime() * 1000)
-            d.status = status
-            d.result = result
-            d.updated_at_ms = now
-            box.space.turna_commands:replace({
-                request_id, t[2], json.encode(d), d.status, d.updated_at_ms
-            })
-            -- Mirror the terminal outcome onto the idem record (post-prune replay);
-            -- replace upgrades a legacy 2-field row and preserves hash/created.
-            if d.idempotency_key ~= nil and d.idempotency_key ~= '' then
-                local ex = box.space.turna_command_idem:get(d.idempotency_key)
-                -- #3.7: the confirm-observed outcome is authoritative; completion
-                -- writes the same terminal result and never downgrades a record
-                -- that already reached a terminal outcome.
-                if ex ~= nil and (ex[4] == nil or ex[4] == '') then
-                    box.space.turna_command_idem:replace({
-                        ex[1], ex[2], ex[3] or '', status, result, ex[6] or 0, now
-                    })
+        --
+        -- The command replace and the idempotency mirror are ONE unit: memtx
+        -- does not make a stored proc atomic on its own, so without box.atomic
+        -- a failing second write leaves the command terminal while the journal
+        -- still reads non-terminal, and a replay then re-runs an applied
+        -- command. Same rule as turna_confirm_runtime_observed; nothing inside
+        -- yields, so the transaction is safe.
+        return box.atomic(function()
+            local t = box.space.turna_commands:get(request_id)
+            if t == nil then return false end
+            local json = require('json')
+            local d = json.decode(t[3])
+            if d.status == 'in_progress'
+                and d.claimed_by == claimed_by
+                and d.claim_token == claim_token then
+                local now = math.floor(require('clock').realtime() * 1000)
+                d.status = status
+                d.result = result
+                d.updated_at_ms = now
+                box.space.turna_commands:replace({
+                    request_id, t[2], json.encode(d), d.status, d.updated_at_ms
+                })
+                -- Mirror the terminal outcome onto the idem record (post-prune
+                -- replay); replace upgrades a legacy 2-field row and preserves
+                -- hash/created.
+                if d.idempotency_key ~= nil and d.idempotency_key ~= '' then
+                    local ex = box.space.turna_command_idem:get(d.idempotency_key)
+                    -- #3.7: the confirm-observed outcome is authoritative;
+                    -- completion writes the same terminal result and never
+                    -- downgrades a record that already reached a terminal outcome.
+                    if ex ~= nil and (ex[4] == nil or ex[4] == '') then
+                        box.space.turna_command_idem:replace({
+                            ex[1], ex[2], ex[3] or '', status, result, ex[6] or 0, now
+                        })
+                    end
                 end
+                return true
             end
-            return true
-        end
-        return false
+            return false
+        end)
     end]],
 })
 
@@ -1189,34 +1265,37 @@ box.schema.func.create("turna_finalize_stale_command", {
         -- command exists, is non-terminal, and its target_incarnation is
         -- non-empty and differs from current_incarnation. Returns true iff it
         -- transitioned the command to done. Mirrors the terminal outcome onto
-        -- the idempotency record (post-prune replay), like turna_complete_command.
-        local t = box.space.turna_commands:get(request_id)
-        if t == nil then return false end
-        local json = require('json')
-        local d = json.decode(t[3])
-        local terminal = d.status == 'done' or d.status == 'failed'
-        local stale = d.target_incarnation ~= nil and d.target_incarnation ~= ''
-            and d.target_incarnation ~= current_incarnation
-        if terminal or not stale then return false end
-        local now = math.floor(require('clock').realtime() * 1000)
-        d.status = 'done'
-        d.result = result
-        d.updated_at_ms = now
-        box.space.turna_commands:replace({
-            request_id, t[2], json.encode(d), d.status, d.updated_at_ms
-        })
-        if d.idempotency_key ~= nil and d.idempotency_key ~= '' then
-            local ex = box.space.turna_command_idem:get(d.idempotency_key)
-            -- #3.7: never downgrade an already-terminal outcome — an applied
-            -- command whose completion was lost keeps its journaled result rather
-            -- than being overwritten by a superseding finalize.
-            if ex ~= nil and (ex[4] == nil or ex[4] == '') then
-                box.space.turna_command_idem:replace({
-                    ex[1], ex[2], ex[3] or '', 'done', result, ex[6] or 0, now
-                })
+        -- the idempotency record (post-prune replay), like turna_complete_command
+        -- -- and, like it, as ONE transaction: both writes land or neither.
+        return box.atomic(function()
+            local t = box.space.turna_commands:get(request_id)
+            if t == nil then return false end
+            local json = require('json')
+            local d = json.decode(t[3])
+            local terminal = d.status == 'done' or d.status == 'failed'
+            local stale = d.target_incarnation ~= nil and d.target_incarnation ~= ''
+                and d.target_incarnation ~= current_incarnation
+            if terminal or not stale then return false end
+            local now = math.floor(require('clock').realtime() * 1000)
+            d.status = 'done'
+            d.result = result
+            d.updated_at_ms = now
+            box.space.turna_commands:replace({
+                request_id, t[2], json.encode(d), d.status, d.updated_at_ms
+            })
+            if d.idempotency_key ~= nil and d.idempotency_key ~= '' then
+                local ex = box.space.turna_command_idem:get(d.idempotency_key)
+                -- #3.7: never downgrade an already-terminal outcome -- an applied
+                -- command whose completion was lost keeps its journaled result
+                -- rather than being overwritten by a superseding finalize.
+                if ex ~= nil and (ex[4] == nil or ex[4] == '') then
+                    box.space.turna_command_idem:replace({
+                        ex[1], ex[2], ex[3] or '', 'done', result, ex[6] or 0, now
+                    })
+                end
             end
-        end
-        return true
+            return true
+        end)
     end]],
 })
 
