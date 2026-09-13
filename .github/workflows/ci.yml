@@ -279,12 +279,18 @@ jobs:
         # requiring a shared backend, a non-loopback management listener.
         run: |
           set -euo pipefail
-          found=$(ls deploy/examples/*.toml 2>/dev/null | wc -l | tr -d ' ')
+          # `ls` on a glob that matches nothing exits 2, and under `pipefail`
+          # that killed the step before the check below could run — so the
+          # intended message never appeared and the job failed with a bare
+          # exit 2. Count with a shell glob, which cannot fail.
+          shopt -s nullglob
+          examples=(deploy/examples/*.toml)
+          found=${#examples[@]}
           if [ "$found" -eq 0 ]; then
-            echo "::error::no example configs found — refusing to report a clean check"
+            echo "::error::no example configs found in deploy/examples/ — refusing to report a clean check"
             exit 1
           fi
-          for f in deploy/examples/*.toml; do
+          for f in "${examples[@]}"; do
             echo "::group::$f"
             TURNA_EXTERNAL_IP=203.0.113.10 \
             TURNA_SHARED_SECRET=ci-example-secret-not-the-placeholder \
@@ -585,10 +591,15 @@ jobs:
           for t in deploy/tarantool/tests/*_test.lua; do
             name=$(basename "$t")
             echo "::group::$name"
-            docker run --rm -e TURNA_PASSWORD=turna \
+            # --entrypoint: the image's ENTRYPOINT is docker-entrypoint.sh with
+            # CMD tarantool, and it treats its first argument as a script path.
+            # `tarantool -e "..."` therefore reached the binary as two file
+            # names and died with `cannot open -e`, so this step had never run a
+            # single suite. Calling the binary directly passes -e through.
+            docker run --rm --entrypoint tarantool -e TURNA_PASSWORD=turna \
               -v "$PWD/deploy/tarantool:/opt/turna:ro" \
               tarantool/tarantool:2 \
-              tarantool -e "dofile('/opt/turna/init.lua'); dofile('/opt/turna/tests/${name}')"
+              -e "dofile('/opt/turna/init.lua'); dofile('/opt/turna/tests/${name}')"
             ran=$((ran + 1))
             echo "::endgroup::"
           done

@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use futures_util::stream::TryStreamExt;
 use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourState};
 use netlink_packet_route::route::{RouteAddress, RouteAttribute};
+use netlink_packet_route::AddressFamily;
 use rtnetlink::sys::AsyncSocket;
-use rtnetlink::{new_connection, Handle, IpVersion, RouteMessageBuilder};
+use rtnetlink::{new_connection, Handle, RouteMessageBuilder};
 
 pub type Mac = [u8; 6];
 
@@ -140,11 +141,19 @@ async fn next_hop(handle: &Handle, target: IpAddr) -> Option<IpAddr> {
 /// Look up the MAC of `next_hop` in the neighbour table. Skips entries that
 /// cannot have a usable address (INCOMPLETE / FAILED / NOARP).
 async fn neigh_mac(handle: &Handle, next_hop: IpAddr) -> Option<Mac> {
+    // rtnetlink 0.23 renamed `set_family(IpVersion)` to
+    // `set_address_family(AddressFamily)`; the old name is deprecated and the
+    // af-xdp jobs deny warnings, so it is a hard error there while the
+    // default-feature build stays green. Same request on the wire.
     let family = match next_hop {
-        IpAddr::V4(_) => IpVersion::V4,
-        IpAddr::V6(_) => IpVersion::V6,
+        IpAddr::V4(_) => AddressFamily::Inet,
+        IpAddr::V6(_) => AddressFamily::Inet6,
     };
-    let mut ns = handle.neighbours().get().set_family(family).execute();
+    let mut ns = handle
+        .neighbours()
+        .get()
+        .set_address_family(family)
+        .execute();
     while let Ok(Some(msg)) = ns.try_next().await {
         if matches!(
             msg.header.state,
