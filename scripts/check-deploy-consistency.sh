@@ -41,14 +41,45 @@ toml_max="$(printf '%s\n' "$relay_block" | awk -F= '/^[[:space:]]*max_port[[:spa
 
 [ -n "$toml_min" ] && [ -n "$toml_max" ] || fail "could not read [turn.relay] min_port/max_port from $TOML"
 
-# ── 2. docker-compose published relay UDP range: "<h1>-<h2>:<c1>-<c2>/udp" ────
+# ── 2. docker-compose relay UDP range ────────────────────────────────────────
+#
+# Two valid shapes, and the check has to know both:
+#
+#   a) `network_mode: host` — no published range exists, and none should. The
+#      container shares the host's stack, so every relay port is reachable by
+#      definition. This is what deploy/docker-compose.yml does, and the reason is
+#      in the file: publishing 16 384 ports through the bridge costs a rule (and
+#      possibly a docker-proxy process) per port, and hides the client's real
+#      source address from the per-IP rate limiter.
+#
+#   b) A published `"<min>-<max>:<min>-<max>/udp"` range, which must equal
+#      turn.toml's. That is the bridge-mode deployment, and the failure it
+#      guards against is an allocation handed out on an unpublished port: the
+#      Allocate succeeds and the media silently goes nowhere.
+#
+# Host mode is only accepted when the `network_mode: host` line is actually
+# there. A compose file with neither a host mode nor a published range is the
+# broken case, and it must not read as "host mode, nothing to check".
+compose_host_mode=0
+grep -qE '^\s*network_mode:\s*host\s*$' "$COMPOSE" && compose_host_mode=1
+
 compose_line="$(grep -E '"[0-9]+-[0-9]+:[0-9]+-[0-9]+/udp"' "$COMPOSE" || true)"
-[ -n "$compose_line" ] || fail "no published relay UDP range (\"<min>-<max>:<min>-<max>/udp\") found in $COMPOSE"
 
-read -r c_h1 c_h2 c_c1 c_c2 <<<"$(printf '%s\n' "$compose_line" | sed -E 's/.*"([0-9]+)-([0-9]+):([0-9]+)-([0-9]+)\/udp".*/\1 \2 \3 \4/')"
+if [ "$compose_host_mode" = 1 ] && [ -n "$compose_line" ]; then
+  fail "$COMPOSE uses network_mode: host AND publishes a relay range — the published range is ignored in host mode, so one of the two is a leftover"
+fi
 
-[ "$c_h1" = "$c_c1" ] && [ "$c_h2" = "$c_c2" ] \
-  || fail "compose host range ${c_h1}-${c_h2} != container range ${c_c1}-${c_c2} in $COMPOSE"
+if [ "$compose_host_mode" = 1 ]; then
+  echo "deploy-consistency: compose uses host networking — no published relay range to compare"
+  c_h1="$toml_min"; c_h2="$toml_max"; c_c1="$toml_min"; c_c2="$toml_max"
+else
+  [ -n "$compose_line" ] || fail "no published relay UDP range (\"<min>-<max>:<min>-<max>/udp\") and no network_mode: host in $COMPOSE"
+
+  read -r c_h1 c_h2 c_c1 c_c2 <<<"$(printf '%s\n' "$compose_line" | sed -E 's/.*"([0-9]+)-([0-9]+):([0-9]+)-([0-9]+)\/udp".*/\1 \2 \3 \4/')"
+
+  [ "$c_h1" = "$c_c1" ] && [ "$c_h2" = "$c_c2" ] \
+    || fail "compose host range ${c_h1}-${c_h2} != container range ${c_c1}-${c_c2} in $COMPOSE"
+fi
 
 # ── 3. helm values relayPortRange.min / .max ─────────────────────────────────
 helm_min="$(awk '
@@ -65,7 +96,12 @@ helm_max="$(awk '
 [ -n "$helm_min" ] && [ -n "$helm_max" ] || fail "could not read relayPortRange.min/max from $VALUES"
 
 # ── Compare all three against the toml source of truth ───────────────────────
-echo "deploy-consistency: turn.toml=${toml_min}-${toml_max}  compose=${c_h1}-${c_h2}  helm=${helm_min}-${helm_max}"
+if [ "$compose_host_mode" = 1 ]; then
+  compose_desc="host-net"
+else
+  compose_desc="${c_h1}-${c_h2}"
+fi
+echo "deploy-consistency: turn.toml=${toml_min}-${toml_max}  compose=${compose_desc}  helm=${helm_min}-${helm_max}"
 
 ok=1
 [ "$c_h1" = "$toml_min" ] && [ "$c_h2" = "$toml_max" ] || { echo "  MISMATCH: docker-compose ${c_h1}-${c_h2} != turn.toml ${toml_min}-${toml_max}" >&2; ok=0; }

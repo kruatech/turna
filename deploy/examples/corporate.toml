@@ -54,11 +54,6 @@ key_path = "/etc/turna/tls/key.pem"
 cert_reload_secs = 300
 enable_alpn = true
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_url = "turns:turn.corp.example:5349"
-turn_shared_secret = "${TURNA_SHARED_SECRET}"
-
 [health]
 listen = "0.0.0.0:8080"
 

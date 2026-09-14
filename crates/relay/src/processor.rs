@@ -182,26 +182,73 @@ fn encode_with_integrity_auto(
 /// reconnects is the point. An operator reading these lines is looking at hosts,
 /// not sessions; use `allocation_id` to tell sessions apart.
 fn loggable_addr(addr: &std::net::SocketAddr) -> String {
-    use std::sync::OnceLock;
-    static SALT: OnceLock<u64> = OnceLock::new();
     if LOG_ALLOCATION_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
         return addr.to_string();
     }
+    hash_ip(&addr.ip())
+}
+
+/// The salted label itself, shared by [`loggable_addr`] and [`loggable_ip`] so
+/// one host cannot end up with two labels depending on which call site saw it.
+fn hash_ip(ip: &std::net::IpAddr) -> String {
+    use std::sync::OnceLock;
+    static SALT: OnceLock<u64> = OnceLock::new();
+    // Eight random bytes from /dev/urandom, once per process.
+    //
+    // This used to derive the salt from the process start time, which is the
+    // exact fallback `observability::syslog` documents CodeQL catching and
+    // rejecting: a restart time is often observable from outside — a rolling
+    // upgrade, a status page, a gap in the metrics — and the search space then
+    // collapses against four billion IPv4 addresses. A label that *looks* like a
+    // hash and protects nothing is worse than no label, because nobody checks.
+    //
+    // If the read fails, addresses are written verbatim and the reason is logged
+    // once, rather than substituting something weaker.
     let salt = *SALT.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+            Ok(()) => u64::from_le_bytes(buf),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "could not read /dev/urandom, so client addresses will NOT be \
+                     redacted in logs — they are written verbatim. A salt derived \
+                     from anything predictable would look like a hash and protect \
+                     nothing, so none is produced."
+                );
+                0
+            }
+        }
     });
-    // FNV-1a. Not cryptographic and does not need to be: the salt is not written
-    // anywhere, and what this provides is a stable label within a process rather
-    // than resistance to an attacker who already holds the log.
+    if salt == 0 {
+        return ip.to_string();
+    }
+    // FNV-1a. Not cryptographic and does not need to be: the salt is never
+    // written anywhere, and what this provides is a stable label within a process
+    // rather than resistance to an attacker who already holds the log.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt;
-    for b in addr.ip().to_string().bytes() {
+    for b in ip.to_string().bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     format!("ip-{h:012x}")
+}
+
+/// A peer or client IP as it should appear in a log.
+///
+/// The `IpAddr` sibling of [`loggable_addr`], for the sites that have no port:
+/// peer addresses from CreatePermission and ChannelBind. Same salt, so a host
+/// carries one label across every line about it — a permission denial and the
+/// allocation it belongs to correlate, which is the whole reason the hash is
+/// stable within a process.
+fn loggable_ip(ip: &std::net::IpAddr) -> String {
+    if LOG_ALLOCATION_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
+        return ip.to_string();
+    }
+    // NOT `loggable_addr(&SocketAddr::new(*ip, 0))`: that would print `1.2.3.4:0`
+    // in the verbatim branch, inventing a port these call sites do not have.
+    hash_ip(ip)
 }
 
 /// Set once at startup from configuration.
@@ -433,6 +480,17 @@ pub struct PacketProcessor {
     store: Arc<AllocationStore>,
     auth: Arc<AuthRegistry>,
     rate_limiter: TieredRateLimiter,
+    /// Second limiter, for sources inside `trusted_prefixes`. `None` when no
+    /// prefix is configured, which is the default — one limiter, exactly as
+    /// before.
+    ///
+    /// A second limiter rather than a branch inside `TieredRateLimiter`: the
+    /// tiers are independent token buckets, so "which bucket" is the only
+    /// decision, and making it at the door keeps every `check_*` on the hot path
+    /// unchanged.
+    trusted_limiter: Option<TieredRateLimiter>,
+    /// Ranges whose sources use `trusted_limiter`. Empty unless configured.
+    trusted_prefixes: Vec<crate::peer_filter::Cidr>,
     external_ip: std::net::IpAddr,
     /// RFC 6156 IPv6 relayed transport. `None` (the default) keeps the historical
     /// IPv4-only behaviour: an explicit `REQUESTED-ADDRESS-FAMILY = IPv6` is
@@ -453,6 +511,119 @@ pub struct PacketProcessor {
     /// RFC 6062 TCP relay engine. `None` = TCP allocations disabled (Allocate
     /// with REQUESTED-TRANSPORT=TCP → 442).
     tcp_relay: Option<Arc<TcpRelayManager>>,
+}
+
+/// Rate-limit tiers handed to a [`PacketProcessor`].
+///
+/// Until 0.5.0 these came only from `TURNA_*` environment variables read inside
+/// the constructor, so the values in force were in no config file and no config
+/// dump — an operator hitting the Allocate ceiling had nothing to look at.
+#[derive(Debug, Clone)]
+pub struct RateLimitSettings {
+    /// Applied to every source not matched by `trusted_prefixes`.
+    pub default: TieredLimits,
+    /// Applied to sources inside `trusted_prefixes`.
+    pub trusted: TieredLimits,
+    /// CIDR ranges whose sources get the `trusted` tier: the offices and VPN
+    /// pools where hundreds of users share one NAT address.
+    pub trusted_prefixes: Vec<String>,
+}
+
+impl RateLimitSettings {
+    /// Apply the legacy `TURNA_*` overrides on top of `base`.
+    ///
+    /// **Deprecated.** Kept because someone may have these exported in a running
+    /// deployment right now, and removing them silently would change limits on
+    /// the next restart with nothing in the log. Each one that is set warns, and
+    /// they go away in the release after next. `[turn.rate_limit]` is the
+    /// supported place.
+    pub fn env_overrides(base: TieredLimits) -> TieredLimits {
+        let mut limits = base;
+        let env_pair = |bkey: &str, rkey: &str, pair: &mut (u32, u32)| {
+            for (key, slot) in [(bkey, &mut pair.0), (rkey, &mut pair.1)] {
+                if let Some(v) = std::env::var(key).ok().and_then(|v| v.parse().ok()) {
+                    tracing::warn!(
+                        env = key,
+                        value = v,
+                        "rate limit set through an environment variable; this is \
+                         deprecated — move it to [turn.rate_limit] in the config file, \
+                         where it is visible in --dump-config"
+                    );
+                    *slot = v;
+                }
+            }
+        };
+        env_pair(
+            "TURNA_RATE_LIMIT_BURST",
+            "TURNA_RATE_LIMIT_RPS",
+            &mut limits.per_ip,
+        );
+        env_pair(
+            "TURNA_PREFIX_BURST",
+            "TURNA_PREFIX_RPS",
+            &mut limits.per_prefix,
+        );
+        env_pair(
+            "TURNA_ALLOCATE_BURST",
+            "TURNA_ALLOCATE_RPS",
+            &mut limits.allocate,
+        );
+        env_pair(
+            "TURNA_CREATE_PERM_BURST",
+            "TURNA_CREATE_PERM_RPS",
+            &mut limits.create_permission,
+        );
+        env_pair(
+            "TURNA_CHANNEL_BIND_BURST",
+            "TURNA_CHANNEL_BIND_RPS",
+            &mut limits.channel_bind,
+        );
+        limits
+    }
+}
+
+impl PacketProcessor {
+    /// Replace the rate limiters with configured ones.
+    ///
+    /// A builder, like [`with_external_ip6`](Self::with_external_ip6), so no
+    /// constructor signature changes and the call sites that do not have a
+    /// config keep working.
+    ///
+    /// The environment overrides still apply on top, so a deployment that has
+    /// them exported keeps its current behaviour (and now says so in the log).
+    pub fn with_rate_limits(mut self, settings: &RateLimitSettings) -> Self {
+        self.rate_limiter =
+            TieredRateLimiter::new(RateLimitSettings::env_overrides(settings.default));
+        self.trusted_prefixes =
+            crate::peer_filter::parse_ranges(&settings.trusted_prefixes, "trusted_prefixes");
+        // No prefixes means no second limiter to keep: `limiter_for` then never
+        // looks at the list, and the hot path is byte-identical to before.
+        self.trusted_limiter = if self.trusted_prefixes.is_empty() {
+            None
+        } else {
+            tracing::info!(
+                prefixes = self.trusted_prefixes.len(),
+                // `.1` is the refill rate; `.0` is the burst depth.
+                allocate_rps = settings.trusted.allocate.1,
+                "trusted rate-limit tier active"
+            );
+            Some(TieredRateLimiter::new(settings.trusted))
+        };
+        self
+    }
+
+    /// Which limiter governs this source.
+    ///
+    /// Linear scan: the list is an operator's own prefixes, so single digits in
+    /// practice, and `peer_filter` matches its allow/deny lists the same way on
+    /// a hotter path.
+    #[inline]
+    fn limiter_for(&self, ip: std::net::IpAddr) -> &TieredRateLimiter {
+        match &self.trusted_limiter {
+            Some(trusted) if self.trusted_prefixes.iter().any(|c| c.contains(ip)) => trusted,
+            _ => &self.rate_limiter,
+        }
+    }
 }
 
 impl PacketProcessor {
@@ -496,43 +667,11 @@ impl PacketProcessor {
         Self {
             store,
             auth,
-            rate_limiter: {
-                let mut limits = TieredLimits::default();
-                let env_pair = |bkey: &str, rkey: &str, pair: &mut (u32, u32)| {
-                    if let Some(b) = std::env::var(bkey).ok().and_then(|v| v.parse().ok()) {
-                        pair.0 = b;
-                    }
-                    if let Some(r) = std::env::var(rkey).ok().and_then(|v| v.parse().ok()) {
-                        pair.1 = r;
-                    }
-                };
-                env_pair(
-                    "TURNA_RATE_LIMIT_BURST",
-                    "TURNA_RATE_LIMIT_RPS",
-                    &mut limits.per_ip,
-                );
-                env_pair(
-                    "TURNA_PREFIX_BURST",
-                    "TURNA_PREFIX_RPS",
-                    &mut limits.per_prefix,
-                );
-                env_pair(
-                    "TURNA_ALLOCATE_BURST",
-                    "TURNA_ALLOCATE_RPS",
-                    &mut limits.allocate,
-                );
-                env_pair(
-                    "TURNA_CREATE_PERM_BURST",
-                    "TURNA_CREATE_PERM_RPS",
-                    &mut limits.create_permission,
-                );
-                env_pair(
-                    "TURNA_CHANNEL_BIND_BURST",
-                    "TURNA_CHANNEL_BIND_RPS",
-                    &mut limits.channel_bind,
-                );
-                TieredRateLimiter::new(limits)
-            },
+            rate_limiter: TieredRateLimiter::new(RateLimitSettings::env_overrides(
+                TieredLimits::default(),
+            )),
+            trusted_limiter: None,
+            trusted_prefixes: Vec::new(),
             external_ip,
             external_ip6: None,
             nonce_mgr: NonceManager::new(),
@@ -577,6 +716,12 @@ impl PacketProcessor {
     /// idle buckets linger until restart; the maintenance loop calls this.
     pub fn cleanup_rate_limiter(&self, max_age_secs: f64) {
         self.rate_limiter.cleanup(max_age_secs);
+        // The trusted limiter holds its own per-IP buckets and would otherwise
+        // grow without bound — the leak would be invisible, because the tier
+        // that leaks is the one serving the busiest sources.
+        if let Some(trusted) = &self.trusted_limiter {
+            trusted.cleanup(max_age_secs);
+        }
     }
 
     // ── Main entry point ─────────────────────────────────────────────────────
@@ -700,7 +845,7 @@ impl PacketProcessor {
             // `process_channel_data`, and established sessions are bounded by
             // the per-allocation bandwidth quota — so a cheaper per-IP-only
             // gate (single shard lock) is sufficient here.
-            if !self.rate_limiter.check_ingress_ip(src.ip()) {
+            if !self.limiter_for(src.ip()).check_ingress_ip(src.ip()) {
                 self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                 return vec![Action::None];
             }
@@ -717,7 +862,7 @@ impl PacketProcessor {
         }
 
         // STUN is pre-auth: keep the full per-IP + per-prefix ingress gate.
-        if !self.rate_limiter.check_ingress(src.ip()) {
+        if !self.limiter_for(src.ip()).check_ingress(src.ip()) {
             self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
@@ -752,7 +897,7 @@ impl PacketProcessor {
                 .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
             // ChannelData uses the per-IP-only ingress gate (see P5 in process()).
-            if !self.rate_limiter.check_ingress_ip(src.ip()) {
+            if !self.limiter_for(src.ip()).check_ingress_ip(src.ip()) {
                 self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                 return vec![Action::None];
             }
@@ -833,7 +978,7 @@ impl PacketProcessor {
         );
         if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
             drop(alloc);
-            debug!(%peer_addr, "bandwidth quota exceeded, dropping relay->client packet");
+            debug!(peer_addr = %loggable_addr(&peer_addr), "bandwidth quota exceeded, dropping relay->client packet");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
@@ -911,7 +1056,7 @@ impl PacketProcessor {
             &alloc.username,
         );
         if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
-            debug!(%src, "bandwidth quota exceeded, dropping packet");
+            debug!(src = %loggable_addr(&src), "bandwidth quota exceeded, dropping packet");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -999,7 +1144,7 @@ impl PacketProcessor {
                 // a reflection/amplification vector. Semantic errors (420/440/
                 // 442/…) are only produced once a message parses cleanly, so the
                 // syntax layer rejects quietly while the protocol layer answers.
-                warn!(%src, %e, "STUN decode error");
+                warn!(src = %loggable_addr(&src), %e, "STUN decode error");
                 self.metrics
                     .parser_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -1021,7 +1166,7 @@ impl PacketProcessor {
         match (&msg.class, &msg.method) {
             (MessageClass::Request, Method::Binding) => self.handle_binding(&msg, &raw, src),
             (MessageClass::Request, Method::Allocate) => {
-                if !self.rate_limiter.check_allocate(src.ip()) {
+                if !self.limiter_for(src.ip()).check_allocate(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                     return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
                 }
@@ -1029,14 +1174,14 @@ impl PacketProcessor {
             }
             (MessageClass::Request, Method::Refresh) => self.handle_refresh(&msg, &raw, src),
             (MessageClass::Request, Method::CreatePermission) => {
-                if !self.rate_limiter.check_create_permission(src.ip()) {
+                if !self.limiter_for(src.ip()).check_create_permission(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                     return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_create_permission(&msg, &raw, src)
             }
             (MessageClass::Request, Method::ChannelBind) => {
-                if !self.rate_limiter.check_channel_bind(src.ip()) {
+                if !self.limiter_for(src.ip()).check_channel_bind(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                     return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
                 }
@@ -1121,7 +1266,7 @@ impl PacketProcessor {
         }
 
         debug!(
-            %src,
+            src = %loggable_addr(&src),
             draining,
             local_node_id = %routing.local_node_id,
             target_node_id = %target.node_id,
@@ -1218,7 +1363,7 @@ impl PacketProcessor {
         let resolution = match self.auth_validate(msg, raw) {
             Ok(r) => r,
             Err(e) => {
-                warn!(%src, %e, "auth failed");
+                warn!(src = %loggable_addr(&src), %e, "auth failed");
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
@@ -1334,7 +1479,7 @@ impl PacketProcessor {
         if dont_fragment {
             use std::os::fd::AsRawFd;
             if let Err(e) = set_dont_fragment(relay_sock.as_raw_fd(), relay_family) {
-                warn!(%src, %e, "DONT-FRAGMENT: failed to set DF on relay socket");
+                warn!(src = %loggable_addr(&src), %e, "DONT-FRAGMENT: failed to set DF on relay socket");
             }
         }
 
@@ -1561,13 +1706,18 @@ impl PacketProcessor {
         // allocation (peer-initiated connections require it). Bind it before
         // committing the allocation; on failure, release the port and reject the
         // Allocate rather than hand back a half-working allocation.
-        let listener = match std::net::TcpListener::bind(("0.0.0.0", relay_port)) {
-            Ok(l) => l,
-            Err(e) => {
-                warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
-                return self.encode_error(msg, src, 508, "Insufficient Capacity");
-            }
-        };
+        // Same bind address as the UDP relay sockets: a TCP allocation that
+        // listened on every interface while the UDP ones were pinned to the
+        // public address would reopen on the private side exactly the surface
+        // `[turn.relay] bind_ip` exists to close.
+        let listener =
+            match std::net::TcpListener::bind((turna_session::relay_bind_addr_v4(), relay_port)) {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
+                    return self.encode_error(msg, src, 508, "Insufficient Capacity");
+                }
+            };
 
         if let Err(e) = self.store.create_for_identity(
             src,
@@ -2082,7 +2232,7 @@ impl PacketProcessor {
         // the whole request (403) and create no permissions.
         for peer_ip in &peers {
             if is_forbidden_peer(*peer_ip) {
-                warn!(%src, %peer_ip, "CreatePermission to forbidden peer denied");
+                warn!(src = %loggable_addr(&src), peer_ip = %loggable_ip(peer_ip), "CreatePermission to forbidden peer denied");
                 self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
                 return self.encode_error(msg, src, 403, "Forbidden");
             }
@@ -2091,7 +2241,7 @@ impl PacketProcessor {
             // Refuse the whole request rather than install a permission that can
             // never carry traffic.
             if self.peer_family_mismatch(&src, peer_ip) {
-                warn!(%src, %peer_ip, "CreatePermission peer address family mismatch");
+                warn!(src = %loggable_addr(&src), peer_ip = %loggable_ip(peer_ip), "CreatePermission peer address family mismatch");
                 self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
                 return self.encode_error(msg, src, 443, "Peer Address Family Mismatch");
             }
@@ -2159,13 +2309,13 @@ impl PacketProcessor {
         // Normalize ::ffff: → v4 and reject special-use peers (C2/C3).
         let peer_addr = normalize_addr(peer_addr);
         if is_forbidden_peer(peer_addr.ip()) {
-            warn!(%src, peer = %peer_addr.ip(), "ChannelBind to forbidden peer denied");
+            warn!(src = %loggable_addr(&src), peer = %loggable_ip(&peer_addr.ip()), "ChannelBind to forbidden peer denied");
             self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
             return self.encode_error(msg, src, 403, "Forbidden");
         }
         // RFC 6156 §4.2: see `peer_family_mismatch`.
         if self.peer_family_mismatch(&src, &peer_addr.ip()) {
-            warn!(%src, peer = %peer_addr.ip(), "ChannelBind peer address family mismatch");
+            warn!(src = %loggable_addr(&src), peer = %loggable_ip(&peer_addr.ip()), "ChannelBind peer address family mismatch");
             self.metrics.peer_rejected.fetch_add(1, Ordering::Relaxed);
             return self.encode_error(msg, src, 443, "Peer Address Family Mismatch");
         }
@@ -2228,7 +2378,7 @@ impl PacketProcessor {
             .iter()
             .any(|a| matches!(a, turna_proto_stun::attribute::Attribute::DontFragment));
         if has_dont_fragment && data.len() > self.mtu as usize {
-            debug!(%src, len = data.len(), mtu = self.mtu, "DONT-FRAGMENT: packet too large, dropping");
+            debug!(src = %loggable_addr(&src), len = data.len(), mtu = self.mtu, "DONT-FRAGMENT: packet too large, dropping");
             return vec![Action::None];
         }
 
@@ -2254,7 +2404,7 @@ impl PacketProcessor {
             &alloc.username,
         );
         if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
-            debug!(%src, "bandwidth quota exceeded, dropping Send indication");
+            debug!(src = %loggable_addr(&src), "bandwidth quota exceeded, dropping Send indication");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }

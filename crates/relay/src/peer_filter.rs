@@ -60,7 +60,7 @@ pub fn normalize_addr(addr: SocketAddr) -> SocketAddr {
 
 /// A parsed CIDR range, e.g. `10.0.0.0/8` or `fc00::/7`.
 #[derive(Debug, Clone)]
-struct Cidr {
+pub(crate) struct Cidr {
     addr: IpAddr,
     prefix: u8,
 }
@@ -68,7 +68,7 @@ struct Cidr {
 impl Cidr {
     /// Parse `"<ip>/<prefix>"`. Returns `None` on a malformed range or an
     /// out-of-bounds prefix (so callers can warn-and-skip).
-    fn parse(s: &str) -> Option<Cidr> {
+    pub(crate) fn parse(s: &str) -> Option<Cidr> {
         let (ip_str, pfx_str) = s.trim().split_once('/')?;
         let addr: IpAddr = ip_str.trim().parse().ok()?;
         let prefix: u8 = pfx_str.trim().parse().ok()?;
@@ -79,7 +79,7 @@ impl Cidr {
         Some(Cidr { addr, prefix })
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => masked_eq_v4(net, ip, self.prefix),
             (IpAddr::V6(net), IpAddr::V6(ip)) => masked_eq_v6(net, ip, self.prefix),
@@ -205,7 +205,7 @@ impl PeerPolicy {
     }
 }
 
-fn parse_ranges(ranges: &[String], label: &str) -> Vec<Cidr> {
+pub(crate) fn parse_ranges(ranges: &[String], label: &str) -> Vec<Cidr> {
     ranges
         .iter()
         .filter_map(|s| match Cidr::parse(s) {

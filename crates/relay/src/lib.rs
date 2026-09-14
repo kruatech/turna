@@ -19,8 +19,13 @@ pub mod sctp_bridge;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod handler;
 
-pub use processor::PacketProcessor;
+pub use processor::{PacketProcessor, RateLimitSettings};
+// Re-exported so a caller can build `RateLimitSettings` without taking a direct
+// dependency on turna-qos. The node does not depend on that crate today, and
+// adding one just to name a struct of five (burst, rate) pairs is not a trade
+// worth making.
 pub use server::RelayServer;
+pub use turna_qos::TieredLimits;
 #[cfg(target_os = "linux")]
 pub mod splice;
 

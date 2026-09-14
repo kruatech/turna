@@ -1,5 +1,11 @@
 //! Packet buffer management — pools, zero-copy, reuse
 
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
 use bytes::BytesMut;
 use std::collections::VecDeque;
 

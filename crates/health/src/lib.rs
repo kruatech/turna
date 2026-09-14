@@ -5,6 +5,12 @@
 //! - GET /ready   → 200 OK / 503 (not ready or draining)
 //! - GET /status  → JSON with node stats
 //! - GET /metrics → Prometheus text format
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
 pub mod load_reporter;
 
 use serde::Serialize;

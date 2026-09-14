@@ -45,8 +45,6 @@ fn clear_turna_env() {
         "TURNA_REALM",
         "TURNA_SHARED_SECRET",
         "TURNA_OTLP_ENDPOINT",
-        "TURNA_SIGNALING_ADDR",
-        "TURNA_TURN_URL",
         "TURNA_HEALTH_ADDR",
         "TURNA_NODE_ID",
         "TURNA_CLUSTER_MODE",
@@ -89,7 +87,6 @@ fn deploy_turn_toml_load_scenarios() {
         "without TURNA_SHARED_SECRET, the file's default should kick in"
     );
     assert_eq!(config.turn.realm, "turna");
-    assert!(!config.signaling.turn_shared_secret.is_empty());
     assert!(!config.is_production());
     assert_eq!(config.grpc.tls_mode, "disabled");
     assert!(!config.grpc.is_enabled());
@@ -104,7 +101,6 @@ fn deploy_turn_toml_load_scenarios() {
         .expect("deploy/turn.toml with env overrides must still validate");
 
     assert_eq!(config.turn.auth.shared_secret, real_secret);
-    assert_eq!(config.signaling.turn_shared_secret, real_secret);
     assert_eq!(config.turn.external_ip, "203.0.113.10");
     assert_eq!(config.turn.realm, "prod.example.com");
 
@@ -164,9 +160,6 @@ shared_secret = "s"
 [auth]
 shared_secret = "this would be silently dropped without deny_unknown_fields"
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_shared_secret = "s"
 "#;
     let err = TurnaConfig::from_str(bad).expect_err(
         "expected parse error for unknown top-level [auth] section, but load succeeded",
@@ -189,9 +182,6 @@ shared_secret = "s"
 # Typo: not a real field of AuthConfig.
 shared_seret = "typo"
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_shared_secret = "s"
 "#;
     let err = TurnaConfig::from_str(bad)
         .expect_err("expected parse error for typo `shared_seret`, but load succeeded");

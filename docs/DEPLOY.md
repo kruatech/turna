@@ -89,6 +89,43 @@ If you want to use port 3478 (which is below 1024 only for `0` and
 If you ever move to port 80/443, see `man capabilities` and grant
 `CAP_NET_BIND_SERVICE`.
 
+## 3a. Host tuning
+
+Two kernel settings decide whether this node loses media under load, and neither
+is a turna setting:
+
+```sh
+sudo install -m 0644 deploy/sysctl.d/99-turna.conf /etc/sysctl.d/99-turna.conf
+sudo sysctl --system
+```
+
+Read the file before applying it — every value carries the reason it is there.
+The two that matter most:
+
+**Socket buffers.** `[turn] socket_recv_buffer_bytes` asks for a buffer and the
+kernel silently clamps the request to `net.core.rmem_max`. Without raising that
+ceiling the config key does nothing. This is worth getting right because a
+receive-buffer overflow is dropped **in the kernel**, before turna sees the
+packet — so `turna_send_queue_dropped_total` stays at zero and every turna metric
+reads clean while users watch the picture break up. The counter that sees it:
+
+```sh
+nstat -az UdpRcvbufErrors UdpInErrors
+```
+
+Run it before and after a load test. If it grows, the buffer is the bottleneck,
+whatever the turna metrics say. The node logs the size the kernel actually gave
+each socket and warns when it is smaller than the size requested.
+
+**The ephemeral port range must not overlap the relay range.** The defaults do
+overlap on most hosts, and a peer socket landing inside the relay range makes the
+relay forward to itself. `scripts/verify/deployment-compliance.sh` checks this
+against the running host.
+
+NUMA, IRQ affinity, conntrack sizing and the measured capacity ceiling are in
+[docs/deployment/host-tuning.md](deployment/host-tuning.md), which is written
+from measurements on this project's own hardware rather than a generic checklist.
+
 ## 4. systemd unit
 
 ```sh
@@ -152,14 +189,21 @@ stunclient 203.0.113.10 -p 3478
 The rules below assume `ufw`. Adapt to your tool.
 
 ```sh
-# TURN listener
+# TURN listener. UDP only: there is no plain TURN-over-TCP listener, so a rule
+# for 3478/tcp opens a port nothing binds. TCP clients are served over TURNS.
 sudo ufw allow 3478/udp comment 'turna STUN/TURN'
-sudo ufw allow 3478/tcp comment 'turna TCP (optional)'
+
+# TURNS, when [tls] is enabled — and it is the ONLY way in for a client whose
+# network blocks UDP. Use 443 instead if your users sit behind filters that
+# only pass well-known ports.
+sudo ufw allow 5349/tcp comment 'turna TURNS'
 
 # Relay range — clients send/receive media on these
 sudo ufw allow 49152:65535/udp comment 'turna relay range'
 
-# Metrics: only your monitoring host, NOT the public Internet
+# Metrics: only your monitoring host, NOT the public Internet. Needed only if
+# you moved [health] listen off 127.0.0.1, which is now the default — the
+# endpoint serves the full Prometheus surface, not just /health.
 sudo ufw allow from 10.20.30.40 to any port 9090 proto tcp comment 'prometheus scrape'
 
 # gRPC management: only operators / control plane peers

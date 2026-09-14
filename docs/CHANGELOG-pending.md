@@ -268,11 +268,16 @@ version heading at release time; the last move was 0.4.0.
   `UserStoreConfig::try_from_env` — is set nowhere: not in the Helm chart, not in
   a shipped config, not in the docs.
 
-  Marked unwired in the crate root and in each module, exactly as
-  `turna_relay::node_migration` already is, with a `check-doc-claims` gate that
-  fails if a module gains a caller and keeps the label, or loses the label
-  without gaining one. Wire it or delete it is recorded as decision 7 in
-  `docs/OPEN-DECISIONS.md`. No code was removed.
+  **Superseded in 0.5.0: the four modules were deleted.** They were first marked
+  unwired in the crate root and in each module, with a `check-doc-claims` gate
+  holding the labels honest, and "wire it or delete it" was recorded as decision
+  7 in `docs/OPEN-DECISIONS.md`. That decision is now closed as *delete*:
+  authenticating users is the signalling service's job, and turna validates a
+  TURN REST credential derived from `[turn.auth] shared_secret`. The
+  `jsonwebtoken`, `argon2`, `password-hash` and `uuid` dependencies went with
+  them, as did `TURNA_JWT_SECRET`. The gate now asserts the deletion instead of
+  the labels: if one of these files returns it must have a caller outside the
+  crate.
 
 - **A second source of truth for the Tarantool schema that does not exist.**
   `tarantool::INIT_SCRIPT` was deleted, leaving a bare comment header where it had

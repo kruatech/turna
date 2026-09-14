@@ -153,18 +153,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "argon2"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
-dependencies = [
- "base64ct",
- "blake2",
- "cpufeatures 0.3.0",
- "password-hash",
-]
-
-[[package]]
 name = "asn1-rs"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -299,7 +287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
- "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -456,15 +443,6 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
-
-[[package]]
-name = "blake2"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
-dependencies = [
- "digest 0.11.3",
-]
 
 [[package]]
 name = "block-buffer"
@@ -1032,7 +1010,6 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
- "ctutils",
 ]
 
 [[package]]
@@ -1888,24 +1865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jsonwebtoken"
-version = "11.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
-dependencies = [
- "aws-lc-rs",
- "base64 0.22.1",
- "getrandom 0.2.17",
- "js-sys",
- "pem",
- "serde",
- "serde_json",
- "signature",
- "simple_asn1",
- "zeroize",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2450,16 +2409,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "password-hash"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
-dependencies = [
- "getrandom 0.4.3",
- "phc",
-]
-
-[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2493,17 +2442,6 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
-]
-
-[[package]]
-name = "phc"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
-dependencies = [
- "base64ct",
- "ctutils",
- "getrandom 0.4.3",
 ]
 
 [[package]]
@@ -3078,7 +3016,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted 0.9.0",
+ "untrusted",
  "windows-sys 0.52.0",
 ]
 
@@ -3229,7 +3167,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -3493,18 +3431,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "simple_asn1"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
-dependencies = [
- "num-bigint",
- "num-traits",
- "thiserror 2.0.20",
- "time",
-]
 
 [[package]]
 name = "siphasher"
@@ -4148,16 +4074,13 @@ dependencies = [
 
 [[package]]
 name = "turna-auth"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "arc-swap",
- "argon2",
  "base64 0.23.1",
  "dashmap",
  "hmac",
- "jsonwebtoken",
- "password-hash",
  "serde",
  "serde_json",
  "sha1",
@@ -4166,12 +4089,11 @@ dependencies = [
  "tracing",
  "turna-crypto",
  "turna-proto-stun",
- "uuid",
 ]
 
 [[package]]
 name = "turna-benchmark"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rand 0.10.2",
  "tokio",
@@ -4181,7 +4103,7 @@ dependencies = [
 
 [[package]]
 name = "turna-cluster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "hmac",
  "serde",
@@ -4194,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "turna-common"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4204,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "turna-config"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4215,7 +4137,7 @@ dependencies = [
 
 [[package]]
 name = "turna-control"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -4239,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "turna-control-plane"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -4253,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "turna-crypto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "hmac",
@@ -4266,7 +4188,7 @@ dependencies = [
 
 [[package]]
 name = "turna-diff-test"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "serde",
@@ -4280,14 +4202,14 @@ dependencies = [
 
 [[package]]
 name = "turna-garbage-gen"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "turna-health"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4298,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "turna-integration-tests"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "hmac",
@@ -4316,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "turna-load-test"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -4338,7 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "turna-management"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -4350,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "turna-node"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "hostname",
  "parking_lot",
@@ -4375,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "turna-observability"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "hostname",
  "opentelemetry",
@@ -4389,21 +4311,21 @@ dependencies = [
 
 [[package]]
 name = "turna-packet"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "turna-proto-rtp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "turna-proto-stun"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "crc",
@@ -4418,7 +4340,7 @@ dependencies = [
 
 [[package]]
 name = "turna-proto-turn"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.20",
@@ -4427,7 +4349,7 @@ dependencies = [
 
 [[package]]
 name = "turna-qos"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dashmap",
  "loom",
@@ -4438,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "turna-relay"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -4463,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "turna-rtp-analyzer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dashmap",
  "tracing",
@@ -4472,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "turna-session"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "dashmap",
@@ -4486,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "turna-soak"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "tokio",
@@ -4499,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "turna-state-backend"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "dashmap",
@@ -4514,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "turna-transport"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4545,7 +4467,7 @@ dependencies = [
 
 [[package]]
 name = "turnactl"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "prost",
  "serde",
@@ -4610,12 +4532,6 @@ dependencies = [
 
 [[package]]
 name = "untrusted"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
-
-[[package]]
-name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -4643,17 +4559,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "uuid"
-version = "1.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
-dependencies = [
- "getrandom 0.4.3",
- "js-sys",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "valuable"

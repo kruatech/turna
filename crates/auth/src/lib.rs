@@ -1,47 +1,37 @@
-//! turna-auth — TURN credential validation, plus four modules nothing calls.
-//!
-//! # Wired
+//! turna-auth — TURN credential validation.
 //!
 //! [`AuthMode`] validates STUN messages for TURN allocations, and
 //! [`tenant::AuthRegistry`] resolves the tenant from the authenticated realm.
 //! Those two are the crate: `turna-relay` uses them on every request.
 //!
-//! # UNWIRED — read this before believing the list below
+//! # What was removed in 0.5.0
 //!
-//! `store` (659 lines), `rotation` (403), `jwt` (184) and `user` (64) have **no
-//! callers anywhere outside this crate**. Checked by taking every `pub` item in
-//! each module and grepping `crates/`, `services/`, `tools/` and `tests/` for it:
-//! 0 of 3, 0 of 6, 0 of 5 and 0 of 3 respectively. They reference each other and
-//! nothing else. Their unit tests pass and test code nothing runs.
+//! `store` (659 lines), `rotation` (403), `jwt` (184) and `user` (64) lived here
+//! with no callers anywhere outside this crate — 0 of 3, 0 of 6, 0 of 5 and 0 of
+//! 3 `pub` items respectively. They referenced each other and nothing else, and
+//! their unit tests tested code nothing ran.
 //!
-//! This header previously advertised them as "User auth (Phase 2)", which is how
-//! a reader concludes that turna has user registration, login, Argon2 password
-//! hashing, JWT signing and token revocation. It has the code for those. It does
-//! not use it.
+//! The header used to advertise them as "User auth (Phase 2)", which is how a
+//! reader concludes that turna has user registration, login, Argon2 password
+//! hashing, JWT signing and token revocation. It had the code. It did not use it.
 //!
-//! Two practical consequences, so this is not merely tidy-mindedness:
+//! Deleting rather than wiring is the answer for this product: authenticating
+//! users is the signalling service's job, and turna receives only the TURN REST
+//! credential derived from `[turn.auth] shared_secret`. `docs/OPEN-DECISIONS.md`
+//! decision 7 records that. The code is in git history if the question reopens.
 //!
-//! * `TURNA_JWT_SECRET` is read by [`store::UserStoreConfig::try_from_env`] and
-//!   is set nowhere — not in the Helm chart, not in any shipped config, not in
-//!   the docs. That is consistent: nothing calls the constructor that reads it.
-//! * An audit item asked for hot rotation of "the shared secret and the JWT
-//!   secret". The first is now implemented. The second would have been rotating a
-//!   secret for a subsystem with no callers.
-//!
-//! The same situation as `turna_relay::node_migration`, and it gets the same
-//! treatment: say so here rather than let the next reader find out. Wire it or
-//! delete it is a product decision — recorded in `docs/OPEN-DECISIONS.md`.
-//!
-//! - [`store::UserStore`] — in-memory user store (Argon2 + JWT). **Unwired.**
-//! - [`user::User`]       — platform user model. **Unwired.**
-//! - [`jwt::Claims`]      — JWT token claims. **Unwired.**
-//! - [`rotation`]         — per-allocation credential rotation. **Unwired.**
+//! One loose end it closes: `TURNA_JWT_SECRET` was read by
+//! `store::UserStoreConfig::try_from_env` and set nowhere — not in the Helm
+//! chart, not in any shipped config, not in the docs. Consistent, since nothing
+//! called the constructor that read it, but it is one fewer phantom knob.
 
-pub mod jwt;
-pub mod rotation;
-pub mod store;
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
 pub mod tenant;
-pub mod user;
 
 pub use tenant::{AuthRegistry, AuthResolution};
 
@@ -117,6 +107,24 @@ static PREVIOUS_SECRET_USES: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// before removing `previous_shared_secret`.
 pub fn previous_secret_uses() -> u64 {
     PREVIOUS_SECRET_USES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Clock-skew grace for TURN REST credential expiry, in seconds.
+///
+/// Defaults to 0 — the historical behaviour — and is raised by the node from
+/// `[turn.auth] credential_clock_skew_secs`, whose own default is 300. A library
+/// user that never calls the setter keeps the strict check, so existing tests
+/// and embedders are unaffected.
+static CREDENTIAL_CLOCK_SKEW_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Set the TURN REST clock-skew grace. Call once at startup.
+pub fn set_credential_clock_skew_secs(secs: u64) {
+    CREDENTIAL_CLOCK_SKEW_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn credential_clock_skew_secs() -> u64 {
+    CREDENTIAL_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// TURN authentication mode.
@@ -252,7 +260,32 @@ impl AuthMode {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                if expiry < now {
+                // Clock-skew grace. The credential is minted by the signalling
+                // service and checked here, on a different machine, so a
+                // disagreement between the two clocks is a property of the
+                // deployment rather than of the credential.
+                //
+                // Without it the symptom is 100 % `Expired` on every client at
+                // once, with nothing in turna's logs pointing at time — a VM
+                // resumed from suspend, a container with no NTP, or someone
+                // setting the date by hand all produce it. The OAuth path
+                // (RFC 7635 §6.1) has had a skew allowance from the start;
+                // this one did not.
+                //
+                // coturn does not check expiry at all, so this stays stricter
+                // than the thing it is compatible with even with the grace.
+                let skew = credential_clock_skew_secs();
+                if expiry.saturating_add(skew) < now {
+                    // Both values logged: a large, constant gap is the signature
+                    // of clock skew, and it is invisible if the message only
+                    // says "expired".
+                    tracing::debug!(
+                        expiry,
+                        now,
+                        skew,
+                        behind_secs = now.saturating_sub(expiry),
+                        "TURN REST credential expired"
+                    );
                     return Err(AuthError::Expired);
                 }
 

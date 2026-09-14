@@ -15,6 +15,15 @@
 //! // _guard must be kept alive for the duration of the process.
 //! ```
 
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
+/// Address redaction for the stdout (`fmt`) layer. See the module docs for why
+/// it sits at the sink rather than at each call site.
+pub mod fmt_redact;
 pub mod syslog;
 pub mod syslog_layer;
 pub mod telemetry;

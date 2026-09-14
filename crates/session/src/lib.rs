@@ -9,6 +9,12 @@
 //! - **Optional write-behind log** for cluster persistence (see `write_op`
 //!   module and `docs/design/allocation-store-persistence.md`)
 
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
 pub mod write_op;
 pub use write_op::{now_ms as epoch_ms, WriteOp};
 
@@ -486,9 +492,113 @@ impl RelayFamily {
 /// The option must be set between `socket()` and `bind()`, which `std` cannot
 /// express, hence `socket2` under `cfg(unix)`. On a non-unix target the std bind is
 /// used and the platform default applies; the downstream checks still hold.
+/// Address the relay UDP sockets bind to, per family. `None` = wildcard, which
+/// is what every build did before 0.5.0.
+///
+/// Process-global, and deliberately so. The alternative is a field on
+/// `PortAllocator`, which means new parameters on `PortAllocator::new`,
+/// `AllocationStore::new` and every test and tool that constructs one — for a
+/// value that cannot legitimately differ between pools on one node, including
+/// the per-tenant pools, which vary by port range and not by interface. The
+/// precedent is `relay::peer_filter::init_peer_policy`, which is process-wide
+/// for the same reason.
+static RELAY_BIND_V4: std::sync::OnceLock<Option<std::net::Ipv4Addr>> = std::sync::OnceLock::new();
+static RELAY_BIND_V6: std::sync::OnceLock<Option<std::net::Ipv6Addr>> = std::sync::OnceLock::new();
+
+/// Set the relay bind addresses. Call once, before any allocation is served.
+///
+/// A second call is ignored rather than panicking: the node calls this on the
+/// startup path only, and a test binary that calls it twice should not take the
+/// process down.
+pub fn init_relay_bind(v4: Option<std::net::Ipv4Addr>, v6: Option<std::net::Ipv6Addr>) {
+    let _ = RELAY_BIND_V4.set(v4);
+    let _ = RELAY_BIND_V6.set(v6);
+}
+
+fn relay_bind_v4() -> std::net::Ipv4Addr {
+    RELAY_BIND_V4
+        .get()
+        .copied()
+        .flatten()
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)
+}
+
+/// The configured v4 relay bind address, for callers outside this crate that
+/// open their own relay-side socket — today that is the RFC 6062 TCP listener
+/// in `turna-relay`, which must not straddle interfaces the UDP sockets avoid.
+pub fn relay_bind_addr_v4() -> std::net::Ipv4Addr {
+    relay_bind_v4()
+}
+
+fn relay_bind_v6() -> std::net::Ipv6Addr {
+    RELAY_BIND_V6
+        .get()
+        .copied()
+        .flatten()
+        .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED)
+}
+
+/// Buffer sizes for relay sockets, in bytes. 0 = leave the kernel default.
+///
+/// Separate from `turna-transport`'s equivalent because this crate does not
+/// depend on that one, and a dependency added to share twenty lines of
+/// `setsockopt` would be the more expensive of the two.
+static RELAY_RECV_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RELAY_SEND_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the buffer sizes applied to every relay socket bound after this call.
+pub fn init_relay_socket_buffers(recv_bytes: usize, send_bytes: usize) {
+    RELAY_RECV_BUFFER.store(recv_bytes, std::sync::atomic::Ordering::Relaxed);
+    RELAY_SEND_BUFFER.store(send_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Apply the configured sizes to one relay socket.
+///
+/// Best-effort and quiet on success: this runs once per allocation, so an info
+/// line per socket would drown the log on a busy node. A clamp is reported at
+/// debug for the same reason — the listener's warning already tells the
+/// operator that `net.core.rmem_max` is the limit, and it is the same ceiling.
+#[cfg(unix)]
+fn apply_relay_buffers(sock: &std::net::UdpSocket) {
+    use std::sync::atomic::Ordering;
+    let recv = RELAY_RECV_BUFFER.load(Ordering::Relaxed);
+    let send = RELAY_SEND_BUFFER.load(Ordering::Relaxed);
+    if recv == 0 && send == 0 {
+        return;
+    }
+    let r = socket2::SockRef::from(sock);
+    if recv > 0 {
+        if let Err(e) = r.set_recv_buffer_size(recv) {
+            tracing::debug!(%e, "relay socket recv buffer not set");
+        } else if let Ok(actual) = r.recv_buffer_size() {
+            if actual / 2 < recv {
+                tracing::debug!(
+                    requested = recv,
+                    effective = actual / 2,
+                    "relay socket recv buffer clamped by net.core.rmem_max"
+                );
+            }
+        }
+    }
+    if send > 0 {
+        if let Err(e) = r.set_send_buffer_size(send) {
+            tracing::debug!(%e, "relay socket send buffer not set");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_relay_buffers(_sock: &std::net::UdpSocket) {}
+
 fn bind_relay_socket(family: RelayFamily, port: u16) -> std::io::Result<std::net::UdpSocket> {
+    let sock = bind_relay_socket_inner(family, port)?;
+    apply_relay_buffers(&sock);
+    Ok(sock)
+}
+
+fn bind_relay_socket_inner(family: RelayFamily, port: u16) -> std::io::Result<std::net::UdpSocket> {
     match family {
-        RelayFamily::V4 => std::net::UdpSocket::bind(("0.0.0.0", port)),
+        RelayFamily::V4 => std::net::UdpSocket::bind((relay_bind_v4(), port)),
         #[cfg(unix)]
         RelayFamily::V6 => {
             let sock = socket2::Socket::new(
@@ -497,14 +607,13 @@ fn bind_relay_socket(family: RelayFamily, port: u16) -> std::io::Result<std::net
                 Some(socket2::Protocol::UDP),
             )?;
             sock.set_only_v6(true)?;
-            sock.bind(&std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+            sock.bind(&std::net::SocketAddr::from((relay_bind_v6(), port)).into())?;
             Ok(sock.into())
         }
         #[cfg(not(unix))]
-        RelayFamily::V6 => std::net::UdpSocket::bind(std::net::SocketAddr::from((
-            std::net::Ipv6Addr::UNSPECIFIED,
-            port,
-        ))),
+        RelayFamily::V6 => {
+            std::net::UdpSocket::bind(std::net::SocketAddr::from((relay_bind_v6(), port)))
+        }
     }
 }
 

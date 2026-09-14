@@ -29,6 +29,20 @@ production = false
 # =============================================================================
 [turn]
 listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
+# SO_RCVBUF / SO_SNDBUF for the listener and every relay socket, in bytes.
+# 0 = leave the kernel default, which is what every release before 0.5.0 did.
+#
+# Video is bursty: one 1080p frame is 20-60 packets within a couple of
+# milliseconds. Debian's stock net.core.rmem_default is 212 992 bytes — about
+# 150 packets for a socket shared by every client on that worker. Overflow is
+# dropped IN THE KERNEL, before turna sees the packet, so it appears in no turna
+# metric; `nstat -az UdpRcvbufErrors` is what counts it.
+#
+# The kernel clamps these to net.core.rmem_max / wmem_max, so raise those first
+# with deploy/sysctl.d/99-turna.conf. The node logs the size it actually got and
+# warns when it is smaller than the size asked for.
+# socket_recv_buffer_bytes = 8388608
+# socket_send_buffer_bytes = 8388608
 # Externally reachable IP. Required in production.
 # Tip: don't leave this blank behind NAT — clients receive this IP in the
 # XOR-RELAYED-ADDRESS attribute.
@@ -79,6 +93,20 @@ token_ttl     = 86400
 # password = "${TURNA_USER_BOB_PASSWORD}"
 
 [turn.relay]
+# Address the relay sockets bind to. Empty = 0.0.0.0, every interface, which is
+# what every release before 0.5.0 did.
+#
+# A node with a public interface for clients and a private one to the SFU has
+# relay ports 49152-65535 open on BOTH while this is empty. [turn.peer_filter]
+# stops the node relaying INTO private space; it does not stop packets arriving
+# on a relay port from the private side. Pin this to the public address unless
+# you have a reason not to — the equivalent of coturn's `relay-ip`.
+#
+# With no NAT this is usually the same address as [turn] external_ip. Behind
+# NAT, this is the private address the node actually owns and external_ip is
+# the public one it advertises.
+# bind_ip  = "203.0.113.10"
+# bind_ip6 = "2001:db8::10"
 min_port        = 49152
 max_port        = 65535
 max_allocations = 8192
@@ -106,21 +134,59 @@ json_logs            = false
 max_spans_per_second = 1000
 
 # =============================================================================
-# [signaling] — compatibility section in the shared root config
+# [turn.rate_limit] — tiered rate limiting
 # =============================================================================
-# The current workspace does not ship a turna-signaling binary. Keep this
-# section populated because the shared root config validates it; future/external
-# credential services can reuse the same values.
-[signaling]
-listen             = "${TURNA_SIGNALING_ADDR:-127.0.0.1:9001}"
-turn_url           = "${TURNA_TURN_URL:-turn:127.0.0.1:3478}"
-turn_shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
+# Two sets of tiers. `default` applies to everyone; `trusted` applies to sources
+# inside trusted_prefixes. Each value is a bucket: `_burst` is its depth,
+# `_rps` how fast it refills per second. Neither may be 0 — a 0 refill means the
+# bucket empties once and never fills again.
+#
+# Why the trusted tier exists: an office of 300 people leaves through one NAT
+# address, and a browser sends one Allocate per ICE transport (two typically,
+# more on dual-stack). A 10:00 all-hands is ~600 Allocates from one IP, and the
+# default 16/s takes 35 seconds to clear them — longer than a browser waits
+# before giving up and retrying, which lengthens the queue. The data-plane
+# tiers are raised too: 300 relaying participants at ~300 pps each is ~90 000
+# pps from one source, against a default refill of 50 000.
+#
+# trusted_prefixes is NOT authentication. Anyone who can spoof a source address
+# in these ranges gets the higher ceiling, so list only prefixes you route.
+# Empty by default: guessing at RFC 1918 would hand the higher ceiling to
+# whatever private network happens to reach this node.
+#
+# [turn.rate_limit]
+# trusted_prefixes = ["10.10.0.0/16", "192.0.2.0/24"]
+#
+# [turn.rate_limit.default]
+# per_ip_burst = 10000
+# per_ip_rps = 50000
+# per_prefix_burst = 40000
+# per_prefix_rps = 200000
+# allocate_burst = 32
+# allocate_rps = 16
+# create_permission_burst = 128
+# create_permission_rps = 64
+# channel_bind_burst = 128
+# channel_bind_rps = 64
+#
+# [turn.rate_limit.trusted]
+# allocate_burst = 512
+# allocate_rps = 128
+#
+# The TURNA_RATE_LIMIT_BURST / TURNA_ALLOCATE_RPS / ... environment variables
+# still override these, and now warn when they do. They are deprecated: a limit
+# set there appears in no config file and in no --dump-config output, which is
+# how an operator ends up looking for a ceiling that is not written down.
 
 # =============================================================================
 # [health] — Prometheus metrics + /health endpoint
 # =============================================================================
 [health]
-listen = "${TURNA_HEALTH_ADDR:-0.0.0.0:9090}"
+# Loopback by default. This endpoint serves /health AND the whole Prometheus
+# surface — hundreds of series, including per-tenant detail — so it does not
+# belong on a public interface. Override TURNA_HEALTH_ADDR with a PRIVATE
+# address if Prometheus scrapes from another machine; never 0.0.0.0.
+listen = "${TURNA_HEALTH_ADDR:-127.0.0.1:9090}"
 
 # =============================================================================
 # [cluster] — multi-node mode

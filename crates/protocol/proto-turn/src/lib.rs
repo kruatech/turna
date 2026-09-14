@@ -3,6 +3,12 @@
 //! Built on top of turna-proto-stun. Provides TURN-specific message builders
 //! and allocation state types.
 
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
 pub use turna_proto_stun::attribute::Attribute;
 pub use turna_proto_stun::header::MessageClass;
 pub use turna_proto_stun::message::{is_channel_data, is_stun_message, StunMessage};

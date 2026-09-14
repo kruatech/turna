@@ -84,7 +84,7 @@ All defaults are safe for local development. For reference:
 | What | Default | Override |
 |---|---|---|
 | TURN/STUN port | `0.0.0.0:3478` | `TURNA_LISTEN_ADDR` |
-| Health/metrics port | `0.0.0.0:9090` | `TURNA_HEALTH_ADDR` |
+| Health/metrics port | `127.0.0.1:9090` | `TURNA_HEALTH_ADDR` |
 | gRPC management port | `127.0.0.1:5350` | `TURNA_GRPC_ADDR` |
 | Shared secret | `change-me-in-production` | `TURNA_SHARED_SECRET` |
 | External IP | _(empty, warns)_ | `TURNA_EXTERNAL_IP` |

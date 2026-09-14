@@ -171,6 +171,32 @@ and an authentication-failure event without a source is not actionable.
 `syslog_redact_addresses = true` hashes them, and loses cross-event correlation —
 which is most of what a SIEM is for.
 
+**Stdout has its own switch:** `[turn.observability] log_allocation_addresses`.
+`true` (the default, and the historical behaviour) writes addresses verbatim;
+`false` replaces them with `ip-<12 hex>` under a per-process salt.
+
+The two settings are independent because the sinks are: a SIEM is inside the
+operator's trust boundary and wants the address, while stdout is whatever the log
+shipper collects and keeps.
+
+Granularity differs between the two branches on purpose. Verbatim is `ip:port`;
+the hash covers the **IP only**, so two concurrent sessions from one host share a
+label. That is deliberate — per-IP correlation across a client's reconnects is
+what an operator reading these lines is after. Use `allocation_id` to tell
+sessions apart.
+
+Until 0.5.0 this switch reached only the three allocation-lifecycle lines.
+Everything else — auth failures, forbidden-peer denials, quota drops, decode
+errors, cluster redirects — wrote the address verbatim whatever the setting said,
+which is the opposite of what an operator who turned it off would conclude. All
+twelve sites now go through the same function. The salt also stopped being
+derived from the process start time: that is the weak fallback `syslog.rs`
+documents CodeQL rejecting, because a restart time is often observable from
+outside and the search space then collapses against four billion addresses. It
+is eight bytes from `/dev/urandom`, and if that read fails the node logs why and
+writes addresses verbatim rather than substituting something that looks like a
+hash and protects nothing.
+
 #### Dashboard
 
 `deploy/grafana/turna-overview.json`. Schema 39, which loads on Grafana 10 and 11.

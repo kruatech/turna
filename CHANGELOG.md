@@ -7,6 +7,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-14
+
+### Breaking
+
+- **`[sfu]`, `[signaling]` and `[recording]` are removed from the config schema.**
+  The schema is `deny_unknown_fields`, so a config still carrying any of them
+  will not load. Delete the sections; nothing else is needed.
+
+  They were parsed, validated and read by nothing. `[signaling]` was the
+  expensive one: `turn_shared_secret` was **mandatory**, and in production a
+  placeholder value was a hard validation error — so every operator had to
+  generate, deploy and rotate a secret for a service that does not exist in this
+  workspace, while its default `listen` of `0.0.0.0:9001` took part in the
+  port-conflict check and suggested something was listening there. A secret that
+  is accepted and consumed by nothing is a false security boundary: it gets
+  rotated on schedule and written into audit reports, and none of that protects
+  anything.
+
+  Loading a config with one of the three now fails with a message naming the
+  section, the release that removed it, and what to do — not with serde's bare
+  `unknown field`, which reads like a typo the operator did not make.
+
+  A minimal TURN-only config (`[turn]`, `[turn.auth]`, `[health]`) now validates.
+  Before this change it did not.
+
+### Added
+
+- `turna-transport::TLS_AVAILABLE`, mirroring `dtls::DTLS_AVAILABLE` and
+  `quic::QUIC_AVAILABLE`.
+- The node **refuses to start** when `[tls] enabled = true` on a binary built
+  without the `tls` feature. Previously the whole TURNS block was compiled out
+  and `tls_cfg` discarded with no log line at all, so the node came up healthy,
+  reported healthy, and served nothing on 5349 — while `EXPOSE 5349/tcp` in the
+  image and `deploy/examples/corporate.toml` both said otherwise. Clients on
+  UDP-blocked networks simply could not connect, and no metric said why. DTLS and
+  QUIC had this guard already.
+- Config warning under `production = true` when `[tls]` is disabled: the node is
+  UDP-only and has no TCP fallback, which is a legitimate deployment but should
+  be read in the log rather than inferred from the users who cannot connect.
+- Config error (production; warning otherwise) when `[turn.tcp_relay]` is enabled
+  without `[tls]`. RFC 6062 carries the TCP allocation over the TLS control
+  connection and turna has no plain-TCP listener, so the datapath was
+  unreachable. The field documentation had said "requires `[tls]` enabled" all
+  along; nothing checked it.
+- CI job `tls-fail-closed`: builds the node with `--no-default-features` and
+  asserts it refuses a config that enables `[tls]`, with the rebuild instruction
+  in the message.
+- README section "Client ICE configuration", stating the two URLs that are served
+  and the one that is not.
+
+### Added (continued)
+
+- `[turn.rate_limit]` — the tiered limiter's tunables, previously readable only
+  from `TURNA_RATE_LIMIT_*` and friends. Those overrides still work and now warn
+  each time they fire; they are deprecated and go away in the release after next.
+
+  Two tiers: `default`, whose values are byte-identical to what was hardcoded
+  before, and `trusted`, applied to sources inside `trusted_prefixes`. The case
+  the strict defaults get wrong is an office behind one NAT address. A browser
+  sends one Allocate per ICE transport, so a 300-person meeting is ~600 Allocates
+  from one IP; at the default 16/s that is 35 seconds, longer than a browser's
+  ICE gathering waits before timing out and retrying — which lengthens the queue
+  the client is already stuck behind. The data-plane tiers matter for the same
+  reason: 300 relaying participants at ~300 pps each is ~90 000 pps from one
+  source, against a default refill of 50 000.
+
+  `trusted_prefixes` is empty by default and is not an authentication boundary.
+- `[turn.relay] bind_ip` / `bind_ip6` — pin the relay sockets to one address.
+  They bound every interface before, so on a node with a public and a private
+  NIC, relay ports 49152-65535 were open on the private side too. The peer
+  filter closes the outbound direction; it does not stop inbound packets on a
+  relay port. The RFC 6062 TCP listener uses the same address.
+- `[turn] socket_recv_buffer_bytes` / `socket_send_buffer_bytes` — `SO_RCVBUF` /
+  `SO_SNDBUF` for the listener and every relay socket. The node logs the size the
+  kernel actually gave and warns when it was clamped, because `setsockopt` is
+  clamped to `net.core.rmem_max` **silently**: asking for 16 MB on a stock host
+  succeeds and yields 212 992 bytes. A receive-buffer overflow is dropped in the
+  kernel, so it appears in no turna metric at all — `nstat -az UdpRcvbufErrors`
+  is the only thing that counts it.
+- `deploy/sysctl.d/99-turna.conf`, `deploy/systemd/turna-node.service`,
+  `deploy/examples/selfhosted.toml` and `docs/SELFHOSTED.md` — the single-node
+  self-hosted path, which had no entry point across 96 documentation files.
+
+### Changed
+
+- **`docker-compose.yml` uses `network_mode: host`.** Publishing 16 384 UDP relay
+  ports through the bridge creates a forwarding rule per port and, depending on
+  the Docker version and `userland-proxy`, a `docker-proxy` process per port:
+  container start measured in tens of seconds, and an extra NAT hop on the media
+  path. It also hid the client's source address behind the gateway's, which
+  quietly collapsed per-IP rate limiting into one shared bucket for everyone.
+
+  Prometheus moves to host networking too — it cannot reach a loopback-bound
+  health port from the bridge — and now binds 9091 explicitly, since the
+  published `9091:9090` mapping that used to separate it from turna's health
+  port does not exist in host mode.
+- **`[health] listen` defaults to `127.0.0.1:9090`.** It serves `/health` and the
+  entire Prometheus surface, several hundred series including per-tenant detail.
+  It was `0.0.0.0` while `docker-compose.yml` published it, so the default
+  deployment offered the metric surface to anything that could route to the host.
+- `EXPOSE 9090/tcp` removed from the image for the same reason.
+- **`tls` is now a default feature of `turna-node`.** It is the only TCP entry
+  point the node has, so the safe configuration is the one you get by doing
+  nothing; opting out is `--no-default-features`, an explicit decision. The
+  release image passes `--features tls` explicitly as well, so moving `tls` out
+  of `default` later cannot silently drop TURNS from the image.
+
+### Removed
+
+- **`turna_auth::{store, rotation, jwt, user}`** — 1 310 lines of user
+  registration, Argon2 hashing, JWT signing and token revocation with no callers
+  outside the crate (0 of 3, 0 of 6, 0 of 5 and 0 of 3 `pub` items). The crate
+  header presented them as "User auth (Phase 2)", which is how a reader concludes
+  turna has platform user auth; it had the code and did not run it.
+
+  Authenticating users is the signalling service's job — turna receives a TURN
+  REST credential and validates it. `docs/OPEN-DECISIONS.md` decision 7 is closed
+  accordingly. `jsonwebtoken`, `argon2`, `password-hash` and `uuid` go with them,
+  as does `TURNA_JWT_SECRET`, which was required by a constructor nothing called
+  and set nowhere in the chart, the configs or the docs.
+
+### Fixed
+
+- **TURN REST credentials had no clock-skew tolerance.** The credential is minted
+  by the signalling service and checked here, on a different machine; a
+  disagreement between the two clocks produced 100 % `Expired` across every
+  client at once with nothing in the log pointing at time. `[turn.auth]
+  credential_clock_skew_secs` (300 by default) closes it, and a rejection now
+  logs `expiry`, `now` and the gap, because a large constant gap is the signature
+  of skew and is invisible when the message only says "expired". The RFC 7635
+  OAuth path had a skew allowance from the start. Even with the grace this stays
+  stricter than coturn, which does not check expiry at all.
+- `rust-toolchain.toml` pins 1.95.0 and every CI job uses it, while
+  `deploy/Dockerfile` built on `rust:1.98.0`. rustup inside the container saw the
+  pin and downloaded 1.95.0 on every build, so each image build depended on
+  `static.rust-lang.org` and CI and the image compiled with different compilers.
+  The image now pins 1.95.0.
+- `deploy/Dockerfile` built without `--features tls` while exposing 5349/tcp.
+- `3478/tcp` is no longer exposed or published. turna has no plain
+  TURN-over-TCP listener, so a client ICE entry of
+  `turn:host:3478?transport=tcp` met a connection refused after spending part of
+  its gathering budget. `docker-compose.yml`, the `EXPOSE` list and the README
+  `docker run` example all advertised the port.
+- README claimed JWT authentication and credential rotation as features. The
+  `jwt`, `store`, `rotation` and `user` modules in `turna-auth` have no callers
+  (see `docs/OPEN-DECISIONS.md` decision 7).
+- README stated that `SIGHUP` is not handled and that the shared secret needs a
+  restart. The handler exists and has since 0.4.0: it re-reads the config file
+  and republishes `shared_secret` / `previous_shared_secret` without dropping
+  calls. Operators were planning rolling restarts for a config reload.
+- README stated that RFC 6062 TCP relay is refused under `production = true`.
+  That gate was lifted when coturn interop was recorded.
+- `scripts/check-doc-claims.sh` checked `deploy/examples/public-turn.toml`, which
+  does not exist — the extractor skipped the missing path, so
+  `deploy/examples/public.toml` was never checked while the section reported a
+  clean pass. A listed config that is not on disk is now a failure.
+- `docs/CLUSTER.md`, `docs/security/accepted-risks.md`: the gossip replay window
+  survives a restart (`seq` starts at 0 on process start, so a captured frame —
+  including a `leaving` — is accepted by a node that has just restarted), and the
+  Tarantool iproto connection is plaintext. Both are bounded by the private
+  network the cluster already requires, and both are now written down with the
+  remediation rather than left to be rediscovered. RISK-004 and RISK-005.
+- `docs/deployment/host-tuning.md`: the capacity cliff has a structural cause —
+  N receive workers feed a single egress task through one 8192-slot channel, so
+  client→peer throughput is bounded by one consumer. Roughly 250-350
+  simultaneously relaying video clients per node, reached as a cliff. Sharding by
+  `relay_port % M` is the fix and is deliberately not made yet: the 112 000 pps
+  figure is a loopback measurement, and a rewrite justified by it would be
+  justified by the wrong bottleneck.
+- **`log_allocation_addresses = false` reached three log lines out of twelve.**
+  The switch exists to keep client addresses out of stdout, and the allocation
+  lifecycle lines honoured it — while auth failures, forbidden-peer denials,
+  quota drops, decode errors and cluster redirects wrote the address verbatim
+  whatever it was set to. An operator who turned it off got the opposite of what
+  they concluded, and the lines that leaked are the high-frequency ones. All
+  twelve now go through the same function, including the peer addresses from
+  CreatePermission and ChannelBind, which had no redacting path at all.
+- **The redaction salt was derived from the process start time.** That is the
+  exact fallback `observability::syslog` documents CodeQL catching and rejecting:
+  a restart time is often observable from outside — a rolling upgrade, a status
+  page, a gap in the metrics — so the search space collapses against four billion
+  IPv4 addresses, while the label still *looks* like a hash. It is now eight
+  bytes from `/dev/urandom`; if that read fails the node says so once and writes
+  addresses verbatim rather than producing a label that protects nothing.
+- `#![forbid(unsafe_code)]` added to every crate that contains none:
+  `turna-config`, `turna-qos`, `turna-crypto`, `turna-session`, `turna-auth`,
+  `turna-proto-turn`, `turna-cluster`, `turna-health`, `turna-observability`,
+  `turna-control`, `turna-proto-stun`, `turna-common` and `turna-packet` —
+  thirteen in all. `turna-transport` and
+  `turna-relay` keep theirs, which is the point. `docs/unsafe-audit.md`
+  claims the audited `unsafe` inventory is confined to transport and relay; the
+  attribute makes that claim checkable by the compiler instead of by a grep
+  someone remembers to run.
+- `scripts/check-doc-claims.sh` scanned only `docs/` for stale SIGHUP claims, so
+  the one in `README.md` — the file an operator reads first — sat one directory
+  outside its reach for the life of the check.
+
 ## [0.4.0] - 2026-08-30
 
 ### Fixed — read this one first

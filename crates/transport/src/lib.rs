@@ -29,6 +29,15 @@ pub mod af_xdp;
 #[cfg(all(target_os = "linux", feature = "af-xdp"))]
 pub mod neighbor;
 
+/// Whether this binary carries the TURNS (TLS-over-TCP) listener.
+///
+/// Declared here rather than in `tcp_tls` because that module is itself behind
+/// the feature gate: a build without `tls` has no `tcp_tls` to read a constant
+/// from, which is exactly the build that needs to answer the question. Mirrors
+/// `dtls::DTLS_AVAILABLE` and `quic::QUIC_AVAILABLE`, whose modules compile
+/// unconditionally and so could keep theirs inside.
+pub const TLS_AVAILABLE: bool = cfg!(feature = "tls");
+
 #[cfg(feature = "tls")]
 pub mod tcp_tls;
 #[cfg(feature = "tls")]
@@ -74,6 +83,10 @@ pub trait Transport: Send + Sync {
 }
 
 // Re-export the default transport
+/// Socket buffer sizing, applied to every socket bound after the call. See
+/// `tokio_transport::apply_socket_buffers` for why the kernel's answer is
+/// logged rather than assumed.
+pub use tokio_transport::init_socket_buffers;
 pub use tokio_transport::TokioTransport;
 
 // Re-export transport selection (config preference + runtime io_uring probe).

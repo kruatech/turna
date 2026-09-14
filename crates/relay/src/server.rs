@@ -398,11 +398,46 @@ impl RelayServer {
         migration: Option<MigrationManager>,
         tcp_relay: Option<Arc<TcpRelayManager>>,
     ) -> Self {
-        let processor = Arc::new(
+        Self::new_full_with_limits(
+            transport,
+            store,
+            auth,
+            external_ip,
+            metrics,
+            cluster,
+            migration,
+            tcp_relay,
+            None,
+        )
+    }
+
+    /// [`new_full`](Self::new_full) with configured rate limits.
+    ///
+    /// A separate constructor rather than a builder on the server: the processor
+    /// is wrapped in an `Arc` here, so anything that adjusted it afterwards would
+    /// have to reach through `Arc::get_mut` and would silently do nothing the day
+    /// a clone was taken first. `None` keeps the historical defaults plus the
+    /// deprecated `TURNA_*` overrides.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full_with_limits(
+        transport: TokioTransport,
+        store: Arc<AllocationStore>,
+        auth: Arc<AuthRegistry>,
+        external_ip: std::net::IpAddr,
+        metrics: Arc<Metrics>,
+        cluster: Option<ClusterRouting>,
+        migration: Option<MigrationManager>,
+        tcp_relay: Option<Arc<TcpRelayManager>>,
+        rate_limits: Option<&crate::processor::RateLimitSettings>,
+    ) -> Self {
+        let mut processor =
             PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
                 .with_migration(migration)
-                .with_tcp_relay(tcp_relay.clone()),
-        );
+                .with_tcp_relay(tcp_relay.clone());
+        if let Some(limits) = rate_limits {
+            processor = processor.with_rate_limits(limits);
+        }
+        let processor = Arc::new(processor);
         Self {
             transport,
             processor,

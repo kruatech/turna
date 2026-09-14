@@ -19,13 +19,9 @@ hmac.workspace     = true
 sha1.workspace     = true
 base64.workspace   = true
 tokio.workspace    = true
-# User auth
-jsonwebtoken.workspace = true
-argon2.workspace       = true
-# Declared explicitly so its `getrandom` feature is actually enabled: features
-# only activate for dependencies a crate names, and OsRng lives behind that one.
-password-hash.workspace = true
-uuid.workspace         = true
+# jsonwebtoken, argon2, password-hash and uuid were removed in 0.5.0 with the
+# store/jwt/user modules that were their only consumers. aes-gcm stays: the
+# RFC 7635 OAuth path in this file uses it.
 # Workspace crates
 turna-crypto.workspace    = true
 turna-proto-stun.workspace = true
