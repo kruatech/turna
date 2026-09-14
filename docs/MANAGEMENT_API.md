@@ -150,6 +150,24 @@ Status: **implemented**; no-op / conflict / restore / lost-completion are
 
 Global / tenant / user policy overrides.
 
+### What `username` means here
+
+The **userid, without the TURN REST expiry prefix**. A client authenticating
+with shared-secret credentials presents `USERNAME = "<unix_expiry>:<userid>"`,
+and the subject these overrides key on is the part after the first colon:
+`alice`, not `1758012345:alice`.
+
+This was not true before 0.5.0. The raw USERNAME was the key, so an override set
+for `alice` matched nothing — the stored key always carried an expiry — and
+`max_per_user` counted each minted credential as a separate user, which made it
+a cap on one pair of credentials rather than on a person. Both now use the
+canonical subject.
+
+Long-term credentials are unaffected: the username **is** the identity there,
+colons included, and nothing is stripped. The same is true for OAuth subjects.
+`Allocation.username` now carries the subject too; the credential as presented
+is recorded on the `allocation created` log line.
+
 ### Request (`SetUserLimitsRequest`)
 
 `node_id` (5), `target` (6), `idempotency_key` (7), `expected_version` (8),

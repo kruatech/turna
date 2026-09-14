@@ -33,6 +33,12 @@ pub struct AuthResolution {
     pub realm: String,
     /// Derived long-term key, for response MESSAGE-INTEGRITY.
     pub key: Vec<u8>,
+    /// The canonical subject behind the presented USERNAME — see
+    /// [`AuthMode::subject_of`]. Quota accounting and `set_user_limits` key on
+    /// this, not on the raw USERNAME, which for TURN REST carries an expiry
+    /// prefix and therefore changes on every credential the signalling service
+    /// mints.
+    pub subject: String,
     /// For OAuth (RFC 7635): the token's remaining lifetime in seconds, so the
     /// allocation lifetime can be capped to it (§6.1). `None` for long-term /
     /// shared-secret auth (no token lifetime to bind).
@@ -162,20 +168,24 @@ impl AuthRegistry {
             // Tenant realm: validate against the tenant's backend. `load()` pins
             // the current backend for this request; a concurrent rotation
             // publishes a new one for the next request without disturbing this.
-            let (key, max_lifetime_secs) = auth.load().validate_with_lifetime(msg, raw)?;
+            let mode = auth.load();
+            let (key, max_lifetime_secs) = mode.validate_with_lifetime(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: Some(tenant_id.clone()),
                 realm: realm_ref.to_string(),
                 key,
+                subject: mode.subject_of(msg.get_username().unwrap_or("")),
                 max_lifetime_secs,
             })
         } else if realm_ref == self.base_realm {
             // Base realm: default/single-tenant.
-            let (key, max_lifetime_secs) = self.base.load().validate_with_lifetime(msg, raw)?;
+            let base = self.base.load();
+            let (key, max_lifetime_secs) = base.validate_with_lifetime(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: None,
                 realm: realm_ref.to_string(),
                 key,
+                subject: base.subject_of(msg.get_username().unwrap_or("")),
                 max_lifetime_secs,
             })
         } else {

@@ -1,0 +1,149 @@
+# Alert rules for the abuse-resistance metrics added in 0.5.0.
+#
+# Kept separate from turna.yml, which covers capacity and correctness. These
+# fire on someone attacking the node, or on a partial failure the node's own
+# readiness will not report — two categories whose thresholds are argued from
+# different evidence and which an operator may want to route somewhere else.
+#
+# Every threshold below has the reasoning next to it. Change them: the numbers
+# that fit a node serving three hundred people are not the numbers for one
+# serving thirty thousand, and a rule that cries wolf is worse than no rule.
+#
+# Load alongside docs/alerts/turna.yml.
+
+groups:
+  - name: turna-abuse
+    rules:
+      # ── Partial datapath failure ───────────────────────────────────────────
+      #
+      # The only item here that is not an attack, and the most important one.
+      # Receive workers are one per SO_REUSEPORT socket and the kernel hashes
+      # clients across them, so one worker exiting takes out a fraction of the
+      # traffic — while the node keeps reporting Ready and every other metric
+      # stays clean. It does not recover on its own.
+      #
+      # `delta` over 10 minutes rather than a threshold, because the expected
+      # value is whatever the node started with (one per core by default) and
+      # hardcoding that here would make this rule wrong on the next machine.
+      - alert: TurnaRecvWorkerDied
+        expr: delta(turna_recv_workers_alive[10m]) < 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A turna receive worker exited on {{ $labels.instance }}"
+          description: >-
+            The clients the kernel hashes to that socket are no longer being
+            served, and the node still reports Ready. This does not recover
+            without a restart. Check the logs for `recv_worker_died`.
+
+      # ── Reflection ────────────────────────────────────────────────────────
+      #
+      # A legitimate client needs single digits of unauthenticated replies in
+      # its entire life: a Binding or two, a challenge, then it is authenticated
+      # and out of scope. A sustained rate of suppressions therefore means one
+      # of two things, and both are worth a page: spoofed requests naming a
+      # victim as the source, or a client population stuck in a challenge loop.
+      #
+      # 5/s over 10 minutes is well clear of a handful of clients retrying.
+      - alert: TurnaUnauthReplyBudgetExhausted
+        expr: rate(turna_unauth_replies_suppressed_total[10m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna is suppressing unauthenticated replies on {{ $labels.instance }}"
+          description: >-
+            Sustained suppression means either spoofed STUN requests — where the
+            source address is the victim the reply would be aimed at — or clients
+            failing authentication in a loop. Check whether
+            turna_auth_failures moves with it: if it does, the clients are
+            real and something is wrong with their credentials.
+
+      # ── DTLS: spoofed handshake flood ─────────────────────────────────────
+      #
+      # Every real client pays exactly one cookie challenge per handshake, so
+      # challenges should track new sessions one-for-one. An order of magnitude
+      # more challenges than accepted sessions is a flood being turned away at
+      # the door — which is the system working, but the operator should know it
+      # is happening, because the same traffic hits everything upstream too.
+      #
+      # The ratio needs a floor on the numerator: at three challenges and zero
+      # accepts the ratio is infinite and means nothing.
+      - alert: TurnaDtlsCookieChallengeFlood
+        expr: >-
+          rate(turna_dtls_cookie_challenges_total[5m]) > 50
+          and
+          rate(turna_dtls_cookie_challenges_total[5m])
+            > 10 * rate(turna_dtls_sessions_total[5m])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spoofed DTLS ClientHellos on {{ $labels.instance }}"
+          description: >-
+            Far more address-validation challenges than completed handshakes.
+            Each one costs an HMAC and a datagram and allocates nothing, so the
+            node is holding, but the traffic is reaching it — consider filtering
+            upstream if it persists.
+
+      # This one means the defence in depth is being used, i.e. the cookie gate
+      # let something through and the pending cap caught it. On a node whose
+      # cookie gate is working this should be flat at zero; anything else is
+      # worth understanding before it becomes an outage.
+      - alert: TurnaDtlsPendingHandshakeCapHit
+        expr: rate(turna_dtls_rejected_pending_cap_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna is dropping DTLS handshakes at the pending cap on {{ $labels.instance }}"
+          description: >-
+            max_pending_handshakes is the backstop behind address validation, so
+            reaching it means either a flood large enough to saturate the
+            validated path, or a legitimate client population larger than the
+            cap. Compare turna_dtls_pending_handshakes against the configured
+            value before raising it — if the gauge sits at the ceiling with
+            turna_dtls_sessions_total flat, it is the former.
+
+      # ── QUIC: spoofed Initials ────────────────────────────────────────────
+      #
+      # Same shape as the DTLS rule, same reasoning. Every client pays one Retry
+      # on its first connection; far more Retries than accepted sessions means
+      # Initials from addresses that do not answer.
+      - alert: TurnaQuicRetryFlood
+        expr: >-
+          rate(turna_quic_retries_sent_total[5m]) > 50
+          and
+          rate(turna_quic_retries_sent_total[5m])
+            > 10 * rate(turna_quic_sessions_total[5m])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spoofed QUIC Initials on {{ $labels.instance }}"
+          description: >-
+            Retry answers an unvalidated Initial with one datagram instead of a
+            TLS signature, so the node is paying almost nothing for these. The
+            alert exists so the traffic is visible, not because the node is at
+            risk from it.
+
+      # ── Rate limiter under pressure ───────────────────────────────────────
+      #
+      # Eviction is normal at the margins — the table is finite and the client
+      # population changes. A sustained rate means the table is being churned,
+      # which is either a spoofed-source flood or a genuine population larger
+      # than max_entries. Both are worth knowing; only the second is fixed by
+      # raising a number.
+      - alert: TurnaRateLimiterTableChurn
+        expr: rate(turna_rate_limiter_evictions_total[10m]) > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna's rate-limiter table is churning on {{ $labels.instance }}"
+          description: >-
+            Entries are being evicted to make room for new sources faster than
+            the client population plausibly changes. New clients are still
+            admitted — this is the design — but per-source limiting is less
+            effective while the table turns over this fast.

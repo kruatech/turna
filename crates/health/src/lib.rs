@@ -324,6 +324,18 @@ pub struct Metrics {
     pub dtls_bytes_tx: AtomicU64,
     pub dtls_outbound_dropped: AtomicU64,
     pub dtls_rejected_per_ip: AtomicU64,
+    /// Receive workers still running. A drop below the configured worker count
+    /// means part of the datapath is unserved; the value does not recover.
+    pub recv_workers_alive: AtomicU64,
+    /// Unauthenticated replies (Binding responses, 401 challenges) suppressed
+    /// because the source exhausted its budget.
+    pub unauth_replies_suppressed: AtomicU64,
+    /// Rate-limiter entries evicted to admit a new source. Rising with a flat
+    /// client count is the signature of a spoofed-source flood.
+    pub rate_limiter_evictions: AtomicU64,
+    pub dtls_cookie_challenges: AtomicU64,
+    pub dtls_pending_handshakes: AtomicU64,
+    pub dtls_rejected_pending_cap: AtomicU64,
     pub dtls_outbound_oversize: AtomicU64,
     pub dtls_accept_timeouts: AtomicU64,
     pub dtls_handshake_failures: AtomicU64,
@@ -335,6 +347,7 @@ pub struct Metrics {
     pub quic_control_dropped_no_stream: AtomicU64,
     pub quic_rejected_over_cap: AtomicU64,
     pub quic_rejected_per_ip: AtomicU64,
+    pub quic_retries_sent: AtomicU64,
     pub quic_cert_reloads: AtomicU64,
     pub quic_cert_reload_failures: AtomicU64,
     pub quic_rejected_rate_limit: AtomicU64,
@@ -541,6 +554,12 @@ impl Metrics {
             dtls_bytes_tx: AtomicU64::new(0),
             dtls_outbound_dropped: AtomicU64::new(0),
             dtls_rejected_per_ip: AtomicU64::new(0),
+            recv_workers_alive: AtomicU64::new(0),
+            unauth_replies_suppressed: AtomicU64::new(0),
+            rate_limiter_evictions: AtomicU64::new(0),
+            dtls_cookie_challenges: AtomicU64::new(0),
+            dtls_pending_handshakes: AtomicU64::new(0),
+            dtls_rejected_pending_cap: AtomicU64::new(0),
             dtls_outbound_oversize: AtomicU64::new(0),
             dtls_accept_timeouts: AtomicU64::new(0),
             dtls_handshake_failures: AtomicU64::new(0),
@@ -552,6 +571,7 @@ impl Metrics {
             quic_control_dropped_no_stream: AtomicU64::new(0),
             quic_rejected_over_cap: AtomicU64::new(0),
             quic_rejected_per_ip: AtomicU64::new(0),
+            quic_retries_sent: AtomicU64::new(0),
             quic_cert_reloads: AtomicU64::new(0),
             quic_cert_reload_failures: AtomicU64::new(0),
             quic_rejected_rate_limit: AtomicU64::new(0),
@@ -903,6 +923,24 @@ impl Metrics {
              # HELP turna_dtls_rejected_per_ip_total DTLS sessions refused because the source IP hit max_sessions_per_ip (DTL-9)\n\
              # TYPE turna_dtls_rejected_per_ip_total counter\n\
              turna_dtls_rejected_per_ip_total {}\n\
+             # HELP turna_rate_limiter_evictions_total Rate-limiter entries dropped to make room for a new source\n\
+             # TYPE turna_rate_limiter_evictions_total counter\n\
+             turna_rate_limiter_evictions_total {}\n\
+             # HELP turna_unauth_replies_suppressed_total Unauthenticated replies not sent because the source exhausted its reflection budget\n\
+             # TYPE turna_unauth_replies_suppressed_total counter\n\
+             turna_unauth_replies_suppressed_total {}\n\
+             # HELP turna_recv_workers_alive Receive workers still running; a fall below the configured count means part of the datapath is unserved\n\
+             # TYPE turna_recv_workers_alive gauge\n\
+             turna_recv_workers_alive {}\n\
+             # HELP turna_dtls_cookie_challenges_total ClientHellos answered with a HelloVerifyRequest because the source address was not validated (RFC 6347 4.2.1)\n\
+             # TYPE turna_dtls_cookie_challenges_total counter\n\
+             turna_dtls_cookie_challenges_total {}\n\
+             # HELP turna_dtls_pending_handshakes DTLS handshakes in flight: state allocated, outcome unknown\n\
+             # TYPE turna_dtls_pending_handshakes gauge\n\
+             turna_dtls_pending_handshakes {}\n\
+             # HELP turna_dtls_rejected_pending_cap_total Datagrams dropped because max_pending_handshakes was reached\n\
+             # TYPE turna_dtls_rejected_pending_cap_total counter\n\
+             turna_dtls_rejected_pending_cap_total {}\n\
              # HELP turna_uring_workers io_uring worker threads in the pool\n\
              # TYPE turna_uring_workers gauge\n\
              turna_uring_workers {}\n\
@@ -1011,6 +1049,9 @@ impl Metrics {
              # HELP turna_quic_rejected_per_ip_total QUIC sessions refused at max_sessions_per_ip\n\
              # TYPE turna_quic_rejected_per_ip_total counter\n\
              turna_quic_rejected_per_ip_total {}\n\
+             # HELP turna_quic_retries_sent_total QUIC Initials answered with a Retry because the source address was not validated (RFC 9000 8.1)\n\
+             # TYPE turna_quic_retries_sent_total counter\n\
+             turna_quic_retries_sent_total {}\n\
              # HELP turna_quic_cert_reloads_total Successful QUIC/WebTransport certificate hot-reloads\n\
              # TYPE turna_quic_cert_reloads_total counter\n\
              turna_quic_cert_reloads_total {}\n\
@@ -1163,6 +1204,12 @@ impl Metrics {
             l(&self.dtls_bytes_tx),
             l(&self.dtls_outbound_dropped),
             l(&self.dtls_rejected_per_ip),
+            l(&self.rate_limiter_evictions),
+            l(&self.unauth_replies_suppressed),
+            l(&self.recv_workers_alive),
+            l(&self.dtls_cookie_challenges),
+            l(&self.dtls_pending_handshakes),
+            l(&self.dtls_rejected_pending_cap),
             l(&self.uring_workers),
             l(&self.uring_cqe_drained_total),
             l(&self.uring_cqe_batches_total),
@@ -1199,6 +1246,7 @@ impl Metrics {
             l(&self.quic_control_dropped_no_stream),
             l(&self.quic_rejected_over_cap),
             l(&self.quic_rejected_per_ip),
+            l(&self.quic_retries_sent),
             l(&self.quic_cert_reloads),
             l(&self.quic_cert_reload_failures),
             l(&self.quic_rejected_rate_limit),

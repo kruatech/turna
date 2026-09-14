@@ -22,7 +22,15 @@ af-xdp = ["turna-transport/af-xdp"]
 # TURN over DTLS (RFC 7350).
 dtls = ["turna-transport/dtls"]
 
+# prctl(PR_SET_DUMPABLE) and setrlimit(RLIMIT_CORE) at startup, so the shared
+# secret cannot end up in a core dump. Already in the tree via turna-transport,
+# so no new crate enters the graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
+# Overwrites the spare copy of the shared secret left by a SIGHUP reload.
+zeroize.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

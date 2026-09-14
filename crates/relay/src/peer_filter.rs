@@ -112,6 +112,10 @@ fn masked_eq_v6(net: Ipv6Addr, ip: Ipv6Addr, prefix: u8) -> bool {
 /// Decides whether a (normalized) peer address may be relayed to.
 #[derive(Debug, Clone)]
 pub struct PeerPolicy {
+    /// This node's own addresses: every listener, plus the advertised
+    /// `external_ip` / `external_ip6` and the relay `bind_ip`. Denied
+    /// unconditionally — see `is_forbidden`.
+    self_addrs: Vec<IpAddr>,
     /// Deny RFC 1918 / ULA peers (the `internet-facing` profile).
     deny_private: bool,
     /// Allow loopback peers (dev/test only).
@@ -135,6 +139,7 @@ impl PeerPolicy {
     /// Internet-facing: deny RFC 1918 / ULA peers (secure default).
     pub fn internet_facing() -> Self {
         Self {
+            self_addrs: Vec::new(),
             deny_private: true,
             allow_loopback: env_allow_loopback(),
             denied: Vec::new(),
@@ -145,6 +150,7 @@ impl PeerPolicy {
     /// LAN / trusted perimeter: allow private peers (explicit opt-in).
     pub fn lan() -> Self {
         Self {
+            self_addrs: Vec::new(),
             deny_private: false,
             allow_loopback: env_allow_loopback(),
             denied: Vec::new(),
@@ -168,11 +174,30 @@ impl PeerPolicy {
             _ => true,
         };
         Self {
+            self_addrs: Vec::new(),
             deny_private,
             allow_loopback: allow_loopback_peers || env_allow_loopback(),
             denied: parse_ranges(denied_peer_ranges, "denied_peer_ranges"),
             allowed: parse_ranges(allowed_peer_ranges, "allowed_peer_ranges"),
         }
+    }
+
+    /// Register this node's own addresses. Builder, so no constructor signature
+    /// changes; call it once at startup with every listener address plus
+    /// `external_ip` / `external_ip6` and the relay `bind_ip`.
+    ///
+    /// Unspecified addresses (`0.0.0.0`, `::`) are skipped: a wildcard listener
+    /// does not name an address, and `is_forbidden` already refuses those
+    /// outright.
+    pub fn with_self_addresses<I: IntoIterator<Item = IpAddr>>(mut self, addrs: I) -> Self {
+        self.self_addrs = addrs
+            .into_iter()
+            .map(normalize_ip)
+            .filter(|a| !a.is_unspecified())
+            .collect();
+        self.self_addrs.sort();
+        self.self_addrs.dedup();
+        self
     }
 
     /// Returns true if relaying to/from this **normalized** peer is refused.
@@ -189,6 +214,21 @@ impl PeerPolicy {
             IpAddr::V4(v4) if is_special_v4(v4) => return true,
             IpAddr::V6(v6) if is_special_v6(v6) => return true,
             _ => {}
+        }
+        // This node's own addresses, and the allow-list does not override them.
+        //
+        // Relaying to ourselves is never a legitimate request and is several
+        // small problems at once: a peer of `external_ip:3478` loops traffic
+        // through the STUN path, burning CPU on datagrams that go nowhere; a
+        // peer pointed at the health port reaches the whole Prometheus surface
+        // if it is not on loopback; a peer pointed at another allocation's relay
+        // port chains one client's traffic into another's.
+        //
+        // `internet-facing` does not cover this, because a node's public address
+        // is public — which is exactly why it is reachable and why it must not
+        // also be a valid relay target.
+        if self.self_addrs.iter().any(|a| *a == ip) {
+            return true;
         }
 
         // Explicit allow wins over deny_private and the deny list.

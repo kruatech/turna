@@ -18,6 +18,9 @@ thiserror.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+# Log throttling for the pre-authentication sites (LogThrottle). Already a
+# workspace member, so no new crate enters the dependency graph.
+turna-common.workspace = true
 turna-proto-stun.workspace = true
 turna-proto-turn.workspace = true
 turna-proto-rtp.workspace = true

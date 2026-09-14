@@ -14,6 +14,72 @@
 
 pub mod drain;
 
+/// Counter that answers "should this event be logged?" with a shrinking yes.
+///
+/// # Why this is in `common`
+///
+/// Three log sites in the relay ran at `warn!` **before authentication**, once
+/// per packet, with attacker-controlled content: a STUN decode error (the
+/// parser's message included), an auth failure, and the rate limiter refusing a
+/// source. One gigabit host produces roughly 1.5 million packets per second, and
+/// a `warn!` line is 100-200 bytes through `tracing-subscriber` to stdout — some
+/// hundreds of megabytes per second of log, spent on formatting in the hot path.
+///
+/// The damage is not the disk. journald applies its own rate limit and starts
+/// dropping, and what it drops is the whole stream — so a flood of
+/// attacker-triggered warnings silences the messages an operator actually needs,
+/// at exactly the moment they need them. The counters
+/// (`parser_rejections`, auth failures) were already there and are the honest
+/// signal; the log line only has to say that it is happening.
+///
+/// First occurrence, then every power of two: 1, 2, 4, 8, ... An attack shows up
+/// as a handful of lines whose `occurrences` field grows, instead of as a
+/// denial of the log.
+///
+/// The pattern already existed inline in `turna-session`; it is here so the
+/// pre-auth sites can use it without copying the arithmetic.
+#[derive(Debug, Default)]
+pub struct LogThrottle {
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl LogThrottle {
+    pub const fn new() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record an occurrence. Returns `Some(total)` when this one should be
+    /// logged, `None` when it should only be counted.
+    pub fn should_log(&self) -> Option<u64> {
+        let n = self
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        // `is_power_of_two()` is true for 1, so the first occurrence always logs.
+        n.is_power_of_two().then_some(n)
+    }
+
+    /// Total occurrences, logged or not.
+    pub fn count(&self) -> u64 {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod log_throttle_tests {
+    use super::LogThrottle;
+
+    #[test]
+    fn logs_the_first_then_powers_of_two() {
+        let t = LogThrottle::new();
+        let logged: Vec<u64> = (0..64).filter_map(|_| t.should_log()).collect();
+        assert_eq!(logged, vec![1, 2, 4, 8, 16, 32, 64]);
+        assert_eq!(t.count(), 64, "every occurrence is counted, logged or not");
+    }
+}
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------

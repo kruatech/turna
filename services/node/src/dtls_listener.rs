@@ -96,6 +96,7 @@ pub fn spawn_dtls(
         max_handshakes_per_sec_per_ip: cfg.max_handshakes_per_sec_per_ip,
         handshake_burst_per_ip: cfg.handshake_burst_per_ip,
         cert_reload_interval: std::time::Duration::from_secs(cfg.cert_reload_secs),
+        max_pending_handshakes: cfg.max_pending_handshakes,
     };
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<DtlsEvent>(1024);
@@ -132,6 +133,15 @@ pub fn spawn_dtls(
                 metrics
                     .dtls_rejected_per_ip
                     .store(s.rejected_per_ip, Relaxed);
+                metrics
+                    .dtls_cookie_challenges
+                    .store(s.cookie_challenges, Relaxed);
+                metrics
+                    .dtls_pending_handshakes
+                    .store(s.pending_handshakes as u64, Relaxed);
+                metrics
+                    .dtls_rejected_pending_cap
+                    .store(s.rejected_pending_cap, Relaxed);
                 metrics
                     .dtls_outbound_oversize
                     .store(s.outbound_oversize, Relaxed);

@@ -399,15 +399,7 @@ impl RelayServer {
         tcp_relay: Option<Arc<TcpRelayManager>>,
     ) -> Self {
         Self::new_full_with_limits(
-            transport,
-            store,
-            auth,
-            external_ip,
-            metrics,
-            cluster,
-            migration,
-            tcp_relay,
-            None,
+            transport, store, auth, external_ip, metrics, cluster, migration, tcp_relay, None,
         )
     }
 
@@ -430,10 +422,9 @@ impl RelayServer {
         tcp_relay: Option<Arc<TcpRelayManager>>,
         rate_limits: Option<&crate::processor::RateLimitSettings>,
     ) -> Self {
-        let mut processor =
-            PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
-                .with_migration(migration)
-                .with_tcp_relay(tcp_relay.clone());
+        let mut processor = PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
+            .with_migration(migration)
+            .with_tcp_relay(tcp_relay.clone());
         if let Some(limits) = rate_limits {
             processor = processor.with_rate_limits(limits);
         }
@@ -862,15 +853,55 @@ impl RelayServer {
             if *shutdown.borrow() {
                 break;
             }
-            if !workers.is_empty() && workers.iter().all(|w| w.is_finished()) {
-                error!(
-                    event = "datapath_dead",
-                    "all recv workers exited — datapath is dead"
-                );
+            // Partial loss has to be as visible as total loss.
+            //
+            // Only the all-dead case was checked. With N workers on SO_REUSEPORT
+            // sockets the kernel hashes clients across them, so one worker
+            // exiting is 1/N of the traffic: either the kernel keeps hashing to
+            // a socket nobody reads, or it rehashes every flow at once. Either
+            // way the node stayed Ready, every metric stayed clean, and a
+            // fraction of the calls degraded silently — which is the failure
+            // mode that gets blamed on the network for a week.
+            if !workers.is_empty() {
+                let alive = workers.iter().filter(|w| !w.is_finished()).count();
+                let total = workers.len();
                 self.processor
                     .metrics()
-                    .set_readiness(turna_health::Readiness::Degraded);
-                break;
+                    .recv_workers_alive
+                    .store(alive as u64, std::sync::atomic::Ordering::Relaxed);
+                if alive == 0 {
+                    error!(
+                        event = "datapath_dead",
+                        total, "all recv workers exited — datapath is dead"
+                    );
+                    self.processor
+                        .metrics()
+                        .set_readiness(turna_health::Readiness::Degraded);
+                    break;
+                }
+                if alive < total {
+                    // Degraded, not dead: the node still serves the flows the
+                    // surviving workers own, and taking it out of rotation
+                    // entirely would drop those too. A quarter is the threshold
+                    // because below it the loss is plausibly one unlucky worker
+                    // and above it the node is no longer the thing it was sized
+                    // as.
+                    let lost_pct = (total - alive) * 100 / total;
+                    if lost_pct >= 25 {
+                        self.processor
+                            .metrics()
+                            .set_readiness(turna_health::Readiness::Degraded);
+                    }
+                    error!(
+                        event = "recv_worker_died",
+                        alive,
+                        total,
+                        lost_pct,
+                        "recv worker(s) exited; clients the kernel hashes to those \
+                         sockets are not being served. This does not recover on its \
+                         own — restart the node."
+                    );
+                }
             }
             if sender_task.is_finished() {
                 error!(

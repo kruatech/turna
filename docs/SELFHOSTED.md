@@ -170,9 +170,17 @@ you.
 | `turna_quota_exceeded_total` | Per-allocation bandwidth cap hit. Over it, packets are **dropped**, not throttled — the user sees frame loss. |
 | `turna_peer_rejected_total` | Peer filter refusing a relay target. A steady rate usually means the SFU's address is missing from `allowed_peer_ranges`. |
 | `turna_auth_previous_secret_total` | Clients still using the old shared secret. Must reach zero before you drop it. |
+| `turna_recv_workers_alive` | Receive workers still running, against the count at startup. A fall is permanent and means the clients the kernel hashes to that socket are unserved **while the node still reports Ready**. Alert on any decrease. |
+| `turna_unauth_replies_suppressed_total` | Binding responses and 401 challenges withheld because a source used up its reflection budget. A real client needs single digits of these in its whole life, so a sustained rate means spoofed requests naming a victim as the source. |
+| `turna_dtls_pending_handshakes` | DTLS handshakes in flight, i.e. state allocated before the source address was proved real. Read it against `turna_dtls_accepted_total`: near the cap with flat accepts is an attack, not load. Only if DTLS is enabled. |
+| `turna_quic_retries_sent_total` | Initials answered with a Retry. Should track new connections roughly one-for-one; far above that is spoofed traffic that cost a datagram instead of a signature. Only if QUIC is enabled. |
 | `nstat -az UdpRcvbufErrors` | Kernel-side buffer overflow. **Not a turna metric** — nothing in turna can see it, which is why it is on this list. |
 
-Alert rules to start from: [`docs/alerts/turna.yml`](alerts/turna.yml).
+Alert rules: [`docs/alerts/turna.yml`](alerts/turna.yml) for capacity and
+correctness, [`docs/alerts/turna-abuse.yml`](alerts/turna-abuse.yml) for the
+signals above. Read the thresholds before loading them — the numbers that fit a
+node serving three hundred people are not the numbers for thirty thousand, and a
+rule that cries wolf is worse than no rule.
 
 ## 9. Rotating the shared secret
 
@@ -188,6 +196,51 @@ sudo systemctl reload turna-node
 
 The realm cannot change this way and a reload that tries is refused — a realm
 change invalidates every credential in flight.
+
+## Upgrading from 0.4.x
+
+Five things change behaviour without you touching the config. None of them is
+a knob you are expected to find in the CHANGELOG afterwards.
+
+**Configs with `[sfu]`, `[signaling]` or `[recording]` will not load.** The
+schema is strict, so a leftover section is a hard failure — with a message
+naming the section and telling you to delete it. Nothing else is needed; those
+sections were parsed and read by nothing.
+
+**`max_per_user` now counts people, not credentials.** It used to key on the raw
+TURN REST username, which carries an expiry prefix and therefore changed every
+time your signalling service minted a credential — so the cap bounded one pair
+of credentials and reset whenever a client asked for a fresh one. It now keys on
+the userid. **Existing values are too low**: one person legitimately holds
+several allocations at once — two ICE transports, a second device, a reconnect
+whose old allocation has not yet expired. Raise it before upgrading, not after
+the support tickets. The reference config uses 12.
+
+`set_user_limits` changes with it: the subject is now `alice`, not
+`1758012345:alice`. Any override you set before was silently matching nothing.
+
+**Per-source caps switched on.** `[tls] max_connections_per_ip` goes from
+unlimited to 64, and the DTLS and QUIC `max_sessions_per_ip` from unlimited to
+16. If a known NAT egress point carries more than that from one address, raise
+it explicitly — the number is now a decision either way.
+
+**QUIC clients pay one extra round trip on their first connection.** Unvalidated
+Initials are answered with a Retry instead of a handshake, which is what stops a
+spoofed Initial from costing a TLS signature. `turna_quic_retries_sent_total`
+should track new connections roughly one-for-one; far more than that means
+spoofed traffic.
+
+**The Tarantool bootstrap requires a password.** It used to generate one and
+print it to STDOUT for you to copy out of the log — which is journald, docker
+logs and whatever collects them. Supply `TURNA_PASSWORD` or
+`TURNA_PASSWORD_FILE`; a rerun with a new value is now how you rotate the
+credential. Only relevant if you use the Tarantool backend; a single node on
+`memory` is unaffected.
+
+Two more worth knowing, though they need no action: `[tls]` is now built into
+the release image by default and the node refuses to start if `[tls]` is enabled
+on a binary without it, and core dumps are disabled unless you set
+`[turn] allow_core_dumps = true`.
 
 ## Things that will bite you
 

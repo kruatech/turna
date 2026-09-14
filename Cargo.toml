@@ -80,6 +80,7 @@ rand = "0.10"
 base64 = "0.23"
 
 # auth
+zeroize = "1"
 #
 # jsonwebtoken, argon2, password-hash and uuid were declared here for
 # turna-auth's store/jwt/user modules, which were deleted in 0.5.0 (they had no

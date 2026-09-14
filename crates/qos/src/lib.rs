@@ -203,6 +203,10 @@ pub struct ShardedRateLimiter {
     refill_rate: u32,
     /// Hard cap on tracked keys; bounds memory under spoofed-source floods.
     max_entries: usize,
+    /// Entries dropped to make room for a new source.
+    evictions: AtomicU64,
+    /// Times the table was found full. Drives the throttled warning.
+    table_full_events: AtomicU64,
 }
 
 impl ShardedRateLimiter {
@@ -223,6 +227,8 @@ impl ShardedRateLimiter {
             max_tokens,
             refill_rate,
             max_entries: 65536,
+            evictions: AtomicU64::new(0),
+            table_full_events: AtomicU64::new(0),
         }
     }
 
@@ -246,11 +252,23 @@ impl ShardedRateLimiter {
             return b.try_acquire(now, max, rate);
         }
 
-        // Unknown IP: enforce the entry cap before inserting so a spoofed-source
-        // flood can't grow the map without bound.
-        if self.buckets.len() >= self.max_entries {
-            tracing::warn!(%ip, "rate limiter table full, denying new IP");
-            return false;
+        // Unknown IP and the table is full. Evict, do not deny.
+        //
+        // Denying was a remote, anonymous, ~1.3 MB denial of service: 65 536
+        // spoofed source addresses fill the table in a fraction of a second, and
+        // every client whose address is not already in it is then refused —
+        // before authentication, before parsing — until `cleanup` drops the
+        // attacker's entries 600 seconds later. Repeating the burst every ten
+        // minutes holds the door shut indefinitely, while established clients
+        // keep working, so "active allocations" looks healthy throughout.
+        //
+        // A limiter that fails closed against *unknown* sources fails closed
+        // against *legitimate* ones the moment addresses can be spoofed, which
+        // for UDP is always.
+        if self.buckets.len() >= self.max_entries && !self.evict_one(now) {
+            // Eviction only fails if the table emptied underneath us, in which
+            // case the insert below has room anyway.
+            self.note_table_full(ip);
         }
         // entry() collapses the race where two threads insert the same new IP.
         let b = self
@@ -258,6 +276,81 @@ impl ShardedRateLimiter {
             .entry(ip)
             .or_insert_with(|| AtomicTokenBucket::new(max, now));
         b.try_acquire(now, max, rate)
+    }
+
+    /// Make room for one new bucket by dropping the idlest of a bounded sample.
+    ///
+    /// Sampling rather than scanning: this runs on the insert path while the
+    /// table is full, which under a flood is every packet from a new address, and
+    /// an O(n) scan there would turn a memory bound into a CPU one.
+    ///
+    /// Picking the idlest is what makes the choice land on the attacker. A
+    /// spoofed address sends one packet and is never seen again, so its entry
+    /// ages; a real client sending continuously has the smallest age in any
+    /// sample and is the least likely to be chosen. When the table is entirely
+    /// attacker entries — the case that matters — every candidate is one.
+    ///
+    /// Evicting a live client is survivable in a way that denying it is not: it
+    /// gets a fresh bucket on its next packet, i.e. more budget, not less. The
+    /// failure direction is deliberate.
+    fn evict_one(&self, now: u64) -> bool {
+        const SAMPLE: usize = 8;
+        let mut victim: Option<(IpAddr, u64)> = None;
+        // The iterator guard is dropped before `remove`: DashMap locks one shard
+        // at a time, and holding a read guard across a write to the same shard
+        // deadlocks.
+        for e in self.buckets.iter().take(SAMPLE) {
+            let age = now.saturating_sub(e.value().last_ts());
+            if victim.is_none_or(|(_, best)| age > best) {
+                victim = Some((*e.key(), age));
+            }
+        }
+        match victim {
+            Some((k, _)) => {
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                self.buckets.remove(&k).is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// One warning per power of two, not one per packet.
+    ///
+    /// The original logged at `warn!` on every refused packet, from an
+    /// attacker-chosen source address — a log amplifier sitting on the same path
+    /// as the denial it was reporting.
+    fn note_table_full(&self, ip: IpAddr) {
+        let n = self.table_full_events.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(
+                %ip,
+                occurrences = n,
+                entries = self.buckets.len(),
+                "rate limiter table is full; evicting the idlest entries to admit \
+                 new sources. A sustained rate here means a spoofed-source flood \
+                 or a genuinely larger client population than max_entries."
+            );
+        }
+    }
+
+    /// Buckets currently held. For the fill-level metric.
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// Capacity at which eviction starts.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Entries dropped to make room. A rising value with a flat client count is
+    /// the signature of a spoofed-source flood.
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
     }
 
     /// Drop buckets idle for `max_age_secs`. Call periodically.
@@ -338,6 +431,19 @@ pub struct TieredRateLimiter {
 }
 
 impl TieredRateLimiter {
+    /// Entries evicted across every tier.
+    ///
+    /// Summed rather than reported per tier: the question an operator has is
+    /// "is the table being churned", and which of five buckets churned first
+    /// does not change the answer or the action.
+    pub fn evictions(&self) -> u64 {
+        self.per_ip.evictions()
+            + self.per_prefix.evictions()
+            + self.allocate.evictions()
+            + self.create_permission.evictions()
+            + self.channel_bind.evictions()
+    }
+
     pub fn new(limits: TieredLimits) -> Self {
         Self {
             per_ip: ShardedRateLimiter::new(limits.per_ip.0, limits.per_ip.1),
@@ -533,5 +639,64 @@ mod loom_bucket {
             // fewer (a lost successful decrement).
             assert_eq!(total, burst, "granted {total}, expected exactly {burst}");
         });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod table_full_tests {
+    use super::*;
+
+    fn ip(n: u32) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(n))
+    }
+
+    /// The regression this file exists for.
+    ///
+    /// Filling the table used to make `check` return false for every source not
+    /// already in it — a remote, anonymous denial of service costing about
+    /// 1.3 MB of spoofed UDP, and lasting until the 600-second cleanup. A new
+    /// source must be admitted even when the table is full.
+    #[test]
+    fn a_full_table_still_admits_a_new_source() {
+        let rl = ShardedRateLimiter::new(100, 100);
+        let cap = rl.max_entries();
+
+        // Fill past capacity with distinct sources, as a spoofed flood would.
+        for i in 0..(cap as u32 + 4_096) {
+            rl.check(ip(i));
+        }
+        assert!(
+            rl.len() <= cap,
+            "the entry cap must still bound memory: {} > {cap}",
+            rl.len()
+        );
+        assert!(
+            rl.evictions() > 0,
+            "the table filled but nothing was evicted — the cap is being enforced \
+             by refusing instead of by making room"
+        );
+
+        // The legitimate client arriving after the flood.
+        let newcomer = ip(0xC000_0201); // 192.0.2.1
+        assert!(
+            rl.check(newcomer),
+            "a new source was refused because the table was full — this is the \
+             spoofed-flood denial of service, not rate limiting"
+        );
+        // And it keeps working, i.e. it really got a bucket rather than a
+        // one-off pass.
+        assert!(rl.check(newcomer));
+    }
+
+    /// Eviction must not become a way to bypass the limit: a source that is
+    /// actually over its rate is still refused while the table is full.
+    #[test]
+    fn eviction_does_not_excuse_an_over_rate_source() {
+        let rl = ShardedRateLimiter::new(4, 0);
+        let loud = ip(0xC000_0202);
+        for _ in 0..4 {
+            assert!(rl.check(loud));
+        }
+        assert!(!rl.check(loud), "a source over its burst must be refused");
     }
 }

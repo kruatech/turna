@@ -300,6 +300,34 @@ pub(crate) async fn run_demux(
                     }
                 }
 
+                // ── Address validation BEFORE anything else. ──
+                //
+                // Every check below this point costs something — a lock, a
+                // counter, eventually a task — and all of it would be spent on
+                // an address the sender merely claimed. RFC 6347 §4.2.1 puts
+                // the cookie exchange first for that reason. A ClientHello
+                // without a cookie this node issued is answered with one
+                // datagram derived from the address, and nothing is retained:
+                // a million spoofed hellos cost a million HMACs and zero bytes.
+                match crate::dtls_cookie::check(&buf[..n], remote) {
+                    crate::dtls_cookie::Verdict::Accept => {}
+                    crate::dtls_cookie::Verdict::SendHelloVerifyRequest(reply) => {
+                        // Best-effort: if the send fails the client retransmits,
+                        // which is the same thing that happens when the reply is
+                        // lost in the network.
+                        let _ = socket.send_to(&reply, remote).await;
+                        stats.cookie_challenges.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    crate::dtls_cookie::Verdict::Drop => {
+                        // Not a well-formed ClientHello. Silence, because a
+                        // reply would make this an amplifier for whatever was
+                        // actually sent.
+                        stats.inbound_dropped.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                }
+
                 // ── New address: admission BEFORE any handshake work. ──
                 if cfg.max_sessions != 0 && stats.active.load(Relaxed) >= cfg.max_sessions {
                     stats.rejected_over_cap.fetch_add(1, Relaxed);
@@ -320,6 +348,28 @@ pub(crate) async fn run_demux(
                         continue;
                     }
                     *m.entry(remote.ip()).or_insert(0) += 1;
+                }
+
+                // ── The bound that survives a spoofed flood. ──
+                //
+                // Every check above this line counts something that already
+                // exists: `max_sessions` counts completed handshakes,
+                // `max_sessions_per_ip` counts sessions, and both are keyed on a
+                // source address the sender chose. None of them bounds the state
+                // allocated below, which is the thing a spoofed ClientHello
+                // actually costs. RFC 6347 §4.2.1 puts the cookie exchange
+                // before this point for that reason; `webrtc-dtls` runs it
+                // inside `DTLSConn`, after.
+                //
+                // Until the demultiplexer issues its own HelloVerifyRequest,
+                // this counter is the whole defence. It is decremented on every
+                // exit path of the task below, including the timeout one.
+                if cfg.max_pending_handshakes != 0
+                    && stats.pending_handshakes.load(Relaxed) >= cfg.max_pending_handshakes
+                {
+                    stats.rejected_pending_cap.fetch_add(1, Relaxed);
+                    release_ip(&per_ip, remote.ip());
+                    continue;
                 }
 
                 let (ptx, prx) = mpsc::channel::<Vec<u8>>(PEER_QUEUE);
@@ -349,6 +399,7 @@ pub(crate) async fn run_demux(
                 let idle = cfg.idle_timeout;
                 let cap = cfg.outbound_queue_capacity;
 
+                stats.pending_handshakes.fetch_add(1, Relaxed);
                 tokio::spawn(async move {
                     // One task per peer: a stalled handshake costs this task, not
                     // the listener. `is_client = false`, no resumption state —
@@ -371,6 +422,12 @@ pub(crate) async fn run_demux(
                             }
                         }
                     };
+
+                    // Released here, before the branch: the handshake is over
+                    // either way, and the session that may follow is counted by
+                    // `active`. Decrementing inside each arm would leak the slot
+                    // on any future arm somebody forgets.
+                    stats_c.pending_handshakes.fetch_sub(1, Relaxed);
 
                     match established {
                         Ok(dtls_conn) => {
