@@ -39,11 +39,6 @@ enabled = true
 ticket_secret = "${TURNA_CLUSTER_SECRET}"
 ticket_ttl_secs = 300
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_url = "turn:turn.example.net:3478"
-turn_shared_secret = "${TURNA_SHARED_SECRET}"
-
 [cluster]
 cluster_mode = true
 cluster_name = "turna-prod"

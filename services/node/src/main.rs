@@ -122,6 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "unknown".into()),
         otlp_endpoint: obs.otlp_endpoint.clone(),
         json_logs: obs.json_logs,
+        // Inverted on purpose: the config key says whether to LOG addresses,
+        // the telemetry flag says whether to HIDE them.
+        redact_stdout_addresses: !obs.log_allocation_addresses,
         sampling: SamplingConfig {
             base_ratio: obs.trace_sample_rate,
             max_spans_per_second: obs.max_spans_per_second,
@@ -171,6 +174,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[turn.dtls] is enabled in the configuration, but this binary \
                     was built without DTLS support; rebuild with `--features dtls` \
                     or disable [turn.dtls]"
+                .into(),
+        );
+    }
+
+    // Same fail-fast for TURNS. Without the `tls` feature the whole listener
+    // block in `run_tokio` is `#[cfg]`-ed away and `tls_cfg` is dropped by a
+    // `let _ =` — no error, no warning, and `EXPOSE 5349/tcp` in the image says
+    // the port is served. An operator on a UDP-blocked network then has no way
+    // in at all, because this node ships no plain TURN-over-TCP listener either.
+    // `tls` is in the node's default features, so reaching this means the binary
+    // was built with `--no-default-features`.
+    if tls_cfg.enabled && !turna_transport::TLS_AVAILABLE {
+        return Err(
+            "[tls] is enabled in the configuration, but this binary was built \
+                    without TURNS support; rebuild with `--features tls` (it is a \
+                    default feature — check for `--no-default-features`) or disable [tls]"
                 .into(),
         );
     }
@@ -298,6 +317,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Arc::new(registry)
     };
+
+    // Clock-skew grace for TURN REST credential expiry. Process-wide, set before
+    // the first request can arrive. The auth crate defaults to 0 so embedders
+    // keep the strict check; the node's config default is 300.
+    turna_auth::set_credential_clock_skew_secs(config.auth.credential_clock_skew_secs);
+
+    // Socket buffers, before anything binds. Both calls are no-ops at 0, which
+    // is the default and the behaviour of every release before 0.5.0.
+    turna_transport::init_socket_buffers(
+        config.socket_recv_buffer_bytes,
+        config.socket_send_buffer_bytes,
+    );
+    turna_session::init_relay_socket_buffers(
+        config.socket_recv_buffer_bytes,
+        config.socket_send_buffer_bytes,
+    );
+
+    // Pin the relay sockets to one interface before any pool exists: the bind
+    // address is read inside `bind_relay_socket`, so it has to be in place
+    // before the first allocation, and `AllocationStore::new` builds the pool.
+    // Empty config values mean the wildcard bind, i.e. the pre-0.5.0 behaviour.
+    // Both strings are validated as the right address family at config load.
+    turna_session::init_relay_bind(
+        (!config.relay.bind_ip.is_empty())
+            .then(|| config.relay.bind_ip.parse().ok())
+            .flatten(),
+        (!config.relay.bind_ip6.is_empty())
+            .then(|| config.relay.bind_ip6.parse().ok())
+            .flatten(),
+    );
+    if !config.relay.bind_ip.is_empty() {
+        info!(bind_ip = %config.relay.bind_ip, "relay sockets pinned to one address");
+    }
 
     let store = Arc::new({
         let mut s = AllocationStore::new(
@@ -699,6 +751,26 @@ fn resolve_external_ip6(cfg: &TurnConfig) -> Option<std::net::Ipv6Addr> {
     }
 }
 
+/// `[turn.rate_limit]` → the relay's limiter settings.
+///
+/// Lives here because turna-relay takes primitives rather than a config type:
+/// the same shape as `peer_filter::from_config`, and for the same reason — the
+/// relay crate does not depend on turna-config and should not start.
+fn rate_limit_settings(cfg: &turna_config::RateLimitConfig) -> turna_relay::RateLimitSettings {
+    let tier = |t: &turna_config::RateLimitTier| turna_relay::TieredLimits {
+        per_ip: (t.per_ip_burst, t.per_ip_rps),
+        per_prefix: (t.per_prefix_burst, t.per_prefix_rps),
+        allocate: (t.allocate_burst, t.allocate_rps),
+        create_permission: (t.create_permission_burst, t.create_permission_rps),
+        channel_bind: (t.channel_bind_burst, t.channel_bind_rps),
+    };
+    turna_relay::RateLimitSettings {
+        default: tier(&cfg.default),
+        trusted: tier(&cfg.trusted),
+        trusted_prefixes: cfg.trusted_prefixes.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_tokio(
     config: TurnConfig,
@@ -726,6 +798,11 @@ fn run_tokio(
     #[cfg(not(feature = "tls"))]
     let _ = &tls_cfg;
     let external_ip6 = resolve_external_ip6(&config);
+    // Built once and shared by every datapath below (tokio server, AF_XDP, and
+    // the QUIC/DTLS processor): each builds its own limiter from these tiers, so
+    // a source's budget is per-datapath, exactly as it was when the tiers came
+    // from the environment.
+    let rate_limits = rate_limit_settings(&config.rate_limit);
 
     let node_audit = {
         let path = &config.observability.node_audit_path;
@@ -2178,7 +2255,8 @@ fn run_tokio(
                         metrics.clone(),
                         cluster_routing.clone(),
                     )
-                    .with_external_ip6(external_ip6),
+                    .with_external_ip6(external_ip6)
+                    .with_rate_limits(&rate_limits),
                 );
                 let af_cfg = config.af_xdp.clone();
                 let listen = config.listen;
@@ -2216,7 +2294,7 @@ fn run_tokio(
                 } else {
                     None
                 };
-                let server = turna_relay::RelayServer::new_full(
+                let server = turna_relay::RelayServer::new_full_with_limits(
                     transport,
                     store,
                     auth,
@@ -2225,6 +2303,7 @@ fn run_tokio(
                     cluster_routing.clone(),
                     migration,
                     tcp_relay,
+                    Some(&rate_limits),
                 )
                 .with_external_ip6(external_ip6)
                 .with_drain_timeout_secs(config.relay.drain_timeout_secs);
@@ -2337,7 +2416,8 @@ fn run_tokio(
                                 metrics.clone(),
                                 cluster_routing.clone(),
                             )
-                            .with_external_ip6(external_ip6),
+                            .with_external_ip6(external_ip6)
+                            .with_rate_limits(&rate_limits),
                         );
                         let qd_sinks = turna_relay::new_client_sinks();
                         // Ephemeral fallback socket (bound off :3478 so it never
@@ -2808,12 +2888,6 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     );
     println!();
 
-    let s = &cfg.signaling;
-    println!("[signaling]");
-    println!("listen             = \"{}\"", s.listen);
-    println!("turn_url           = \"{}\"", s.turn_url);
-    println!("turn_shared_secret = \"{}\"", mask(&s.turn_shared_secret));
-    println!();
     println!("[health]");
     println!("listen = \"{}\"", cfg.health.listen);
     println!();

@@ -23,11 +23,6 @@ min_port        = 50000
 max_port        = 65535
 max_allocations = 20000
 
-[signaling]
-listen             = "0.0.0.0:9101"
-turn_url           = "turn:127.0.0.1:3478"
-turn_shared_secret = "bench-secret"
-
 [health]
 listen = "0.0.0.0:9190"
 

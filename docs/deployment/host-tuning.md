@@ -28,9 +28,30 @@ every frame. Seven percent above it, the egress queue shed a million frames in
 two minutes. A node at 110 000 looks perfectly healthy and is one traffic bump
 from losing 6 % of media.
 
-No amount of tuning changes that shape. It means **run at a fraction of the
-measured ceiling**, and it means `turna_send_queue_dropped_total` is the series
-that tells you the truth — a client-side loss measurement cannot see a frame the
+No amount of tuning changes that shape, and the reason is structural rather than
+environmental: **N receive workers feed one egress task.** The client→peer path
+funnels every worker's output through a single `mpsc` channel of 8192 into one
+consumer that awaits `send_to` sequentially (`crates/relay/src/server.rs:590`
+and `:108`). When that channel fills, packets are dropped and
+`turna_send_queue_dropped_total` counts them. The peer→client direction has a
+task per relay port and no such funnel.
+
+For video — roughly 300-500 pps per relaying participant in each direction —
+that ceiling is on the order of 250-350 simultaneously relaying clients per node,
+and it is reached as a cliff rather than a slope. It is not a problem for a
+deployment sized below it, and it scales by adding nodes, but it is the first
+thing growth will hit, so it should be known in advance rather than discovered.
+
+Sharding the egress (M channels and tasks chosen by `relay_port % M`, which
+preserves per-allocation packet order and therefore RTP sequencing) is the
+obvious fix. It has not been made, because the number above was measured over
+loopback: it bounds the software path and says nothing about what a real NIC
+does first. Re-measure on two machines through an actual interface before
+changing this — a rewrite justified by a loopback figure is a rewrite justified
+by the wrong bottleneck.
+
+It also means **run at a fraction of the measured ceiling**, and it means
+`turna_send_queue_dropped_total` is the series that tells you the truth — a client-side loss measurement cannot see a frame the
 server discarded before sending, and that discrepancy made a capacity figure come
 out 27 % too high here.
 

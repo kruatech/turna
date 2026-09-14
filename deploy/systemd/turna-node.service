@@ -1,0 +1,75 @@
+[Unit]
+Description=turna TURN/STUN server
+Documentation=https://github.com/kruatech/turna
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=turna
+Group=turna
+ExecStart=/usr/local/bin/turna-node /etc/turna/turn.toml
+
+# Shared-secret rotation without dropping calls. The handler re-reads this exact
+# file and republishes shared_secret / previous_shared_secret; a changed realm is
+# refused. Procedure: write the new secret, keep the old one in
+# previous_shared_secret, reload, watch turna_auth_previous_secret_total flatten,
+# drop the old one, reload again.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5s
+
+# One descriptor per relay socket plus the listeners. The default 1024 is
+# nowhere near enough and the failure is allocations rejected with no obvious
+# cause. This is the per-process limit; the system-wide one is fs.file-max in
+# deploy/sysctl.d/99-turna.conf.
+LimitNOFILE=65536
+
+# The node stops accepting immediately and then waits for allocations to end,
+# bounded by [turn.relay] drain_timeout_secs (30 by default). Give systemd more
+# than that so it never kills a drain that was going to finish.
+TimeoutStopSec=60
+
+# --- Hardening --------------------------------------------------------------
+#
+# None of this is needed for correctness; all of it is cheap. Remove a line only
+# when you know why it is in the way.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# AF_INET/AF_INET6 for the sockets, AF_UNIX for logging and the local control
+# plane. AF_NETLINK is needed by the AF_XDP datapath only; add it there.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ProtectSystem=strict makes the whole filesystem read-only, which is what we
+# want: the node reads its config and its certificates and writes nothing under
+# normal operation.
+ReadOnlyPaths=/etc/turna
+# Uncomment when [turn.observability] node_audit_path is set — that is the one
+# thing the node writes.
+# ReadWritePaths=/var/lib/turna
+
+# Ports 3478 and 5349 are both above 1024, so no capability is needed. If you
+# move the TURNS listener to 443 (worth doing where filters only pass
+# well-known ports), uncomment both lines.
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+Environment=RUST_LOG=info,turna=info
+# 0 = one worker per core.
+Environment=TURNA_WORKERS=0
+
+[Install]
+WantedBy=multi-user.target

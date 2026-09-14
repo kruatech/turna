@@ -197,15 +197,30 @@ Two things this explains rather than merely tidies:
   secret" is half-answerable. The shared secret is done; rotating the JWT secret
   would be rotating a secret for a subsystem with no callers.
 
-**Wiring** means deciding what platform user auth is *for* here — the management
-plane already has mTLS and RBAC, and the TURN dataplane has long-term
+**Wiring** would mean deciding what platform user auth is *for* here — the
+management plane already has mTLS and RBAC, and the TURN dataplane has long-term
 credentials. Neither obviously wants a second identity system.
 
-**Deleting** is straightforward: four modules, their tests, and the `argon2`,
-`jsonwebtoken` and `uuid` dependencies they are the only users of.
+## Decided (2026-09-14, 0.5.0): deleted
 
-Not decided. Same shape as decision 4 (`node_migration.rs`) and recorded the same
-way, so it cannot quietly start looking supported.
+Authenticating users is the signalling service's job. turna receives a TURN REST
+credential derived from `[turn.auth] shared_secret` and validates it; it has no
+business holding a user table, hashing passwords or issuing JWTs, and a second
+identity system inside the TURN server is a liability rather than a feature.
+
+Removed: the four modules and their tests, plus the `jsonwebtoken`, `argon2`,
+`password-hash` and `uuid` dependencies they were the only users of in this
+crate. `aes-gcm` stays — the RFC 7635 OAuth path uses it. `TURNA_JWT_SECRET` is
+gone with the code that read it.
+
+The git history holds all of it if the question reopens, which is the whole
+argument for deleting rather than keeping 1 310 lines that nothing runs: the code
+is not lost, it is merely no longer something a reader can mistake for a feature.
+
+`scripts/check-doc-claims.sh` now asserts the decision rather than the old
+"labelled UNWIRED" state: if one of these files comes back it must have a caller
+outside the crate, or the gate fails. The previous check looped over four
+filenames and would have passed silently over an empty list.
 ### 8. The HTTP management surface — wire it or delete it?
 
 `turnactl`'s header documented eleven commands. Seven of them POST to `/manage`,

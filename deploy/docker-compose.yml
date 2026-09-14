@@ -5,8 +5,10 @@
 #   docker compose -f deploy/docker-compose.yml logs -f turna
 #
 # Services:
-#   turna      — TURN/STUN server (UDP/TCP:3478, health/metrics:9090)
+#   turna      — TURN/STUN server (UDP:3478, TURNS TCP:5349; health on 127.0.0.1:9090)
 #   prometheus — optional metrics collection (host TCP:9091)
+#
+# Both services use host networking. See the note on the turna service.
 
 services:
   turna:
@@ -14,17 +16,21 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     image: turna:local
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "5349:5349/tcp"
-      - "9090:9090/tcp"
-      # Relay ports. This published range MUST equal [turn.relay]
-      # min_port..max_port in deploy/turn.toml (the config this compose
-      # mounts): an allocation handed out on an unpublished port succeeds at
-      # Allocate but its relay traffic is silently dropped (P0 #13). Narrow
-      # BOTH together for a smaller dev window.
-      - "49152-65535:49152-65535/udp"
+    # Host networking, which is the standard for a TURN server and not a
+    # shortcut. Publishing 16 384 UDP relay ports through the bridge creates a
+    # forwarding rule per port and, depending on the Docker version and
+    # userland-proxy setting, a docker-proxy process per port: container start
+    # measured in tens of seconds, memory spent on nothing, and an extra NAT hop
+    # on the media path.
+    #
+    # It also means the node sees real client source addresses. Behind the
+    # bridge it sees the gateway's, which quietly breaks per-IP rate limiting —
+    # every client shares one bucket.
+    #
+    # The trade: no port isolation from the host, and [health] listen must be a
+    # real bind address rather than something the bridge hides. deploy/turn.toml
+    # binds health to 127.0.0.1 for that reason.
+    network_mode: host
     environment:
       RUST_LOG: "info,turna=debug"
       TURNA_WORKERS: "0" # 0 = auto-detect
@@ -42,13 +48,21 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
-    networks:
-      - turna
 
   prometheus:
     image: prom/prometheus:v2.50.1
-    ports:
-      - "9091:9090"
+    # Also host networking, and it has to be: turna binds health/metrics to
+    # 127.0.0.1, which a container on the bridge cannot reach. The alternative —
+    # opening 9090 to every interface so the bridge can scrape it — puts the
+    # full metric surface on the network, which is what this change is avoiding.
+    network_mode: host
+    # Moved off 9090 explicitly. Prometheus defaults to it, and on the host
+    # network that is turna's health port; the published "9091:9090" mapping
+    # that used to separate them does not exist in host mode.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=:9091
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -56,12 +70,6 @@ services:
     depends_on:
       turna:
         condition: service_healthy
-    networks:
-      - turna
 
 volumes:
   prometheus_data:
-
-networks:
-  turna:
-    driver: bridge

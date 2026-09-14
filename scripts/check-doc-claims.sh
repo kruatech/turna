@@ -405,49 +405,41 @@ if [ -f "$CM" ] && [ -f README.md ] && [ -f deploy/helm/turna/values.yaml ]; the
 fi
 
 # ---------------------------------------------------------------------------
-section "turna-auth: unwired modules stay labelled as unwired"
+section "turna-auth: the deleted modules stay deleted"
 # ---------------------------------------------------------------------------
 
 # store.rs, rotation.rs, jwt.rs and user.rs — 1310 lines of user registration,
-# Argon2 hashing, JWT signing and token revocation — have no callers outside the
-# auth crate, and the crate header used to advertise them as a feature. The same
-# shape as node_migration.rs, and it gets the same guard: if a module gains a real
-# caller the label must go, and if it does not, the label must stay.
+# Argon2 hashing, JWT signing and token revocation — had no callers outside the
+# auth crate and were deleted in 0.5.0 (OPEN-DECISIONS decision 7: authenticating
+# users is the signalling service's job; turna gets a TURN REST credential).
+#
+# This used to check that each file carried an UNWIRED label. With the files gone
+# that loop passed over an empty list, which is the shape of check this script
+# exists to prevent — a green tick on nothing. It now asserts the decision
+# instead: the file is absent, or it is back AND something outside the crate
+# actually calls it.
 AUTH_SRC=crates/auth/src
 if [ -d "$AUTH_SRC" ]; then
   AUTH_BAD=""
   for m in store rotation jwt user; do
     f="$AUTH_SRC/$m.rs"
     [ -f "$f" ] || continue
-    # Every `pub` item this module exports, looked for outside the auth crate.
-    WIRED=0
-    #
-    # Matched by MODULE PATH, not by type name. Two heuristics were tried and both
-    # broke on the same thing: `User` is too generic. A bare `grep -w User` hit
-    # state-backend's own types, and narrowing it to "files that also mention
-    # turna_auth" still hit turna-health — because it renders a metric called
-    # `turna_auth_previous_secret_total` and a HELP string containing the word
-    # "User". A module path cannot be produced by coincidence.
-    #
-    # `lib.rs` re-exports only `tenant`, so any external use of these four has to
-    # spell the module: `turna_auth::store::X` or `use turna_auth::{store, ...}`.
+    # Matched by MODULE PATH, not by type name. `User` is too generic: a bare
+    # `grep -w User` hits state-backend's own types, and narrowing to files that
+    # also mention turna_auth still hits turna-health, which renders a metric
+    # called turna_auth_previous_secret_total and a HELP string containing the
+    # word "User". A module path cannot be produced by coincidence.
     if grep -rlE "turna_auth::(\\{[^}]*\\b$m\\b|$m\\b)" --include='*.rs' \
          crates services tools tests 2>/dev/null | grep -qv "^$AUTH_SRC/"; then
-      WIRED=1
+      continue   # back on purpose, and wired — fine
     fi
-    LABELLED=0
-    head -20 "$f" | grep -q 'UNWIRED' && LABELLED=1
-    if [ "$WIRED" = 1 ] && [ "$LABELLED" = 1 ]; then
-      AUTH_BAD="$AUTH_BAD $m(now-wired-but-still-labelled)"
-    elif [ "$WIRED" = 0 ] && [ "$LABELLED" = 0 ]; then
-      AUTH_BAD="$AUTH_BAD $m(unwired-and-unlabelled)"
-    fi
+    AUTH_BAD="$AUTH_BAD $m"
   done
   if [ -n "$AUTH_BAD" ]; then
-    fail "turna-auth module labels disagree with reality:$AUTH_BAD" \
-      "A module with no callers must say UNWIRED in its header; one that gained a caller must stop saying it. See docs/OPEN-DECISIONS.md decision 7."
+    fail "turna-auth modules deleted in 0.5.0 are back with no callers:$AUTH_BAD" \
+      "Either wire them and say so in docs/OPEN-DECISIONS.md decision 7, or delete them again. Unwired code in this crate is what the deletion was for."
   else
-    pass "turna-auth unwired modules are labelled, wired ones are not"
+    pass "the four unwired turna-auth modules are gone (or back and wired)"
   fi
 fi
 
@@ -754,8 +746,12 @@ if [ -f "$CFG_SRC" ]; then
   # checked without rendering. CI renders and parses it for real (default AND
   # production-example values), but only on the packaging job — this catches a bad
   # key in the fast gate, and on a machine with no helm.
+  # deploy/examples/public.toml — NOT public-turn.toml, which is what this list
+  # said until 0.5.0. The extractor skips a path that does not exist, so the one
+  # public-facing example went unchecked while the section reported a clean pass.
+  # Missing files are now an explicit failure below rather than a silent skip.
   CFG_BAD=$(python3 - "$CFG_SRC" turn.toml deploy/turn.toml bench/turna.toml bench/smoke-tarantool.toml \
-    deploy/examples/public-turn.toml deploy/examples/corporate.toml deploy/examples/cluster.toml <<'CFGPY'
+    deploy/examples/public.toml deploy/examples/corporate.toml deploy/examples/cluster.toml <<'CFGPY'
 import os, re, sys, tomllib
 src = open(sys.argv[1]).read()
 known = set()
@@ -804,6 +800,10 @@ if os.path.isfile(HELM_TPL):
 
 for path in sys.argv[2:]:
     if not os.path.isfile(path):
+        # A silent skip is how deploy/examples/public.toml went unchecked for
+        # months under a misspelled path. If a shipped config moves, this check
+        # has to say so rather than quietly cover one file fewer.
+        bad.append(path + "(listed here but not on disk — fix the path or drop it)")
         continue
     raw = open(path).read()
     # ${VAR:-default} placeholders are not TOML; substitute so the file parses.
@@ -844,7 +844,10 @@ NODE_MAIN=services/node/src/main.rs
 if [ -f "$NODE_MAIN" ]; then
   if grep -q 'SignalKind::hangup()' "$NODE_MAIN"; then
     STALE=""
-    for d in $(grep -rl 'SIGHUP' docs --include='*.md' 2>/dev/null); do
+    # README.md included: it carried "SIGHUP is not handled" for the whole life
+    # of this check, one directory outside its reach, and that is the line an
+    # operator reads before planning a rolling restart.
+    for d in $(grep -rl 'SIGHUP' docs README.md --include='*.md' 2>/dev/null); do
       # Exempt a report that already flags itself as superseded.
       grep -q 'FIXED SINCE' "$d" && continue
       if grep -qE 'does not handle SIGHUP|SIGHUP. is not handled|SIGHUP is not handled' "$d"; then

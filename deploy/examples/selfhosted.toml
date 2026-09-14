@@ -1,0 +1,154 @@
+# Scenario: one self-hosted node on your own hardware, serving a conferencing
+# product whose media goes through an SFU.
+#
+# This is the profile to copy for "TURN for our own Meet/Zoom-alike, on our own
+# metal". Every key here is set deliberately and says why. The other examples
+# (public / corporate / cluster) illustrate one dimension each; this one is a
+# complete deployment.
+#
+# Loaded by CI through the real validator with production = true.
+#
+# Companion: docs/SELFHOSTED.md walks through the host setup, certificates and
+# the client-side ICE configuration. deploy/sysctl.d/99-turna.conf and
+# deploy/systemd/turna-node.service are the other two files you need.
+
+production = true
+
+[turn]
+listen = "0.0.0.0:3478"
+# The address clients are told to send media to. With no NAT this is the node's
+# own public address; behind NAT it is the NAT's address, and [turn.relay]
+# bind_ip below is the private one the node actually owns.
+external_ip = "${TURNA_EXTERNAL_IP}"
+realm = "turn.example.internal"
+
+# Socket buffers. Video is bursty — a 1080p frame is 20-60 packets in a couple
+# of milliseconds — and a receive-buffer overflow is dropped in the kernel,
+# where no turna metric can see it. These are requests: the kernel clamps them
+# to net.core.rmem_max, so apply deploy/sysctl.d/99-turna.conf first. The node
+# logs the size it actually got.
+socket_recv_buffer_bytes = 8388608
+socket_send_buffer_bytes = 8388608
+
+[turn.auth]
+# Signs the TURN REST (coturn-compatible) time-limited credentials your
+# signalling service hands out. It never leaves this file and the signalling
+# service; clients never see it.
+#
+# Rotation does not need a restart: put the new value here, keep the old one in
+# previous_shared_secret, send SIGHUP, watch turna_auth_previous_secret_total
+# flatten, drop the old one, SIGHUP again.
+shared_secret = "${TURNA_SHARED_SECRET}"
+# Long enough for a meeting to start, short enough that a leaked credential is
+# not useful tomorrow.
+token_ttl = 3600
+
+[turn.relay]
+# Pin the relay sockets to the public interface. Without this they bind every
+# interface, which on a two-NIC node means ports 49152-65535 are open on the
+# private side as well. [turn.peer_filter] stops the node relaying INTO private
+# space; it does not stop packets arriving from there.
+#
+# Set this to the address this machine actually owns. Behind NAT that is the
+# private address, and external_ip above is the public one.
+# bind_ip = "203.0.113.10"
+
+# Kept clear of the host's ephemeral range. The defaults overlap on most Linux
+# hosts, and a peer socket landing inside the relay range makes the relay
+# forward to itself. 99-turna.conf moves ip_local_port_range below this.
+min_port = 49152
+max_port = 65535
+# One allocation per relay port, and a client behind a symmetric NAT may hold
+# more than one. 8000 leaves headroom in a 16 384-port range.
+max_allocations = 8000
+
+[turn.relay.quota]
+# 100 Mbit/s per allocation, both directions counted together.
+#
+# This is abuse protection, not QoS. Over the limit, packets are DROPPED, not
+# throttled — the client sees frame loss, not a lower bitrate — so set it well
+# above what a legitimate participant uses rather than close to it. A 1080p
+# sender plus 9 received tiles plus a screen share stays under 40 Mbit/s.
+#
+# Per-user overrides for trusted accounts go through the control plane
+# (turnactl set-user-limits), not this file.
+max_bytes_per_sec_per_allocation = 12500000
+# Two ICE transports per participant, plus room for a second device.
+max_per_user = 6
+
+[turn.peer_filter]
+# Stays internet-facing. The tempting setting here is profile = "lan", and it is
+# the wrong one: it lets any authenticated client relay to any host in your
+# private network, which is the SSRF vector this filter exists to close. Keep
+# the deny and allow-list the one host that needs relaying to.
+profile = "internet-facing"
+# The SFU, and nothing else. A /32 per host.
+allowed_peer_ranges = ["192.0.2.20/32"]
+# The SFU should listen on a private address rather than loopback. If it really
+# is on 127.0.0.1 on this same box, you need allow_loopback_peers = true — but
+# that opens relaying to every service on the host, so prefer the private IP.
+allow_loopback_peers = false
+
+[turn.rate_limit]
+# Offices and VPN pools: hundreds of users arrive from one NAT address, and the
+# default Allocate ceiling (32 burst, 16/s) is sized to stop abuse from the open
+# internet, not to admit a 10:00 all-hands. A browser sends one Allocate per ICE
+# transport, so 300 people is ~600 Allocates in a few seconds.
+#
+# NOT authentication: anyone who can spoof a source address in these ranges gets
+# the higher ceiling. List only prefixes you route.
+trusted_prefixes = ["198.51.100.0/24"]
+
+[turn.rate_limit.trusted]
+allocate_burst = 512
+allocate_rps = 128
+per_ip_burst = 200000
+per_ip_rps = 1000000
+
+[tls]
+# TURNS, and it is not optional here: turna has no plain TURN-over-TCP listener,
+# so this is the only way in for a client whose network blocks UDP. Corporate
+# guests are exactly that population.
+#
+# Put it on 443 instead of 5349 if your users sit behind filters that only allow
+# well-known ports. Nothing else in the config changes.
+enabled = true
+listen = "0.0.0.0:5349"
+cert_path = "/etc/turna/tls/cert.pem"
+key_path = "/etc/turna/tls/key.pem"
+# Re-read the certificate every five minutes so a renewal lands without a
+# restart. Matters more than it sounds with 90-day certificates.
+cert_reload_secs = 300
+enable_alpn = true
+# RFC 7443 strict mode is deliberately OFF. It refuses clients that negotiate no
+# ALPN, and that includes some non-browser stacks. Turn it on only after you
+# know every client population advertises stun.turn.
+alpn_required = false
+
+[turn.observability]
+# Client IP addresses appear in warn-level logs on every 403 and every rate-limit
+# rejection. For a node serving your own staff that is personal data with an
+# unbounded retention.
+#
+# Two switches, because the sinks differ. A SIEM sits inside your trust boundary
+# and an authentication failure without a source is not actionable, so redaction
+# there is a choice; stdout is whatever your shipper keeps, so it is turned off
+# here. Off means `ip-<12 hex>` under a per-process salt — a host keeps one label
+# across every line about it, which is what you need to read an incident, while
+# the address itself does not survive into the log.
+syslog_redact_addresses = true
+log_allocation_addresses = false
+
+[health]
+# Loopback. This endpoint serves /health AND the full Prometheus surface —
+# hundreds of series including per-tenant detail — so it does not belong on a
+# public interface. Point it at a private address if Prometheus scrapes from
+# another machine, never at 0.0.0.0.
+listen = "127.0.0.1:9090"
+
+[management]
+# Off. The gRPC control plane is a separate binary (turna-control-plane) and
+# these RPCs include shutdown; there is no reason for a single self-hosted node
+# to expose them until you need turnactl.
+listen = "127.0.0.1:5350"
+enabled = false

@@ -1,5 +1,11 @@
 //! Cryptographic primitives for TURN auth
 
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
+
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha1::Sha1;

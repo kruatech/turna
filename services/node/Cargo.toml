@@ -7,7 +7,12 @@ edition.workspace = true
 [features]
 tls = ["turna-relay/tls", "turna-transport/tls"]
 sctp = ["turna-relay/sctp", "turna-transport/sctp"]
-default = []
+# TURNS is in `default` because it is the only TCP entry point this node has:
+# there is no plain TURN-over-TCP listener (docs/interop/transports-2026-08-19.md),
+# so a build without `tls` cannot serve a client whose network blocks UDP. The
+# safe configuration has to be the one you get by doing nothing; opting out is
+# `--no-default-features`, which is an explicit decision someone owns.
+default = ["tls"]
 io-uring = ["turna-transport/io-uring", "turna-relay/io-uring"]
 # Raw QUIC datapath. WebTransport (browser H3) builds on it.
 quic = ["turna-transport/quic"]

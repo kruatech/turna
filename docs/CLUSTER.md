@@ -320,6 +320,32 @@ new clients elsewhere during the grace window.
 
 ## Limitations
 
+- **Gossip is designed for a private network, and the replay window survives a
+  restart.** Frames are signed with HMAC-SHA256, so an attacker cannot forge one
+  without the cluster secret. Replay of a *captured* frame is bounded only by
+  `seq > node.seq`, and `seq` starts at 0 when the process starts
+  (`gossip.rs:138`). A node that restarts therefore accepts any captured frame
+  whose `seq` is higher than its own current counter — including a `leaving`,
+  which evicts a live node from the ring and plants a tombstone that suppresses
+  it for `gossip_interval_secs × 3`.
+
+  For a cluster whose gossip port is reachable only from its own peers this is a
+  low risk, and cluster mode is marked experimental in the README. **Do not put
+  the gossip port on an interface anything else can reach.** If that stops being
+  possible, the fix is to include a per-process `boot_id` in the signed payload
+  and accept `seq` monotonically within a `boot_id`, so a new boot resets the
+  counter without accepting the old one's frames; a timestamp with a bounded
+  window would also work.
+
+- **The Tarantool connection is plaintext.** `tcp_connect_and_auth`
+  (`state-backend/src/tarantool.rs`) speaks iproto over plain TCP with
+  password authentication (chap-sha1). The credentials are not sent in the clear,
+  but the allocation records are — and those carry client and peer addresses.
+
+  Put the backend on a private network, or behind stunnel or WireGuard. This does
+  not apply to a single node with the `memory` backend, which is the standalone
+  default.
+
 - **`node_id` must be unique per host.** Identical ids are deduplicated into a
   single ring entry, so every node would serve locally and balancing silently
   does nothing. Cluster mode logs a warning if `node_id` is left at the default

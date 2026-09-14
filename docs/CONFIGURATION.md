@@ -540,6 +540,82 @@ Exposed on `[health].listen` `/metrics`. Transport-relevant series:
 
 Alert rules: `docs/alerts/transport-backends.yml`.
 
+## Rate limiting (`[turn.rate_limit]`)
+
+Five tiers, each a token bucket described by a `_burst` (depth) and a `_rps`
+(refill per second): `per_ip` and `per_prefix` on the packet path,
+`allocate`, `create_permission` and `channel_bind` on the control path. The
+`allocate` tier is the strict one, because each Allocate costs a relay port, a
+socket and a store entry.
+
+Two sets of them live under `[turn.rate_limit]`. `default` applies to everyone;
+`trusted` applies to sources matched by `trusted_prefixes`.
+
+```toml
+[turn.rate_limit]
+trusted_prefixes = ["198.51.100.0/24"]
+
+[turn.rate_limit.trusted]
+allocate_burst = 512
+allocate_rps = 128
+```
+
+The `default` values are the ones that were previously hardcoded, so upgrading
+without writing this section changes nothing.
+
+**Why the trusted tier exists.** The defaults are sized against abuse from the
+open internet, where a source address is one client. An office is not: several
+hundred people leave through one NAT address. A browser sends an Allocate per ICE
+transport, so a 300-person meeting starting on the hour is roughly 600 Allocates
+from one IP — 35 seconds at the default 16/s, which is longer than a browser's
+ICE gathering waits before timing out and retrying, and the retries lengthen the
+queue. The data-plane tiers have the same problem: 300 relaying participants at
+~300 pps each is ~90 000 pps from one source against a default refill of 50 000.
+
+**`trusted_prefixes` is not authentication.** Anyone who can spoof a source
+address inside those ranges gets the higher ceiling. It is a capacity knob; list
+only prefixes you route. It is empty by default, because a default that guessed
+at RFC 1918 would hand the higher ceiling to whatever private network happened to
+reach the node.
+
+**No value may be `0`.** Config validation refuses it. A zero refill is a bucket
+that empties once and never fills again, which is never what "0" is meant to
+express, and this limiter has no way to say "unlimited".
+
+The `TURNA_RATE_LIMIT_BURST`, `TURNA_ALLOCATE_RPS` and related environment
+variables still override these and now warn each time they do. They are
+deprecated: a limit set there appears in no config file and in no
+`--dump-config` output, which is how an operator ends up hunting for a ceiling
+that is written down nowhere.
+
+## Bandwidth quota: what it is and is not
+
+`[turn.relay.quota] max_bytes_per_sec_per_allocation` is **abuse protection, not
+QoS**, and two properties decide how to size it.
+
+**It drops, it does not throttle.** Over the limit, packets are discarded and
+`turna_quota_exceeded_total` increments. There is no backpressure and no signal
+to the sender, so a client does not degrade to a lower bitrate — it loses frames,
+which looks to the user (and to whoever is debugging) like a network fault.
+
+**One window covers both directions.** Client→peer and peer→client share the
+same budget, so the figure has to cover a participant's upload *and* everything
+they receive.
+
+That combination means a value set close to real usage produces intermittent
+frame loss at exactly the moments the call gets busy. For a conferencing product
+through an SFU, work out the received side first: a participant sending 1080p at
+2-4 Mbit/s might receive 9 tiles at 0.5-2 Mbit/s each plus a screen share, so
+30-40 Mbit/s of headroom is ordinary, not exceptional. `corporate.toml`'s
+4 000 000 bytes/s (32 Mbit/s) is already tight for a large meeting;
+`selfhosted.toml` uses 12 500 000 (100 Mbit/s), which is far above legitimate use
+and still low enough to make relaying a bulk transfer unattractive.
+
+Under `production = true` a value of `0` (unlimited) is refused unless
+`allow_unlimited_bandwidth = true` is set explicitly. For individual accounts
+that genuinely need more, use `set_user_limits` through the control plane rather
+than raising the figure for everyone.
+
 ## Dynamic node runtime configuration
 
 The node-scoped management API exposes a strict dynamic whitelist:

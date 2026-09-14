@@ -65,6 +65,49 @@ each entry is revisited at the version named under "Review by".
   `libxdp`/`libbpf` to `NOTICE`.
 - **Review by:** whenever `af-xdp` graduates from experimental.
 
+## RISK-004 — gossip replay survives a node restart
+
+- **Status:** accepted for the experimental cluster mode; not applicable to a
+  standalone node, which runs no gossip.
+- **Description:** gossip frames are signed with HMAC-SHA256, so forgery needs
+  the cluster secret. Replay of a captured frame is bounded only by
+  `seq > node.seq`, and `seq` starts at 0 on process start
+  (`crates/cluster/src/gossip.rs:138`). After a restart a node accepts any
+  captured frame with a higher `seq` — including a `leaving`, which evicts a live
+  node from the ring and plants a tombstone suppressing it for
+  `gossip_interval_secs × 3`.
+- **Why it stays:** the attack needs a position on the gossip network, which is
+  a private segment by deployment requirement, and cluster mode is marked
+  experimental in the README. The fix touches the wire format, which is not worth
+  changing while the mode is experimental and the deployment guidance already
+  excludes the exposure.
+- **Compensating controls:** the cluster secret is mandatory and validated in
+  production; `docs/CLUSTER.md` states the private-network requirement under
+  Limitations; an evicted node rejoins on its next gossip interval, so the
+  impact is a bounded balancing disruption rather than a lasting one.
+- **Planned remediation:** include a per-process `boot_id` in the signed payload
+  and accept `seq` monotonically within a `boot_id`, so a new boot resets the
+  counter without accepting the previous boot's frames. Alternatively a
+  timestamp with a bounded acceptance window.
+- **Review by:** whenever cluster mode leaves experimental status.
+
+## RISK-005 — Tarantool iproto is plaintext
+
+- **Status:** accepted; not applicable to the standalone `memory` backend, which
+  is the default.
+- **Description:** `tcp_connect_and_auth` in
+  `crates/state-backend/src/tarantool.rs` speaks iproto over plain TCP.
+  Authentication is chap-sha1, so the password is not sent in the clear, but the
+  allocation records are — and those carry client and peer addresses.
+- **Why it stays:** turna does not implement iproto over TLS, and the standard
+  deployment for a state backend is a private network. Adding a TLS iproto
+  client is a larger change than the exposure justifies while the deployment
+  requirement covers it.
+- **Compensating controls:** backend credentials are required and never logged;
+  `docs/CLUSTER.md` states the requirement under Limitations; stunnel or
+  WireGuard in front of the backend closes it without changing turna.
+- **Review by:** whenever cluster mode leaves experimental status.
+
 ## RISK — active-session HA remains experimental
 
 **Scope:** multi-node gossip/redirect/failover tooling.

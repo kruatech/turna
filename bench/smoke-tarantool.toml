@@ -31,11 +31,6 @@ max_allocations = 100
 max_bytes_per_sec_per_allocation = 0
 max_per_user      = 100
 
-[signaling]
-listen             = "127.0.0.1:9101"
-turn_url           = "turn:127.0.0.1:3478"
-turn_shared_secret = "smoke-test-not-used"
-
 [health]
 listen = "127.0.0.1:9090"
 

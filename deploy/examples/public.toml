@@ -39,11 +39,6 @@ max_allocations = 8000
 max_bytes_per_sec_per_allocation = 2000000
 max_per_user = 4
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_url = "turn:turn.example.net:3478"
-turn_shared_secret = "${TURNA_SHARED_SECRET}"
-
 [health]
 listen = "0.0.0.0:8080"
 

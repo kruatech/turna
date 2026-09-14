@@ -75,13 +75,6 @@ data:
     listen = "127.0.0.1:{{ .Values.turn.managementPort }}"
     enabled = false
 
-    [signaling]
-    # There is no turna-signaling binary in the current workspace. The section
-    # is still present because the shared root config validates it.
-    listen = "127.0.0.1:9001"
-    turn_url = {{ .Values.turn.turnUrl | quote }}
-    turn_shared_secret = "${TURNA_SHARED_SECRET:-}"
-
     [cluster]
     cluster_mode = {{ .Values.cluster.enabled }}
     # Stable standalone id from values; the experimental StatefulSet overrides

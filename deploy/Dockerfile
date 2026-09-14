@@ -7,13 +7,18 @@
 #
 # Run:
 #   docker run --rm \
-#     -p 3478:3478/udp -p 3478:3478/tcp -p 9090:9090/tcp \
+#     -p 3478:3478/udp -p 5349:5349/tcp \
 #     -v "$PWD/deploy/turn.toml:/etc/turna/turn.toml:ro" \
 #     turna:local
 # =============================================================================
 # Stage 1: Build
 # =============================================================================
-FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder
+# Pinned to the same toolchain as rust-toolchain.toml and every CI job (1.95.0).
+# It was 1.98.0 here: rustup inside the container saw the pin, downloaded 1.95.0
+# on every build, and the image and CI compiled with different compilers. Lowered
+# rather than raising the pin because the version appears in eight places in
+# .github/workflows/ci.yml plus the msrv job's name.
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cmake \
@@ -27,7 +32,10 @@ WORKDIR /build
 # crates/binaries that are no longer members of the current workspace.
 COPY . .
 # Build only binaries that exist in the current workspace.
-RUN cargo build --locked --release \
+# `--features tls` is spelled out even though `tls` is a default feature of
+# turna-node: if somebody later moves it out of `default`, this image must keep
+# serving TURNS rather than start dropping port 5349 silently.
+RUN cargo build --locked --release --features tls \
     --bin turna-node \
     --bin turna-control-plane \
     --bin turnactl
@@ -59,7 +67,7 @@ RUN mkdir -p /etc/turna/tls /etc/turna/ebpf /var/run/turna \
 
 # OCI image metadata. VERSION is passed by the release workflow
 # (--build-arg VERSION=<tag>); the default tracks the current chart/appVersion.
-ARG VERSION=0.4.0
+ARG VERSION=0.5.0
 LABEL org.opencontainers.image.title="turna" \
       org.opencontainers.image.description="High-performance TURN/STUN server in Rust" \
       org.opencontainers.image.source="https://github.com/kruatech/turna" \
@@ -68,11 +76,19 @@ LABEL org.opencontainers.image.title="turna" \
 
 # Ports:
 #   3478/udp  - TURN/STUN
-#   3478/tcp  - TURN over TCP
 #   5349/tcp  - TURNS (TLS), when enabled in config
 #   5350/tcp  - gRPC management API, when enabled/bound externally
-#   9090/tcp  - health + Prometheus metrics
-EXPOSE 3478/udp 3478/tcp 5349/tcp 5350/tcp 9090/tcp
+#
+# 3478/tcp is deliberately absent: turna has no plain TURN-over-TCP listener.
+# The supported client URLs are turn:<host>:3478?transport=udp and
+# turns:<host>:5349?transport=tcp. See "Client ICE configuration" in README.md.
+#
+# 9090/tcp is absent too: health and the full Prometheus surface bind
+# 127.0.0.1 in deploy/turn.toml, so EXPOSE would advertise a port that is
+# deliberately not reachable from outside the network namespace. Scrape it over
+# host networking (deploy/docker-compose.yml) or point TURNA_HEALTH_ADDR at a
+# private address.
+EXPOSE 3478/udp 5349/tcp 5350/tcp
 # Relay UDP ports. Publish a narrower range in compose/dev when needed.
 EXPOSE 49152-65535/udp
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \

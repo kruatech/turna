@@ -5,6 +5,8 @@ global:
 scrape_configs:
   - job_name: 'turna'
     static_configs:
-      - targets: ['turna:9090']
+      # Host networking on both sides (see deploy/docker-compose.yml), so the
+      # node is on loopback rather than behind a compose service name.
+      - targets: ['127.0.0.1:9090']
     metrics_path: /metrics
     scrape_interval: 5s

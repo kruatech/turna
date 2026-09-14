@@ -13,8 +13,8 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 ## Status
 
 **Production GA (`0.4.0`).** The default **Tokio datapath** is the primary supported path:
-STUN binding, the TURN allocation lifecycle, long-term-credential and JWT auth,
-Prometheus/OpenTelemetry, config validation, durable runtime configuration,
+STUN binding, the TURN allocation lifecycle, long-term-credential and TURN REST
+(coturn-compatible) auth, Prometheus/OpenTelemetry, config validation, durable runtime configuration,
 per-subject limits, and graceful drain.
 
 The new GA management changes are implemented in source but are **not considered
@@ -138,7 +138,7 @@ live in [bench/README.md](bench/README.md).
 | mTLS for TURNS clients                         | Opt-in (`[tls] client_ca`); no CRL/OCSP by design |
 | IPv6 relayed transport                         | Opt-in via `[turn] external_ip6`; 440 when unset. Relayed media and coturn interop verified on routable addresses |
 | Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS on the demux path, which is the default since 0.4.1 (`demux = false` gives the stock listener and no hot reload). Verified under load: 0 → 1, no failures, 36 021 frames relayed with zero errors across the swap |
-| Shared-secret rotation without restart         | **Not supported.** `SIGHUP` is not handled and `UpdateConfig` carries allocation limits, not the secret — `[turn.auth] shared_secret` changes only with a restart. Ephemeral credentials derived from it expire on their own; the secret does not. See R13 in [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md) |
+| Shared-secret rotation without restart         | Supported via `SIGHUP`. The handler re-reads the same config file and republishes `shared_secret` / `previous_shared_secret` without dropping calls; a changed realm is refused. `UpdateConfig` still carries allocation limits only, not the secret. Overlap window: set the new secret, keep the old one in `previous_shared_secret`, `SIGHUP`, wait for `turna_auth_previous_secret_total` to flatten, drop the old one, `SIGHUP` again |
 | Multi-node ownership/state failover            | Experimental / limited scope                  |
 | Transparent active-session (media) failover    | Out of GA scope                               |
 
@@ -152,10 +152,10 @@ RPC contract.
 - STUN binding and full TURN allocation lifecycle (Allocate / Refresh /
   CreatePermission / ChannelBind / Send & Data indications)
 - UDP relay on the default path (IPv4, plus IPv6 when `external_ip6` is set); TCP relay (RFC 6062)
-  behind the `tls` feature, since RFC 6062 requires a TCP/TLS control connection
-  — and refused under `production = true`
-- Long-term credential mechanism, JWT-based auth, rate limiting and credential
-  rotation; multi-tenant realms with per-tenant relay port pools and limits
+  requires `[tls]`, since RFC 6062 carries the control connection over TCP/TLS
+- Long-term credentials, TURN REST (coturn-compatible) time-limited credentials,
+  rate limiting, and shared-secret rotation via `SIGHUP`; multi-tenant realms with
+  per-tenant relay port pools and limits
 - Pluggable state backend (in-memory, Tarantool) for clustered deployments
 - gRPC control plane + CLI (`turnactl`) for live management
 - OpenTelemetry tracing and Prometheus metrics out of the box
@@ -171,12 +171,14 @@ cargo build --release
 ./target/release/turna-node deploy/turn.toml
 ```
 
+Running one node on your own hardware: [docs/SELFHOSTED.md](docs/SELFHOSTED.md)
+is the start-to-finish version, with the host tuning and the client ICE config.
+
 ### Docker
 
 ```bash
 docker build -f deploy/Dockerfile -t turna:local .
-docker run --rm \
-  -p 3478:3478/udp -p 3478:3478/tcp -p 9090:9090/tcp \
+docker run --rm --network host \
   -v "$PWD/deploy/turn.toml:/etc/turna/turn.toml:ro" \
   turna:local
 ```
@@ -229,6 +231,28 @@ listen = "0.0.0.0:9090"
 `deploy/turn.toml` is a complete annotated example; every option is documented
 in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). With `production = true`,
 config validation rejects placeholder secrets and a missing `external_ip`.
+
+### Client ICE configuration
+
+Two URLs are served, and a third one that browser examples commonly carry is not:
+
+```js
+iceServers: [
+  { urls: "turn:turn.example.net:3478?transport=udp", username, credential },
+  { urls: "turns:turn.example.net:5349?transport=tcp", username, credential },
+  // NOT served: turn:turn.example.net:3478?transport=tcp
+]
+```
+
+`transport=tcp` without TLS has no listener — by design, not by omission. TCP
+clients are served over TURNS, which is also what gets through a firewall that
+inspects traffic on 443 (point `[tls] listen` there if 5349 is filtered). A
+client config that keeps the plain-TCP URL spends its ICE-gathering budget on a
+connection refused before falling through to the URL that works.
+
+TURNS therefore is not optional infrastructure here: it is the only TCP entry
+point, which is why `tls` is a default Cargo feature and why a binary built with
+`--no-default-features` refuses to start when `[tls]` is enabled.
 
 ## Architecture
 
@@ -312,7 +336,7 @@ Workspace crates can be consumed via a git dependency:
 
 ```toml
 [dependencies]
-turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.4.0" }
+turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.5.0" }
 ```
 
 ## Development

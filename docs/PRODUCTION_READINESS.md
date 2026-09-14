@@ -32,7 +32,10 @@ max_per_user = 100
 max_bytes_per_sec_per_allocation = 12500000   # ~100 Mbit/s per user; set to your ceiling
 
 [health]
-listen = "0.0.0.0:9090"
+# Loopback. This endpoint serves the entire Prometheus surface, not just
+# /health, so give it a PRIVATE address if a remote Prometheus scrapes it —
+# never 0.0.0.0.
+listen = "127.0.0.1:9090"
 
 [management]
 listen = "127.0.0.1:5350"

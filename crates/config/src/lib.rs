@@ -1,7 +1,10 @@
 //! Unified configuration for all Turna services.
 //!
 //! Single root config with sections:
-//!   [turn], [sfu], [signaling], [cluster], [health], [management], [recording]
+//!   [turn], [tls], [cluster], [health], [management], [grpc], [[tenants]]
+//!
+//! `[sfu]`, `[signaling]` and `[recording]` were removed in 0.5.0. They were
+//! parsed and validated but read by nothing — see `REMOVED_SECTIONS` below.
 //!
 //! Features:
 //! - ENV variable substitution: `shared_secret = "${TURNA_SHARED_SECRET}"`
@@ -9,6 +12,12 @@
 //! - Validation at startup (port conflicts, required fields)
 //! - **Strict schema** (`deny_unknown_fields`): typos and stale layout fail
 //!   loudly instead of silently falling back to defaults.
+
+// This crate contains no `unsafe`. The attribute makes that checkable by
+// the compiler instead of by `docs/unsafe-audit.md`: a future change that
+// introduces `unsafe` here fails to build rather than quietly widening the
+// audited surface, which is confined to turna-transport and turna-relay.
+#![forbid(unsafe_code)]
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -59,17 +68,11 @@ pub struct TurnaConfig {
     #[serde(default)]
     pub turn: TurnConfig,
     #[serde(default)]
-    pub sfu: SfuConfig,
-    #[serde(default)]
-    pub signaling: SignalingConfig,
-    #[serde(default)]
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub health: HealthConfig,
     #[serde(default)]
     pub management: ManagementConfig,
-    #[serde(default)]
-    pub recording: RecordingConfig,
     /// TLS configuration for the gRPC management API (read by
     /// `turna-control-plane`). Optional; absent or `tls_mode = "disabled"`
     /// means plaintext.
@@ -88,14 +91,56 @@ pub struct TurnaConfig {
     pub tenants: Vec<TenantConfig>,
 }
 
+/// Sections that existed up to 0.4.0, were parsed and validated, and were read
+/// by no service in the workspace. Removed in 0.5.0.
+///
+/// `deny_unknown_fields` turns a leftover one into `unknown field ...`, which is
+/// correct and unhelpful: the operator did not make a typo, they upgraded. Each
+/// name carries the sentence that answers "what do I do now".
+const REMOVED_SECTIONS: &[(&str, &str)] = &[
+    (
+        "signaling",
+        "[signaling] was removed in 0.5.0. It was parsed and validated — including \
+         a mandatory turn_shared_secret — but no binary in this workspace ever read \
+         it. Delete the section. Signalling is a separate service with its own \
+         config; the credential it hands out is derived from [turn.auth] shared_secret.",
+    ),
+    (
+        "sfu",
+        "[sfu] was removed in 0.5.0. No binary in this workspace read it. Delete the \
+         section; turna is a TURN/STUN server and the SFU is a separate service.",
+    ),
+    (
+        "recording",
+        "[recording] was removed in 0.5.0. No binary in this workspace read it. \
+         Delete the section; turna records nothing.",
+    ),
+];
+
+/// Map a serde error onto the removal notice when it names a removed section.
+///
+/// Matched against the message rather than pre-scanned out of the TOML text: a
+/// section name can also appear in a comment or a string value, and rewriting the
+/// error only where serde actually rejected that key keeps it honest.
+fn parse_root(expanded: &str) -> Result<TurnaConfig> {
+    toml::from_str(expanded).map_err(|e| {
+        let msg = e.to_string();
+        for (name, hint) in REMOVED_SECTIONS {
+            if msg.contains("unknown field") && msg.contains(&format!("`{name}`")) {
+                return ConfigError::ParseError(format!("{hint} (serde: {msg})"));
+            }
+        }
+        ConfigError::ParseError(msg)
+    })
+}
+
 impl TurnaConfig {
     /// Load from TOML file with ENV substitution.
     pub fn load(path: &str) -> Result<Self> {
         let content =
             std::fs::read_to_string(path).map_err(|_| ConfigError::FileNotFound(path.into()))?;
         let expanded = expand_env_vars(&content)?;
-        let config: TurnaConfig =
-            toml::from_str(&expanded).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: TurnaConfig = parse_root(&expanded)?;
         config.validate()?;
         info!(path, "config loaded and validated");
         Ok(config)
@@ -105,8 +150,7 @@ impl TurnaConfig {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_str: &str) -> Result<Self> {
         let expanded = expand_env_vars(toml_str)?;
-        let config: TurnaConfig =
-            toml::from_str(&expanded).map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: TurnaConfig = parse_root(&expanded)?;
         config.validate()?;
         Ok(config)
     }
@@ -225,7 +269,6 @@ impl TurnaConfig {
         // Check port conflicts
         let all_ports = [
             ("turn", self.turn.listen),
-            ("signaling", self.signaling.listen),
             ("health", self.health.listen),
             ("management", self.management.listen),
         ];
@@ -502,15 +545,40 @@ impl TurnaConfig {
             }
         }
 
-        // Signaling validation
-        if self.signaling.turn_shared_secret.is_empty() {
-            errors.push("signaling.turn_shared_secret is empty".into());
+        // RFC 6062 §4.1 puts the TCP-allocation control connection on TCP/TLS, and
+        // this node has no plain-TCP listener — so [turn.tcp_relay] without [tls]
+        // is a datapath with no way for a client to reach it. The field docs have
+        // said "requires [tls] enabled" all along; nothing checked it.
+        //
+        // Hard error under production, warning otherwise: a dev box that flips the
+        // flag while reading the code should be told, not blocked.
+        if self.turn.tcp_relay.enabled && !self.tls.enabled {
+            if prod {
+                errors.push(
+                    "[turn.tcp_relay] needs [tls] enabled: RFC 6062 carries the TCP \
+                     allocation over the TLS control connection, and this node has no \
+                     plain-TCP listener, so no client could open one"
+                        .into(),
+                );
+            } else {
+                warn!(
+                    "[turn.tcp_relay] is enabled but [tls] is not — no client can open a \
+                     TCP allocation, because the RFC 6062 control connection needs the \
+                     TURNS listener"
+                );
+            }
         }
-        if self.signaling.turn_shared_secret == DEFAULT_SHARED_SECRET && prod {
-            errors.push(
-                "signaling.turn_shared_secret is the placeholder default; \
-                 set TURNA_SHARED_SECRET or edit turn.toml"
-                    .into(),
+        // Not an error: a UDP-only deployment is legitimate (a closed network, or
+        // a fleet that fronts TURNS elsewhere). But turna ships no plain
+        // TURN-over-TCP listener, so with [tls] off there is no TCP entry point at
+        // all, and the browser ICE URL `turns:host:5349?transport=tcp` fails. That
+        // is a decision the operator should read in the log on day one, not infer
+        // from the users who cannot connect.
+        if prod && !self.tls.enabled {
+            warn!(
+                "[tls] is disabled: this node serves UDP only. There is no plain \
+                 TURN-over-TCP listener, so clients behind a UDP-blocking firewall \
+                 have no fallback. Enable [tls] for TURNS on 5349 (or 443)."
             );
         }
 
@@ -645,6 +713,62 @@ impl TurnaConfig {
             }
         }
 
+        // Relay bind addresses: a v6 literal in bind_ip would bind nothing a v4
+        // allocation can use, and the failure would surface as "no ports
+        // available" under load rather than as a config problem at startup.
+        if !self.turn.relay.bind_ip.is_empty() {
+            match self.turn.relay.bind_ip.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(_)) => {}
+                Ok(std::net::IpAddr::V6(_)) => errors.push(
+                    "turn.relay.bind_ip must be an IPv4 address (it binds the v4 relay \
+                     sockets); use turn.relay.bind_ip6 for IPv6"
+                        .into(),
+                ),
+                Err(_) => errors.push(format!(
+                    "turn.relay.bind_ip {:?} is not a valid IP address; leave it empty \
+                     to bind every interface",
+                    self.turn.relay.bind_ip
+                )),
+            }
+        }
+        if !self.turn.relay.bind_ip6.is_empty() {
+            match self.turn.relay.bind_ip6.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V6(_)) => {}
+                Ok(std::net::IpAddr::V4(_)) => errors.push(
+                    "turn.relay.bind_ip6 must be an IPv6 address; use turn.relay.bind_ip \
+                     for IPv4"
+                        .into(),
+                ),
+                Err(_) => errors.push(format!(
+                    "turn.relay.bind_ip6 {:?} is not a valid IP address; leave it empty \
+                     to bind every interface",
+                    self.turn.relay.bind_ip6
+                )),
+            }
+        }
+
+        // Rate-limit tiers: a zero anywhere is a limiter that refuses forever.
+        errors.extend(self.turn.rate_limit.default.validate("default"));
+        errors.extend(self.turn.rate_limit.trusted.validate("trusted"));
+        for cidr in &self.turn.rate_limit.trusted_prefixes {
+            if let Err(e) = validate_cidr(cidr) {
+                errors.push(format!("turn.rate_limit.trusted_prefixes: {e}"));
+            }
+        }
+        // A trusted tier stricter than the default one is almost certainly a
+        // copy-paste or a swapped block: the point of the trusted set is a
+        // higher ceiling for sources that share a NAT address.
+        if !self.turn.rate_limit.trusted_prefixes.is_empty()
+            && self.turn.rate_limit.trusted.allocate_rps < self.turn.rate_limit.default.allocate_rps
+        {
+            warn!(
+                trusted = self.turn.rate_limit.trusted.allocate_rps,
+                default = self.turn.rate_limit.default.allocate_rps,
+                "turn.rate_limit.trusted.allocate_rps is lower than the default tier — \
+                 sources in trusted_prefixes are being limited harder than everyone else"
+            );
+        }
+
         if !errors.is_empty() {
             return Err(ConfigError::Validation(errors.join("; ")));
         }
@@ -721,6 +845,25 @@ pub enum TransportSelection {
 #[serde(default, deny_unknown_fields)]
 pub struct TurnConfig {
     pub listen: SocketAddr,
+    /// `SO_RCVBUF` for the main listener and every relay socket, in bytes.
+    /// 0 (the default) leaves the kernel default alone — no release before
+    /// 0.5.0 touched it.
+    ///
+    /// Video is bursty: one 1080p frame is 20-60 UDP packets in a couple of
+    /// milliseconds. Debian's stock `net.core.rmem_default` is 212 992 bytes,
+    /// about 150 packets, and an overflow is dropped *in the kernel* — before
+    /// turna sees the packet, so `send_queue_dropped` and every other metric
+    /// here reads clean while the user watches the picture break up. The only
+    /// thing that counts it is `nstat -az UdpRcvbufErrors`.
+    ///
+    /// The kernel clamps this to `net.core.rmem_max`, so raise that first
+    /// (`deploy/sysctl.d/99-turna.conf`). The node logs the size it actually
+    /// got and warns when it is smaller than the one requested.
+    #[serde(default)]
+    pub socket_recv_buffer_bytes: usize,
+    /// `SO_SNDBUF`, same units and the same clamp, against `net.core.wmem_max`.
+    #[serde(default)]
+    pub socket_send_buffer_bytes: usize,
     pub external_ip: String,
     /// RFC 6156 IPv6 relayed transport: the IPv6 address advertised in
     /// XOR-RELAYED-ADDRESS for allocations that asked for
@@ -771,6 +914,11 @@ pub struct TurnConfig {
     /// RFC 6062 TCP relay. Disabled by default; requires `[tls]` enabled.
     #[serde(default)]
     pub tcp_relay: TcpRelaySection,
+    /// Tiered rate limiting (`[turn.rate_limit]`). Until 0.5.0 these were
+    /// readable only from `TURNA_RATE_LIMIT_*` and friends, so the values in
+    /// force appeared in no config file and no config dump.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
     /// Peer-address filtering policy (M1). Defaults to `internet-facing`
     /// (denies RFC 1918 / ULA peers). Set `profile = "lan"` to allow private
     /// relaying. See `docs/security/peer-filter.md`.
@@ -782,6 +930,8 @@ impl Default for TurnConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:3478".parse().unwrap(),
+            socket_recv_buffer_bytes: 0,
+            socket_send_buffer_bytes: 0,
             external_ip: String::new(),
             external_ip6: String::new(),
             realm: "turna".into(),
@@ -796,6 +946,7 @@ impl Default for TurnConfig {
             dtls: DtlsSection::default(),
             sctp: SctpSection::default(),
             tcp_relay: TcpRelaySection::default(),
+            rate_limit: RateLimitConfig::default(),
             peer_filter: PeerFilterConfig::default(),
         }
     }
@@ -870,6 +1021,11 @@ impl PeerFilterConfig {
 }
 
 /// Lightweight CIDR syntax check (the relay does the authoritative parse).
+/// serde cannot express a non-zero integer default inline.
+fn default_credential_clock_skew() -> u64 {
+    300
+}
+
 fn validate_cidr(s: &str) -> std::result::Result<(), String> {
     let Some((ip_str, pfx_str)) = s.trim().split_once('/') else {
         return Err(format!("{s:?} is not in <ip>/<prefix> form"));
@@ -930,6 +1086,19 @@ pub struct AuthConfig {
     #[serde(default)]
     pub previous_shared_secret: String,
     pub token_ttl: u64,
+    /// Clock-skew grace applied to TURN REST credential expiry, in seconds.
+    ///
+    /// The credential is minted by the signalling service and checked by this
+    /// node, on a different machine. When the two clocks disagree the symptom is
+    /// 100 % `Expired` on every client at once, with nothing in the log pointing
+    /// at time — a VM resumed from suspend, a container with no NTP, a hand-set
+    /// date. The RFC 7635 OAuth path has had a skew allowance since it landed;
+    /// this one did not.
+    ///
+    /// 300 by default. Even with it, this stays stricter than coturn, which does
+    /// not check the expiry at all. 0 restores the exact pre-0.5.0 behaviour.
+    #[serde(default = "default_credential_clock_skew")]
+    pub credential_clock_skew_secs: u64,
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
     pub oauth: OAuthConfig,
@@ -943,6 +1112,7 @@ impl Default for AuthConfig {
             shared_secret: DEFAULT_SHARED_SECRET.into(),
             previous_shared_secret: String::new(),
             token_ttl: 86400,
+            credential_clock_skew_secs: default_credential_clock_skew(),
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
         }
@@ -1041,12 +1211,178 @@ pub struct StaticUser {
     pub password: String,
 }
 
+/// One set of rate-limit tiers. Every value is `(burst, refill per second)`
+/// split into two keys, because TOML tuples read badly in a config a human
+/// edits at 3am.
+///
+/// Two of these live under `[turn.rate_limit]`: `default`, applied to everyone,
+/// and `trusted`, applied to sources inside `trusted_prefixes`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitTier {
+    /// Per-source-IP packet gate. Cheap data-plane check on every packet.
+    pub per_ip_burst: u32,
+    pub per_ip_rps: u32,
+    /// Aggregate gate for the source's /24 (v4) or /48 (v6).
+    pub per_prefix_burst: u32,
+    pub per_prefix_rps: u32,
+    /// Allocate. The expensive one: each Allocate takes a relay port, a socket
+    /// and a store entry, so the default is deliberately strict.
+    pub allocate_burst: u32,
+    pub allocate_rps: u32,
+    pub create_permission_burst: u32,
+    pub create_permission_rps: u32,
+    pub channel_bind_burst: u32,
+    pub channel_bind_rps: u32,
+}
+
+impl Default for RateLimitTier {
+    /// The values that were hardcoded in `qos::TieredLimits::default()` and
+    /// overridable only through `TURNA_*` environment variables. Unchanged, so
+    /// upgrading without writing a `[turn.rate_limit]` section changes nothing.
+    fn default() -> Self {
+        Self {
+            per_ip_burst: 10_000,
+            per_ip_rps: 50_000,
+            per_prefix_burst: 40_000,
+            per_prefix_rps: 200_000,
+            allocate_burst: 32,
+            allocate_rps: 16,
+            create_permission_burst: 128,
+            create_permission_rps: 64,
+            channel_bind_burst: 128,
+            channel_bind_rps: 64,
+        }
+    }
+}
+
+impl RateLimitTier {
+    /// Defaults for sources inside `trusted_prefixes`.
+    ///
+    /// Sized for an office behind one NAT address, which is the case the strict
+    /// defaults get wrong. A browser sends an Allocate per ICE transport — two
+    /// typically, more on dual-stack — so a 300-person meeting starting at the
+    /// top of the hour is ~600 Allocates from one IP. At the default 16/s that
+    /// is 35 seconds, longer than a browser's ICE gathering will wait: clients
+    /// time out, retry, and lengthen the queue they are already stuck behind.
+    ///
+    /// The data-plane tiers are raised for the same reason. 300 relaying
+    /// participants at roughly 300 pps each is ~90 000 pps from a single source
+    /// address, against a default refill of 50 000.
+    pub fn trusted_default() -> Self {
+        Self {
+            per_ip_burst: 200_000,
+            per_ip_rps: 1_000_000,
+            per_prefix_burst: 400_000,
+            per_prefix_rps: 2_000_000,
+            allocate_burst: 512,
+            allocate_rps: 128,
+            create_permission_burst: 2_048,
+            create_permission_rps: 1_024,
+            channel_bind_burst: 2_048,
+            channel_bind_rps: 1_024,
+        }
+    }
+
+    fn validate(&self, label: &str) -> Vec<String> {
+        let mut errs = Vec::new();
+        // A refill of 0 is a limiter that lets the burst through once and then
+        // refuses everything forever. That is never what someone means by "0";
+        // they mean "unlimited", which this limiter cannot express — so say so
+        // rather than silently bricking the tier.
+        for (name, burst, rps) in [
+            ("per_ip", self.per_ip_burst, self.per_ip_rps),
+            ("per_prefix", self.per_prefix_burst, self.per_prefix_rps),
+            ("allocate", self.allocate_burst, self.allocate_rps),
+            (
+                "create_permission",
+                self.create_permission_burst,
+                self.create_permission_rps,
+            ),
+            (
+                "channel_bind",
+                self.channel_bind_burst,
+                self.channel_bind_rps,
+            ),
+        ] {
+            if burst == 0 {
+                errs.push(format!(
+                    "turn.rate_limit.{label}.{name}_burst is 0 — no request of this \
+                     kind could ever pass. Raise it; there is no 'unlimited' value."
+                ));
+            }
+            if rps == 0 {
+                errs.push(format!(
+                    "turn.rate_limit.{label}.{name}_rps is 0 — the bucket would never \
+                     refill, so this tier would serve {burst} requests and then refuse \
+                     everything until restart."
+                ));
+            }
+        }
+        errs
+    }
+}
+
+/// `[turn.rate_limit]` — the tiered limiter's tunables.
+///
+/// These were readable only from `TURNA_RATE_LIMIT_*` and friends, which meant
+/// they lived outside the durable config the README presents as the GA
+/// contract: an operator hitting the Allocate ceiling found no key to look at,
+/// and the value that was actually in force did not appear in `--dump-config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Limits applied to every source not matched by `trusted_prefixes`.
+    pub default: RateLimitTier,
+    /// Limits applied to sources inside `trusted_prefixes`.
+    pub trusted: RateLimitTier,
+    /// CIDR ranges whose sources get the `trusted` tier — the offices and VPN
+    /// pools whose users come through one NAT address.
+    ///
+    /// This is not an authentication boundary: anyone who can spoof a source
+    /// address in these ranges gets the higher ceiling. It is a capacity knob,
+    /// so keep it to prefixes you route.
+    pub trusted_prefixes: Vec<String>,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            default: RateLimitTier::default(),
+            trusted: RateLimitTier::trusted_default(),
+            // Empty: the trusted tier does nothing until an operator names a
+            // prefix. A default that guessed at RFC 1918 would hand the higher
+            // ceiling to whatever private range happened to reach the node.
+            trusted_prefixes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RelayConfig {
     pub min_port: u16,
     pub max_port: u16,
     pub max_allocations: usize,
+    /// Address the relay UDP sockets bind to. Empty (the default) = `0.0.0.0`,
+    /// every interface — which is what every release before 0.5.0 did.
+    ///
+    /// A self-hosted TURN node usually has two interfaces: a public one for
+    /// clients and a private one to the SFU and the rest of the estate. With the
+    /// wildcard bind, relay ports 49152-65535 are open on the private one too.
+    /// The peer filter closes the *outbound* direction (relaying INTO private
+    /// space), but inbound packets on a relay port still arrive and are matched
+    /// against permissions — so pinning the bind is defence in depth, and the
+    /// equivalent of coturn's `relay-ip`.
+    ///
+    /// Set it and `external_ip` normally holds the same address (no NAT), or the
+    /// NAT's public address when the node is behind one.
+    #[serde(default)]
+    pub bind_ip: String,
+    /// Same for IPv6 relay sockets. Empty = `::`. Only meaningful when
+    /// `[turn] external_ip6` is set, since without it no v6 allocation is served.
+    #[serde(default)]
+    pub bind_ip6: String,
     /// Per-user bandwidth + allocation count limits. Defaults are
     /// "no bandwidth limit, 100 allocations per username".
     pub quota: QuotaConfig,
@@ -1095,6 +1431,8 @@ impl Default for RelayConfig {
             min_port: 49152,
             max_port: 65535,
             max_allocations: 10000,
+            bind_ip: String::new(),
+            bind_ip6: String::new(),
             quota: QuotaConfig::default(),
             // The value this was hard-coded to before it became configurable.
             max_packets_per_sec: 0,
@@ -1133,50 +1471,9 @@ impl Default for QuotaConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SfuConfig {
-    pub listen: SocketAddr,
-    pub max_rooms: usize,
-    pub max_participants_per_room: usize,
-}
-
-impl Default for SfuConfig {
-    fn default() -> Self {
-        Self {
-            listen: "0.0.0.0:4000".parse().unwrap(),
-            max_rooms: 1000,
-            max_participants_per_room: 50,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SignalingConfig {
-    pub listen: SocketAddr,
-    pub turn_url: String,
-    pub turn_shared_secret: String,
-    pub max_rooms: usize,
-}
-
-impl Default for SignalingConfig {
-    fn default() -> Self {
-        Self {
-            listen: "0.0.0.0:9001".parse().unwrap(),
-            turn_url: "turn:127.0.0.1:3478".into(),
-            turn_shared_secret: DEFAULT_SHARED_SECRET.into(),
-            max_rooms: 1000,
-        }
-    }
-}
-
-impl SignalingConfig {
-    pub fn load(path: &str) -> Result<Self> {
-        let config = TurnaConfig::load(path)?;
-        Ok(config.signaling)
-    }
-}
+// `SfuConfig` and `SignalingConfig` lived here until 0.5.0. See
+// `REMOVED_SECTIONS` at the top of this file for why they are gone and what an
+// upgrading operator is told.
 
 // ── Observability ─────────────────────────────────────────────────────────────
 
@@ -2374,23 +2671,7 @@ impl GrpcConfigSection {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RecordingConfig {
-    pub output_dir: String,
-    pub enabled: bool,
-    pub max_duration_secs: u64,
-}
-
-impl Default for RecordingConfig {
-    fn default() -> Self {
-        Self {
-            output_dir: "/var/lib/turna/recordings".into(),
-            enabled: false,
-            max_duration_secs: 7200,
-        }
-    }
-}
+// `RecordingConfig` lived here until 0.5.0. See `REMOVED_SECTIONS`.
 
 // ---------------------------------------------------------------------------
 // ENV variable expansion
@@ -2507,16 +2788,6 @@ min_port = 49152
 max_port = 65535
 max_allocations = 10000
 
-[sfu]
-listen = "0.0.0.0:4000"
-max_rooms = 1000
-max_participants_per_room = 50
-
-[signaling]
-listen = "0.0.0.0:9001"
-turn_url = "turn:203.0.113.1:3478"
-turn_shared_secret = "${TURNA_SHARED_SECRET:-dev-secret-change-me}"
-
 [cluster]
 node_id = "node-1"
 gossip_port = 7946
@@ -2532,11 +2803,6 @@ listen = "0.0.0.0:8080"
 [management]
 listen = "127.0.0.1:9090"
 enabled = true
-
-[recording]
-output_dir = "/var/lib/turna/recordings"
-enabled = false
-max_duration_secs = 7200
 "#
     .into()
 }
@@ -3408,7 +3674,6 @@ mod tests {
         };
         cfg.turn.external_ip = "203.0.113.1".into();
         cfg.turn.auth.shared_secret = "a-real-non-placeholder-secret".into();
-        cfg.signaling.turn_shared_secret = "a-real-non-placeholder-secret".into();
         cfg.tenants = vec![TenantConfig {
             id: "t1".into(),
             realm: "t1realm".into(),
@@ -3446,9 +3711,6 @@ enabled = true
 ticket_secret = "deadbeef"
 ticket_ttl_secs = 120
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_shared_secret = "s"
 "#;
         let config = TurnaConfig::from_str(toml).unwrap();
         assert!(config.turn.migration.enabled);
@@ -3467,8 +3729,6 @@ external_ip = "127.0.0.1"
 shared_secret = "s"
 [turn.migration]
 ticket_secret = "${TURNA_NONEXISTENT_MT_SECRET:-fallback-mt}"
-[signaling]
-turn_shared_secret = "s"
 "#;
         let config = TurnaConfig::from_str(toml).unwrap();
         assert_eq!(config.turn.migration.ticket_secret, "fallback-mt");
@@ -3487,8 +3747,6 @@ shared_secret = "s"
 enabled = true
 ticket_secret = "x"
 ticket_ttl_secs = 0
-[signaling]
-turn_shared_secret = "s"
 "#;
         assert!(
             TurnaConfig::from_str(toml).is_err(),
@@ -3524,9 +3782,6 @@ external_ip = "127.0.0.1"
 [turn.auth]
 shared_secret = "test-secret"
 
-[signaling]
-listen = "0.0.0.0:9001"
-turn_shared_secret = "test-secret"
 "#;
         let config = TurnaConfig::from_str(toml).unwrap();
         assert_eq!(config.turn.listen.port(), 3478);
@@ -3540,17 +3795,40 @@ turn_shared_secret = "test-secret"
 
     #[test]
     fn port_conflict_detected() {
+        // Until 0.5.0 this fixture collided `[turn]` with `[signaling]`, which
+        // no longer exists. The check itself is unchanged and still covers the
+        // three remaining listeners; health-on-the-TURN-port is the realistic
+        // version of the mistake, since 3478 is the one port an operator types
+        // from memory.
         let toml = r#"
 [turn]
 listen = "0.0.0.0:3478"
 [turn.auth]
 shared_secret = "s"
-[signaling]
+[health]
 listen = "0.0.0.0:3478"
-turn_shared_secret = "s"
 "#;
         let err = TurnaConfig::from_str(toml).unwrap_err();
-        assert!(err.to_string().contains("conflicts"));
+        assert!(
+            err.to_string().contains("conflicts"),
+            "expected a port-conflict error, got: {err}"
+        );
+
+        // The counterpart, so the check cannot pass by rejecting everything:
+        // distinct ports must validate.
+        let ok = r#"
+[turn]
+listen = "0.0.0.0:3478"
+[turn.auth]
+shared_secret = "s"
+[health]
+listen = "127.0.0.1:8081"
+"#;
+        // 8081, not 9090: the default `[management] listen` is 127.0.0.1:9090,
+        // and the check compares ports across every listener regardless of the
+        // address, so 9090 here would collide with a default this fixture never
+        // mentions.
+        TurnaConfig::from_str(ok).expect("distinct listener ports must validate");
     }
 
     #[test]
@@ -3558,8 +3836,6 @@ turn_shared_secret = "s"
         let toml = r#"
 [turn.auth]
 shared_secret = ""
-[signaling]
-turn_shared_secret = "s"
 "#;
         let err = TurnaConfig::from_str(toml).unwrap_err();
         assert!(err.to_string().contains("shared_secret"));
@@ -3589,8 +3865,6 @@ shared_secret = "s"
 [turn.relay]
 min_port = 60000
 max_port = 50000
-[signaling]
-turn_shared_secret = "s"
 "#;
         let err = TurnaConfig::from_str(toml).unwrap_err();
         assert!(err.to_string().contains("min_port"));
@@ -3634,8 +3908,6 @@ turn_shared_secret = "s"
         let toml = r#"
 [turn.auth]
 shared_secret = "s"
-[signaling]
-turn_shared_secret = "s"
 [unknown_section]
 foo = "bar"
 "#;
@@ -3654,8 +3926,6 @@ foo = "bar"
 [turn.auth]
 shared_secret = "s"
 typo_field = "x"
-[signaling]
-turn_shared_secret = "s"
 "#;
         let err =
             TurnaConfig::from_str(toml).expect_err("unknown field in [turn.auth] must be rejected");
@@ -3678,8 +3948,6 @@ realm = "turna"
 [auth]
 shared_secret = "turna-secret"
 
-[signaling]
-turn_shared_secret = "s"
 "#;
         let err = TurnaConfig::from_str(toml).expect_err("flat [auth] section must be rejected");
         let msg = err.to_string().to_lowercase();
@@ -3711,8 +3979,6 @@ external_ip = "1.2.3.4"
 [turn.auth]
 shared_secret = "change-me-in-production"
 
-[signaling]
-turn_shared_secret = "ok-for-signaling"
 "#
     }
 
@@ -3726,8 +3992,6 @@ external_ip = "1.2.3.4"
 [turn.auth]
 shared_secret = "change-me-in-production"
 
-[signaling]
-turn_shared_secret = "ok-for-signaling"
 "#
     }
 
@@ -3741,8 +4005,6 @@ external_ip = ""
 [turn.auth]
 shared_secret = "a-real-secret-12345"
 
-[signaling]
-turn_shared_secret = "another-one"
 "#
     }
 
@@ -3756,8 +4018,6 @@ external_ip = "not-an-ip"
 [turn.auth]
 shared_secret = "a-real-secret-12345"
 
-[signaling]
-turn_shared_secret = "another-one"
 "#
     }
 
@@ -3774,8 +4034,6 @@ shared_secret = "deadbeef-this-is-a-real-secret-honest"
 [turn.relay.quota]
 allow_unlimited_bandwidth = true
 
-[signaling]
-turn_shared_secret = "another-not-placeholder"
 "#
     }
 
@@ -3858,8 +4116,7 @@ mod b2_bandwidth_optin_tests {
             "production = true\n\n\
              [turn]\nexternal_ip = \"1.2.3.4\"\n\n\
              [turn.auth]\nshared_secret = \"deadbeef-this-is-a-real-secret-honest\"\n\n\
-             {quota_section}\
-             [signaling]\nturn_shared_secret = \"another-not-placeholder\"\n"
+             {quota_section}"
         )
     }
 
@@ -3959,5 +4216,61 @@ mod b2_bandwidth_optin_tests {
         };
         assert!(!off.gc_enabled());
         assert!(off.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod removed_sections_tests {
+    use super::*;
+
+    const MINIMAL: &str = "\
+[turn]
+listen = \"0.0.0.0:3478\"
+
+[turn.auth]
+shared_secret = \"a-real-secret-not-the-placeholder\"
+";
+
+    /// The three phantom sections must stay gone, and the operator who upgrades
+    /// with one still in their file must be told what to do — not handed
+    /// serde's `unknown field` and left to guess whether they made a typo.
+    #[test]
+    fn removed_sections_are_rejected_with_migration_advice() {
+        for (name, _) in REMOVED_SECTIONS {
+            let toml = format!("{MINIMAL}\n[{name}]\n");
+            let err = TurnaConfig::from_str(&toml)
+                .expect_err("a removed section must not load")
+                .to_string();
+            assert!(
+                err.contains("removed in 0.5.0"),
+                "[{name}] was rejected without the migration notice: {err}"
+            );
+            assert!(
+                err.contains(&format!("[{name}]")),
+                "the notice for [{name}] should name the section: {err}"
+            );
+        }
+    }
+
+    /// The counterpart: a config carrying none of them loads. Before 0.5.0 this
+    /// exact file failed, because `signaling.turn_shared_secret` was required
+    /// for a service that did not exist.
+    #[test]
+    fn minimal_config_without_phantom_sections_loads() {
+        TurnaConfig::from_str(MINIMAL)
+            .expect("a TURN-only config must validate with no [signaling] section");
+    }
+
+    /// A real typo must still read like a typo. The rewrite above is keyed to
+    /// three names; everything else keeps serde's wording.
+    #[test]
+    fn unrelated_unknown_section_keeps_the_plain_serde_error() {
+        let err = TurnaConfig::from_str(&format!("{MINIMAL}\n[singaling]\n"))
+            .expect_err("unknown section must be rejected")
+            .to_string();
+        assert!(
+            !err.contains("removed in 0.5.0"),
+            "a typo must not be reported as a removed section: {err}"
+        );
     }
 }

@@ -35,6 +35,80 @@ use tokio::net::UdpSocket;
 #[cfg(target_os = "linux")]
 const MAX_PACKET_SIZE: u32 = 8192;
 
+/// Requested socket buffer sizes, in bytes. 0 = leave the kernel default alone.
+///
+/// Process-global and applied inside `bind`, alongside `try_attach_bpf_filter`,
+/// which reads its setting the same way. The alternative is a parameter on both
+/// bind functions and every caller of them, for a value that is one number for
+/// the whole node.
+static SOCKET_RECV_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SOCKET_SEND_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the buffer sizes applied to every socket bound after this call.
+pub fn init_socket_buffers(recv_bytes: usize, send_bytes: usize) {
+    SOCKET_RECV_BUFFER.store(recv_bytes, std::sync::atomic::Ordering::Relaxed);
+    SOCKET_SEND_BUFFER.store(send_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Apply the configured buffer sizes and report what the kernel actually gave.
+///
+/// The report is the point. `setsockopt(SO_RCVBUF)` is silently clamped to
+/// `net.core.rmem_max`, so asking for 16 MB on a host with the stock 212 992
+/// byte ceiling succeeds and yields 212 992 — and the operator, having set the
+/// config key, has every reason to believe the buffer is 16 MB. Video is bursty
+/// (a 1080p frame is 20-60 packets in a few milliseconds), so an undersized
+/// receive buffer drops packets **in the kernel**, before turna sees them:
+/// invisible to `send_queue_dropped` and to every other metric this node has.
+///
+/// Linux returns double what was requested (it accounts for its own overhead),
+/// hence the halving before comparison.
+#[cfg(unix)]
+pub(crate) fn apply_socket_buffers(socket: &UdpSocket, what: &str) {
+    use std::sync::atomic::Ordering;
+    let sock = socket2::SockRef::from(socket);
+    for (want, label) in [
+        (SOCKET_RECV_BUFFER.load(Ordering::Relaxed), "recv"),
+        (SOCKET_SEND_BUFFER.load(Ordering::Relaxed), "send"),
+    ] {
+        if want == 0 {
+            continue;
+        }
+        let set = if label == "recv" {
+            sock.set_recv_buffer_size(want)
+        } else {
+            sock.set_send_buffer_size(want)
+        };
+        if let Err(e) = set {
+            tracing::warn!(%e, what, label, want, "could not set socket buffer size");
+            continue;
+        }
+        let got = if label == "recv" {
+            sock.recv_buffer_size()
+        } else {
+            sock.send_buffer_size()
+        };
+        match got {
+            // Kernel reports twice the usable size.
+            Ok(actual) if actual / 2 < want => tracing::warn!(
+                what,
+                label,
+                requested = want,
+                effective = actual / 2,
+                "socket buffer was clamped by the kernel — raise net.core.rmem_max \
+                 and net.core.wmem_max (see docs/deployment/host-tuning.md); until \
+                 then bursts are dropped in the kernel, where no turna metric sees them"
+            ),
+            Ok(actual) => {
+                tracing::info!(what, label, effective = actual / 2, "socket buffer set")
+            }
+            Err(e) => tracing::warn!(%e, what, label, "could not read back socket buffer size"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply_socket_buffers(_socket: &UdpSocket, _what: &str) {}
+
 /// Shared UDP socket handle — cheaply cloneable.
 #[derive(Clone)]
 pub struct TokioTransport {
@@ -45,6 +119,7 @@ impl TokioTransport {
     pub async fn bind(addr: SocketAddr) -> Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         tracing::info!(%addr, "UDP socket bound (tokio)");
+        apply_socket_buffers(&socket, "listener");
 
         // Attach the kernel-side STUN/ChannelData filter unless explicitly
         // disabled. We deliberately swallow errors: lack of permission to
@@ -234,6 +309,7 @@ impl TokioTransport {
             sock.bind(&addr.into())?;
             let socket = UdpSocket::from_std(sock.into())?;
             tracing::info!(%addr, "UDP socket bound (tokio, SO_REUSEPORT)");
+            apply_socket_buffers(&socket, "listener");
             Self::try_attach_bpf_filter(&socket);
             Ok(Self {
                 socket: Arc::new(socket),

@@ -4,7 +4,7 @@ production: false
 
 image:
   repository: turna
-  tag: "0.4.0"
+  tag: "0.5.0"
   pullPolicy: IfNotPresent
 
 turn:
@@ -28,7 +28,8 @@ turn:
   externalIP6: ""
   nodeId: "turna-standalone" # Stable durable-state key for the standalone node
   transport: "tokio" # GA production backend; auto/io_uring remain opt-in
-  turnUrl: "turn:127.0.0.1:3478"
+  # `turnUrl` lived here until 0.5.0. Its only consumer was the [signaling]
+  # section of the ConfigMap, which no binary ever read; both are gone.
   relayPortRange:
     min: 49152
     max: 65535

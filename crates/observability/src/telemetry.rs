@@ -63,6 +63,14 @@ pub struct TelemetryConfig {
     pub syslog_endpoint: String,
     /// Hash client addresses before sending them to the collector.
     pub syslog_redact_addresses: bool,
+    /// Hash client addresses on the stdout (`fmt`) layer.
+    ///
+    /// Set from `[turn.observability] log_allocation_addresses` inverted: that
+    /// key says whether to LOG addresses, this one says whether to HIDE them.
+    /// Independent of the syslog switch because the sinks are — a SIEM is inside
+    /// the operator's trust boundary, a log shipper's retention is whatever it
+    /// happens to be.
+    pub redact_stdout_addresses: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +98,7 @@ impl Default for TelemetryConfig {
             json_logs: false,
             syslog_endpoint: String::new(),
             syslog_redact_addresses: false,
+            redact_stdout_addresses: false,
         }
     }
 }
@@ -289,16 +298,27 @@ where
     // `Layered<EnvFilter, _>`). It used to have to be first for the same reason;
     // `build_otel_layer` is now generic over S, so `extra` can sit under it and
     // OTel still gets a type it accepts.
+    // Stdout redaction is a process-wide switch read inside the formatter, so it
+    // has to be set before the subscriber is installed.
+    crate::fmt_redact::set_redact_addresses(config.redact_stdout_addresses);
+
     macro_rules! try_init_with_fmt {
         ($base:expr) => {
             if config.json_logs {
                 $base
-                    .with(tracing_subscriber::fmt::layer().json())
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .json()
+                            .fmt_fields(crate::fmt_redact::RedactingJsonFields),
+                    )
                     .try_init()
                     .map_err(|e| TelemetryError::Tracer(e.to_string()))
             } else {
                 $base
-                    .with(tracing_subscriber::fmt::layer())
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .fmt_fields(crate::fmt_redact::RedactingFields),
+                    )
                     .try_init()
                     .map_err(|e| TelemetryError::Tracer(e.to_string()))
             }

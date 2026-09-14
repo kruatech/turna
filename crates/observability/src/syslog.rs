@@ -197,7 +197,7 @@ impl SyslogExporter {
         // reads `self.config.redact_addresses` and a second value would simply be
         // ignored. Which is what happened in the first attempt at this.
         let mut config = config;
-        let salt = salt_or_disable();
+        let salt = process_salt().map(|s| s.to_string());
         config.redact_addresses = config.redact_addresses && salt.is_some();
         let salt = salt.unwrap_or_default();
 
@@ -361,7 +361,7 @@ fn parse_endpoint(s: &str) -> Option<(&str, SocketAddr)> {
     Some((proto, addr))
 }
 
-fn looks_like_address(key: &str) -> bool {
+pub(crate) fn looks_like_address(key: &str) -> bool {
     matches!(
         key,
         "src" | "src_ip" | "client" | "client_addr" | "peer" | "peer_ip" | "remote"
@@ -386,6 +386,17 @@ fn looks_like_address(key: &str) -> bool {
 /// Read straight from /dev/urandom rather than through `rand`, which lives in
 /// turna-crypto: pulling that in would link crypto into every binary that logs,
 /// for one salt.
+/// The process-wide salt, read once.
+///
+/// Shared with `fmt_redact` so a host carries ONE label whichever sink wrote the
+/// line. Two independently generated salts would hash the same address two ways,
+/// and an operator correlating a stdout line with a SIEM event would get nothing
+/// and not know why.
+pub(crate) fn process_salt() -> Option<&'static str> {
+    static SALT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SALT.get_or_init(salt_or_disable).as_deref()
+}
+
 fn salt_or_disable() -> Option<String> {
     use std::io::Read;
     let mut buf = [0u8; 8];
@@ -418,7 +429,7 @@ const FNV_PRIME: u64 = 0x100_0000_01b3;
 /// Somebody holding the log *and* guessing an address could confirm the guess.
 /// That is true of SHA-256 here too: the input space is four billion. If that
 /// matters, use `--strip-addresses` and accept losing correlation.
-fn hash_address(salt: &str, v: &str) -> String {
+pub(crate) fn hash_address(salt: &str, v: &str) -> String {
     let mut h: u64 = FNV_OFFSET_BASIS;
     for b in salt.bytes().chain(v.bytes()) {
         h ^= b as u64;
