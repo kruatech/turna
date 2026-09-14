@@ -2269,3 +2269,100 @@ mod dtls_e2e {
         );
     }
 }
+
+// ── Abuse regressions ───────────────────────────────────────────────────────
+//
+// One test per finding from the second audit pass, at the level the finding
+// actually lives. These are the configuration half: each asserts that a
+// dangerous setting is refused at startup with a message naming what to change.
+//
+// The wire-level halves — a spoofed-source flood that must not lock out new
+// clients (21), and unclaimed EVEN-PORT reservations that must be swept (30) —
+// are unit tests in `turna-qos` and `turna-session`, because the failure is in
+// the data structure and reproducing it through a socket would buy flakiness
+// rather than confidence.
+//
+// Still missing, and named rather than silently absent: a TURNS per-IP
+// connection cap exercised over a real TLS listener (28), and 508-requires-auth
+// checked on the wire (33). Both need a live node plus a client that speaks the
+// transport, which this harness does not have yet.
+
+#[test]
+fn abuse_full_software_attribute_is_refused_in_production() {
+    // Advertising the release in an unauthenticated Binding response hands a
+    // scanner the exact version to match against a CVE list.
+    assert_refused(
+        "software_attribute = full under production",
+        "production = true\n[turn]\nsoftware_attribute = \"full\"",
+        "software_attribute",
+    );
+}
+
+#[test]
+fn abuse_unknown_software_attribute_is_refused() {
+    // A typo must not silently fall through to the most revealing setting.
+    assert_refused(
+        "software_attribute typo",
+        "[turn]\nsoftware_attribute = \"verbose\"",
+        "software_attribute",
+    );
+}
+
+#[test]
+fn abuse_zero_rate_limit_is_refused() {
+    // A refill of 0 is a bucket that empties once and never fills: the tier
+    // would serve `burst` requests and then refuse everything until restart.
+    // "0 means unlimited" is the obvious reading and the wrong one.
+    assert_refused(
+        "zero refill in a rate-limit tier",
+        "[turn.rate_limit.default]\nallocate_rps = 0",
+        "allocate_rps",
+    );
+}
+
+#[test]
+fn abuse_trusted_prefix_must_be_a_cidr() {
+    // A malformed prefix that parsed as "nothing matches" would silently leave
+    // the offices it was meant to cover on the strict tier.
+    assert_refused(
+        "malformed trusted prefix",
+        "[turn.rate_limit]\ntrusted_prefixes = [\"10.0.0.0\"]",
+        "trusted_prefixes",
+    );
+}
+
+#[test]
+fn abuse_tcp_relay_without_tls_is_refused_in_production() {
+    // RFC 6062 carries the TCP allocation over the TLS control connection, and
+    // this node has no plain-TCP listener — so the datapath would be enabled and
+    // unreachable.
+    assert_refused(
+        "tcp_relay without tls under production",
+        "production = true\n[turn.tcp_relay]\nenabled = true",
+        "tls",
+    );
+}
+
+#[test]
+fn abuse_relay_bind_ip_family_mismatch_is_refused() {
+    // A v6 literal in bind_ip binds nothing a v4 allocation can use. Left
+    // unchecked, it surfaces as "no ports available" under load rather than as
+    // a configuration problem at startup.
+    assert_refused(
+        "IPv6 literal in bind_ip",
+        "[turn.relay]\nbind_ip = \"2001:db8::1\"",
+        "bind_ip",
+    );
+}
+
+#[test]
+fn abuse_removed_config_sections_are_refused_with_migration_advice() {
+    // The three phantom sections are gone. An upgrader who left one in place
+    // must be told what happened, not handed serde's `unknown field` — which
+    // reads like a typo they did not make.
+    assert_refused(
+        "[signaling] after 0.5.0",
+        "[signaling]\nlisten = \"0.0.0.0:9001\"",
+        "removed in 0.5.0",
+    );
+}

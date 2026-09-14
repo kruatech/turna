@@ -159,17 +159,40 @@ Known residual gaps, per transport:
   mitigation, not a fix: an attacker still consumes one timeout window at a time,
   so new-session throughput degrades under a deliberate flood. The fix is owning
   the UDP demultiplexer so handshakes run concurrently instead of serially inside
-  `accept()` — and that is now implemented as `[turn.dtls] demux = true`, which
-  also brings pre-handshake admission, a per-IP handshake rate limit, certificate
-  hot-reload and observable handshake failures. It is **off by default** because
-  it displaces the only DTLS path with recorded verification, so on a default
-  deployment the residual gaps still stand: no pre-handshake rate limiting and no
-  certificate hot-reload (a rotated cert needs a restart). DTLS 1.2 only.
+  `accept()` — implemented as `[turn.dtls] demux = true`, which is the default
+  and brings pre-handshake admission, a per-IP handshake rate limit, certificate
+  hot-reload and observable handshake failures. (This paragraph said "off by
+  default" until 0.5.0; it had been on since 0.4.1.) DTLS 1.2 only.
+
+  Since 0.5.0 the demux path also performs **stateless address validation**
+  before allocating anything: a ClientHello without a cookie this node issued is
+  answered with a HelloVerifyRequest (RFC 6347 §4.2.1) and no state is kept.
+  Without it, one spoofed ~100-byte ClientHello bought a channel, a map entry, a
+  connection and a task for `accept_timeout_secs` — and nothing bounded that,
+  because `max_sessions` counts handshakes that already succeeded. A flood was an
+  out-of-memory kill in seconds, from any address, with no credentials. A
+  `max_pending_handshakes` cap (512) remains as the backstop behind the cookie.
+
+  One caveat on that: `webrtc-dtls` performs its own HelloVerifyRequest inside
+  the connection. If it still does after this gate, a client pays two cookie
+  round trips — slower, not broken. Watch handshake latency when you enable
+  DTLS.
 - **QUIC/WebTransport:** the `[turn.quic]` transport limits (stream counts,
   datagram buffer, idle timeout) now apply on **both** paths. `alpn` is inert
   under WebTransport (wtransport forces `h3`).
-  `max_handshakes_per_sec_per_ip` is **off by default**; set it on any
-  internet-facing listener.
+  `max_handshakes_per_sec_per_ip` and `max_sessions_per_ip` default to 8 and 16
+  since 0.5.0; both were 0 (unlimited), which left `max_sessions` — a global
+  number — as the only bound, and a global bound is exhausted by one host.
+
+  Since 0.5.0 an Initial from an address quinn has not validated is answered
+  with a Retry (RFC 9000 §8.1) rather than a handshake. Without it every spoofed
+  Initial bought a full TLS 1.3 handshake, ECDHE and a certificate signature
+  included — a cryptographic denial of service that needs no amplification to
+  work. The WebTransport path does the same: `wtransport` 0.7 exposes
+  `remote_address_validated()` and `retry()` on its `IncomingSession`, and there
+  the check runs **before** the per-IP tables are touched — admitting an
+  unvalidated Initial would otherwise let a spoofed source consume a slot
+  belonging to an address that never sent anything.
 - **Evidence status differs, and the difference is what to read.** All four
   transports now have recorded runs against the current code, but they are not
   equally strong:
@@ -353,6 +376,11 @@ target there is no SIGHUP and the restart still applies.
 | `turna_peer_rejected_total` | Peer-filter blocks; useful for SSRF/private-address probing. |
 | `turna_quota_exceeded_total` | Abuse or too-tight quota. |
 | `turna_send_queue_dropped_total` | Internal backpressure. |
+| `turna_recv_workers_alive` | Partial datapath failure. The node keeps reporting Ready while a fraction of clients go unserved, and it does not recover. Alert on any decrease. |
+| `turna_unauth_replies_suppressed_total` | Reflection: spoofed requests naming a victim as the source, or clients looping on authentication. |
+| `turna_rate_limiter_evictions_total` | Table churn — a spoofed-source flood, or a client population larger than `max_entries`. |
+| `turna_dtls_cookie_challenges_total` / `turna_dtls_rejected_pending_cap_total` | Spoofed DTLS handshakes turned away at the door, and the backstop behind them. |
+| `turna_quic_retries_sent_total` | Spoofed QUIC Initials. One per real client per first connection; far above that is a flood. |
 | `tarantool_writer_errors_total` | Backend write failures. |
 | `tarantool_writes_dropped_total` | HA correctness risk; page on any sustained increase. |
 | `failover_errors_total` | Failover sweeps failing. |
@@ -434,6 +462,12 @@ feature before enabling it in front of users.
 - The target node checks `expected_version` inside a serialized apply section,
   persists desired state, publishes one immutable snapshot, then confirms
   observed state. A no-op succeeds without increasing the version.
+- `set_user_limits` takes the **userid without the TURN REST expiry prefix** —
+  `alice`, not `1758012345:alice`. Before 0.5.0 it keyed on the raw USERNAME, so
+  an override set for a user matched nothing and `max_per_user` counted each
+  minted credential as a separate person, capping one pair of credentials rather
+  than one user. Existing `max_per_user` values are therefore too low now that
+  the field means what it says.
 - `set_user_limits` resolves each field independently in this order: user,
   tenant, node runtime default, bootstrap default. Lowering a limit below usage
   does not destroy allocations; it rejects new allocations until usage falls.

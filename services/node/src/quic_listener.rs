@@ -111,6 +111,9 @@ pub fn spawn_quic(
                 metrics
                     .quic_rejected_per_ip
                     .store(s.rejected_per_ip, Relaxed);
+                metrics
+                    .quic_retries_sent
+                    .store(s.retries_sent, Relaxed);
                 metrics.quic_cert_reloads.store(s.cert_reloads, Relaxed);
                 metrics
                     .quic_cert_reload_failures

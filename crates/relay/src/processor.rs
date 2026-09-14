@@ -188,6 +188,47 @@ fn loggable_addr(addr: &std::net::SocketAddr) -> String {
     hash_ip(&addr.ip())
 }
 
+/// Throttles for the log sites that run BEFORE authentication.
+///
+/// All three sat at `warn!`, once per packet, with attacker-controlled content
+/// — the parser's error text, the source address, the rate limiter's refusal.
+/// A single gigabit host is ~1.5 M packets/second, so the log became the denial
+/// of service: journald's own rate limit starts dropping the whole stream, and
+/// what it drops includes the messages an operator needs to see what is
+/// happening.
+///
+/// The counters (`parser_rejections`, auth failures) are the signal; the line
+/// only has to say it is happening, and `occurrences` says how much.
+/// What to advertise in SOFTWARE, from `[turn] software_attribute`.
+///
+/// Process-wide: the value cannot differ between responses, and threading it to
+/// the one place it is read would mean a parameter on the Binding path for a
+/// string chosen once at startup.
+static SOFTWARE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// `"none"` | `"product"` | `"full"`. Anything else is treated as `product`,
+/// the safe middle — an unrecognised value must not silently reveal more.
+pub fn set_software_attribute(mode: &str) {
+    let v = match mode.trim().to_ascii_lowercase().as_str() {
+        "none" => 0u8,
+        "full" => 2,
+        _ => 1,
+    };
+    SOFTWARE_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn software_attribute() -> Option<&'static str> {
+    match SOFTWARE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        2 => Some(concat!("turna ", env!("CARGO_PKG_VERSION"))),
+        _ => Some("turna"),
+    }
+}
+
+static DECODE_ERROR_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
+static UNAUTH_BUDGET_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
+static AUTH_FAILED_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
+
 /// The salted label itself, shared by [`loggable_addr`] and [`loggable_ip`] so
 /// one host cannot end up with two labels depending on which call site saw it.
 fn hash_ip(ip: &std::net::IpAddr) -> String {
@@ -491,6 +532,20 @@ pub struct PacketProcessor {
     trusted_limiter: Option<TieredRateLimiter>,
     /// Ranges whose sources use `trusted_limiter`. Empty unless configured.
     trusted_prefixes: Vec<crate::peer_filter::Cidr>,
+    /// Budget for replies sent to an address that has not authenticated:
+    /// Binding responses and 401 challenges.
+    ///
+    /// Separate from the ingress tiers because the thing being limited is
+    /// different. Ingress bounds what a source may *ask*, and the generous
+    /// defaults are right for that — a real client sends thousands of packets a
+    /// second once it is relaying. This bounds what the node *emits* to an
+    /// unproven address, and a real client needs a handful of those in total:
+    /// a Binding or two, a challenge, then it is authenticated and out of scope.
+    ///
+    /// The distinction matters under spoofing, where the source address is the
+    /// victim: a 48-byte response to a 20-byte request, up to the per-IP ingress
+    /// refill of 50 000/second, is 2.4 MB/s aimed at whoever the attacker named.
+    unauth_reply_limiter: TieredRateLimiter,
     external_ip: std::net::IpAddr,
     /// RFC 6156 IPv6 relayed transport. `None` (the default) keeps the historical
     /// IPv4-only behaviour: an explicit `REQUESTED-ADDRESS-FAMILY = IPv6` is
@@ -592,8 +647,9 @@ impl PacketProcessor {
     /// The environment overrides still apply on top, so a deployment that has
     /// them exported keeps its current behaviour (and now says so in the log).
     pub fn with_rate_limits(mut self, settings: &RateLimitSettings) -> Self {
-        self.rate_limiter =
-            TieredRateLimiter::new(RateLimitSettings::env_overrides(settings.default));
+        self.rate_limiter = TieredRateLimiter::new(RateLimitSettings::env_overrides(
+            settings.default,
+        ));
         self.trusted_prefixes =
             crate::peer_filter::parse_ranges(&settings.trusted_prefixes, "trusted_prefixes");
         // No prefixes means no second limiter to keep: `limiter_for` then never
@@ -672,6 +728,18 @@ impl PacketProcessor {
             )),
             trusted_limiter: None,
             trusted_prefixes: Vec::new(),
+            // (64, 8): a legitimate client needs single digits of these, ever.
+            // Only `per_ip` is consulted; the other tiers are set to the same
+            // values rather than left at their generous defaults so that a
+            // future caller reaching for one does not get an accidental
+            // free pass.
+            unauth_reply_limiter: TieredRateLimiter::new(TieredLimits {
+                per_ip: (64, 8),
+                per_prefix: (512, 64),
+                allocate: (64, 8),
+                create_permission: (64, 8),
+                channel_bind: (64, 8),
+            }),
             external_ip,
             external_ip6: None,
             nonce_mgr: NonceManager::new(),
@@ -716,6 +784,18 @@ impl PacketProcessor {
     /// idle buckets linger until restart; the maintenance loop calls this.
     pub fn cleanup_rate_limiter(&self, max_age_secs: f64) {
         self.rate_limiter.cleanup(max_age_secs);
+        // Mirrored here rather than at the eviction site: the counter lives in
+        // turna-qos, which has no Metrics handle, and this runs on the same
+        // five-second sweep that already visits the limiter.
+        self.metrics.rate_limiter_evictions.store(
+            self.rate_limiter.evictions()
+                + self
+                    .trusted_limiter
+                    .as_ref()
+                    .map(|t| t.evictions())
+                    .unwrap_or(0),
+            Ordering::Relaxed,
+        );
         // The trusted limiter holds its own per-IP buckets and would otherwise
         // grow without bound — the leak would be invisible, because the tier
         // that leaks is the one serving the busiest sources.
@@ -1144,7 +1224,9 @@ impl PacketProcessor {
                 // a reflection/amplification vector. Semantic errors (420/440/
                 // 442/…) are only produced once a message parses cleanly, so the
                 // syntax layer rejects quietly while the protocol layer answers.
-                warn!(src = %loggable_addr(&src), %e, "STUN decode error");
+                if let Some(occurrences) = DECODE_ERROR_LOG.should_log() {
+                    warn!(src = %loggable_addr(&src), %e, occurrences, "STUN decode error");
+                }
                 self.metrics
                     .parser_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -1301,7 +1383,38 @@ impl PacketProcessor {
 
     // ── STUN handlers ─────────────────────────────────────────────────────────
 
+    /// May this address be sent an unauthenticated reply right now?
+    ///
+    /// Silence is the correct refusal: answering "you are rate limited" is
+    /// itself an unauthenticated reply to a possibly-spoofed address, which is
+    /// the thing being limited.
+    fn allow_unauth_reply(&self, src: SocketAddr) -> bool {
+        if self.unauth_reply_limiter.check_ingress_ip(src.ip()) {
+            return true;
+        }
+        self.metrics
+            .unauth_replies_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(occurrences) = UNAUTH_BUDGET_LOG.should_log() {
+            warn!(
+                src = %loggable_addr(&src),
+                occurrences,
+                "unauthenticated-reply budget exhausted for this source; dropping \
+                 silently. Sustained, this is reflection: the source address of a \
+                 spoofed request is the victim the reply would be aimed at."
+            );
+        }
+        false
+    }
+
     fn handle_binding(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
+        // Reflection budget. A Binding response is 48 bytes for a 20-byte
+        // request and needs no credentials, so the only thing between a spoofed
+        // request and the victim is how many replies this node will emit to one
+        // address.
+        if !self.allow_unauth_reply(src) {
+            return vec![Action::None];
+        }
         // RFC 5389 §10.1.2: if MESSAGE-INTEGRITY present, validate it over the
         // actual message bytes (not an empty buffer).
         // A client may authenticate a Binding with RFC 5389 MESSAGE-INTEGRITY
@@ -1322,9 +1435,18 @@ impl PacketProcessor {
             msg.transaction_id,
         );
         resp.add(Attribute::XorMappedAddress(src));
-        resp.add(Attribute::Software(
-            concat!("turna ", env!("CARGO_PKG_VERSION")).into(),
-        ));
+        // SOFTWARE is optional (RFC 5389 §15.10) and this response is
+        // unauthenticated, so whatever goes here is handed to anyone who sends
+        // 20 bytes — including a scanner matching versions against CVE lists.
+        // It is also ~16 bytes of free amplification on a reflected Binding.
+        //
+        // `product` is the production default: enough for an operator debugging
+        // interop to see which implementation answered, without naming the
+        // release. `full` stays available outside production, where knowing the
+        // exact build is worth more than hiding it.
+        if let Some(sw) = software_attribute() {
+            resp.add(Attribute::Software(sw.into()));
+        }
 
         let mut buf = [0u8; 256];
         let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
@@ -1345,10 +1467,6 @@ impl PacketProcessor {
         src: SocketAddr,
         ingress_tcp: bool,
     ) -> Vec<Action> {
-        if self.metrics.is_draining() {
-            return self.encode_error(msg, src, 508, "Server Draining");
-        }
-
         // A3-L1: authenticate first (RFC 5766 §6.2). Running the 437/442 checks
         // before auth let an unauthenticated client probe whether an allocation
         // already exists on this 5-tuple (437 vs 401 disclosure). Challenge and
@@ -1363,7 +1481,9 @@ impl PacketProcessor {
         let resolution = match self.auth_validate(msg, raw) {
             Ok(r) => r,
             Err(e) => {
-                warn!(src = %loggable_addr(&src), %e, "auth failed");
+                if let Some(occurrences) = AUTH_FAILED_LOG.should_log() {
+                    warn!(src = %loggable_addr(&src), %e, occurrences, "auth failed");
+                }
                 self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
@@ -1378,6 +1498,24 @@ impl PacketProcessor {
         let key = resolution.key;
         let realm = resolution.realm;
         let tenant_id = resolution.tenant_id;
+        // Drain is reported only to a client that proved who it is.
+        //
+        // This check used to sit above the challenge — seven lines above the
+        // comment that explains why 437 and 442 were moved *below* it, for
+        // exactly the same two reasons. A 508 before authentication is an
+        // unauthenticated reply to a source address that may be spoofed, so it
+        // both amplifies and tells a scanner the node's lifecycle state. The
+        // client that needs to know a node is draining is a real client, and it
+        // finds out one round trip later: 401 challenge, credentials, then 508
+        // (or 300 Try Alternate in a cluster).
+        if self.metrics.is_draining() {
+            return self.encode_error(msg, src, 508, "Server Draining");
+        }
+
+        // The identity quotas are keyed on. For TURN REST this is the USERNAME
+        // without its `<expiry>:` prefix, so a fresh credential does not read as
+        // a fresh person — see `AuthMode::subject_of`.
+        let subject = resolution.subject;
 
         // RFC 7635 §6.1: an OAuth token with no remaining lifetime cannot
         // authorize a new allocation — capping the granted lifetime by it would
@@ -1416,6 +1554,7 @@ impl PacketProcessor {
                 realm.clone(),
                 tenant_id.clone(),
                 token_max_lifetime,
+                subject.clone(),
             );
         }
 
@@ -1507,10 +1646,11 @@ impl PacketProcessor {
         if let Some(max) = token_max_lifetime {
             lifetime = lifetime.min(max);
         }
-        let username = msg.get_username().unwrap_or("").to_string();
+        // Kept for the log line below; accounting uses `subject`.
+        let credential = msg.get_username().unwrap_or("").to_string();
         let (dynamic_lifetime, lifetime_disabled) =
             self.store
-                .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &username);
+                .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &subject);
         if lifetime_disabled {
             if let Some(token) = issued_token.as_ref() {
                 self.store
@@ -1523,10 +1663,14 @@ impl PacketProcessor {
             lifetime = lifetime.min(dynamic_lifetime);
         }
 
+        // `subject`, not the raw USERNAME: the allocation's identity field is
+        // what every quota and every `set_user_limits` override keys on, and for
+        // TURN REST the raw string carries an expiry that changes per credential.
+        // The credential itself is logged below, so the audit trail keeps it.
         if let Err(e) = self.store.create_for_identity(
             src,
             relay_addr,
-            username,
+            subject.clone(),
             key.clone(),
             lifetime,
             realm.clone(),
@@ -1592,7 +1736,7 @@ impl PacketProcessor {
             encode_with_integrity_auto(&resp, &mut buf, &key, msg),
             vec![Action::None]
         );
-        info!(src = %loggable_addr(&src), %relay_addr, lifetime, "allocation created");
+        info!(src = %loggable_addr(&src), %relay_addr, lifetime, subject = %subject, %credential, "allocation created");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -1627,6 +1771,8 @@ impl PacketProcessor {
         realm: String,
         tenant_id: Option<String>,
         token_max_lifetime: Option<u32>,
+        // The quota identity, already stripped of any TURN REST expiry prefix.
+        subject: String,
     ) -> Vec<Action> {
         // RFC 6062 §4.1: EVEN-PORT / RESERVATION-TOKEN / DONT-FRAGMENT MUST NOT
         // appear with a TCP allocation.
@@ -1680,10 +1826,11 @@ impl PacketProcessor {
         if let Some(max) = token_max_lifetime {
             lifetime = lifetime.min(max);
         }
-        let username = msg.get_username().unwrap_or("").to_string();
+        // Kept for the log line below; accounting uses `subject`.
+        let credential = msg.get_username().unwrap_or("").to_string();
         let (dynamic_lifetime, lifetime_disabled) =
             self.store
-                .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &username);
+                .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &subject);
         if lifetime_disabled {
             return self.encode_error(msg, src, 486, "Allocation Quota Reached");
         }
@@ -1712,17 +1859,17 @@ impl PacketProcessor {
         // `[turn.relay] bind_ip` exists to close.
         let listener =
             match std::net::TcpListener::bind((turna_session::relay_bind_addr_v4(), relay_port)) {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
-                    return self.encode_error(msg, src, 508, "Insufficient Capacity");
-                }
-            };
+            Ok(l) => l,
+            Err(e) => {
+                warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
+                return self.encode_error(msg, src, 508, "Insufficient Capacity");
+            }
+        };
 
         if let Err(e) = self.store.create_for_identity(
             src,
             relay_addr,
-            username,
+            subject.clone(),
             key.clone(),
             lifetime,
             realm,
@@ -1755,7 +1902,7 @@ impl PacketProcessor {
             encode_with_integrity_auto(&resp, &mut buf, &key, msg),
             vec![Action::None]
         );
-        info!(src = %loggable_addr(&src), %relay_addr, lifetime, "TCP allocation created (RFC 6062)");
+        info!(src = %loggable_addr(&src), %relay_addr, lifetime, subject = %subject, %credential, "TCP allocation created (RFC 6062)");
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -2460,6 +2607,11 @@ impl PacketProcessor {
     }
 
     fn encode_auth_challenge(&self, msg: &StunMessage, dst: SocketAddr) -> Vec<Action> {
+        // A 401 is also an unauthenticated reply, and a larger one than a
+        // Binding response. It shares the budget.
+        if !self.allow_unauth_reply(dst) {
+            return vec![Action::None];
+        }
         let realm = self.auth.default_realm();
         let nonce = self.nonce_mgr.issue(dst);
         // RFC 7635 §6.1: when the base realm uses OAuth, advertise the

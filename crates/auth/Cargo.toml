@@ -19,6 +19,8 @@ hmac.workspace     = true
 sha1.workspace     = true
 base64.workspace   = true
 tokio.workspace    = true
+# Overwrites key material on drop; see `impl Drop for AuthMode`.
+zeroize.workspace  = true
 # jsonwebtoken, argon2, password-hash and uuid were removed in 0.5.0 with the
 # store/jwt/user modules that were their only consumers. aes-gcm stays: the
 # RFC 7635 OAuth path in this file uses it.

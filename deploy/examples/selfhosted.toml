@@ -30,6 +30,18 @@ realm = "turn.example.internal"
 socket_recv_buffer_bytes = 8388608
 socket_send_buffer_bytes = 8388608
 
+# "turna" with no version. The Binding response carrying this is
+# unauthenticated, so the version would go to any scanner that sends 20 bytes.
+# "full" is refused under production anyway; this is the explicit form of the
+# default, written out so it is a decision rather than an omission.
+software_attribute = "product"
+
+# No core dumps. The shared secret is resident for the whole run, and
+# systemd-coredump is enabled by default on most distributions, so a crash would
+# write it to disk in the clear. Flip this to true only while you are actually
+# collecting a dump.
+allow_core_dumps = false
+
 [turn.auth]
 # Signs the TURN REST (coturn-compatible) time-limited credentials your
 # signalling service hands out. It never leaves this file and the signalling
@@ -73,8 +85,14 @@ max_allocations = 8000
 # Per-user overrides for trusted accounts go through the control plane
 # (turnactl set-user-limits), not this file.
 max_bytes_per_sec_per_allocation = 12500000
-# Two ICE transports per participant, plus room for a second device.
-max_per_user = 6
+# Per PERSON, not per credential. Until 0.5.0 this counted the raw TURN REST
+# USERNAME, which carries an expiry prefix and therefore changed on every
+# credential the signalling service minted — so the cap bounded one pair of
+# credentials and reset whenever a client asked for a fresh one. It now keys on
+# the userid behind the prefix, so the number has to cover everything one person
+# holds at once: two ICE transports per participant, a second device, and a
+# reconnect whose old allocation has not yet expired.
+max_per_user = 12
 
 [turn.peer_filter]
 # Stays internet-facing. The tempting setting here is profile = "lan", and it is
@@ -120,6 +138,11 @@ key_path = "/etc/turna/tls/key.pem"
 # restart. Matters more than it sounds with 90-day certificates.
 cert_reload_secs = 300
 enable_alpn = true
+# Per-source connection cap. One host holding every slot of max_connections
+# would lock out exactly the population TURNS exists for — clients whose network
+# blocks UDP and have no other way in. Raise it for a known NAT egress point,
+# the same addresses you listed in trusted_prefixes.
+max_connections_per_ip = 64
 # RFC 7443 strict mode is deliberately OFF. It refuses clients that negotiate no
 # ALPN, and that includes some non-browser stacks. Turn it on only after you
 # know every client population advertises stun.turn.

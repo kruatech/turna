@@ -543,8 +543,10 @@ fn relay_bind_v6() -> std::net::Ipv6Addr {
 /// Separate from `turna-transport`'s equivalent because this crate does not
 /// depend on that one, and a dependency added to share twenty lines of
 /// `setsockopt` would be the more expensive of the two.
-static RELAY_RECV_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static RELAY_SEND_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RELAY_RECV_BUFFER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static RELAY_SEND_BUFFER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Set the buffer sizes applied to every relay socket bound after this call.
 pub fn init_relay_socket_buffers(recv_bytes: usize, send_bytes: usize) {
@@ -590,13 +592,30 @@ fn apply_relay_buffers(sock: &std::net::UdpSocket) {
 #[cfg(not(unix))]
 fn apply_relay_buffers(_sock: &std::net::UdpSocket) {}
 
+/// A starting point inside `[min, max]` for the port cursor.
+///
+/// Not cryptographic, and does not need to be: the requirement is that seeing
+/// one relay port tells you nothing about the next, and a sequence with an
+/// unobserved origin satisfies that. Predictability of the *sequence* was the
+/// problem, not guessability of a single draw.
+fn random_start_port(min_port: u16, max_port: u16) -> u16 {
+    if max_port <= min_port {
+        return min_port;
+    }
+    let span = (max_port - min_port) as u32 + 1;
+    min_port + (rand::random::<u32>() % span) as u16
+}
+
 fn bind_relay_socket(family: RelayFamily, port: u16) -> std::io::Result<std::net::UdpSocket> {
     let sock = bind_relay_socket_inner(family, port)?;
     apply_relay_buffers(&sock);
     Ok(sock)
 }
 
-fn bind_relay_socket_inner(family: RelayFamily, port: u16) -> std::io::Result<std::net::UdpSocket> {
+fn bind_relay_socket_inner(
+    family: RelayFamily,
+    port: u16,
+) -> std::io::Result<std::net::UdpSocket> {
     match family {
         RelayFamily::V4 => std::net::UdpSocket::bind((relay_bind_v4(), port)),
         #[cfg(unix)]
@@ -611,9 +630,10 @@ fn bind_relay_socket_inner(family: RelayFamily, port: u16) -> std::io::Result<st
             Ok(sock.into())
         }
         #[cfg(not(unix))]
-        RelayFamily::V6 => {
-            std::net::UdpSocket::bind(std::net::SocketAddr::from((relay_bind_v6(), port)))
-        }
+        RelayFamily::V6 => std::net::UdpSocket::bind(std::net::SocketAddr::from((
+            relay_bind_v6(),
+            port,
+        ))),
     }
 }
 
@@ -650,7 +670,22 @@ impl PortAllocator {
         Self {
             min_port,
             max_port,
-            next_port: Mutex::new(min_port),
+            // Random start, not `min_port`.
+            //
+            // A relay port is public: it travels in XOR-RELAYED-ADDRESS and ends
+            // up in the SDP. Handing them out consecutively means that knowing
+            // one tells an off-path attacker where the next allocations are, and
+            // the peer whose address is permitted — the SFU — is not a secret
+            // either. Spoofed packets from that address then reach a client's
+            // RTP stack: SRTP keeps the contents safe, but the jitter buffer and
+            // the loss counters do not care that the payload failed to
+            // authenticate.
+            //
+            // RFC 6056 §3.3 asks for unpredictability in ephemeral port
+            // selection for the same reason, and coturn randomises. The cursor
+            // still walks linearly from wherever it starts, so allocation stays
+            // O(1) while the range is sparse; only the starting point moves.
+            next_port: Mutex::new(random_start_port(min_port, max_port)),
             used: Mutex::new(HashSet::new()),
             reservations: Mutex::new(HashMap::new()),
         }
@@ -805,9 +840,33 @@ impl PortAllocator {
     /// Expired reservations are swept and their ports released first. Returns
     /// `None` if the token is unknown or expired.
     fn claim_reservation(&self, token: &[u8; 8]) -> Option<u16> {
+        self.sweep_expired_reservations();
+        self.reservations.lock().remove(token).map(|r| r.port)
+    }
+
+    /// Release the ports of reservations whose 30-second lifetime has passed.
+    ///
+    /// This used to run **only** inside `claim_reservation`, i.e. only when some
+    /// client presented a RESERVATION-TOKEN — so a client that asked for
+    /// `EVEN-PORT R=1` and never came back left the odd port marked used
+    /// forever. Two ports per Allocate, one of which never returns: at the
+    /// default Allocate rate and a 16 384-port range, an authenticated client
+    /// exhausts the pool from a single address in about seventeen minutes.
+    ///
+    /// The symptom hides the cause. Every new Allocate answers 508 Insufficient
+    /// Capacity, `turna_relay_ports_in_use` reads 100 %, the capacity API says
+    /// SATURATED — and the allocation count is low, because the ports are held
+    /// by reservations nobody is going to claim. Recovery was a restart, or the
+    /// luck of some unrelated client presenting a token.
+    ///
+    /// Now also called from the periodic maintenance sweep, so expiry happens on
+    /// time rather than on the next visitor.
+    pub fn sweep_expired_reservations(&self) -> usize {
         let now = Instant::now();
+        // Lock order is `used` then `reservations`, as documented on the fields.
         let mut used = self.used.lock();
         let mut res = self.reservations.lock();
+        let before = res.len();
         res.retain(|_, r| {
             if r.expires_at <= now {
                 used.remove(&r.port); // release the leaked reserved port
@@ -816,7 +875,7 @@ impl PortAllocator {
                 true
             }
         });
-        res.remove(token).map(|r| r.port)
+        before - res.len()
     }
 
     /// I9: cancel a reservation created by an EVEN-PORT (R=1) allocate — drop the
@@ -2632,6 +2691,23 @@ impl AllocationStore {
     /// the remainder roll to the next tick — the work is idempotent and
     /// order-independent, so no cursor is needed.
     pub fn cleanup_expired_budget(&self, max_ops: usize) -> usize {
+        // 0. Expired EVEN-PORT reservations, in every pool.
+        //
+        // Not budgeted by `max_ops`: the reservation map is bounded by the port
+        // range and the work is a single `retain` per pool. Skipping it under a
+        // large store would reintroduce exactly the leak this call exists to
+        // close — and the leak is worse than a slow sweep, because a leaked port
+        // never comes back on its own.
+        let swept = self.ports.sweep_expired_reservations()
+            + self
+                .tenant_pools
+                .iter()
+                .map(|p| p.ports.sweep_expired_reservations())
+                .sum::<usize>();
+        if swept > 0 {
+            tracing::debug!(swept, "released expired EVEN-PORT reservations");
+        }
+
         // 1. Read-only classification pass (short read locks, no write lock held
         //    across the map).
         let mut expired: Vec<(SocketAddr, SocketAddr)> = Vec::new();
@@ -4394,5 +4470,70 @@ mod i9_reservation_cancel_tests {
             "reservation entry dropped"
         );
         drop(sock);
+    }
+}
+
+#[cfg(test)]
+mod reservation_sweep_tests {
+    use super::*;
+
+    /// The port leak this sweep exists to close.
+    ///
+    /// `EVEN-PORT R=1` takes two ports: the even one for the allocation and the
+    /// odd one for a reservation. Expiry used to run only inside
+    /// `claim_reservation`, so a client that asked for a pair and never
+    /// presented the token held the odd port for the life of the process. An
+    /// authenticated client repeating that exhausts the range — 508 to everyone,
+    /// ports reading 100 % used, and almost no live allocations to explain it.
+    #[test]
+    fn unclaimed_reservations_are_swept_and_their_ports_released() {
+        let pool = PortAllocator::new(50000, 50019); // 20 ports
+        let mut tokens = Vec::new();
+        for _ in 0..5 {
+            let (_even, token) = pool
+                .allocate_even_with_reservation()
+                .expect("range has room for five pairs");
+            tokens.push(token);
+        }
+        assert_eq!(pool.in_use(), 10, "five pairs hold ten ports");
+
+        // Age every reservation past its lifetime. Rewriting the deadline rather
+        // than sleeping 30 seconds: the sweep's input is the clock, and the test
+        // should exercise the sweep, not the clock.
+        {
+            let mut res = pool.reservations.lock();
+            for r in res.values_mut() {
+                r.expires_at = Instant::now() - Duration::from_secs(1);
+            }
+        }
+
+        let swept = pool.sweep_expired_reservations();
+        assert_eq!(swept, 5, "every expired reservation should have been dropped");
+        assert_eq!(
+            pool.in_use(),
+            5,
+            "the reserved odd ports must return to the pool; only the five even \
+             ports of the live allocations stay used"
+        );
+
+        // And the tokens are gone, so a late claim gets nothing rather than a
+        // port that has since been handed to somebody else.
+        for t in &tokens {
+            assert!(pool.claim_reservation(t).is_none());
+        }
+    }
+
+    /// The counterpart: a reservation inside its lifetime survives the sweep,
+    /// so the fix cannot work by simply dropping everything.
+    #[test]
+    fn live_reservations_survive_the_sweep() {
+        let pool = PortAllocator::new(50000, 50019);
+        let (_even, token) = pool.allocate_even_with_reservation().expect("room");
+        assert_eq!(pool.sweep_expired_reservations(), 0);
+        assert_eq!(pool.in_use(), 2);
+        assert!(
+            pool.claim_reservation(&token).is_some(),
+            "a live token must still be claimable after a sweep"
+        );
     }
 }

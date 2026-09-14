@@ -239,6 +239,11 @@ pub struct QuicStats {
     pub cert_reload_failures: std::sync::atomic::AtomicU64,
     /// Handshakes refused by the per-IP handshake rate limiter.
     pub rejected_rate_limit: std::sync::atomic::AtomicU64,
+    /// Initials answered with a Retry because the source address was not yet
+    /// validated. Counts both the raw QUIC and the WebTransport paths. Under normal traffic this tracks new connections one-for-one;
+    /// a large value with few `accepted` means spoofed Initials, and each one
+    /// cost a datagram instead of a signature.
+    pub retries_sent: std::sync::atomic::AtomicU64,
     /// Observed client address changes (QUIC connection migration).
     pub migrations: std::sync::atomic::AtomicU64,
     /// True once the QUIC endpoint is bound and accepting; cleared on drain.
@@ -265,6 +270,7 @@ pub struct QuicStatsSnapshot {
     pub cert_reloads: u64,
     pub cert_reload_failures: u64,
     pub rejected_rate_limit: u64,
+    pub retries_sent: u64,
     pub migrations: u64,
     pub listening: bool,
 }
@@ -289,6 +295,7 @@ impl QuicStats {
             cert_reloads: self.cert_reloads.load(Relaxed),
             cert_reload_failures: self.cert_reload_failures.load(Relaxed),
             rejected_rate_limit: self.rejected_rate_limit.load(Relaxed),
+            retries_sent: self.retries_sent.load(Relaxed),
             migrations: self.migrations.load(Relaxed),
             listening: self.listening.load(Relaxed),
         }
@@ -632,6 +639,31 @@ impl QuicServer {
                 continue;
             }
 
+            // Address validation before the handshake (RFC 9000 §8.1).
+            //
+            // Without it the server runs a full TLS 1.3 handshake — ECDHE plus a
+            // certificate signature — for every spoofed Initial, and sends the
+            // result to an address that never asked. quinn caps amplification at
+            // 3x, so the reflection is weak; the cost is CPU, and a signature per
+            // spoofed packet is a cryptographic denial of service that needs no
+            // amplification to work.
+            //
+            // `retry()` answers with a stateless token instead: one datagram, no
+            // state kept, and a client really at that address returns with the
+            // token and proceeds. A spoofed source never does. This is the QUIC
+            // equivalent of the DTLS HelloVerifyRequest.
+            //
+            // Always, not adaptively: the extra round trip costs a real client
+            // one RTT on its first connection, and deciding when to switch it on
+            // means being wrong about it under exactly the load that matters.
+            if !incoming.remote_address_validated() {
+                stats
+                    .retries_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                incoming.retry();
+                continue;
+            }
+
             let tx = event_tx.clone();
             let reg = outbound.clone();
             let st = stats.clone();
@@ -778,6 +810,26 @@ impl QuicServer {
                 }
                 inc = endpoint.accept() => inc,
             };
+
+            // Address validation first, before any counter is touched.
+            //
+            // Everything below this point keys on `remote`, and `remote` is
+            // whatever the sender put in the packet until quinn has validated
+            // it. Admitting an unvalidated Initial into the per-IP tables lets a
+            // spoofed source consume a slot belonging to an address that never
+            // sent anything — and the handshake it then runs is a full TLS 1.3
+            // exchange, ECDHE and a certificate signature included.
+            //
+            // `retry()` answers with a stateless token instead: one datagram,
+            // nothing retained. It consumes `incoming`, and panics if the
+            // address is already validated, hence the guard.
+            if !incoming.remote_address_validated() {
+                stats
+                    .retries_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                incoming.retry();
+                continue;
+            }
 
             // PRE-handshake admission control: `IncomingSession` exposes the peer
             // address and can be refused outright, so an over-cap or abusive

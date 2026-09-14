@@ -456,12 +456,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // M1: install the configured peer-filter policy before serving.
     // Default profile is internet-facing (denies RFC1918/ULA); opt into
     // LAN relaying via [turn.peer_filter] profile = "lan".
-    turna_relay::peer_filter::init_peer_policy(turna_relay::peer_filter::PeerPolicy::from_config(
-        &config.peer_filter.profile,
-        config.peer_filter.allow_loopback_peers,
-        &config.peer_filter.denied_peer_ranges,
-        &config.peer_filter.allowed_peer_ranges,
-    ));
+    // Keep the shared secret out of core dumps, before anything else can crash.
+    //
+    // It lives in memory for the whole run — a `String` in the config, bytes in
+    // `AuthMode`, and a second copy in `previous_shared_secret` during a
+    // rotation — so a dump written by `systemd-coredump`, which most
+    // distributions enable by default, puts it on disk in the clear. For TURN
+    // REST that secret mints credentials for anybody, so this is not a
+    // crash-report inconvenience.
+    //
+    // Both calls, not one: `RLIMIT_CORE = 0` stops the kernel writing a dump,
+    // and `PR_SET_DUMPABLE = 0` additionally stops another process of the same
+    // user attaching to `/proc/<pid>/mem`. Best-effort — a container may refuse
+    // either — and failure is reported rather than fatal, because a node that
+    // will not start is worse than one whose memory is marginally more exposed.
+    #[cfg(unix)]
+    if !config.allow_core_dumps {
+        // SAFETY: both are plain syscalls with scalar arguments and no memory
+        // is shared with the kernel beyond the `rlimit` struct we own.
+        unsafe {
+            let lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &lim) != 0 {
+                warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "could not disable core dumps (RLIMIT_CORE); a crash may write the \
+                     shared secret to disk"
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+                warn!(
+                    error = %std::io::Error::last_os_error(),
+                    "could not clear PR_SET_DUMPABLE; /proc/<pid>/mem stays readable by \
+                     a same-user process"
+                );
+            }
+        }
+    }
+
+    // SOFTWARE for unauthenticated Binding responses. Validated at config load;
+    // an unrecognised value is treated as `product` rather than as `full`.
+    turna_relay::processor::set_software_attribute(&config.software_attribute);
+
+    // This node's own addresses go into the policy's unconditional deny. A
+    // public address is reachable by definition, which is precisely why it must
+    // not also be a valid relay target: relaying to `external_ip:3478` loops
+    // traffic through the STUN path, and relaying to the health port reaches the
+    // whole Prometheus surface when it is not on loopback.
+    let mut self_addrs: Vec<std::net::IpAddr> = vec![config.listen.ip(), health_listen.ip()];
+    self_addrs.push(external_ip);
+    // Resolved here rather than reused: `external_ip6` is computed inside
+    // `run_tokio`, which has not started yet.
+    if let Some(v6) = resolve_external_ip6(&config) {
+        self_addrs.push(std::net::IpAddr::V6(v6));
+    }
+    for s in [&config.relay.bind_ip, &config.relay.bind_ip6] {
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            self_addrs.push(ip);
+        }
+    }
+    turna_relay::peer_filter::init_peer_policy(
+        turna_relay::peer_filter::PeerPolicy::from_config(
+            &config.peer_filter.profile,
+            config.peer_filter.allow_loopback_peers,
+            &config.peer_filter.denied_peer_ranges,
+            &config.peer_filter.allowed_peer_ranges,
+        )
+        .with_self_addresses(self_addrs),
+    );
 
     run_tokio(
         config,
@@ -1003,6 +1068,27 @@ fn run_tokio(
                         skipped += 1;
                     }
                 }
+
+                // The secrets have been copied into the AuthModes that will
+                // serve them, so the strings this reload parsed are now a spare
+                // plaintext copy. Overwrite them before `root` is dropped:
+                // without this, a deployment that rotates on a schedule leaves
+                // one readable copy of the secret in freed memory per reload,
+                // which is the case that made rotation worse than not rotating.
+                //
+                // The live configuration's copy is a different matter and stays
+                // — it is the working secret. `AuthMode` zeroizes on drop, so
+                // the derived key material is covered when a rotation replaces
+                // it.
+                let mut root = root;
+                root.turn.auth.zeroize_secrets();
+                for t in root.tenants.iter_mut() {
+                    // Tenants carry the secrets flat, not inside an AuthConfig.
+                    use zeroize::Zeroize;
+                    t.shared_secret.zeroize();
+                    t.previous_shared_secret.zeroize();
+                }
+                drop(root);
 
                 // Never log the secrets, nor a hash of them: a hash of a
                 // low-entropy secret is a crackable record of it.

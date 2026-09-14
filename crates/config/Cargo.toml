@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Overwrites the shared secret when an AuthConfig is dropped — including the
+# copy the previous configuration held across a SIGHUP reload.
+zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

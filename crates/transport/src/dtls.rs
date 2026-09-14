@@ -67,6 +67,27 @@ pub struct DtlsConfig {
     /// Poll interval for certificate hot-reload. 0 disables it. **Demux path
     /// only** — `listen()` fixes its config at bind time.
     pub cert_reload_interval: Duration,
+    /// Ceiling on handshakes in flight across the whole listener. 0 disables it.
+    ///
+    /// **This is the bound that keeps a spoofed flood from exhausting memory.**
+    /// On the demux path a datagram from an unknown address allocates a channel,
+    /// a map entry, a `DTLSConn` and a task before anything has proved the
+    /// source address is real: RFC 6347 §4.2.1 puts the HelloVerifyRequest
+    /// cookie exchange there for exactly that reason, but `webrtc-dtls` performs
+    /// it *inside* `DTLSConn`, by which point the state exists. `max_sessions`
+    /// does not help — it counts sessions that completed a handshake, and
+    /// `active` is incremented only after one succeeds.
+    ///
+    /// One ClientHello is about a hundred bytes and buys `accept_timeout`
+    /// seconds of state. At 100 000 spoofed packets per second that is a million
+    /// concurrent `DTLSConn`s, tens of kilobytes each, and the process is gone
+    /// in seconds.
+    ///
+    /// The real fix is a stateless cookie in the demultiplexer itself, so that
+    /// nothing is allocated until a ClientHello carries a cookie this node
+    /// issued. Until that lands, this cap is what stands between the listener
+    /// and an out-of-memory kill, so it defaults to on.
+    pub max_pending_handshakes: usize,
 }
 
 /// Events surfaced from established DTLS sessions. `session_id` is the client's
@@ -123,6 +144,14 @@ pub struct DtlsStats {
     pub outbound_dropped: std::sync::atomic::AtomicU64,
     /// DTL-9: sessions refused because the source IP hit max_sessions_per_ip.
     pub rejected_per_ip: std::sync::atomic::AtomicU64,
+    /// ClientHellos answered with a HelloVerifyRequest because the source
+    /// address had not been validated. One datagram each, no state retained.
+    pub cookie_challenges: std::sync::atomic::AtomicU64,
+    /// Handshakes in flight right now: state allocated, outcome unknown.
+    pub pending_handshakes: std::sync::atomic::AtomicUsize,
+    /// Datagrams dropped because `max_pending_handshakes` was reached. A rising
+    /// value with a flat `accepted` is the signature of a spoofed-source flood.
+    pub rejected_pending_cap: std::sync::atomic::AtomicU64,
     /// Outbound datagrams dropped because they exceeded the configured record
     /// MTU. A DTLS record cannot be fragmented at the record layer, so sending
     /// one anyway would rely on IP fragmentation (commonly dropped on the
@@ -173,6 +202,9 @@ pub struct DtlsStatsSnapshot {
     pub bytes_tx: u64,
     pub outbound_dropped: u64,
     pub rejected_per_ip: u64,
+    pub cookie_challenges: u64,
+    pub pending_handshakes: usize,
+    pub rejected_pending_cap: u64,
     pub outbound_oversize: u64,
     pub accept_timeouts: u64,
     pub handshake_failures: u64,
@@ -197,6 +229,9 @@ impl DtlsStats {
             bytes_tx: self.bytes_tx.load(Relaxed),
             outbound_dropped: self.outbound_dropped.load(Relaxed),
             rejected_per_ip: self.rejected_per_ip.load(Relaxed),
+            cookie_challenges: self.cookie_challenges.load(Relaxed),
+            pending_handshakes: self.pending_handshakes.load(Relaxed),
+            rejected_pending_cap: self.rejected_pending_cap.load(Relaxed),
             outbound_oversize: self.outbound_oversize.load(Relaxed),
             accept_timeouts: self.accept_timeouts.load(Relaxed),
             handshake_failures: self.handshake_failures.load(Relaxed),

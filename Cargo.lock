@@ -4089,6 +4089,7 @@ dependencies = [
  "tracing",
  "turna-crypto",
  "turna-proto-stun",
+ "zeroize",
 ]
 
 [[package]]
@@ -4133,6 +4134,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -4275,6 +4277,7 @@ name = "turna-node"
 version = "0.5.0"
 dependencies = [
  "hostname",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
@@ -4293,6 +4296,7 @@ dependencies = [
  "turna-session",
  "turna-state-backend",
  "turna-transport",
+ "zeroize",
 ]
 
 [[package]]
@@ -4372,6 +4376,7 @@ dependencies = [
  "tracing",
  "turna-auth",
  "turna-cluster",
+ "turna-common",
  "turna-crypto",
  "turna-health",
  "turna-proto-rtp",

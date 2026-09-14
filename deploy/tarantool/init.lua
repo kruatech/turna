@@ -11,10 +11,10 @@
 --   3. Creates the indexes turna relies on for performance.
 --   4. Creates a dedicated role `turna_app` with exactly the rights
 --      turna needs — read + write on its own spaces, nothing else.
---   5. Creates a user `turna` (default name; override via TURNA_USER env)
---      with a generated password, grants it `turna_app`, and prints the
---      password to STDOUT once. The operator captures it from the log
---      and feeds it back via TURNA_BACKEND_PASSWORD.
+--   5. Creates (or updates) a user `turna` (default name; override via
+--      TURNA_USER env) with the password you supply in TURNA_PASSWORD or
+--      TURNA_PASSWORD_FILE, and grants it `turna_app`. Nothing is generated
+--      and no secret is printed — a rerun with a new value rotates it.
 --
 -- # Usage
 --
@@ -33,9 +33,11 @@
 -- # Environment variables read
 --
 --   TURNA_USER             — application user name (default: "turna")
---   TURNA_PASSWORD         — application user password. If unset, a
---                          random 32-byte hex password is generated
---                          and printed once.
+--   TURNA_PASSWORD         — application user password. REQUIRED (or use
+--                          TURNA_PASSWORD_FILE). The script refuses to run
+--                          without one and never generates or prints a secret.
+--   TURNA_PASSWORD_FILE    — path to a 0600 file holding the password, as an
+--                          alternative to putting it in the environment.
 --   TURNA_LISTEN           — iproto bind address (default: "0.0.0.0:3301")
 --   TURNA_WORK_DIR         — Tarantool data dir (default: "/var/lib/tarantool")
 --   TURNA_MEMTX_MEMORY     — memtx_memory in bytes (default: 1 GiB)
@@ -43,7 +45,8 @@
 -- # Operator checklist
 --
 --   [ ] Run this script.
---   [ ] Note the printed password (or supply TURNA_PASSWORD).
+--   [ ] Generate a password (`openssl rand -hex 32`) and supply it via
+--       TURNA_PASSWORD or TURNA_PASSWORD_FILE.
 --   [ ] Drop it into a secret store (Vault, systemd LoadCredential, k8s
 --       Secret) — never commit, never paste in chat.
 --   [ ] On the turna-node host, set TURNA_BACKEND_URI, TURNA_BACKEND_USER,
@@ -63,27 +66,47 @@ local LISTEN     = env("TURNA_LISTEN",       "0.0.0.0:3301")
 local WORK_DIR   = env("TURNA_WORK_DIR",     "/var/lib/tarantool")
 local MEMORY     = tonumber(env("TURNA_MEMTX_MEMORY", tostring(1024 * 1024 * 1024)))
 
--- Generate a password if the operator didn't supply one. 32 hex chars
--- = 128 bits of entropy; matches `openssl rand -hex 16`.
-local function gen_password()
-    local fd = io.open("/dev/urandom", "rb")
-    if fd == nil then
-        error("cannot open /dev/urandom; supply TURNA_PASSWORD instead")
-    end
-    local raw = fd:read(16)
-    fd:close()
-    local hex = ""
-    for i = 1, #raw do
-        hex = hex .. string.format("%02x", string.byte(raw, i))
-    end
-    return hex
-end
+-- No password generator here any more: the only way this script could have
+-- handed a generated secret to an operator was by printing it, and its STDOUT
+-- is the log estate. Generate one where you keep secrets:
+--   openssl rand -hex 32
 
+-- The password is never generated here, and never printed.
+--
+-- It used to be: with TURNA_PASSWORD unset a random one was created and written
+-- to STDOUT "once", for the operator to copy out of the log. STDOUT of a
+-- container or a service is journald and docker logs, which is usually a central
+-- collector with its own retention and a much wider set of readers than the
+-- credential deserves. The convenience of a first run is not worth a state
+-- backend password living in the log estate permanently.
+--
+-- Either supply TURNA_PASSWORD from wherever you keep secrets, or point
+-- TURNA_PASSWORD_FILE at a 0600 file. Refusing is the honest outcome: there is
+-- no way for this script to hand a secret to an operator that does not also
+-- hand it to whoever reads the logs.
 local APP_PASSWORD = env("TURNA_PASSWORD", nil)
-local generated_password = false
 if APP_PASSWORD == nil then
-    APP_PASSWORD = gen_password()
-    generated_password = true
+    local path = env("TURNA_PASSWORD_FILE", nil)
+    if path ~= nil then
+        local fh = io.open(path, "r")
+        if fh == nil then
+            error("TURNA_PASSWORD_FILE is set but " .. path .. " cannot be read")
+        end
+        APP_PASSWORD = (fh:read("*a") or ""):gsub("%s+$", "")
+        fh:close()
+        if APP_PASSWORD == "" then
+            error("TURNA_PASSWORD_FILE " .. path .. " is empty")
+        end
+    end
+end
+if APP_PASSWORD == nil or APP_PASSWORD == "" then
+    error(
+        "no application password: set TURNA_PASSWORD, or TURNA_PASSWORD_FILE " ..
+        "pointing at a file containing it (mode 0600). Generate one with " ..
+        "`openssl rand -hex 32` and store it where you keep your other secrets. " ..
+        "This script will not generate one, because the only way it could give " ..
+        "it to you is by writing it to the log."
+    )
 end
 
 -- box.cfg may already be running (when invoked via `tt connect`); in that
@@ -758,17 +781,31 @@ box.schema.func.create("turna_load_active_revocations", {
 
 box.schema.func.create("turna_claim_allocation", {
     language = "LUA", is_sandboxed = false, setuid = true,
+    -- The compare and the swap must be one unit. memtx does not make a stored
+    -- proc atomic by itself — the three procedures below say so and wrap
+    -- themselves in box.atomic; this one, which is the failover CAS primitive,
+    -- did not.
+    --
+    -- It works today because a Lua function without yields is effectively
+    -- atomic under memtx. It stops working the moment
+    -- memtx_use_mvcc_transaction_manager is enabled or the space moves to
+    -- vinyl: every statement becomes its own transaction, so two nodes can both
+    -- pass the expected_node_id check and both update. That is precisely the
+    -- split brain a CAS exists to prevent, and it would appear as two nodes
+    -- each believing they own the same allocation.
     body = [[function(port, expected_node_id, new_node_id)
-        local p = tonumber(port)
-        local t = box.space.turna_allocations:get(p)
-        if t == nil then return false end
-        if t[3] ~= expected_node_id then return false end
-        local json = require('json')
-        local payload = json.decode(t[5])
-        payload.node_id = new_node_id
-        local new_json = json.encode(payload)
-        box.space.turna_allocations:update(p, {{'=', 3, new_node_id}, {'=', 5, new_json}})
-        return true
+        return box.atomic(function()
+            local p = tonumber(port)
+            local t = box.space.turna_allocations:get(p)
+            if t == nil then return false end
+            if t[3] ~= expected_node_id then return false end
+            local json = require('json')
+            local payload = json.decode(t[5])
+            payload.node_id = new_node_id
+            local new_json = json.encode(payload)
+            box.space.turna_allocations:update(p, {{'=', 3, new_node_id}, {'=', 5, new_json}})
+            return true
+        end)
     end]],
 })
 
@@ -1809,15 +1846,13 @@ end
 -- ── 4. User ─────────────────────────────────────────────────────────────────
 
 if box.schema.user.exists(APP_USER) then
-    -- Refresh the password on every run if TURNA_PASSWORD was supplied;
-    -- preserve the existing one if we're using a generated value and the
-    -- user already exists (idempotent reruns shouldn't rotate secrets).
-    if not generated_password then
-        box.schema.user.passwd(APP_USER, APP_PASSWORD)
-        print("user '" .. APP_USER .. "' password updated from TURNA_PASSWORD")
-    else
-        print("user '" .. APP_USER .. "' already exists; password unchanged")
-    end
+    -- The password is always supplied now, so a rerun always sets it. That is
+    -- what makes this script the way to rotate the credential: change the value
+    -- in your secret store and run it again. The old branch existed to avoid
+    -- rotating a *generated* secret on an idempotent rerun, and there is no
+    -- generated secret any more.
+    box.schema.user.passwd(APP_USER, APP_PASSWORD)
+    print("user '" .. APP_USER .. "' password set from the supplied value")
 else
     box.schema.user.create(APP_USER, { password = APP_PASSWORD })
     print("user '" .. APP_USER .. "' created")
@@ -1839,15 +1874,9 @@ print("  execute on versioned turna stored functions (least privilege)")
 print("  NO execute on universe — privilege-tightened")
 print("User '" .. APP_USER .. "' granted 'turna_app'.")
 print("─────────────────────────────────────────────────")
-if generated_password then
-    print("")
-    print("GENERATED PASSWORD (capture this once; will not be shown again):")
-    print("")
-    print("  " .. APP_PASSWORD)
-    print("")
-    print("Set on the turna-node host:")
-    print("  export TURNA_BACKEND_URI='" .. LISTEN .. "'")
-    print("  export TURNA_BACKEND_USER='" .. APP_USER .. "'")
-    print("  export TURNA_BACKEND_PASSWORD='" .. APP_PASSWORD .. "'")
-end
+print("")
+print("Set on the turna-node host (the password is the one you supplied):")
+print("  export TURNA_BACKEND_URI='" .. LISTEN .. "'")
+print("  export TURNA_BACKEND_USER='" .. APP_USER .. "'")
+print("  export TURNA_BACKEND_PASSWORD='<the value of TURNA_PASSWORD>'")
 print("─────────────────────────────────────────────────")

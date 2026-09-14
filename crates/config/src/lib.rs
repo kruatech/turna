@@ -747,6 +747,56 @@ impl TurnaConfig {
             }
         }
 
+        // SOFTWARE: `full` names the release to anyone who sends 20 unauthenticated
+        // bytes, which is a scanner's first question. Allowed outside production,
+        // where knowing the exact build usually matters more.
+        match self.turn.software_attribute.trim().to_ascii_lowercase().as_str() {
+            "none" | "product" => {}
+            "full" if !prod => {}
+            "full" => errors.push(
+                "turn.software_attribute = \"full\" advertises the release version in \
+                 an unauthenticated Binding response; use \"product\" or \"none\" in \
+                 production"
+                    .into(),
+            ),
+            other => errors.push(format!(
+                "turn.software_attribute {other:?} is not one of \"none\", \"product\", \"full\""
+            )),
+        }
+
+        if prod && self.turn.allow_core_dumps {
+            warn!(
+                "turn.allow_core_dumps = true in production: a core dump writes the \
+                 shared secret to disk in the clear, and systemd-coredump is enabled \
+                 by default on most distributions. Turn it off once you have the dump \
+                 you needed."
+            );
+        }
+
+        // Security switches must not be reachable from the environment in
+        // production.
+        //
+        // The environment is not an auditable source of policy: it is not in
+        // git, it does not appear in `--dump-config`, it is inherited by child
+        // processes, and it shows up in `docker inspect` and `/proc/*/environ`.
+        // One line copied out of a dev compose file — `TURNA_ALLOW_LOOPBACK_PEERS=1`
+        // — opens relaying into loopback while the config file reads clean, and
+        // the operator reviewing that file has no way to tell.
+        //
+        // `TURNA_PRODUCTION` itself stays honoured: it can only tighten.
+        if prod {
+            for key in ["TURNA_ALLOW_LOOPBACK_PEERS"] {
+                if std::env::var(key).is_ok() {
+                    errors.push(format!(
+                        "{key} is set and production = true: security policy comes from \
+                         the config file only. Set it in [turn.peer_filter] or unset \
+                         the variable — an environment override is invisible to anyone \
+                         reading turn.toml."
+                    ));
+                }
+            }
+        }
+
         // Rate-limit tiers: a zero anywhere is a limiter that refuses forever.
         errors.extend(self.turn.rate_limit.default.validate("default"));
         errors.extend(self.turn.rate_limit.trusted.validate("trusted"));
@@ -864,6 +914,40 @@ pub struct TurnConfig {
     /// `SO_SNDBUF`, same units and the same clamp, against `net.core.wmem_max`.
     #[serde(default)]
     pub socket_send_buffer_bytes: usize,
+    /// What to put in the STUN SOFTWARE attribute: `"none"`, `"product"` or
+    /// `"full"`.
+    ///
+    /// The Binding response carrying it is **unauthenticated**, so whatever is
+    /// here is handed to anyone who sends 20 bytes — including a scanner
+    /// matching the version against a CVE list. It is also about 16 bytes of
+    /// free amplification on a reflected Binding. RFC 5389 §15.10 makes the
+    /// attribute optional.
+    ///
+    /// `"product"` (the default) sends `turna` with no version: an operator
+    /// debugging interop can still see which implementation answered. `"full"`
+    /// adds the release and is refused under `production = true`. `"none"` sends
+    /// nothing.
+    #[serde(default = "default_software_attribute")]
+    pub software_attribute: String,
+    /// Allow this process to produce a core dump.
+    ///
+    /// `false` (the default) calls `prctl(PR_SET_DUMPABLE, 0)` and
+    /// `setrlimit(RLIMIT_CORE, 0)` at startup. The shared secret lives in memory
+    /// for the life of the process — as a `String` in the config, as bytes in
+    /// `AuthMode`, and again in `previous_shared_secret` during a rotation — so
+    /// a core dump written by `systemd-coredump` (enabled by default on most
+    /// distributions) puts it on disk in the clear, as does anything that can
+    /// read `/proc/<pid>/mem` at the same privilege level.
+    ///
+    /// Compromising a TURN REST shared secret means being able to mint
+    /// credentials for anyone, so this is not a crash-report inconvenience.
+    ///
+    /// Set it to `true` deliberately when you need a dump to debug something,
+    /// and it warns at startup under `production = true` so it cannot be left on
+    /// by accident. It lives under `[turn]` rather than a section of its own
+    /// because it is a property of this process, like the socket buffers above.
+    #[serde(default)]
+    pub allow_core_dumps: bool,
     pub external_ip: String,
     /// RFC 6156 IPv6 relayed transport: the IPv6 address advertised in
     /// XOR-RELAYED-ADDRESS for allocations that asked for
@@ -932,6 +1016,8 @@ impl Default for TurnConfig {
             listen: "0.0.0.0:3478".parse().unwrap(),
             socket_recv_buffer_bytes: 0,
             socket_send_buffer_bytes: 0,
+            software_attribute: default_software_attribute(),
+            allow_core_dumps: false,
             external_ip: String::new(),
             external_ip6: String::new(),
             realm: "turna".into(),
@@ -1020,12 +1106,42 @@ impl PeerFilterConfig {
     }
 }
 
-/// Lightweight CIDR syntax check (the relay does the authoritative parse).
+impl AuthConfig {
+    /// Overwrite the secrets in this configuration.
+    ///
+    /// An inherent method and not `impl Drop`, which is what this was first
+    /// written as: `#[serde(default)]` makes the derived `Deserialize` build an
+    /// `AuthConfig::default()` and move fields out of it, and a type that
+    /// implements `Drop` cannot be moved out of. The compiler catches that, but
+    /// the shape of the mistake is worth keeping: a destructor looks like it
+    /// covers every path and here it could not exist at all.
+    ///
+    /// So the caller owns the timing. The one that matters is the SIGHUP reload:
+    /// the config holds the shared secret as a `String` for the life of the
+    /// process, and each reload builds a second `TurnaConfig` and discards the
+    /// first, leaving one readable copy per reload in freed memory. The node
+    /// calls this on the configuration it is discarding.
+    ///
+    /// The live configuration's copy is not covered and cannot be — it is the
+    /// working secret. `AuthMode` does zeroize on drop, which covers the derived
+    /// key material.
+    pub fn zeroize_secrets(&mut self) {
+        use zeroize::Zeroize;
+        self.shared_secret.zeroize();
+        self.previous_shared_secret.zeroize();
+    }
+}
+
+fn default_software_attribute() -> String {
+    "product".to_string()
+}
+
 /// serde cannot express a non-zero integer default inline.
 fn default_credential_clock_skew() -> u64 {
     300
 }
 
+/// Lightweight CIDR syntax check (the relay does the authoritative parse).
 fn validate_cidr(s: &str) -> std::result::Result<(), String> {
     let Some((ip_str, pfx_str)) = s.trim().split_once('/') else {
         return Err(format!("{s:?} is not in <ip>/<prefix> form"));
@@ -1299,11 +1415,7 @@ impl RateLimitTier {
                 self.create_permission_burst,
                 self.create_permission_rps,
             ),
-            (
-                "channel_bind",
-                self.channel_bind_burst,
-                self.channel_bind_rps,
-            ),
+            ("channel_bind", self.channel_bind_burst, self.channel_bind_rps),
         ] {
             if burst == 0 {
                 errs.push(format!(
@@ -2068,7 +2180,13 @@ impl Default for TlsConfig {
             handshake_timeout_secs: 5,
             read_timeout_secs: 300,
             max_connections: 10_000,
-            max_connections_per_ip: 0,
+            // 64 rather than unlimited. One host could otherwise open the whole
+            // max_connections budget (10 000 TLS sessions), say nothing for the
+            // 300-second read timeout, and leave legitimate TURNS clients — the
+            // ones whose network blocks UDP and have no other way in — refused.
+            // The handshake rate limiter bounds speed, not how many are held.
+            // Raise it for known NAT egress points via trusted_prefixes.
+            max_connections_per_ip: 64,
             cert_reload_secs: 30,
             enable_alpn: true,
             max_handshakes_per_sec_per_ip: 0,
@@ -2148,9 +2266,12 @@ impl Default for QuicConfigSection {
             keep_alive_secs: 10,
             alpn: vec!["stun.turn".to_string()],
             max_sessions: 10_000,
-            max_sessions_per_ip: 0,
+            // Both per-IP bounds default to ON now. They were 0 (unlimited),
+            // which left `max_sessions` — a global number — as the only limit,
+            // and a global limit is exhausted by one host.
+            max_sessions_per_ip: 16,
             cert_reload_secs: 30,
-            max_handshakes_per_sec_per_ip: 0,
+            max_handshakes_per_sec_per_ip: 8,
             handshake_burst_per_ip: 0,
         }
     }
@@ -2290,6 +2411,24 @@ pub struct DtlsSection {
     /// `listen()` fixes its config at bind time, which is why the stock path can
     /// only warn that the files changed.
     pub cert_reload_secs: u64,
+    /// Ceiling on DTLS handshakes in flight across the listener. 0 = unlimited.
+    ///
+    /// This is the bound that keeps a spoofed flood from exhausting memory, and
+    /// it is not the same thing as `max_sessions`: that one counts handshakes
+    /// that SUCCEEDED, so it bounds nothing an attacker has to do. On the demux
+    /// path a datagram from an unknown address allocates a channel, a map entry,
+    /// a connection and a task before RFC 6347's HelloVerifyRequest cookie has
+    /// proved the source address is real — `webrtc-dtls` runs that exchange
+    /// inside the connection, after the state exists.
+    ///
+    /// One ClientHello is about a hundred bytes and buys `accept_timeout_secs`
+    /// of state. Unbounded, 100 000 spoofed packets per second is an
+    /// out-of-memory kill in seconds, from any address, with no credentials.
+    ///
+    /// Only the demux path (`demux = true`, the default) enforces it; the stock
+    /// listener runs handshakes below `accept()` where there is nothing to
+    /// count.
+    pub max_pending_handshakes: usize,
     /// Upper bound, in seconds, on one DTLS `accept()` — i.e. on a single
     /// handshake. 0 disables the bound.
     ///
@@ -2314,12 +2453,27 @@ impl Default for DtlsSection {
             idle_timeout_secs: 300,
             mtu: 1200,
             outbound_queue_capacity: 1024,
-            max_sessions_per_ip: 0,
+            // On by default. Both were 0 (unlimited), which left `max_sessions`
+            // as the only bound — and `max_sessions` counts handshakes that
+            // SUCCEEDED, so it bounded nothing an attacker has to do.
+            max_sessions_per_ip: 16,
             accept_timeout_secs: 10,
             demux: true,
-            max_handshakes_per_sec_per_ip: 0,
+            max_handshakes_per_sec_per_ip: 8,
             handshake_burst_per_ip: 0,
             cert_reload_secs: 0,
+            // The ceiling on handshakes in flight. On the demux path a datagram
+            // from an unknown address allocates a channel, a map entry, a
+            // DTLSConn and a task before the cookie exchange proves the source
+            // is real — webrtc-dtls performs HelloVerifyRequest inside DTLSConn,
+            // by which point the state exists. One ~100-byte ClientHello buys
+            // accept_timeout_secs of it, so 100 000 spoofed packets per second
+            // is an out-of-memory kill in seconds.
+            //
+            // 512 is deliberately small: a legitimate burst of new DTLS clients
+            // is nothing like that, and refusing a datagram costs a retransmit
+            // while accepting one costs memory that is not returned.
+            max_pending_handshakes: 512,
         }
     }
 }
@@ -2748,6 +2902,35 @@ fn expand_env_vars(input: &str) -> Result<String> {
                 .map(|i| path_start + i)
                 .unwrap_or(line.len());
             let file_path = line[path_start..path_end].trim();
+
+            // Permissions, before the contents.
+            //
+            // A `file://` secret is the recommended way to keep a shared secret
+            // out of the config file, and it only helps if the file itself is
+            // not world-readable. Nothing checked, so a secret mounted with the
+            // default 0644 looked exactly as safe as one at 0600 — the config
+            // said `file:///run/secrets/...` either way.
+            //
+            // A warning rather than an error: this runs during expansion, which
+            // has no view of `production`, and refusing to start over a
+            // permission bit would be a worse failure than reporting it. The
+            // production gate for it lives in `validate`.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = std::fs::metadata(file_path) {
+                    let mode = md.permissions().mode() & 0o777;
+                    if mode & 0o077 != 0 {
+                        warn!(
+                            path = file_path,
+                            mode = format!("{mode:04o}"),
+                            "secret file is readable by group or others; chmod 600 it. \
+                             A file:// secret only keeps the value out of the config \
+                             if the file is not world-readable."
+                        );
+                    }
+                }
+            }
 
             let content = std::fs::read_to_string(file_path)
                 .map_err(|_| ConfigError::SecretFileError(file_path.into()))?;

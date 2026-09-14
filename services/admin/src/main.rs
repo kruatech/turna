@@ -192,18 +192,103 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
+/// Constant-time byte comparison.
+///
+/// `==` on `str` returns as soon as two bytes differ, so the time it takes to
+/// reject a token is proportional to how many leading characters were right.
+/// Over enough requests that recovers the token one character at a time, and
+/// this endpoint is reachable over the network by anyone who can route to it.
+///
+/// Whether the timing is exploitable through a real network is arguable; the
+/// argument is not worth having for four lines, and the next person to read
+/// `==` here would have to have it again.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // The length is not a secret: an attacker learns it from the token they
+        // were issued, or from the length of any token that is accepted.
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Consecutive authentication failures, for the backoff below.
+static AUTH_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Delay a failed authentication, and only a failed one.
+///
+/// There was nothing between an attacker and an unlimited guessing rate: the
+/// token is a static string, the endpoint answers as fast as it can reject, and
+/// a wrong answer cost the sender nothing.
+///
+/// This is a delay rather than a lockout on purpose. A lockout after N failures
+/// hands anyone who can reach the port the ability to lock the operator out of
+/// their own admin surface — trading a brute-force risk for a denial-of-service
+/// certainty. A delay costs the attacker the one thing they need, which is
+/// attempts per second, and costs a correct token nothing at all: success is
+/// never delayed, and the counter resets on it.
+///
+/// Global rather than per-IP because the handlers have no client address —
+/// wiring `ConnectInfo` through would change how the server is started. The
+/// difference matters less here than it would on a public datapath: this
+/// surface has a handful of legitimate users, so one shared budget does not
+/// starve anybody, and an attacker with many addresses still cannot go faster
+/// than the shared delay.
+///
+/// Capped at two seconds: past that it stops adding protection and starts
+/// looking like the service is broken to an operator who typed their token
+/// wrong.
+async fn penalise_auth_failure() {
+    let n = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_power_of_two() {
+        warn!(
+            consecutive_failures = n,
+            "admin authentication failed; responses are being delayed. A rising \
+             count means someone is guessing the token."
+        );
+    }
+    let delay_ms = 50u64.saturating_mul(1 << n.min(5)).min(2_000);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+fn note_auth_success() {
+    AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Check the token, applying the failure delay. Every handler uses this rather
+/// than [`check_auth`] directly, so a new route cannot accidentally get the
+/// check without the backoff.
+async fn authorised(headers: &HeaderMap, token: &Option<String>) -> bool {
+    if check_auth(headers, token) {
+        note_auth_success();
+        true
+    } else {
+        penalise_auth_failure().await;
+        false
+    }
+}
+
 fn check_auth(headers: &HeaderMap, token: &Option<String>) -> bool {
     let Some(expected) = token else { return true };
     headers
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == expected)
+        .map(|v| constant_time_eq(v.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
 }
 
 // ── read-only handlers ────────────────────────────────────────────────────────
 
-async fn api_status(State(st): State<Arc<AppState>>) -> Response {
+async fn api_status(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&headers, &st.auth_token).await {
+        return unauthorized();
+    }
     match proxy::fetch_json(&st.http, &st.upstream.status_url).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
@@ -212,7 +297,13 @@ async fn api_status(State(st): State<Arc<AppState>>) -> Response {
         }
     }
 }
-async fn api_metrics(State(st): State<Arc<AppState>>) -> Response {
+async fn api_metrics(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&headers, &st.auth_token).await {
+        return unauthorized();
+    }
     match proxy::fetch_text(&st.http, &st.upstream.metrics_url).await {
         Ok(t) => (StatusCode::OK, Json(prometheus::parse(&t))).into_response(),
         Err(e) => {
@@ -221,7 +312,13 @@ async fn api_metrics(State(st): State<Arc<AppState>>) -> Response {
         }
     }
 }
-async fn api_health(State(st): State<Arc<AppState>>) -> Response {
+async fn api_health(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&headers, &st.auth_token).await {
+        return unauthorized();
+    }
     match proxy::fetch_status_code(&st.http, &st.upstream.health_url).await {
         Ok(code) => StatusCode::from_u16(code)
             .unwrap_or(StatusCode::OK)
@@ -232,7 +329,13 @@ async fn api_health(State(st): State<Arc<AppState>>) -> Response {
         }
     }
 }
-async fn api_ready(State(st): State<Arc<AppState>>) -> Response {
+async fn api_ready(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&headers, &st.auth_token).await {
+        return unauthorized();
+    }
     match proxy::fetch_status_code(&st.http, &st.upstream.ready_url).await {
         Ok(code) => StatusCode::from_u16(code)
             .unwrap_or(StatusCode::OK)
@@ -243,7 +346,13 @@ async fn api_ready(State(st): State<Arc<AppState>>) -> Response {
         }
     }
 }
-async fn api_cluster(State(st): State<Arc<AppState>>) -> Response {
+async fn api_cluster(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorised(&headers, &st.auth_token).await {
+        return unauthorized();
+    }
     match proxy::fetch_json(&st.http, &st.upstream.cluster_url).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(_) => (StatusCode::OK, Json(serde_json::json!([]))).into_response(),
@@ -257,7 +366,7 @@ async fn api_manage(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if !check_auth(&headers, &st.auth_token) {
+    if !authorised(&headers, &st.auth_token).await {
         return unauthorized();
     }
     let command = body["command"].as_str().unwrap_or("?");
@@ -344,6 +453,25 @@ async fn main() -> anyhow::Result<()> {
                 cfg.listen.split(':').next_back().unwrap_or("8080"),
             );
         }
+        // The token protects the surface; it does not protect the wire. This
+        // server speaks plain HTTP, so on a non-loopback bind the token itself
+        // travels in a header in the clear on every request — and the metrics
+        // and cluster topology come back the same way.
+        //
+        // A warning and not a refusal: the common shape is a reverse proxy
+        // terminating TLS in front of this, and refusing would break it for no
+        // gain. What must not happen is an operator concluding that
+        // `--auth-token` made the exposure safe.
+        if !listen_loopback {
+            warn!(
+                listen = %cfg.listen,
+                "admin is bound beyond loopback and serves PLAIN HTTP: the \
+                 X-Admin-Token header is sent in the clear on every request, as \
+                 are the metrics and cluster topology in the replies. Put a TLS \
+                 terminator in front of it, or bind 127.0.0.1 and reach it over \
+                 an SSH tunnel."
+            );
+        }
     }
 
     let grpc_channel = grpc_client::build_channel(&cfg.grpc_addr, tls.as_ref())
@@ -360,10 +488,20 @@ async fn main() -> anyhow::Result<()> {
     info!(grpc_addr = %cfg.grpc_addr, tls = tls_desc, "lazy gRPC channel configured");
 
     if cfg.auth_token.is_some() {
-        info!("operator auth: X-Admin-Token required for mutations");
+        // Every route, not only the mutating one. Until 0.5.0 the read-only
+        // routes took no token at all: /api/status, /api/metrics and
+        // /api/cluster returned the node's full Prometheus surface, its
+        // readiness and the cluster topology to anyone who could reach the
+        // port. The startup check above reasoned about "unauthenticated
+        // mutations" and was right about mutations, which is how the gap
+        // survived — the read side was never the thing being checked.
+        info!("operator auth: X-Admin-Token required on every /api route");
     } else {
         // loopback only — WARN is sufficient, no bail
-        warn!("no auth token — mutations unauthenticated (loopback-only, acceptable for dev)");
+        warn!(
+            "no auth token: every /api route is open, reads included \
+             (loopback-only, acceptable for dev)"
+        );
     }
 
     // Parsed here so a bad address stops startup with a clear message instead of

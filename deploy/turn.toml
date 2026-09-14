@@ -43,6 +43,30 @@ listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
 # warns when it is smaller than the size asked for.
 # socket_recv_buffer_bytes = 8388608
 # socket_send_buffer_bytes = 8388608
+#
+# What to advertise in the STUN SOFTWARE attribute: "none" | "product" | "full".
+#
+# The Binding response carrying it is UNAUTHENTICATED, so whatever is here goes
+# to anyone who sends 20 bytes — including a scanner matching the version
+# against a CVE list — and it is ~16 bytes of free amplification on a reflected
+# Binding. RFC 5389 §15.10 makes the attribute optional.
+#
+# "product" (the default) sends "turna" with no version, which is still enough
+# for an operator debugging interop to see which implementation answered.
+# "full" adds the release and is REFUSED under production = true. An
+# unrecognised value is treated as "product", never as "full".
+# software_attribute = "product"
+#
+# Allow this process to write a core dump. false by default, and that default is
+# the security control: the shared secret is resident for the whole run — in the
+# config, in AuthMode, and again in previous_shared_secret during a rotation —
+# so a dump written by systemd-coredump (on by default in most distributions)
+# puts it on disk in the clear. Compromising a TURN REST secret means minting
+# credentials for anybody.
+#
+# Turn it on deliberately when you need a dump, then turn it off. Under
+# production = true it warns at startup so it cannot be left on by accident.
+# allow_core_dumps = false
 # Externally reachable IP. Required in production.
 # Tip: don't leave this blank behind NAT — clients receive this IP in the
 # XOR-RELAYED-ADDRESS attribute.
@@ -310,9 +334,14 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # read_timeout_secs = 300
 # # Global connection cap.
 # max_connections = 10000
-# # Per-source-IP connection cap; 0 = unlimited. Without it one source can
-# # occupy every slot of max_connections.
-# max_connections_per_ip = 0
+# # Per-source-IP connection cap; 0 = unlimited. Defaults to 64 since 0.5.0.
+# #
+# # It was 0, and that mattered: one host could hold all 10 000 slots in silence
+# # for the 300-second read timeout, leaving legitimate TURNS clients refused —
+# # and those are the clients whose network blocks UDP, so they have no other way
+# # in. The handshake rate limiter bounds speed, not how many connections are
+# # held. Raise it for known NAT egress points.
+# max_connections_per_ip = 64
 # # Re-read cert_path/key_path every N seconds and pick up a rotated
 # # certificate without a restart (new connections get the new material;
 # # established ones keep their session). 0 disables reloading.
@@ -390,7 +419,28 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # # Post-handshake session cap; 0 = unlimited.
 # max_sessions = 10000
 # # Per-source-IP session cap (anti slot-exhaustion); 0 = unlimited.
-# max_sessions_per_ip = 0
+# # Defaults to 16 since 0.5.0. It was 0, which left max_sessions — a global
+# # number — as the only limit, and a global limit is exhausted by one host.
+# max_sessions_per_ip = 16
+# # Ceiling on handshakes IN FLIGHT across the listener; 0 = unlimited.
+# #
+# # This is the bound that keeps a spoofed flood from exhausting memory, and it
+# # is not the same thing as max_sessions: that one counts handshakes that
+# # SUCCEEDED, so it bounds nothing an attacker has to do. On the demux path a
+# # datagram from an unknown address allocates a channel, a map entry, a
+# # connection and a task BEFORE the RFC 6347 cookie exchange has proved the
+# # source address is real — webrtc-dtls runs that exchange inside the
+# # connection, after the state exists.
+# #
+# # One ~100-byte ClientHello buys accept_timeout_secs of state. Unbounded,
+# # 100 000 spoofed packets/second is an out-of-memory kill in seconds, from any
+# # address, with no credentials. 512 is deliberately small: a legitimate burst
+# # of new DTLS clients looks nothing like that, and refusing a datagram costs a
+# # retransmit while accepting one costs memory that is not returned.
+# #
+# # Watch turna_dtls_pending_handshakes against turna_dtls_accepted_total: a
+# # gauge near the cap with flat accepts is an attack, not load.
+# max_pending_handshakes = 512
 # # Per-session idle timeout. Must be > 0.
 # idle_timeout_secs = 300
 # # Application record MTU, 576..65535. An outbound datagram larger than this
@@ -481,7 +531,22 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # alpn = ["stun.turn"]
 # # Session caps, same semantics as [turn.dtls]; 0 = unlimited.
 # max_sessions = 10000
-# max_sessions_per_ip = 0
+# # Defaults to 16 since 0.5.0, for the same reason as the DTLS one: a global
+# # cap is exhausted by a single host.
+# max_sessions_per_ip = 16
+# #
+# # NOTE on address validation, which has no key here because it is
+# # unconditional: an Initial from an address quinn has not validated is
+# # answered with a Retry (RFC 9000 §8.1) instead of a handshake. Without that,
+# # every spoofed Initial bought a full TLS 1.3 handshake — ECDHE plus a
+# # certificate signature — which is a cryptographic denial of service that
+# # needs no amplification to work. It costs a real client one extra round trip
+# # on its first connection; watch turna_quic_retries_sent_total.
+# #
+# # Both paths do this. On the WebTransport path the check runs before the
+# # per-IP tables are touched: admitting an unvalidated Initial would let a
+# # spoofed source consume a slot belonging to an address that never sent
+# # anything.
 # # Per-source-IP handshake RATE limit; 0 = unlimited. max_sessions_per_ip only
 # # bounds concurrent sessions, so a source that opens and drops sessions in a
 # # loop never trips it while still costing a handshake each time. Off by

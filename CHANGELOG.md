@@ -7,6 +7,312 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`services/admin`: the read-only API routes required no token.**
+  `/api/status`, `/api/metrics`, `/api/health`, `/api/ready` and `/api/cluster`
+  returned the node's full Prometheus surface, its readiness and the cluster
+  topology to anyone who could reach the port. Only `/api/manage` checked.
+
+  The startup guard reasoned about "unauthenticated mutations" and was correct
+  about mutations, which is how this survived: the read side was never the thing
+  being checked. Every `/api` route now authenticates.
+
+- **`services/admin`: the token was compared with `==`.** String equality
+  returns as soon as two bytes differ, so rejection time was proportional to how
+  many leading characters were right — recoverable one character at a time over
+  enough requests, on an endpoint reachable by anyone who can route to it.
+  Constant-time comparison now.
+
+- **`services/admin`: nothing slowed down token guessing.** A wrong answer cost
+  the sender nothing, so an attacker had an unlimited guessing rate against a
+  static string. Failed authentications are now delayed with exponential backoff
+  (capped at two seconds); success is never delayed and resets the counter.
+
+  A delay rather than a lockout on purpose: locking out after N failures hands
+  anyone who can reach the port the ability to lock the operator out of their own
+  admin surface, trading a brute-force risk for a denial-of-service certainty.
+
+- **`services/admin`: a non-loopback bind now warns that the wire is plain
+  HTTP.** The token protects the surface, not the transport — on a non-loopback
+  bind it travels in a header in the clear on every request, as do the metrics
+  and topology in the replies. A warning and not a refusal, because the common
+  shape is a TLS terminator in front; what must not happen is an operator
+  concluding that `--auth-token` made the exposure safe.
+
+### Added
+
+- **Stateless address validation on the DTLS demux path (RFC 6347 §4.2.1).** A
+  ClientHello without a cookie this node issued is now answered with a
+  HelloVerifyRequest and **nothing is allocated** — the cookie is
+  `HMAC-SHA256(key, client_addr ‖ time_bucket)`, derived rather than stored, so
+  a million spoofed hellos cost a million HMACs and zero bytes of retained
+  state. Binding to the address is what makes it worth issuing: a cookie
+  harvested by a real client is useless from anywhere else.
+
+  `max_pending_handshakes`, added earlier in this release, bounded how much a
+  flood could allocate but did not stop the allocation happening before the
+  sender was known to exist. It stays as the backstop. New counter:
+  `turna_dtls_cookie_challenges_total`, which should track new DTLS sessions
+  one-for-one.
+
+  The parser reads five fields and refuses a fragmented ClientHello rather than
+  reassembling one: reassembly means holding state for an unvalidated address,
+  which is the thing being avoided. Anything malformed is dropped in silence,
+  because replying would make this an amplifier for whatever was sent.
+
+- `[turn] allow_core_dumps` (default `false`): the node now calls
+  `setrlimit(RLIMIT_CORE, 0)` and `prctl(PR_SET_DUMPABLE, 0)` at startup. The
+  shared secret is resident for the whole run — a `String` in the config, bytes
+  in `AuthMode`, a second copy in `previous_shared_secret` during a rotation —
+  so a dump written by `systemd-coredump`, which most distributions enable by
+  default, put it on disk in the clear, as did `/proc/<pid>/mem` to any
+  same-user process. Compromising a TURN REST secret means minting credentials
+  for anyone, so this is not a crash-report inconvenience. Setting it to `true`
+  warns under `production = true`.
+- Seven `abuse_*` regression tests in `tests/integration`, one per configuration
+  finding: `software_attribute = full`, an unknown `software_attribute`, a zero
+  rate-limit refill, a malformed trusted prefix, `tcp_relay` without `[tls]`, a
+  family mismatch in `bind_ip`, and a leftover `[signaling]` section. The
+  wire-level halves of findings 21 and 30 are unit tests in `turna-qos` and
+  `turna-session`, where the failure actually lives.
+
+### Changed
+
+- `deploy/turn.toml` and `deploy/examples/selfhosted.toml` document the keys
+  added in this release, including the two whose defaults changed —
+  `[tls] max_connections_per_ip` (0 → 64) and the DTLS/QUIC
+  `max_sessions_per_ip` (0 → 16). The annotated config is the reference an
+  operator reads, and it was six keys behind the schema.
+
+### Fixed
+
+- **Key material was freed without being overwritten.** The shared secret is
+  resident for the whole run, and a SIGHUP rotation made that worse rather than
+  better: the new `AuthMode` and `TurnaConfig` were swapped in and the old
+  ones — holding the previous secret — were dropped, leaving the bytes wherever
+  the allocator put them next. One readable copy accumulated per reload, in the
+  process image and, if the page was ever swapped, on disk.
+
+  `AuthMode` and `AuthConfig` now zeroize on drop, covering the shared secret,
+  `previous_shared_secret` and the OAuth AS-RS and kid keys. This is `Drop`
+  rather than a `SecretBox` type on purpose: no call site changes, nothing has
+  to remember to wrap anything, and a future variant that forgets is a missing
+  arm in one place rather than a missing wrapper somewhere in the tree.
+
+  It does not claim to be complete: the secret still exists in memory while the
+  node runs, and a copy taken into a local lives until that local drops. What it
+  removes is the long tail of copies that outlive their usefulness. With
+  `allow_core_dumps = false` closing the dump and `/proc/<pid>/mem` paths, the
+  three exposures the audit listed are now addressed.
+
+- **`file://` secrets were read without checking their permissions.** The whole
+  point of the indirection is to keep the value out of the config file, and a
+  secret mounted at the default 0644 looked exactly as safe as one at 0600 —
+  the config said `file:///run/secrets/...` either way. Group- or
+  world-readable now warns with the mode and the file.
+
+- **The death of one receive worker was invisible until all of them died.** Only
+  the all-dead case set `Degraded`. With N workers on `SO_REUSEPORT` sockets the
+  kernel hashes clients across them, so one worker exiting takes out 1/N of the
+  traffic — and the node stayed Ready with every metric clean while a fraction
+  of calls degraded silently, which is the shape that gets blamed on the network
+  for a week. `turna_recv_workers_alive` now reports the count, any loss logs
+  `recv_worker_died`, and losing a quarter or more sets `Degraded`. It does not
+  recover on its own; the log line says so.
+
+- **Nothing bounded unauthenticated replies to one address.** A Binding response
+  is 48 bytes for a 20-byte request and needs no credentials, so the only limit
+  was the per-IP ingress budget — which under spoofing belongs to the victim,
+  not the attacker: up to 50 000 replies/second, about 2.4 MB/s aimed at whoever
+  the attacker named as the source. The ingress tiers are the wrong instrument
+  here because they bound what a source may *ask*, and a real client legitimately
+  asks thousands of times a second once it is relaying.
+
+  A separate budget (64 burst, 8/s per IP) now covers the replies the node
+  *emits* before authentication — Binding responses and 401 challenges — of
+  which a real client needs single digits in its whole life. Over budget the
+  reply is dropped in silence: answering "you are rate limited" would itself be
+  an unauthenticated reply to the same address. New counter:
+  `turna_unauth_replies_suppressed_total`.
+
+- **`508 Server Draining` was answered before authentication.** The check sat
+  seven lines above the comment explaining why 437 and 442 had been moved
+  *below* authentication, for the same two reasons: an unauthenticated reply
+  goes to a source address that may be spoofed, and it tells a scanner the
+  node's lifecycle state. A real client learns a node is draining one round trip
+  later — challenge, credentials, then 508 (or 300 Try Alternate in a cluster).
+
+- **The SOFTWARE attribute named the release to anyone who sent 20 bytes.** The
+  Binding response carrying it is unauthenticated, so the exact version went to
+  any scanner matching against a CVE list, plus about 16 bytes of free
+  amplification on a reflected Binding. RFC 5389 §15.10 makes the attribute
+  optional. `[turn] software_attribute` now takes `none`, `product` (the
+  default: `turna` with no version) or `full`, and `full` is refused under
+  `production = true`.
+
+- **Security switches were reachable from the environment.**
+  `TURNA_ALLOW_LOOPBACK_PEERS` was ORed with the config value, so one line
+  copied out of a dev compose file opened relaying into loopback while
+  `turn.toml` read clean. The environment is not an auditable source of policy:
+  not in git, absent from `--dump-config`, inherited by child processes, visible
+  in `docker inspect` and `/proc/*/environ`. Under `production = true` such a
+  variable is now a startup error naming the config key to use instead.
+  `TURNA_PRODUCTION` stays honoured — it can only tighten.
+
+- **`turna_claim_allocation` performed its compare-and-swap without
+  `box.atomic`.** This is the failover CAS primitive, and the three procedures
+  beside it in the same file wrap themselves with a comment saying memtx does
+  not make a stored proc atomic by itself. It works today only because a Lua
+  function without yields is effectively atomic under memtx; enable
+  `memtx_use_mvcc_transaction_manager`, or move the space to vinyl, and two
+  nodes can both pass the `expected_node_id` check and both update — the split
+  brain the CAS exists to prevent.
+
+- **The Tarantool bootstrap generated a password and printed it to STDOUT.**
+  STDOUT of a container or service is journald and docker logs, usually a
+  central collector with its own retention and a far wider set of readers than a
+  state-backend credential deserves. The script now requires `TURNA_PASSWORD` or
+  `TURNA_PASSWORD_FILE` and refuses to run without one: there is no way for it
+  to hand a secret to an operator that does not also hand it to whoever reads
+  the logs. A rerun with a new value rotates the credential.
+
+- **Three log sites ran at `warn!`, once per packet, before authentication.** A
+  STUN decode error (with the parser's message), an auth failure, and the rate
+  limiter refusing a source — all with attacker-controlled content, all on the
+  pre-auth path. One gigabit host is roughly 1.5 M packets/second and a `warn!`
+  line is 100-200 bytes, so the log became the denial of service: journald's own
+  rate limit starts dropping the whole stream, taking with it the messages an
+  operator needs to see what is happening. The counters were already there and
+  are the honest signal. `turna_common::LogThrottle` now gates all three — first
+  occurrence, then every power of two, with the running total on the line.
+
+- **Relay ports were handed out consecutively.** A relay port is public: it
+  travels in XOR-RELAYED-ADDRESS and ends up in the SDP. Knowing one told an
+  off-path attacker where the next allocations were, and the permitted peer —
+  the SFU — is not a secret either, so spoofed packets from that address reached
+  a client's RTP stack. SRTP keeps the contents safe; the jitter buffer and the
+  loss counters do not care that a packet failed to authenticate. The cursor now
+  starts at a random point in the range and still walks linearly, so allocation
+  stays O(1) while the range is sparse. RFC 6056 §3.3; coturn already
+  randomises.
+
+- **The node's own addresses were valid relay peers.** Nothing stopped an
+  authenticated client pointing a peer at `external_ip:3478` (traffic loops
+  through the STUN path, burning CPU), at the health port (the entire Prometheus
+  surface, when it is not on loopback), or at another allocation's relay port.
+  `internet-facing` does not cover it, because a node's public address is public
+  — which is exactly why it is reachable and why it must not also be a relay
+  target. Every listener, `external_ip` / `external_ip6` and the relay `bind_ip`
+  now join the unconditional deny, which the allow-list cannot override.
+
+- **`max_per_user` and `set_user_limits` did not match the identity they were
+  meant to limit.** Accounting keyed on the raw USERNAME, and for shared-secret
+  (TURN REST) credentials that is `"<unix_expiry>:<userid>"` by the
+  coturn-compatible contract — a different string every time the signalling
+  service mints a credential, which is per call or per `token_ttl` at best.
+
+  So `max_per_user` capped one pair of credentials rather than one person, and
+  the cap reset the moment a client asked for a fresh credential: a compromised
+  account, or a signalling bug handing out credentials without limit, stepped
+  around it by construction. `set_user_limits(user = "alice")` — a documented GA
+  contract — could never match, because the stored key was
+  `"1758012345:alice"`.
+
+  `AuthMode::subject_of` now yields the canonical subject: the userid for TURN
+  REST, the username unchanged for long-term credentials (where a colon is part
+  of the identity) and for OAuth. `AuthResolution` carries it, and quotas,
+  lifetime policy and overrides key on it. The credential as presented is
+  recorded on the `allocation created` log line, so the audit trail keeps it.
+
+  **`max_per_user` now means what it says**, which makes existing values too
+  low: one person legitimately holds several allocations at once — two ICE
+  transports, a second device, a reconnect whose old allocation has not yet
+  expired. `deploy/examples/selfhosted.toml` goes from 6 to 12.
+
+- **DTLS: a spoofed ClientHello allocated state before anything proved the
+  source address was real.** On the demux path — the default since 0.4.1 — a
+  datagram from an unknown address allocated a channel, a map entry, a
+  `DTLSConn` and a task, and held them for `accept_timeout_secs`. RFC 6347
+  §4.2.1 puts the HelloVerifyRequest cookie exchange ahead of exactly that;
+  `webrtc-dtls` performs it *inside* `DTLSConn`, after the state exists.
+
+  Nothing bounded it. `max_sessions` counts sessions that completed a
+  handshake — `active` is incremented only on success — so it bounded nothing
+  an attacker has to do, and `max_sessions_per_ip` and the handshake rate
+  limiter both key on an address the sender chose. One ~100-byte ClientHello
+  bought ten seconds of state: 100 000 spoofed packets per second is an
+  out-of-memory kill in seconds, from any address, with no credentials.
+
+  `[turn.dtls] max_pending_handshakes` (512) now caps handshakes in flight, and
+  `max_sessions_per_ip` (16) and `max_handshakes_per_sec_per_ip` (8) default to
+  on rather than unlimited. New counters: `pending_handshakes`,
+  `rejected_pending_cap`.
+
+  This is a bound, not the fix. The fix is a stateless cookie in the
+  demultiplexer, so nothing is allocated until a ClientHello carries a cookie
+  this node issued — which is what `DTLSv1_listen` does and what the stock
+  `listen()` path got from `webrtc-dtls` before demux replaced it.
+
+- **QUIC: no address validation before the handshake.** Every spoofed Initial
+  bought a full TLS 1.3 handshake — ECDHE plus a certificate signature — whose
+  result went to an address that never asked. quinn caps amplification at 3x, so
+  the reflection is weak; the cost is CPU, and a signature per spoofed packet is
+  a cryptographic denial of service that needs no amplification to work.
+
+  Unvalidated Initials are now answered with `retry()`: a stateless token, one
+  datagram, no state kept. `[turn.quic] max_sessions_per_ip` (16) and
+  `max_handshakes_per_sec_per_ip` (8) also default to on. New counter:
+  `turna_quic_retries_sent_total`.
+
+  Both paths are covered. On the WebTransport path the check runs **before** the
+  per-IP tables are touched, because everything after it keys on an address that
+  is whatever the sender put in the packet until quinn has validated it —
+  admitting an unvalidated Initial would let a spoofed source consume a slot
+  belonging to an address that never sent anything.
+
+- **TURNS had no per-source connection cap.** `max_connections_per_ip` defaulted
+  to 0 while `max_connections` was 10 000 and the read timeout 300 seconds, so
+  one host could hold the entire budget in silence and leave legitimate TURNS
+  clients refused — the clients whose network blocks UDP and who have no other
+  way in. The handshake rate limiter bounds speed, not how many connections are
+  held. Default is now 64.
+
+- **A full rate-limiter table refused every new source instead of making room.**
+  `ShardedRateLimiter::check` returned `false` for any address not already
+  tracked once the table hit its 65 536-entry cap — before authentication and
+  before parsing. Filling it costs about 1.3 MB of spoofed UDP from 65 536
+  addresses, and the entries only cleared 600 seconds later, so repeating the
+  burst every ten minutes held the door shut against new clients indefinitely.
+  Established clients kept working throughout, so allocation counts looked
+  healthy while nobody new could connect.
+
+  A limiter that fails closed against *unknown* sources fails closed against
+  *legitimate* ones the moment addresses can be spoofed, which for UDP is
+  always. The table now evicts the idlest of a bounded sample instead: a spoofed
+  address sends one packet and ages, a real client sending continuously has the
+  smallest age in any sample. Evicting a live client is survivable in a way
+  refusing it is not — it gets a fresh bucket, i.e. more budget, not less. New
+  counters: `evictions()` and a fill level via `len()` / `max_entries()`.
+
+  The accompanying `warn!` fired once per refused packet, from an
+  attacker-chosen source address — a log amplifier on the same path as the
+  denial it reported. It is now one line per power of two.
+
+- **Unclaimed EVEN-PORT reservations leaked their ports until restart.**
+  `EVEN-PORT R=1` takes two ports, and expiry ran only inside
+  `claim_reservation` — so a client that asked for a pair and never presented
+  the RESERVATION-TOKEN held the odd port for the life of the process. At the
+  default Allocate rate against a 16 384-port range, one authenticated client
+  exhausts the pool in about seventeen minutes.
+
+  The symptom hid the cause: 508 Insufficient Capacity for everyone,
+  `turna_relay_ports_in_use` at 100 %, the capacity API reporting SATURATED, and
+  a live-allocation count too low to explain any of it. Recovery was a restart,
+  or the luck of an unrelated client presenting a token.
+  `PortAllocator::sweep_expired_reservations` now also runs from the periodic
+  maintenance sweep, across the base pool and every tenant pool.
+
 ## [0.5.0] - 2026-09-14
 
 ### Breaking

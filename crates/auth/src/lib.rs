@@ -127,6 +127,43 @@ fn credential_clock_skew_secs() -> u64 {
     CREDENTIAL_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+impl AuthMode {
+    /// The stable identity behind a USERNAME, for quota accounting and for
+    /// `set_user_limits`.
+    ///
+    /// For `SharedSecret` (TURN REST) the USERNAME is
+    /// `"<unix_expiry>:<userid>"` by the coturn-compatible contract, so the raw
+    /// string changes every time the signalling service mints a credential —
+    /// which is per call, or per `token_ttl` at best. Keying quotas on it made
+    /// `max_per_user` a limit on one pair of credentials rather than on a
+    /// person: fetching a fresh credential reset the count, so the cap bounded
+    /// nothing a caller could not trivially step around. It also meant
+    /// `set_user_limits(user = "alice")` could never match, because the stored
+    /// key was `"1758012345:alice"`.
+    ///
+    /// The expiry is dropped here and nowhere else: `Allocation::username` keeps
+    /// the full string, so logs and audit still show the credential that was
+    /// actually presented.
+    ///
+    /// Only the first `:` is treated as the separator — a userid containing one
+    /// keeps it, matching `validate`, which splits the same way.
+    pub fn subject_of(&self, username: &str) -> String {
+        match self {
+            // The prefix is part of the protocol contract, not of the name.
+            AuthMode::SharedSecret { .. } => username
+                .split_once(':')
+                .map(|(_expiry, userid)| userid)
+                .unwrap_or(username)
+                .to_string(),
+            // A long-term username is the identity. It may legitimately contain
+            // a colon, so nothing is stripped.
+            AuthMode::LongTerm { .. } => username.to_string(),
+            // OAuth identities are already canonical.
+            AuthMode::OAuth { .. } => username.to_string(),
+        }
+    }
+}
+
 /// TURN authentication mode.
 pub enum AuthMode {
     /// Long-term credentials. Users are stored as pre-derived keys (Variant B:
@@ -176,6 +213,59 @@ pub enum AuthMode {
         /// AUTHORIZATION challenge (RFC 7635 §6.1). Defaults to `server_name`.
         as_identity: String,
     },
+}
+
+/// Overwrite the key material when an `AuthMode` is dropped.
+///
+/// The shared secret is resident for the whole run, and a SIGHUP rotation makes
+/// that worse rather than better: the new `AuthMode` is swapped in and the old
+/// one — holding the previous secret — is freed, leaving the bytes in whatever
+/// the allocator does with them next. Nothing overwrote them, so they stayed
+/// readable in the process image and, if the page was ever swapped, on disk.
+///
+/// This is the last of the three exposures the audit listed. Core dumps and
+/// `/proc/<pid>/mem` are closed by `[turn] allow_core_dumps = false`; what
+/// remains is the freed allocation, and that is what this closes.
+///
+/// It is not complete protection and does not claim to be: the secret still has
+/// to exist in memory while the node is running, and a copy taken by
+/// `validate()` into a local lives until that local drops. What it removes is
+/// the long tail — the copies that outlive their usefulness, of which a rotating
+/// deployment accumulates one per reload.
+///
+/// `Drop` rather than a `SecretBox` type: no call site changes, nothing has to
+/// remember to wrap anything, and a future variant that forgets to zeroize is a
+/// missing arm here rather than a missing wrapper somewhere in the tree.
+impl Drop for AuthMode {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            AuthMode::SharedSecret {
+                secret, previous, ..
+            } => {
+                secret.zeroize();
+                if let Some(p) = previous {
+                    p.zeroize();
+                }
+            }
+            AuthMode::OAuth {
+                as_rs_keys,
+                kid_keys,
+                ..
+            } => {
+                for k in as_rs_keys.iter_mut() {
+                    k.zeroize();
+                }
+                for (_, k) in kid_keys.iter_mut() {
+                    k.zeroize();
+                }
+            }
+            // Long-term credentials hold pre-derived keys in an
+            // interior-mutable map shared behind an `Arc`, so there is nothing
+            // this `Drop` uniquely owns to overwrite.
+            AuthMode::LongTerm { .. } => {}
+        }
+    }
 }
 
 impl AuthMode {
@@ -1147,5 +1237,52 @@ mod oauth_tests {
         let (msg, raw) = signed_with_token(&token, &mac_key);
         let mode = AuthMode::oauth("example.com", vec![as_rs_key.to_vec()], "turn.example.com");
         assert!(matches!(mode.validate(&msg, &raw), Err(AuthError::Expired)));
+    }
+}
+
+#[cfg(test)]
+mod subject_tests {
+    use super::*;
+
+    fn shared() -> AuthMode {
+        AuthMode::SharedSecret {
+            realm: "r".into(),
+            secret: b"s".to_vec(),
+            previous: None,
+        }
+    }
+
+    /// The bug this exists for: every credential the signalling service minted
+    /// looked like a different person to the quota accounting, so `max_per_user`
+    /// limited one pair of credentials rather than one user — and a caller
+    /// stepped around it by asking for a fresh credential.
+    #[test]
+    fn turn_rest_credentials_for_one_user_share_a_subject() {
+        let m = shared();
+        assert_eq!(m.subject_of("1758012345:alice"), "alice");
+        assert_eq!(m.subject_of("1758099999:alice"), "alice");
+        assert_eq!(
+            m.subject_of("100:alice"),
+            m.subject_of("200:alice"),
+            "two credentials for the same user must account to the same subject"
+        );
+    }
+
+    /// Only the first colon separates. A userid containing one keeps it, which
+    /// matches how `validate` splits the same string.
+    #[test]
+    fn only_the_expiry_prefix_is_stripped() {
+        assert_eq!(shared().subject_of("100:alice:desk"), "alice:desk");
+        // No colon at all: nothing to strip, and refusing to guess is better
+        // than inventing an identity.
+        assert_eq!(shared().subject_of("alice"), "alice");
+    }
+
+    /// A long-term username is the identity and may legitimately contain a
+    /// colon, so nothing is removed.
+    #[test]
+    fn long_term_usernames_are_left_alone() {
+        let m = AuthMode::long_term("r".to_string(), [("100:alice", "pw")]);
+        assert_eq!(m.subject_of("100:alice"), "100:alice");
     }
 }
