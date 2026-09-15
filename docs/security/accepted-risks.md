@@ -65,6 +65,37 @@ each entry is revisited at the version named under "Review by".
   `libxdp`/`libbpf` to `NOTICE`.
 - **Review by:** whenever `af-xdp` graduates from experimental.
 
+## RISK-006 — the DTLS stack is a maintained copy, not a tracked dependency
+
+- **Status:** accepted; applies only when `[turn.dtls] enabled = true`.
+- **Description:** `crates/dtls` is webrtc-dtls 0.10.0 brought into the tree and
+  modified (MIT OR Apache-2.0; origin and changes recorded in
+  `crates/dtls/src/lib.rs` and `NOTICE`). It is not pinned to upstream and does
+  not receive upstream's fixes. A security fix published for webrtc-dtls, or for
+  pion/dtls which it ports, will not reach this copy unless somebody carries it
+  across.
+- **Why it stays:** turna validates the client's address statelessly before
+  allocating anything — a ClientHello without a cookie this node issued is
+  answered with a HelloVerifyRequest and no state is kept. The upstream crate
+  performs that exchange inside the connection, after the allocation, and
+  exposes no way to say the address is already proved: `flight0` generates its
+  own random cookie, `flight2` compares against it, and an externally issued
+  cookie can never match. Handing it a stripped ClientHello fails too, because
+  that message carries `message_seq = 1` while `full_pull_map` demands an exact
+  match. Both were observed on the wire. Closing the amplification hole
+  therefore required a change to the handshake state machine, which cannot be
+  made from outside the crate.
+- **Compensating controls:** the modification is small and localised (five
+  files, each marked); the flag it adds is dangerous alone and is set in exactly
+  one place, behind the address gate; `max_pending_handshakes` remains as a
+  backstop; the DTLS path is opt-in and off by default.
+- **Planned remediation:** offer the change upstream as pion/dtls's
+  `InsecureSkipVerifyHello` equivalent. If it lands, this copy can go back to
+  being a dependency.
+- **Review by:** whenever webrtc-dtls or pion/dtls publishes a security
+  advisory, and at each turna release while DTLS is enabled anywhere. Check
+  https://github.com/webrtc-rs/webrtc and https://github.com/pion/dtls.
+
 ## RISK-004 — gossip replay survives a node restart
 
 - **Status:** accepted for the experimental cluster mode; not applicable to a

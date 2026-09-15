@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! `webrtc_dtls::listener::listen()` + `accept()` runs the entire handshake
+//! `turna_dtls::listener::listen()` + `accept()` runs the entire handshake
 //! inline inside `accept()`, serially, with no timeout of its own
 //! (webrtc-rs/webrtc#614). Three consequences follow from that one design, and
 //! all three are closed here rather than separately:
@@ -49,7 +49,7 @@
 //!   fails with E0046.
 //! * `webrtc_util::Error::from_std<T>(T) -> Self where T: std::error::Error +
 //!   Send + Sync + 'static`.
-//! * `webrtc_dtls::conn::DTLSConn::new(conn: Arc<dyn Conn + Send + Sync>,
+//! * `turna_dtls::conn::DTLSConn::new(conn: Arc<dyn Conn + Send + Sync>,
 //!   config: Config, is_client: bool, initial_state: Option<State>)`.
 //!
 //! Re-check these if either crate is bumped; they are the only places this module
@@ -158,11 +158,21 @@ impl webrtc_util::conn::Conn for PeerConn {
 }
 
 /// Build the DTLS `Config` from the current certificate material on disk.
-fn build_config(cfg: &DtlsConfig) -> Result<webrtc_dtls::config::Config> {
+fn build_config(cfg: &DtlsConfig) -> Result<turna_dtls::config::Config> {
     let certificate = load_certificate(&cfg.cert_path, &cfg.key_path)?;
-    Ok(webrtc_dtls::config::Config {
+    Ok(turna_dtls::config::Config {
         certificates: vec![certificate],
         insecure_skip_verify: false,
+        // The in-connection cookie exchange is skipped because it already
+        // happened, one layer up and statelessly: no connection is built until
+        // a ClientHello carries a cookie this node issued for that address
+        // (`dtls_cookie`). Running it twice cannot work — the two mechanisms
+        // issue different cookies and the client can only answer one.
+        //
+        // This flag is dangerous on its own: without the gate in front of it a
+        // spoofed ClientHello would allocate a connection, which is the whole
+        // attack. It is set here and nowhere else.
+        insecure_skip_verify_hello: true,
         ..Default::default()
     })
 }
@@ -374,6 +384,19 @@ pub(crate) async fn run_demux(
 
                 let (ptx, prx) = mpsc::channel::<Vec<u8>>(PEER_QUEUE);
                 // The first datagram is the ClientHello; it must not be lost.
+                //
+                // Handed over as it arrived, cookie and all.
+                //
+                // The connection is built with `insecure_skip_verify_hello`, so
+                // `turna-dtls` accepts this ClientHello at whatever `message_seq`
+                // it carries and goes straight to the ServerHello flight. The
+                // cookie exchange already happened — here, before any of this
+                // was allocated.
+                //
+                // An earlier version rewrote the datagram to remove the cookie,
+                // because the upstream crate could not be told the address was
+                // proved. That cost a round trip and meant editing somebody
+                // else's wire format on the hot path; the flag replaces both.
                 if ptx.try_send(buf[..n].to_vec()).is_err() {
                     release_ip(&per_ip, remote.ip());
                     continue;
@@ -405,13 +428,13 @@ pub(crate) async fn run_demux(
                     // the listener. `is_client = false`, no resumption state —
                     // the same arguments the stock listener passes.
                     let established = if handshake_timeout.is_zero() {
-                        webrtc_dtls::conn::DTLSConn::new(conn, handshake_cfg, false, None)
+                        turna_dtls::conn::DTLSConn::new(conn, handshake_cfg, false, None)
                             .await
                             .map_err(|e| e.to_string())
                     } else {
                         match tokio::time::timeout(
                             handshake_timeout,
-                            webrtc_dtls::conn::DTLSConn::new(conn, handshake_cfg, false, None),
+                            turna_dtls::conn::DTLSConn::new(conn, handshake_cfg, false, None),
                         )
                         .await
                         {

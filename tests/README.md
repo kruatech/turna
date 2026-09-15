@@ -25,7 +25,18 @@ copies drift apart.
 Run everything in the workspace:
 
 ```bash
-cargo test --workspace --locked
+cargo test --workspace --locked --exclude turna-dtls
+cargo test -p turna-dtls --locked -- --test-threads=1 --exclude turna-dtls
+cargo test -p turna-dtls --locked -- --test-threads=1
+
+`turna-dtls` runs on its own, single-threaded. Its tests stand up real UDP
+sockets and share a process-wide crypto provider, so in parallel they fail each
+other: 62 pass one at a time, 17 fail together. The interference is in the test
+suite, not the code — it came with the crate (see `crates/dtls/src/lib.rs` for
+where the crate came from) and has not been untangled. A suite that only passes
+with the right flag and does not say so is a suite people learn to ignore, which
+is why it is written down here and enforced in CI rather than left to be
+rediscovered.
 ```
 
 This is the command CI runs, on Linux and macOS alike. Note what it does **not**

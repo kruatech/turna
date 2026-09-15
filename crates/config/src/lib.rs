@@ -2377,7 +2377,7 @@ pub struct DtlsSection {
     /// DTL-9: max concurrent DTLS sessions from one source IP (anti
     /// slot-exhaustion). 0 = unlimited.
     pub max_sessions_per_ip: usize,
-    /// Use the owned UDP demultiplexer instead of `webrtc_dtls::listen()`.
+    /// Use the owned UDP demultiplexer instead of `turna_dtls::listen()`.
     ///
     /// **Default since 2026-09-01.** `listen()` runs handshakes serially inside
     /// `accept()` (webrtc-rs/webrtc#614), which forces three compromises:
@@ -3562,12 +3562,19 @@ mod tests {
         assert!(!cfg.turn.quic.enable_datagrams, "explicit override applied");
         // Untouched fields fall back to defaults.
         assert_eq!(cfg.turn.quic.max_bi_streams, 256);
-        // Session caps: bounded by default, per-IP opt-in. A config written
-        // before these keys existed must keep parsing and get these values.
+        // Session caps, both bounded by default since 0.5.0. A config written
+        // before these keys existed keeps parsing and gets these values.
         assert_eq!(q.max_sessions, 10_000);
-        assert_eq!(q.max_sessions_per_ip, 0, "per-IP cap is opt-in");
+        assert_eq!(
+            q.max_sessions_per_ip, 16,
+            "per-IP cap is ON by default: it was 0, which left max_sessions — a \
+             global number — as the only bound, and a global bound is exhausted \
+             by one host"
+        );
+        // Same two values through the parser: a `[turn.quic]` section that does
+        // not mention them falls back to the defaults asserted above, not to 0.
         assert_eq!(cfg.turn.quic.max_sessions, 10_000);
-        assert_eq!(cfg.turn.quic.max_sessions_per_ip, 0);
+        assert_eq!(cfg.turn.quic.max_sessions_per_ip, 16);
     }
 
     #[test]
@@ -3594,10 +3601,15 @@ mod tests {
 
     #[test]
     fn quic_rate_limit_is_off_by_default() {
-        // Both rate knobs default to 0 (disabled), so an existing deployment sees
-        // no behaviour change from their introduction.
+        // The per-IP handshake RATE limit is on by default since 0.5.0; the
+        // burst override is not, because 0 means "derive it from the rate".
+        //
+        // This asserted both were 0 and that an existing deployment would see no
+        // behaviour change. That was the wrong guarantee: unlimited handshakes
+        // per source is what makes a spoofed flood free, and keeping it for the
+        // sake of continuity kept the hole open.
         let q = QuicConfigSection::default();
-        assert_eq!(q.max_handshakes_per_sec_per_ip, 0);
+        assert_eq!(q.max_handshakes_per_sec_per_ip, 8);
         assert_eq!(q.handshake_burst_per_ip, 0);
         assert_eq!(q.cert_reload_secs, 30);
     }
@@ -3609,7 +3621,12 @@ mod tests {
         assert!(!t.enabled, "TURNS is opt-in");
         assert_eq!(t.listen.port(), 5349, "IANA TURNS port");
         assert_eq!(t.max_connections, 10_000);
-        assert_eq!(t.max_connections_per_ip, 0, "per-IP cap is opt-in");
+        assert_eq!(
+            t.max_connections_per_ip, 64,
+            "per-IP cap is ON by default: at 0 one host could hold all 10 000 \
+             slots in silence for the read timeout, locking out exactly the \
+             clients TURNS exists for — the ones whose network blocks UDP"
+        );
         assert_eq!(
             t.cert_reload_secs, 30,
             "certificate hot-reload on by default"
@@ -3774,7 +3791,12 @@ mod tests {
         assert!(cfg.turn.dtls.enabled);
         assert_eq!(cfg.turn.dtls.mtu, 1100);
         assert_eq!(cfg.turn.dtls.max_sessions, 10_000);
-        assert_eq!(cfg.turn.dtls.max_sessions_per_ip, 0, "per-IP cap is opt-in");
+        assert_eq!(
+            cfg.turn.dtls.max_sessions_per_ip, 16,
+            "per-IP cap is ON by default: max_sessions counts handshakes that \
+             already SUCCEEDED, so on its own it bounded nothing an attacker \
+             has to do"
+        );
         assert_eq!(cfg.turn.dtls.outbound_queue_capacity, 1024);
     }
 

@@ -188,6 +188,25 @@ fn loggable_addr(addr: &std::net::SocketAddr) -> String {
     hash_ip(&addr.ip())
 }
 
+/// What authentication established about a client, as one value.
+///
+/// These four travel together from `AuthRegistry::resolve` to wherever an
+/// allocation is created, and splitting them across a parameter list made
+/// `handle_allocate_tcp` take eight arguments — which is the symptom, not the
+/// problem. The problem is that four names were standing in for one idea.
+///
+/// `subject` is the quota identity: for TURN REST credentials the USERNAME
+/// without its `<expiry>:` prefix, so a fresh credential does not read as a
+/// fresh person. `key` is the long-term key the MESSAGE-INTEGRITY check
+/// produced, and `realm` / `tenant_id` say which tenant's limits apply.
+#[derive(Clone)]
+struct AuthedIdentity {
+    key: Vec<u8>,
+    realm: String,
+    tenant_id: Option<String>,
+    subject: String,
+}
+
 /// Throttles for the log sites that run BEFORE authentication.
 ///
 /// All three sat at `warn!`, once per packet, with attacker-controlled content
@@ -1550,11 +1569,13 @@ impl PacketProcessor {
             return self.handle_allocate_tcp(
                 msg,
                 src,
-                key.clone(),
-                realm.clone(),
-                tenant_id.clone(),
+                AuthedIdentity {
+                    key: key.clone(),
+                    realm: realm.clone(),
+                    tenant_id: tenant_id.clone(),
+                    subject: subject.clone(),
+                },
                 token_max_lifetime,
-                subject.clone(),
             );
         }
 
@@ -1767,13 +1788,15 @@ impl PacketProcessor {
         &self,
         msg: &StunMessage,
         src: SocketAddr,
-        key: Vec<u8>,
-        realm: String,
-        tenant_id: Option<String>,
+        identity: AuthedIdentity,
         token_max_lifetime: Option<u32>,
-        // The quota identity, already stripped of any TURN REST expiry prefix.
-        subject: String,
     ) -> Vec<Action> {
+        let AuthedIdentity {
+            key,
+            realm,
+            tenant_id,
+            subject,
+        } = identity;
         // RFC 6062 §4.1: EVEN-PORT / RESERVATION-TOKEN / DONT-FRAGMENT MUST NOT
         // appear with a TCP allocation.
         let has_df = msg

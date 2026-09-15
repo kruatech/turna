@@ -29,11 +29,27 @@
 //!
 //! # What it does not do
 //!
-//! `webrtc-dtls` performs its own HelloVerifyRequest inside `DTLSConn`. If it
-//! still does so after this gate, a client pays two cookie round trips instead
-//! of one — slower, not broken, and the protocol allows it. If that shows up as
-//! doubled handshake latency, the fix is on the `webrtc-dtls` side, not here;
-//! removing this gate would put the memory back at the mercy of the sender.
+//! `webrtc-dtls` performs its own cookie exchange inside `DTLSConn` and offers
+//! no way to disable it. The two cannot both act on the same message: its
+//! `flight0` treats a ClientHello that already carries a cookie as none of its
+//! business and returns without an alert, an error or a reply, so the client
+//! retransmits into silence until the accept timeout. That was measured on the
+//! wire, not inferred.
+//!
+//! `turna-dtls` resolves it with `Config::insecure_skip_verify_hello` plus a
+//! starting handshake sequence of 1, set on the demux path only: the connection
+//! accepts the ClientHello it is given, at the `message_seq = 1` the client
+//! correctly sends after our HelloVerifyRequest, and goes straight to the
+//! ServerHello flight. One cookie exchange, one round trip, and it happens here
+//! — before anything is allocated.
+//!
+//! Two earlier attempts are worth knowing about, because both looked right.
+//! Rewriting the datagram to strip the cookie made the upstream state machine
+//! run its own exchange: correct, but it cost a round trip and meant editing
+//! somebody else's wire format on the hot path. Setting the skip flag alone did
+//! not work either — the message was held, not dropped, by a reassembly buffer
+//! that files by `message_seq` and only ever reads index 0. Neither failure
+//! produced an error anywhere; both produced silence until the accept timeout.
 
 use std::net::SocketAddr;
 
@@ -337,6 +353,7 @@ mod tests {
         );
     }
 
+    /// The rewrite must produce exactly the datagram the client would have sent
     /// Anything that is not a well-formed ClientHello is dropped in silence.
     /// Replying would make this an amplifier for whatever was actually sent.
     #[test]

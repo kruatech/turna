@@ -227,7 +227,7 @@ impl PeerPolicy {
         // `internet-facing` does not cover this, because a node's public address
         // is public — which is exactly why it is reachable and why it must not
         // also be a valid relay target.
-        if self.self_addrs.iter().any(|a| *a == ip) {
+        if self.self_addrs.contains(&ip) {
             return true;
         }
 

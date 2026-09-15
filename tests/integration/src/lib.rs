@@ -173,9 +173,37 @@ fn start_with_config_transport(
     // go above `[turn]`, the rest go below. Without this, `production = true`
     // parsed as `health.production` and the node failed with "unknown field",
     // which looked like the gate not firing.
-    let (top_level, sections) = match body.find('[') {
-        Some(i) => (&body[..i], &body[i..]),
-        None => (body, ""),
+    // Keys that belong INSIDE the tables the template already opens.
+    //
+    // A test cannot write its own `[turn]` or `[turn.relay]`: TOML refuses a
+    // table opened twice, and refuses `turn.x = ...` followed by `[turn]` for
+    // the same reason. So a gate on a key in either table was untestable
+    // through this harness — the first three tests that needed one all failed
+    // with "duplicate key" instead of with the gate's message.
+    //
+    // `@turn` and `@relay` mark where those keys start; everything up to the
+    // next `[section]` is spliced into the matching table below. Two markers
+    // rather than one general mechanism because the template opens exactly two
+    // tables, and a general one would need a TOML parser to know where each key
+    // belongs.
+    fn splice(body: &str, marker: &str) -> (String, String) {
+        match body.find(marker) {
+            Some(i) => {
+                let after = &body[i + marker.len()..];
+                let end = after.find('[').unwrap_or(after.len());
+                (
+                    after[..end].to_string(),
+                    format!("{}{}", &body[..i], &after[end..]),
+                )
+            }
+            None => (String::new(), body.to_string()),
+        }
+    }
+    let (turn_keys, body_rest) = splice(body, "@turn\n");
+    let (relay_keys, body_rest) = splice(&body_rest, "@relay\n");
+    let (top_level, sections) = match body_rest.find('[') {
+        Some(i) => (body_rest[..i].to_string(), body_rest[i..].to_string()),
+        None => (body_rest.clone(), String::new()),
     };
     std::fs::write(
         &cfg_path,
@@ -185,6 +213,7 @@ fn start_with_config_transport(
              listen = \"127.0.0.1:{turn_port}\"\n\
              realm = \"turna\"\n\
              transport = \"{transport}\"\n\
+             {turn_keys}\
              [[turn.auth.static_users]]\n\
              username = \"testuser\"\n\
              password = \"testpass\"\n\
@@ -192,6 +221,7 @@ fn start_with_config_transport(
              min_port = 49152\n\
              max_port = 49500\n\
              max_allocations = 256\n\
+             {relay_keys}\
              [health]\n\
              listen = \"127.0.0.1:{health_port}\"\n\
              {sections}\n"
@@ -2293,7 +2323,7 @@ fn abuse_full_software_attribute_is_refused_in_production() {
     // scanner the exact version to match against a CVE list.
     assert_refused(
         "software_attribute = full under production",
-        "production = true\n[turn]\nsoftware_attribute = \"full\"",
+        "production = true\n@turn\nsoftware_attribute = \"full\"\n",
         "software_attribute",
     );
 }
@@ -2303,7 +2333,7 @@ fn abuse_unknown_software_attribute_is_refused() {
     // A typo must not silently fall through to the most revealing setting.
     assert_refused(
         "software_attribute typo",
-        "[turn]\nsoftware_attribute = \"verbose\"",
+        "@turn\nsoftware_attribute = \"verbose\"\n",
         "software_attribute",
     );
 }
@@ -2350,7 +2380,7 @@ fn abuse_relay_bind_ip_family_mismatch_is_refused() {
     // a configuration problem at startup.
     assert_refused(
         "IPv6 literal in bind_ip",
-        "[turn.relay]\nbind_ip = \"2001:db8::1\"",
+        "@relay\nbind_ip = \"2001:db8::1\"\n",
         "bind_ip",
     );
 }

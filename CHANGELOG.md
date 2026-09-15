@@ -61,6 +61,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is the thing being avoided. Anything malformed is dropped in silence,
   because replying would make this an amplifier for whatever was sent.
 
+  A validated ClientHello is handed to the DTLS connection as it arrived, and
+  the handshake resumes at the sequence the client is actually on. This needed
+  the DTLS stack to move into the tree as `crates/dtls`: the upstream crate runs
+  its own cookie exchange, cannot be told the address is already proved, and has
+  no equivalent of GnuTLS's `gnutls_dtls_prestate_set` for resuming a handshake
+  mid-flight.
+
+  Three counters are seeded to 1 on a server resuming after an external
+  HelloVerifyRequest, which consumed sequence 0 (RFC 6347 §4.2.4): the fragment
+  buffer, so the `message_seq = 1` ClientHello is yielded rather than held
+  forever at an index nobody reads; `handshake_recv_sequence`, so the flight
+  finds it in the cache; and `handshake_send_sequence`, so the ServerHello
+  leaves at sequence 1 — without which the client rejects the handshake at
+  Finished, since the message sequence is part of the transcript hash (§4.2.6).
+
+  One cookie exchange, one round trip. Verified against OpenSSL `s_client` with
+  a real certificate chain.
+
 - `[turn] allow_core_dumps` (default `false`): the node now calls
   `setrlimit(RLIMIT_CORE, 0)` and `prctl(PR_SET_DUMPABLE, 0)` at startup. The
   shared secret is resident for the whole run — a `String` in the config, bytes

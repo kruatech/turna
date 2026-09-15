@@ -15,7 +15,7 @@ web-transport = ["quic", "dep:wtransport"]
 # ring/mmap datapath should adopt xsk-rs (see docs/design/af-xdp-datapath.md).
 af-xdp = ["dep:xsk-rs", "dep:rtnetlink", "dep:netlink-packet-route", "dep:futures-util", "dep:libxdp-sys", "dep:libbpf-sys"]
 # TURN over DTLS (RFC 7350), pure-Rust DTLS 1.2 via webrtc-dtls.
-dtls = ["dep:webrtc-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
+dtls = ["dep:turna-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
 # TURN-over-SCTP client control transport (experimental). Reuses the tcp_tls
 # frame codec + shared stream-event types, so it depends on the `tls` feature.
 # socket2 (cfg(unix)) and libc are already non-optional deps; SCTP needs the
@@ -51,7 +51,9 @@ wtransport = { version = "0.7", features = ["quinn"], optional = true }
 # wrongly put it under [target.linux] which broke macOS builds). webrtc-dtls
 # 0.10 API (Config / listener::listen / Conn+Listener / Certificate::from_pem
 # behind the `pem` feature) verified against 0.10.0 source.
-webrtc-dtls = { version = "0.10", features = ["pem"], optional = true }
+# DTLS lives in the workspace now — see crates/dtls/src/lib.rs for why the
+# upstream crate could not be used as a dependency.
+turna-dtls = { workspace = true, optional = true }
 webrtc-util = { version = "0.9", optional = true }
 # Needed only to implement `webrtc_util::conn::Conn` for the owned DTLS
 # demultiplexer (crates/transport/src/dtls_demux.rs): the trait is declared with

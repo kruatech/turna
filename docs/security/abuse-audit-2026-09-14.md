@@ -41,12 +41,39 @@ drops. Zeroization removes the copies that outlive their usefulness — of which
 rotating deployment accumulated one per reload — not the working copy. Anything
 that can read this process's memory while it is running still gets the secret.
 
-**35 is closed, with one thing to watch.** `webrtc-dtls` performs its own
-HelloVerifyRequest inside `DTLSConn`. If it still does so after this gate, a
-client pays two cookie round trips instead of one — slower, not broken, and the
-protocol allows it. Watch handshake latency after enabling DTLS; if it has
-doubled, the second exchange is the one to remove, on the `webrtc-dtls` side.
-Removing this gate instead would put the memory back at the mercy of the sender.
+**35 is closed, at one round trip, and the DTLS stack moved into the tree.**
+
+The upstream crate runs its own cookie exchange with no way to disable it, and
+the two cannot both act on the same message. Getting to one exchange took three
+attempts, and the first two are worth recording because both looked correct:
+
+Rewriting the datagram to strip our cookie worked — the library then ran its own
+exchange from the beginning — but cost a round trip and meant editing somebody
+else's wire format on the hot path.
+
+Porting pion's `insecure_skip_verify_hello` flag did not work on its own. The
+flag makes `flight0` skip its HelloVerifyRequest, but it was designed for a
+server that never sent one: with it set, pion expects the ClientHello at
+`message_seq 0`. Ours arrives at 1, because our HelloVerifyRequest consumed
+sequence 0 (RFC 6347 §4.2.4). The reassembly buffer files by `message_seq` and
+only reads the index it is currently on, so the message was **held** — not
+dropped, not rejected, not logged — and the handshake died at the accept
+timeout with nothing anywhere to say why.
+
+What works is the equivalent of GnuTLS's `gnutls_dtls_prestate_set`: three
+counters seeded to 1 on the resuming server. The fragment buffer, so the message
+is yielded at all; `handshake_recv_sequence`, so the flight finds it in the
+cache; and `handshake_send_sequence`, so our ServerHello leaves at sequence 1 —
+without which the client rejects the handshake at Finished, because the message
+sequence is part of the transcript hash (§4.2.6) and the two sides compute
+different MACs.
+
+Verified on the wire against OpenSSL `s_client` with a real certificate chain:
+full handshake, `ECDHE-ECDSA-AES128-GCM-SHA256`, one cookie challenge, one
+session, no timeouts.
+
+This is why the DTLS stack now lives in `crates/dtls` rather than as a
+dependency — see RISK-006 in `accepted-risks.md`.
 
 **34, two scenarios still missing.** A TURNS per-IP connection cap exercised over
 a real TLS listener, and 508-requires-auth checked on the wire. Both need a test

@@ -53,7 +53,7 @@ pub struct DtlsConfig {
     /// serialisation.
     pub accept_timeout: Duration,
     /// Use the owned UDP demultiplexer ([`crate::dtls_demux`]) instead of
-    /// `webrtc_dtls::listener::listen()`. Off by default: the stock path is the
+    /// `turna_dtls::listener::listen()`. Off by default: the stock path is the
     /// one with recorded verification. The demux path makes handshakes
     /// concurrent, moves admission control ahead of the handshake, and enables
     /// certificate hot-reload and a per-IP handshake rate limit.
@@ -311,8 +311,8 @@ impl DtlsServer {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
-        use webrtc_dtls::config::Config;
-        use webrtc_dtls::listener::listen;
+        use turna_dtls::config::Config;
+        use turna_dtls::listener::listen;
         use webrtc_util::conn::Listener;
 
         // Opt-in: own the UDP socket instead of letting `listen()` own it. See
@@ -656,7 +656,7 @@ pub(crate) async fn handle_dtls_session(
 
 /// Build a `webrtc-dtls` certificate from PEM cert + key files.
 ///
-/// `webrtc_dtls::crypto::Certificate::from_pem` (behind webrtc-dtls' `pem`
+/// `turna_dtls::crypto::Certificate::from_pem` (behind webrtc-dtls' `pem`
 /// feature) expects a single PEM string with the **private key first** (PKCS#8,
 /// tag `PRIVATE_KEY`) followed by the certificate chain. PKCS#1 (`RSA PRIVATE
 /// KEY`) / SEC1 (`EC PRIVATE KEY`) keys are not accepted — convert with
@@ -665,7 +665,7 @@ pub(crate) async fn handle_dtls_session(
 pub(crate) fn load_certificate(
     cert_path: &str,
     key_path: &str,
-) -> Result<webrtc_dtls::crypto::Certificate> {
+) -> Result<turna_dtls::crypto::Certificate> {
     // If the operator did not configure a cert/key, use an ephemeral
     // self-signed cert (dev/test convenience — DTLS-TURN has no CA trust needs
     // for a throwaway handshake). But if a cert/key WAS configured and fails to
@@ -673,7 +673,7 @@ pub(crate) fn load_certificate(
     // operator would believe DTLS is serving their cert when it is not.
     if cert_path.is_empty() || key_path.is_empty() {
         tracing::info!("DTLS: no operator cert configured; using ephemeral self-signed cert");
-        return webrtc_dtls::crypto::Certificate::generate_self_signed(vec![
+        return turna_dtls::crypto::Certificate::generate_self_signed(vec![
             "turn.local".to_owned()
         ])
         .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")));
@@ -713,7 +713,7 @@ pub(crate) fn load_certificate(
 fn load_operator_certificate(
     cert_path: &str,
     key_path: &str,
-) -> Result<webrtc_dtls::crypto::Certificate> {
+) -> Result<turna_dtls::crypto::Certificate> {
     if cert_path.is_empty() || key_path.is_empty() {
         return Err(DtlsError::Other(
             "no DTLS cert_path/key_path configured".to_owned(),
@@ -732,7 +732,7 @@ fn load_operator_certificate(
     // `from_pem` may panic on unexpected key DER; contain it so a bad operator
     // cert degrades to the self-signed fallback instead of crashing the node.
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        webrtc_dtls::crypto::Certificate::from_pem(&combined)
+        turna_dtls::crypto::Certificate::from_pem(&combined)
     }));
     match parsed {
         Ok(Ok(cert)) => Ok(cert),
