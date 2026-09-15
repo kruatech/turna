@@ -118,9 +118,7 @@ impl HandshakeCache {
         let cache = self.cache.lock().await;
         cache
             .iter()
-            .filter(|c| {
-                c.typ == HandshakeType::ClientHello && c.is_client && c.epoch == epoch
-            })
+            .filter(|c| c.typ == HandshakeType::ClientHello && c.is_client && c.epoch == epoch)
             .map(|c| c.message_sequence as isize)
             .max()
     }

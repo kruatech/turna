@@ -282,10 +282,7 @@ fn check_auth(headers: &HeaderMap, token: &Option<String>) -> bool {
 
 // ── read-only handlers ────────────────────────────────────────────────────────
 
-async fn api_status(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !authorised(&headers, &st.auth_token).await {
         return unauthorized();
     }
@@ -297,10 +294,7 @@ async fn api_status(
         }
     }
 }
-async fn api_metrics(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_metrics(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !authorised(&headers, &st.auth_token).await {
         return unauthorized();
     }
@@ -312,10 +306,7 @@ async fn api_metrics(
         }
     }
 }
-async fn api_health(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_health(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !authorised(&headers, &st.auth_token).await {
         return unauthorized();
     }
@@ -329,10 +320,7 @@ async fn api_health(
         }
     }
 }
-async fn api_ready(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_ready(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !authorised(&headers, &st.auth_token).await {
         return unauthorized();
     }
@@ -346,10 +334,7 @@ async fn api_ready(
         }
     }
 }
-async fn api_cluster(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_cluster(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !authorised(&headers, &st.auth_token).await {
         return unauthorized();
     }

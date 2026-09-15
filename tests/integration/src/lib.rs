@@ -2312,10 +2312,10 @@ mod dtls_e2e {
 // the data structure and reproducing it through a socket would buy flakiness
 // rather than confidence.
 //
-// Still missing, and named rather than silently absent: a TURNS per-IP
-// connection cap exercised over a real TLS listener (28), and 508-requires-auth
-// checked on the wire (33). Both need a live node plus a client that speaks the
-// transport, which this harness does not have yet.
+// Both wire-level cases are covered now, and neither needed the transport
+// client I expected. Drain is entered with SIGTERM rather than through the
+// management API, and the TURNS per-IP cap is enforced before the TLS
+// handshake, so a plain TCP connection is enough to trip it.
 
 #[test]
 fn abuse_full_software_attribute_is_refused_in_production() {
@@ -2395,4 +2395,336 @@ fn abuse_removed_config_sections_are_refused_with_migration_advice() {
         "[signaling]\nlisten = \"0.0.0.0:9001\"",
         "removed in 0.5.0",
     );
+}
+
+/// Establish one authenticated allocation, for tests that need the node to have
+/// something to drain.
+///
+/// Uses the credentials the drain test writes into its own config rather than
+/// `effective_credentials()`, which reads the environment for the shared
+/// server — this node is private to the test.
+///
+/// Returns false rather than panicking: a caller that cannot get an allocation
+/// should say what it is skipping, not report a failure of whatever it was
+/// actually testing.
+async fn authenticated_allocate(socket: &UdpSocket, target: SocketAddr) -> bool {
+    let mut probe = TurnMsg::request(0x0003);
+    probe.add_requested_transport();
+    let Some((resp401, _)) = send_recv(socket, target, &probe.encode(), 2000).await else {
+        return false;
+    };
+    let (Some(realm), Some(nonce)) = (extract_realm(&resp401), extract_nonce(&resp401)) else {
+        return false;
+    };
+    let key = long_term_key("testuser", &realm, "testpass");
+    let mut alloc = TurnMsg::request(0x0003);
+    alloc.add_requested_transport();
+    alloc.add_lifetime(600);
+    alloc.add_username("testuser");
+    alloc.add_realm(&realm);
+    alloc.add_nonce(&nonce);
+    match send_recv(socket, target, &alloc.encode_with_integrity(&key), 2000).await {
+        Some((resp, _)) => !is_error(&resp),
+        None => false,
+    }
+}
+
+/// `508 Server Draining` must not be answered before authentication.
+///
+/// It used to be: the drain check sat above the challenge, seven lines above
+/// the comment explaining why 437 and 442 had been moved *below* it, for the
+/// same two reasons. An unauthenticated reply goes to a source address that may
+/// be spoofed, and it tells a scanner the node's lifecycle state.
+///
+/// Drain is entered with SIGTERM rather than through the management API: the
+/// signal handler sets draining immediately and then serves for
+/// `drain_grace_secs` before exiting, which is a real window and needs no gRPC
+/// client. The grace is raised here so the window is not a race.
+#[test]
+fn abuse_draining_is_not_reported_before_authentication() {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: node binary not built");
+        return;
+    }
+    let turn_port = free_port(true);
+    let health_port = free_port(false);
+    let dir = std::env::temp_dir().join(format!("turna-drain-{}-{turn_port}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cfg_path = dir.join("turn.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [turn.relay]\n\
+             min_port = 49152\n\
+             max_port = 49500\n\
+             max_allocations = 256\n\
+             [cluster]\n\
+             node_id = \"drain-test\"\n\
+             drain_grace_secs = 20\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n"
+        ),
+    )
+    .expect("write config");
+
+    let mut child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .spawn()
+        .expect("spawn node");
+    let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !http_ready(&health) {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("node did not become ready");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let target: SocketAddr = format!("127.0.0.1:{turn_port}").parse().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    let outcome = rt.block_on(async {
+        // A live allocation first. Drain finishes as soon as the node is empty
+        // — `remaining == 0` breaks the loop immediately — so with no
+        // allocation there is no window to test in, and the earlier version of
+        // this test passed by skipping through a hole it had made itself.
+        let holder = bind_socket().await;
+        if !authenticated_allocate(&holder, target).await {
+            eprintln!("skipping: could not establish the allocation that holds drain open");
+            return None;
+        }
+
+        // Now enter drain. SIGTERM sets the flag before the grace window
+        // starts, and the allocation keeps the window open.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // An Allocate with no credentials, from a different socket. The node is
+        // draining, so the tempting answer is 508 — and that is the bug.
+        let probe_sock = bind_socket().await;
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        send_recv(&probe_sock, target, &probe.encode(), 2000).await
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let (resp, _) = match outcome {
+        Some(v) => v,
+        // With a 20-second grace window this is not a slow machine — it means
+        // the node stopped answering during drain, which is itself wrong: a
+        // draining node serves until the window closes. Skipping here would
+        // make the test green while proving nothing, which is how it passed
+        // before the grace was set explicitly.
+        None => panic!(
+            "no reply from a draining node within the grace window; it should still be \
+             answering, and a 401 challenge is what an unauthenticated Allocate must get"
+        ),
+    };
+    assert!(is_error(&resp), "expected an error response");
+    let (code, _) = extract_error_code(&resp).expect("error response carries ERROR-CODE");
+    assert_eq!(
+        code, 401,
+        "a draining node answered an unauthenticated Allocate with {code} instead of a 401 \
+         challenge. 508 before authentication is a reply to a source address that may be \
+         spoofed, and it hands a scanner the node's lifecycle state — which is exactly why \
+         437 and 442 were moved below the challenge."
+    );
+}
+
+/// A single source must not be able to hold every TURNS connection slot.
+///
+/// `max_connections_per_ip` defaulted to 0 — unlimited — while `max_connections`
+/// was 10 000 and the read timeout 300 seconds. One host could open the whole
+/// budget and say nothing, and the clients it locked out are precisely the ones
+/// TURNS exists for: the ones whose network blocks UDP and have no other way in.
+///
+/// The cap is enforced after `accept()` and before the TLS handshake, so the
+/// test needs no TLS client — a refused connection is simply dropped. It is
+/// observed through `turna_tls_rejected_per_ip_total` rather than through the
+/// socket, because a dropped connection and a slow one look the same from
+/// outside.
+#[test]
+fn abuse_turns_per_ip_connection_cap_is_enforced() {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: node binary not built");
+        return;
+    }
+    let turn_port = free_port(true);
+    let tls_port = free_port(false);
+    let health_port = free_port(false);
+    let dir = std::env::temp_dir().join(format!("turna-turns-{}-{tls_port}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    // A throwaway certificate. `[tls] enabled = true` without cert_path falls
+    // back to /etc/turna/tls/, which does not exist in a test environment: the
+    // TURNS bridge then fails to start and the node reports degraded rather
+    // than exiting, so the listener is simply absent and every connection below
+    // would fail for the wrong reason.
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    let openssl = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-keyout",
+            key_path.to_str().unwrap(),
+            "-out",
+            cert_path.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match openssl {
+        Ok(st) if st.success() => {}
+        // No openssl, or it refused. Skipping is right: the property under test
+        // is the per-IP cap, not certificate generation, and a test that fails
+        // because a system binary is missing teaches people to ignore it.
+        _ => {
+            eprintln!("skipping: could not generate a test certificate (openssl missing?)");
+            return;
+        }
+    }
+
+    let cfg_path = dir.join("turn.toml");
+    // Cap of 4 rather than the default 64: the property is "a cap exists and
+    // holds", and proving it with four connections instead of sixty-five keeps
+    // the test fast and its failure readable.
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [turn.relay]\n\
+             min_port = 49152\n\
+             max_port = 49500\n\
+             max_allocations = 256\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n\
+             [tls]\n\
+             enabled = true\n\
+             listen = \"127.0.0.1:{tls_port}\"\n\
+             cert_path = \"{cert}\"\n\
+             key_path = \"{key}\"\n\
+             max_connections_per_ip = 4\n",
+            cert = cert_path.display(),
+            key = key_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut child = match std::process::Command::new(&bin).arg(&cfg_path).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("skipping: cannot spawn node: {e}");
+            return;
+        }
+    };
+    let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !http_ready(&health) {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            // A build without `--features tls` has no TURNS listener and the
+            // node refuses to start. That is correct behaviour, tested
+            // elsewhere, and not this test's business.
+            eprintln!("skipping: node did not become ready (built without the tls feature?)");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let tls_addr: SocketAddr = format!("127.0.0.1:{tls_port}").parse().unwrap();
+    // Held open: the cap counts concurrent connections, so dropping each one
+    // before opening the next would test nothing.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        match std::net::TcpStream::connect_timeout(&tls_addr, Duration::from_secs(2)) {
+            Ok(s) => held.push(s),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("a connection below the cap was refused: {e}");
+            }
+        }
+    }
+    // Two more, past the cap. The TCP connect still succeeds — the listener
+    // accepted and then dropped — so the socket says nothing useful.
+    for _ in 0..2 {
+        let _ = std::net::TcpStream::connect_timeout(&tls_addr, Duration::from_secs(2));
+    }
+    // The TLS stats are copied into the Prometheus metrics by a task that ticks
+    // every five seconds (`spawn_tls_metrics_mirror`), so the counter is not
+    // visible the instant the connection is refused. Poll rather than sleep a
+    // fixed six seconds: on a normal run this returns after one tick.
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    let mut refused = 0.0;
+    while std::time::Instant::now() < deadline {
+        refused = metric_value(&health, "turna_tls_rejected_per_ip_total");
+        if refused >= 1.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(held);
+
+    assert!(
+        refused >= 1.0,
+        "turna_tls_rejected_per_ip_total is {refused} after opening past a cap of 4. \
+         Either the cap is not enforced, or its counter is not exported — and the second \
+         is as bad as the first, because an operator investigating a lockout has nothing \
+         to look at."
+    );
+}
+
+/// Read one Prometheus counter from the health endpoint. Returns 0.0 when the
+/// metric is absent, so a caller asserting `>= 1.0` fails on a missing metric
+/// rather than silently passing.
+fn metric_value(health: &SocketAddr, name: &str) -> f64 {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(health, Duration::from_millis(500)) else {
+        return 0.0;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    if s.write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return 0.0;
+    }
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    buf.lines()
+        .find(|l| l.starts_with(name) && !l.starts_with('#'))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
 }

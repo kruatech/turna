@@ -673,9 +673,9 @@ pub(crate) fn load_certificate(
     // operator would believe DTLS is serving their cert when it is not.
     if cert_path.is_empty() || key_path.is_empty() {
         tracing::info!("DTLS: no operator cert configured; using ephemeral self-signed cert");
-        return turna_dtls::crypto::Certificate::generate_self_signed(vec![
-            "turn.local".to_owned()
-        ])
+        return turna_dtls::crypto::Certificate::generate_self_signed(
+            vec!["turn.local".to_owned()],
+        )
         .map_err(|e| DtlsError::Other(format!("dtls self-signed certificate: {e}")));
     }
     match load_operator_certificate(cert_path, key_path) {

@@ -77,7 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Finished, since the message sequence is part of the transcript hash (§4.2.6).
 
   One cookie exchange, one round trip. Verified against OpenSSL `s_client` with
-  a real certificate chain.
+  a real certificate chain — one handshake, one client, on loopback.
+
+  **The DTLS interop and soak evidence recorded before this release describes
+  the old stack and does not carry over.** `docs/feature-support.md` and
+  `docs/PRODUCTION_READINESS.md` R4 say so, and
+  `docs/verification/dtls-stack-2026-09-15.md` lists what has to be rerun: a
+  spoofed-source flood, three browsers, coturn's client, twenty-four hours under
+  load, certificate hot-reload, and a real interface with packet loss.
 
 - `[turn] allow_core_dumps` (default `false`): the node now calls
   `setrlimit(RLIMIT_CORE, 0)` and `prctl(PR_SET_DUMPABLE, 0)` at startup. The

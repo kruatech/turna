@@ -1,3 +1,7 @@
+//! **Modified from webrtc-dtls 0.10.0.** An extension this implementation does
+//! not parse is logged at `debug` rather than `warn`: ignoring unknown
+//! extensions is what the protocol requires, so it is not a warning.
+
 #[cfg(test)]
 mod handshake_message_client_hello_test;
 
@@ -170,8 +174,21 @@ impl HandshakeMessageClientHello {
             if let Ok(extension) = Extension::unmarshal(&mut extension_reader) {
                 extensions.push(extension);
             } else {
-                log::warn!(
-                    "Unsupported Extension Type {} {}",
+                // Debug, not warn.
+                //
+                // An extension this implementation does not parse is ordinary
+                // TLS: the peer advertises what it supports and the other side
+                // ignores what it does not know (RFC 8446 §4.2, and the same
+                // rule in TLS 1.2). Every OpenSSL client trips this two or three
+                // times per handshake — session_ticket and encrypt_then_mac
+                // among them — so at `warn` it is one to three lines of noise
+                // per connection that report nothing wrong.
+                //
+                // A warning that fires on correct behaviour trains people to
+                // stop reading warnings, which costs more than the information
+                // it carries.
+                log::debug!(
+                    "unparsed extension type {} {}",
                     extension_buffer[offset],
                     extension_buffer[offset + 1]
                 );

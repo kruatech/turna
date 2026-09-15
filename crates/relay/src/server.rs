@@ -399,7 +399,15 @@ impl RelayServer {
         tcp_relay: Option<Arc<TcpRelayManager>>,
     ) -> Self {
         Self::new_full_with_limits(
-            transport, store, auth, external_ip, metrics, cluster, migration, tcp_relay, None,
+            transport,
+            store,
+            auth,
+            external_ip,
+            metrics,
+            cluster,
+            migration,
+            tcp_relay,
+            None,
         )
     }
 
@@ -422,9 +430,10 @@ impl RelayServer {
         tcp_relay: Option<Arc<TcpRelayManager>>,
         rate_limits: Option<&crate::processor::RateLimitSettings>,
     ) -> Self {
-        let mut processor = PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
-            .with_migration(migration)
-            .with_tcp_relay(tcp_relay.clone());
+        let mut processor =
+            PacketProcessor::new_with_cluster(store, auth, external_ip, metrics, cluster)
+                .with_migration(migration)
+                .with_tcp_relay(tcp_relay.clone());
         if let Some(limits) = rate_limits {
             processor = processor.with_rate_limits(limits);
         }

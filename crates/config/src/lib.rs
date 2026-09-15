@@ -750,7 +750,13 @@ impl TurnaConfig {
         // SOFTWARE: `full` names the release to anyone who sends 20 unauthenticated
         // bytes, which is a scanner's first question. Allowed outside production,
         // where knowing the exact build usually matters more.
-        match self.turn.software_attribute.trim().to_ascii_lowercase().as_str() {
+        match self
+            .turn
+            .software_attribute
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "none" | "product" => {}
             "full" if !prod => {}
             "full" => errors.push(
@@ -1415,7 +1421,11 @@ impl RateLimitTier {
                 self.create_permission_burst,
                 self.create_permission_rps,
             ),
-            ("channel_bind", self.channel_bind_burst, self.channel_bind_rps),
+            (
+                "channel_bind",
+                self.channel_bind_burst,
+                self.channel_bind_rps,
+            ),
         ] {
             if burst == 0 {
                 errs.push(format!(

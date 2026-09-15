@@ -12,3 +12,42 @@ the License in the LICENSE file or at:
 
 "turna" and the turna logo are trademarks of Anton Krutilin; see TRADEMARKS.md.
 This NOTICE is for attribution and does not grant trademark rights.
+Add this to the existing NOTICE file at the repository root.
+(The file was not in the working set, so it could not be edited directly.)
+
+--------------------------------------------------------------------------------
+
+crates/dtls
+-----------
+
+This component is derived from webrtc-dtls 0.10.0
+  Copyright (c) Rain Liu <yuliu@webrtc.rs>
+  https://github.com/webrtc-rs/dtls
+  Licensed under MIT OR Apache-2.0
+
+webrtc-dtls is itself a port of pion/dtls
+  Copyright (c) The Pion community
+  https://github.com/pion/dtls
+  Licensed under MIT
+
+The copy in crates/dtls has been modified. Changed files carry a note at the
+top saying what changed, per Apache License 2.0 section 4(b). The full licence
+texts are in crates/dtls/LICENSE-MIT and crates/dtls/LICENSE-APACHE.
+
+Summary of modifications:
+
+  src/config.rs                    added Config::insecure_skip_verify_hello
+  src/handshaker.rs                carries the flag into HandshakeConfig
+  src/conn/mod.rs                  threads the flag from Config
+  src/flight/flight0.rs            honours the flag: accepts a ClientHello at a
+                                   non-zero message_seq and proceeds directly to
+                                   Flight4 instead of answering with its own
+                                   HelloVerifyRequest
+  src/handshake/handshake_cache.rs added current_client_hello_sequence()
+
+The reason for each is in crates/dtls/src/lib.rs. In short: turna validates the
+client's address statelessly before allocating anything, and the upstream crate
+offers no way to tell a connection that this has already been done.
+
+No trademark of the webrtc-rs or pion projects is used. The crate is named
+turna-dtls precisely so that a modified copy is not mistaken for the original.

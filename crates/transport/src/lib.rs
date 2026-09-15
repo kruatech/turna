@@ -83,11 +83,11 @@ pub trait Transport: Send + Sync {
 }
 
 // Re-export the default transport
-pub use tokio_transport::TokioTransport;
 /// Socket buffer sizing, applied to every socket bound after the call. See
 /// `tokio_transport::apply_socket_buffers` for why the kernel's answer is
 /// logged rather than assumed.
 pub use tokio_transport::init_socket_buffers;
+pub use tokio_transport::TokioTransport;
 
 // Re-export transport selection (config preference + runtime io_uring probe).
 pub use probe::{probe_io_uring, IoUringProbe};
@@ -102,11 +102,11 @@ pub mod gso;
 pub mod numa;
 
 pub mod dtls;
-#[cfg(feature = "dtls")]
-pub(crate) mod dtls_demux;
 /// Stateless address validation for the demux path: a ClientHello without a
 /// cookie this node issued is answered with a HelloVerifyRequest and allocates
 /// nothing. See the module docs for why the pending-handshake cap was not
 /// enough on its own.
 #[cfg(feature = "dtls")]
 pub(crate) mod dtls_cookie;
+#[cfg(feature = "dtls")]
+pub(crate) mod dtls_demux;

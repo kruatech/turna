@@ -164,6 +164,14 @@ Known residual gaps, per transport:
   hot-reload and observable handshake failures. (This paragraph said "off by
   default" until 0.5.0; it had been on since 0.4.1.) DTLS 1.2 only.
 
+  **The evidence below predates the current stack.** In 0.5.0 the DTLS server
+  side moved into the tree as `crates/dtls` with a change to the handshake state
+  machine, so the interop runs, the 24-hour soak and the loss figures recorded
+  for DTLS describe code that is no longer shipped. What is verified on the
+  current stack is one handshake against OpenSSL `s_client`. See
+  `docs/verification/dtls-stack-2026-09-15.md` for what has to be redone before
+  the beta label can move.
+
   Since 0.5.0 the demux path also performs **stateless address validation**
   before allocating anything: a ClientHello without a cookie this node issued is
   answered with a HelloVerifyRequest (RFC 6347 §4.2.1) and no state is kept.
