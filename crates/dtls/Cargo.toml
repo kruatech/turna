@@ -1,0 +1,79 @@
+# turna-dtls — DTLS 1.2 for the TURN datapath.
+#
+# This crate began as `webrtc-dtls` 0.10.0 by Rain Liu <yuliu@webrtc.rs>
+# (https://github.com/webrtc-rs/dtls), dual-licensed MIT OR Apache-2.0. Both
+# licence texts are kept alongside this file and the origin is restated in
+# `src/lib.rs`. Modified files carry a note saying what changed, as Apache-2.0
+# §4(b) requires.
+#
+# It is not a fork tracked against upstream: it is turna's code now, and the
+# maintenance of it — including future security fixes upstream makes and this
+# copy does not — is turna's. See `docs/security/accepted-risks.md`.
+#
+# Why a copy rather than a dependency: turna's DTLS listener validates the
+# client's address itself, statelessly, before allocating anything (RFC 6347
+# §4.2.1). The upstream crate performs that exchange inside the connection
+# object, after the allocation, and exposes no way to say "this address is
+# already proved". Reconciling the two needs a change to the handshake state
+# machine, which cannot be made from outside the crate.
+
+[package]
+name = "turna-dtls"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "DTLS 1.2 for the turna TURN datapath, derived from webrtc-dtls"
+publish = false
+
+[dependencies]
+util = { version = "0.9.0", package = "webrtc-util", default-features = false, features = ["conn"] }
+
+byteorder = "1"
+rand_core = "0.6"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["default", "ecdh", "ecdsa"] }
+p384 = "0.13"
+rand = "0.8"
+hmac = "0.12"
+sec1 = { version = "0.7", features = ["std"] }
+sha1 = "0.10"
+sha2 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["block-padding", "alloc"] }
+aes-gcm = "0.10"
+ccm = "0.5"
+tokio = { version = "1.32.0", features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+async-trait = "0.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+x509-parser = "0.16"
+der-parser = "8.1"
+rcgen = "0.13"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+log = "0.4"
+thiserror = "1"
+# Not optional. Upstream gated `Certificate::from_pem` behind a `pem` feature;
+# turna loads operator certificates from PEM on every DTLS path, so the gate
+# only created a way to build a crate that cannot read a certificate.
+pem = "3"
+portable-atomic = "1.6"
+
+[dev-dependencies]
+tokio-test = "0.4"
+env_logger = "0.10"
+chrono = "0.4.28"
+clap = "3"

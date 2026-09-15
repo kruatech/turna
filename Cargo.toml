@@ -21,6 +21,9 @@ members = [
     "crates/config",
     "crates/cluster",
     "crates/transport",
+    # DTLS, derived from webrtc-dtls 0.10.0 (MIT OR Apache-2.0) and maintained
+    # here. See crates/dtls/src/lib.rs for the origin and the reason.
+    "crates/dtls",
     "crates/state-backend",
 
     # infra
@@ -117,6 +120,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # workspace-крейты
 turna-common        = { path = "crates/common" }
+turna-dtls          = { path = "crates/dtls" }
 turna-proto-stun    = { path = "crates/protocol/proto-stun" }
 turna-proto-turn    = { path = "crates/protocol/proto-turn" }
 turna-proto-rtp     = { path = "crates/protocol/proto-rtp" }

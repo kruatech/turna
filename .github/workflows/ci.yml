@@ -84,7 +84,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake libclang-dev pkg-config protobuf-compiler
       - run: cargo build --workspace --locked
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --exclude turna-dtls
+      # turna-dtls separately, single-threaded: its tests stand up real UDP
+      # sockets and share a process-wide crypto provider, so in parallel they
+      # fail each other — 62 pass one at a time, 17 fail together. Inherited
+      # from webrtc-dtls; the interference is in the test suite, not the code.
+      - run: cargo test -p turna-dtls --locked -- --test-threads=1
 
   test:
     name: test (${{ matrix.os }})
@@ -112,7 +117,12 @@ jobs:
       - name: cargo test workspace
         env:
           TURNA_TEST_REQUIRE_SERVER: "1"
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --exclude turna-dtls
+      # turna-dtls separately, single-threaded: its tests stand up real UDP
+      # sockets and share a process-wide crypto provider, so in parallel they
+      # fail each other — 62 pass one at a time, 17 fail together. Inherited
+      # from webrtc-dtls; the interference is in the test suite, not the code.
+      - run: cargo test -p turna-dtls --locked -- --test-threads=1
 
   integration-hermetic:
     name: integration tests (hermetic turna-node)
