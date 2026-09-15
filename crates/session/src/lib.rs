@@ -543,10 +543,8 @@ fn relay_bind_v6() -> std::net::Ipv6Addr {
 /// Separate from `turna-transport`'s equivalent because this crate does not
 /// depend on that one, and a dependency added to share twenty lines of
 /// `setsockopt` would be the more expensive of the two.
-static RELAY_RECV_BUFFER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static RELAY_SEND_BUFFER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static RELAY_RECV_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RELAY_SEND_BUFFER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Set the buffer sizes applied to every relay socket bound after this call.
 pub fn init_relay_socket_buffers(recv_bytes: usize, send_bytes: usize) {
@@ -612,10 +610,7 @@ fn bind_relay_socket(family: RelayFamily, port: u16) -> std::io::Result<std::net
     Ok(sock)
 }
 
-fn bind_relay_socket_inner(
-    family: RelayFamily,
-    port: u16,
-) -> std::io::Result<std::net::UdpSocket> {
+fn bind_relay_socket_inner(family: RelayFamily, port: u16) -> std::io::Result<std::net::UdpSocket> {
     match family {
         RelayFamily::V4 => std::net::UdpSocket::bind((relay_bind_v4(), port)),
         #[cfg(unix)]
@@ -630,10 +625,9 @@ fn bind_relay_socket_inner(
             Ok(sock.into())
         }
         #[cfg(not(unix))]
-        RelayFamily::V6 => std::net::UdpSocket::bind(std::net::SocketAddr::from((
-            relay_bind_v6(),
-            port,
-        ))),
+        RelayFamily::V6 => {
+            std::net::UdpSocket::bind(std::net::SocketAddr::from((relay_bind_v6(), port)))
+        }
     }
 }
 
@@ -4508,7 +4502,10 @@ mod reservation_sweep_tests {
         }
 
         let swept = pool.sweep_expired_reservations();
-        assert_eq!(swept, 5, "every expired reservation should have been dropped");
+        assert_eq!(
+            swept, 5,
+            "every expired reservation should have been dropped"
+        );
         assert_eq!(
             pool.in_use(),
             5,

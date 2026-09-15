@@ -666,9 +666,8 @@ impl PacketProcessor {
     /// The environment overrides still apply on top, so a deployment that has
     /// them exported keeps its current behaviour (and now says so in the log).
     pub fn with_rate_limits(mut self, settings: &RateLimitSettings) -> Self {
-        self.rate_limiter = TieredRateLimiter::new(RateLimitSettings::env_overrides(
-            settings.default,
-        ));
+        self.rate_limiter =
+            TieredRateLimiter::new(RateLimitSettings::env_overrides(settings.default));
         self.trusted_prefixes =
             crate::peer_filter::parse_ranges(&settings.trusted_prefixes, "trusted_prefixes");
         // No prefixes means no second limiter to keep: `limiter_for` then never
@@ -1882,12 +1881,12 @@ impl PacketProcessor {
         // `[turn.relay] bind_ip` exists to close.
         let listener =
             match std::net::TcpListener::bind((turna_session::relay_bind_addr_v4(), relay_port)) {
-            Ok(l) => l,
-            Err(e) => {
-                warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
-                return self.encode_error(msg, src, 508, "Insufficient Capacity");
-            }
-        };
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
+                    return self.encode_error(msg, src, 508, "Insufficient Capacity");
+                }
+            };
 
         if let Err(e) = self.store.create_for_identity(
             src,

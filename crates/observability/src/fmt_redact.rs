@@ -46,6 +46,24 @@ fn redacting() -> bool {
     REDACT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Fields the `log` → `tracing` bridge adds to every event it forwards.
+///
+/// `tracing-log` attaches the originating target, module path, file and line as
+/// ordinary fields, so a single line from a crate that logs through `log` comes
+/// out four times longer than one that logs through `tracing` — and three
+/// quarters of it repeats what the target already said. `crates/dtls` logs
+/// through `log`, so every DTLS line carried them.
+///
+/// They are dropped rather than rendered: the information is either already in
+/// the line (target) or is of use to whoever is editing the source, not to
+/// whoever is reading the log at three in the morning.
+fn is_log_bridge_field(name: &str) -> bool {
+    matches!(
+        name,
+        "log.target" | "log.module_path" | "log.file" | "log.line"
+    )
+}
+
 /// Replace a value with its salted label when the field name names an address.
 fn value_for(name: &str, raw: &str) -> String {
     if redacting() && looks_like_address(name) {
@@ -75,7 +93,7 @@ struct TextVisitor<'a, 'w> {
 
 impl TextVisitor<'_, '_> {
     fn write(&mut self, name: &str, raw: &str) {
-        if self.result.is_err() {
+        if self.result.is_err() || is_log_bridge_field(name) {
             return;
         }
         let sep = if self.first { "" } else { " " };
@@ -155,7 +173,7 @@ fn json_escape(s: &str) -> String {
 
 impl JsonVisitor<'_, '_> {
     fn write(&mut self, name: &str, raw: &str) {
-        if self.result.is_err() {
+        if self.result.is_err() || is_log_bridge_field(name) {
             return;
         }
         let sep = if self.first { "" } else { "," };
@@ -211,6 +229,22 @@ mod tests {
         assert_eq!(json_escape("a\nb"), r"a\nb");
         assert_eq!(json_escape("a\u{1}b"), r"a\u0001b");
         assert_eq!(json_escape("192.0.2.1:5000"), "192.0.2.1:5000");
+    }
+
+    /// The `log` bridge's metadata never reaches the line.
+    ///
+    /// Four fields per event, on every line from a crate that logs through
+    /// `log` — `crates/dtls` does — and all four repeat or refine what the
+    /// target already said.
+    #[test]
+    fn log_bridge_metadata_is_dropped() {
+        for f in ["log.target", "log.module_path", "log.file", "log.line"] {
+            assert!(is_log_bridge_field(f), "{f} should be dropped");
+        }
+        // Not everything beginning with "log" — a field a caller named
+        // deliberately must survive.
+        assert!(!is_log_bridge_field("log_allocation_addresses"));
+        assert!(!is_log_bridge_field("logged_in"));
     }
 
     #[test]
