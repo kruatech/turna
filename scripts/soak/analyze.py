@@ -30,6 +30,25 @@ import sys
 # per-allocation state and would run far past this.
 RSS_GROWTH_PCT = 15.0
 
+# Warm-up excluded from the RSS baseline.
+#
+# The comparison takes the minimum of the first half of the idle samples, and on
+# a long run that minimum is the very first one — taken before the pools,
+# allocation maps and port tables have reached working size. A 24 h run then
+# measures growth from a number the process never returns to, and reports a leak
+# because the first hour was cheap.
+#
+# Measured on the 2026-09-15 DTLS soak: idle floor 12.3 MiB at 30 min, 14.1 at
+# 3.4 h, then 14.0-14.6 for the remaining 21 hours, drifting DOWN as often as up.
+# The halves comparison called that +16.8% and failed the run. A leak does not
+# drift down.
+#
+# Two hours rather than a fraction of the run: warm-up is a property of the
+# process, not of how long you intend to watch it. Runs shorter than three times
+# this keep the old behaviour, because excluding two hours from a six-hour run
+# would leave too little to compare.
+RSS_WARMUP_SECS = 7200
+
 # File descriptors: relay sockets are one fd each, so a genuine leak is visible in
 # whole numbers. A small drift is normal (log rotation, reconnects to the state
 # backend), so this is absolute rather than proportional.
@@ -220,12 +239,23 @@ def main(out_dir):
 
     # ── RSS ──
     rss = series(idle, "rss_kb")
+    warmed = [(t, v) for t, v in rss if t >= RSS_WARMUP_SECS]
+    excluded = 0
+    # Only skip the warm-up when enough run remains to compare halves of it.
+    if dur >= RSS_WARMUP_SECS * 3 and len(warmed) >= 4:
+        excluded = len(rss) - len(warmed)
+        rss = warmed
     if len(rss) >= 4:
         half = len(rss) // 2
         early = min(v for _, v in rss[:half])
         late = min(v for _, v in rss[half:])
         growth = (late - early) / early * 100 if early else 0
         detail = f"idle floor {early/1024:.0f} MiB -> {late/1024:.0f} MiB ({growth:+.1f}%)"
+        if excluded:
+            detail += (
+                f", excluding the first {RSS_WARMUP_SECS//3600} h of warm-up "
+                f"({excluded} sample(s))"
+            )
         if growth > RSS_GROWTH_PCT:
             report("FAIL", "RSS", f"{detail}; over the {RSS_GROWTH_PCT}% threshold — this is the leak signal")
         else:
