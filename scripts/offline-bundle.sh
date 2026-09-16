@@ -208,9 +208,6 @@ otlp_endpoint = ""
 # A syslog collector on the local network. Security events only.
 syslog_endpoint = ""
 
-[signaling]
-listen = "127.0.0.1:9001"
-turn_shared_secret = "${TURNA_SHARED_SECRET}"
 TOML
 
 # ── instructions ──────────────────────────────────────────────────────────

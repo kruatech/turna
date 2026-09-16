@@ -104,9 +104,6 @@ max_port = 49999
 max_allocations = 800
 [turn.relay.quota]
 allow_unlimited_bandwidth = true
-[signaling]
-listen = "127.0.0.1:9001"
-turn_shared_secret = "$SEC"
 $K
 enabled = true
 EOF
@@ -153,9 +150,6 @@ max_port = 49999
 max_allocations = 800
 [health]
 listen = "127.0.0.1:9091"
-[signaling]
-listen = "127.0.0.1:9001"
-turn_shared_secret = "$SEC"
 [turn.quic]
 enabled = true
 listen = "0.0.0.0:3479"

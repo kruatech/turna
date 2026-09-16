@@ -207,9 +207,6 @@ max_allocations = 800
 max_per_user = 0
 [health]
 listen = "127.0.0.1:9091"
-[signaling]
-listen             = "127.0.0.1:9001"
-turn_shared_secret = "afxdp-lab-secret"
 EOF
 
 target/release/turna-node --dump-config "$OUT/turn.toml" > "$OUT/config-resolved.txt" 2>"$OUT/config-error.txt" \

@@ -107,9 +107,6 @@ key_path  = "$REPO/$OUT/live.key"
 cert_reload_secs = 5
 [health]
 listen = "127.0.0.1:$HEALTH_PORT"
-[signaling]
-listen             = "127.0.0.1:$SIGNALING_PORT"
-turn_shared_secret = "$SECRET_OLD"
 EOF
 
 pkill -x turna-node 2>/dev/null; sleep 1

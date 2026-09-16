@@ -224,6 +224,19 @@ unlimited to 64, and the DTLS and QUIC `max_sessions_per_ip` from unlimited to
 16. If a known NAT egress point carries more than that from one address, raise
 it explicitly — the number is now a decision either way.
 
+**A `[turn.dtls] demux = false` config will refuse to start.**
+`max_handshakes_per_sec_per_ip` also defaults to 8 now, and it cannot be
+enforced on the stock listener, where the handshake runs below `accept()`.
+Validation refuses the combination rather than accepting a limit that would do
+nothing. Add `max_handshakes_per_sec_per_ip = 0` to keep the stock listener, or
+drop `demux = false` — it has been the default since 0.4.1, and the stock path
+has neither handshake rate limiting nor certificate hot-reload.
+
+The default is not made to depend on `demux`, deliberately: a setting whose
+meaning changes with a neighbouring key is one nobody can read off the config
+file, and it would silently drop the limit for anyone who later switched
+`demux` off.
+
 **QUIC clients pay one extra round trip on their first connection.** Unvalidated
 Initials are answered with a Retry instead of a handshake, which is what stops a
 spoofed Initial from costing a TLS signature. `turna_quic_retries_sent_total`

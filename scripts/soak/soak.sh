@@ -441,9 +441,6 @@ max_per_user = 0
 [health]
 listen = "$HEALTH_ADDR"
 
-[signaling]
-listen             = "127.0.0.1:9001"
-turn_shared_secret = "$SHARED_SECRET"
 EOF
   log "generated $CONFIG"
 fi

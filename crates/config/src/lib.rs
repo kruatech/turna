@@ -358,9 +358,13 @@ impl TurnaConfig {
         if self.turn.dtls.enabled && !self.turn.dtls.demux {
             if self.turn.dtls.max_handshakes_per_sec_per_ip != 0 {
                 errors.push(
-                    "turn.dtls.max_handshakes_per_sec_per_ip requires turn.dtls.demux = true \
-                     (on the stock listener the handshake runs below accept(), so the limit \
-                     cannot be enforced)"
+                    "turn.dtls.max_handshakes_per_sec_per_ip requires turn.dtls.demux = true. \
+                     On the stock listener the handshake runs below accept(), so the limit \
+                     cannot be enforced, and accepting a setting that does nothing would be \
+                     worse than refusing it. Either set demux = true, which is the default \
+                     and the better path, or add `max_handshakes_per_sec_per_ip = 0` to \
+                     [turn.dtls] to say you are going without it. It defaults to 8 since \
+                     0.5.0, which is why a config that worked before may stop here."
                         .into(),
                 );
             }
