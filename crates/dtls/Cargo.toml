@@ -76,4 +76,6 @@ portable-atomic = "1.6"
 tokio-test = "0.4"
 env_logger = "0.10"
 chrono = "0.4.28"
-clap = "3"
+# clap removed: it was here for the upstream examples, which this copy does not
+# carry, and clap 3 pulls `atty` — unmaintained, RUSTSEC-2024-0375, and it failed
+# cargo-deny the moment this crate entered the tree.
