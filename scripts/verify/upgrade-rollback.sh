@@ -105,9 +105,6 @@ max_allocations = 200
 max_per_user = 0
 [health]
 listen = "127.0.0.1:$HEALTH_PORT"
-[signaling]
-listen             = "127.0.0.1:$SIGNALING_PORT"
-turn_shared_secret = "$SECRET"
 EOF
 
 NODE_PID=""

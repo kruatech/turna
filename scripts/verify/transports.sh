@@ -122,9 +122,6 @@ max_allocations = 800
 max_per_user = 0
 [health]
 listen = "127.0.0.1:9091"
-[signaling]
-listen             = "127.0.0.1:9001"
-turn_shared_secret = "$SECRET"
 $1
 EOF
 }
@@ -200,7 +197,17 @@ fi
 if want dtls; then
 for DEMUX in false true; do
   say "phase 3: DTLS (demux = $DEMUX)"
-  gen_config "$(printf '[turn.dtls]\nenabled = true\nlisten = "0.0.0.0:5350"\ncert_path = "%s"\nkey_path = "%s"\ndemux = %s\n' "$OUT/cert.pem" "$OUT/key.pem" "$DEMUX")"
+  # The per-IP handshake rate limit defaults to 8 since 0.5.0 and is refused
+  # with `demux = false`: on the stock listener the handshake runs below
+  # accept(), where the limit cannot be enforced, and config validation says so
+  # rather than accepting a setting that would do nothing. The stock phase
+  # therefore has to turn it off explicitly.
+  #
+  # Without this the phase did not run at all and the script still reported
+  # "10 passed, 0 failed" — the silent-no-op outcome this file's own header
+  # calls the worst one a verification script can have.
+  DTLS_RATE=$([ "$DEMUX" = "true" ] && echo 8 || echo 0)
+  gen_config "$(printf '[turn.dtls]\nenabled = true\nlisten = "0.0.0.0:5350"\ncert_path = "%s"\nkey_path = "%s"\ndemux = %s\nmax_handshakes_per_sec_per_ip = %s\n' "$OUT/cert.pem" "$OUT/key.pem" "$DEMUX" "$DTLS_RATE")"
   if start_node "dtls-$DEMUX"; then
     run "DTLS allocation + media (demux = $DEMUX)" "dtls-$DEMUX" \
       "$LOAD" --server 127.0.0.1:5350 --secret "$SECRET" dtls-check

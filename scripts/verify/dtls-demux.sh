@@ -138,9 +138,6 @@ max_handshakes_per_sec_per_ip = $HANDSHAKE_LIMIT
 handshake_burst_per_ip = $HANDSHAKE_LIMIT
 [health]
 listen = "127.0.0.1:$HEALTH_PORT"
-[signaling]
-listen             = "127.0.0.1:$SIGNALING_PORT"
-turn_shared_secret = "$SECRET"
 EOF
 
 NODE_PID=""
