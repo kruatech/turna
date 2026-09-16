@@ -660,7 +660,13 @@ impl QuicServer {
                 stats
                     .retries_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                incoming.retry();
+                // quinn's retry returns a Result; wtransport's, on the WebTransport
+                // path below, does not. A failure means the datagram could not be
+                // sent — the client retransmits its Initial and gets another Retry,
+                // the same recovery as a reply lost in the network.
+                if let Err(e) = incoming.retry() {
+                    tracing::debug!(%e, "could not send QUIC Retry");
+                }
                 continue;
             }
 
