@@ -688,7 +688,11 @@ pub(crate) fn load_certificate(
                 error = %e,
                 cert = %cert_path,
                 key = %key_path,
-                "DTLS operator certificate configured but failed to load; refusing to start. \
+                // "refusing to start" is wrong on the reload path, where the node is
+                // already running and keeps the previous certificate. Said once at
+                // startup and again every `cert_reload_secs`, it told an operator
+                // watching a rotation that their node had failed to start.
+                "DTLS operator certificate configured but failed to load. \
                  The key must be PKCS#8 ECDSA P-256 (`PRIVATE KEY`, not `EC PRIVATE KEY`); \
                  convert with `openssl pkcs8 -topk8 -nocrypt -in key.pem -out key.pk8.pem`."
             );
@@ -735,7 +739,33 @@ fn load_operator_certificate(
         turna_dtls::crypto::Certificate::from_pem(&combined)
     }));
     match parsed {
-        Ok(Ok(cert)) => Ok(cert),
+        Ok(Ok(cert)) => {
+            // `from_pem` parses an RSA key happily; `validate_config` then
+            // refuses it at handshake time with "invalid private key type",
+            // because the DTLS server side accepts only Ed25519 and ECDSA P-256.
+            //
+            // Without this check a hot-reload of an RSA pair reported success —
+            // `cert_reloads_total` incremented, the audit log recorded
+            // "reloaded" — and every subsequent handshake failed. An operator
+            // rotating a certificate would see a green counter and a dead
+            // listener. Measured, not hypothesised: it is what happened during
+            // the 2026-09-16 verification run.
+            //
+            // The same predicate as `validate_config`, deliberately: a second,
+            // independently written check would drift from it on the next
+            // upgrade and put the silent failure back.
+            use turna_dtls::crypto::CryptoPrivateKeyKind;
+            match cert.private_key.kind {
+                CryptoPrivateKeyKind::Ed25519(_) | CryptoPrivateKeyKind::Ecdsa256(_) => Ok(cert),
+                _ => Err(DtlsError::Other(
+                    "private key is not Ed25519 or ECDSA P-256; the DTLS server side \
+                     accepts only those, and an RSA key parses but fails every \
+                     handshake. Generate one with `openssl ecparam -name prime256v1 \
+                     -genkey -noout | openssl pkcs8 -topk8 -nocrypt`"
+                        .to_owned(),
+                )),
+            }
+        }
         Ok(Err(e)) => Err(DtlsError::Other(format!("from_pem: {e}"))),
         Err(_) => Err(DtlsError::Other(
             "from_pem panicked (key likely not PKCS#8; convert with `openssl pkcs8 -topk8`)"

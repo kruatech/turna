@@ -170,15 +170,22 @@ pub fn spawn_dtls(
         });
     }
 
-    // DTLS has no certificate hot-reload: webrtc-dtls takes its `Config` at
-    // `listen()`, and swapping material would mean rebinding the UDP socket and
-    // dropping every live session. The operator trap is that rotating the cert
-    // (ACME renewal) then does *nothing* with no signal at all — the listener
-    // keeps serving the old certificate until the process restarts. Watch the
-    // files and say so loudly; TURNS (tcp_tls) does reload, DTLS cannot.
+    // Whether a certificate change is picked up depends on which path is
+    // running, and the two need opposite things said about them.
+    //
+    // The demultiplexer rebuilds its DTLS config per handshake and does reload
+    // — verified on the wire on 2026-09-16: a replaced certificate reached the
+    // next client within `cert_reload_secs`, and a broken file left the
+    // previous one in service. The stock listener takes its `Config` at
+    // `listen()`, so a rotation there does nothing until the process restarts,
+    // and that silence is the operator trap worth warning about.
+    //
+    // This block said the second thing about both, which meant it told
+    // operators to restart a node that had already picked the change up.
     if !cfg.cert_path.as_os_str().is_empty() && !cfg.key_path.as_os_str().is_empty() {
         let cert_path = cfg.cert_path.clone();
         let key_path = cfg.key_path.clone();
+        let demux = cfg.demux;
         tokio::spawn(async move {
             let mtime =
                 |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
@@ -193,14 +200,31 @@ pub fn spawn_dtls(
                 if new_cert != cert_mt || new_key != key_mt {
                     cert_mt = new_cert;
                     key_mt = new_key;
-                    tracing::warn!(
-                        cert = %cert_path.display(),
-                        key = %key_path.display(),
-                        "DTLS certificate material changed on disk but DTLS cannot \
-                         hot-reload it (webrtc-dtls fixes its config at listen time). \
-                         The listener is still serving the OLD certificate — restart \
-                         the node to pick up the new one."
-                    );
+                    // Only the stock listener is stuck with its startup config.
+                    //
+                    // The demultiplexer rebuilds the DTLS config per handshake and
+                    // does reload — verified on the wire: a replaced certificate is
+                    // served to the next client within `cert_reload_secs`, and a
+                    // broken file leaves the previous one in service. This warning
+                    // predates that and contradicted it, telling operators to
+                    // restart a node that had already picked the change up.
+                    if demux {
+                        tracing::debug!(
+                            cert = %cert_path.display(),
+                            key = %key_path.display(),
+                            "DTLS certificate material changed on disk; the \
+                             demultiplexer will use it for new handshakes"
+                        );
+                    } else {
+                        tracing::warn!(
+                            cert = %cert_path.display(),
+                            key = %key_path.display(),
+                            "DTLS certificate material changed on disk but the stock \
+                             listener fixes its config at listen time. It is still \
+                             serving the OLD certificate — restart the node, or set \
+                             [turn.dtls] demux = true, which reloads without one."
+                        );
+                    }
                 }
             }
         });
