@@ -43,6 +43,12 @@ mod quic_client;
 mod tcp_relay_client;
 #[cfg(feature = "tls")]
 mod tls_client;
+#[cfg(any(
+    feature = "quic",
+    feature = "web-transport",
+    all(feature = "sctp", target_os = "linux")
+))]
+mod transport_probe;
 #[cfg(feature = "web-transport")]
 mod wt_client;
 use turn_client::{Creds, FAMILY_V4, FAMILY_V6};
@@ -116,6 +122,32 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Mode {
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    TransportNetwork {
+        #[arg(long)]
+        transport: String,
+        #[arg(long, default_value = "127.0.0.1:39001")]
+        peer: SocketAddr,
+        #[arg(long, default_value_t = 10)]
+        pps: u64,
+    },
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    TransportProbe {
+        #[arg(long)]
+        transport: String,
+        #[arg(long, default_value = "hold")]
+        action: String,
+        #[arg(long, default_value_t = 0)]
+        hold_secs: u64,
+    },
     /// Establish N allocations, drop them all at once, and re-establish them
     /// simultaneously — a link flap or a node loss, from the server's side.
     ///
@@ -357,6 +389,12 @@ enum Mode {
 impl Mode {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(any(
+                feature = "quic",
+                feature = "web-transport",
+                all(feature = "sctp", target_os = "linux")
+            ))]
+            Mode::TransportProbe { .. } | Mode::TransportNetwork { .. } => "transport-probe",
             #[cfg(all(feature = "sctp", target_os = "linux"))]
             Mode::SctpCheck => "sctp-check",
             #[cfg(all(feature = "sctp", target_os = "linux"))]
@@ -1327,6 +1365,54 @@ async fn main() {
         }
     };
 
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    if let Mode::TransportNetwork {
+        transport,
+        peer,
+        pps,
+    } = &cli.mode
+    {
+        let result = tokio::time::timeout(
+            Duration::from_secs(cli.duration.saturating_add(30)),
+            transport_probe::network(transport, cli.server, &creds, *peer, cli.duration, *pps),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => std::process::exit(0),
+            other => {
+                eprintln!("transport-network failed: {other:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    if let Mode::TransportProbe {
+        transport,
+        action,
+        hold_secs,
+    } = &cli.mode
+    {
+        let result = tokio::time::timeout(
+            Duration::from_secs(hold_secs.saturating_add(25)),
+            transport_probe::run(transport, cli.server, &creds, action, *hold_secs),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => std::process::exit(0),
+            other => {
+                eprintln!("transport-probe failed: {other:?}");
+                std::process::exit(1);
+            }
+        }
+    }
     #[cfg(all(feature = "sctp", target_os = "linux"))]
     if let Mode::SctpCheck = &cli.mode {
         match sctp_client::check(cli.server, &creds, cli.rtt_timeout_ms).await {
@@ -1578,6 +1664,14 @@ async fn main() {
                 cli.rtt_timeout_ms,
             )
             .await
+        }
+        #[cfg(any(
+            feature = "quic",
+            feature = "web-transport",
+            all(feature = "sctp", target_os = "linux")
+        ))]
+        Mode::TransportProbe { .. } | Mode::TransportNetwork { .. } => {
+            unreachable!("handled above")
         }
         #[cfg(all(feature = "sctp", target_os = "linux"))]
         Mode::SctpCheck => unreachable!("handled above"),

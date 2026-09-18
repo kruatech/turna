@@ -1,6 +1,6 @@
 # Design: QUIC / WebTransport transport
 
-Status: **implemented, experimental.** Two paths ship behind Cargo features:
+Status: **supported on Linux/macOS with tokio.** Two paths ship behind Cargo features:
 raw QUIC (`quic`) and WebTransport-over-HTTP/3 (`web-transport`, which implies
 `quic`). Selected at runtime with `[turn.quic] web_transport`.
 
@@ -131,19 +131,12 @@ quic = ["dep:quinn", "dep:wtransport", "dep:rustls", "dep:rustls-pemfile"]
 
 ### Also implemented on the WebTransport path (wtransport 0.7)
 
-- **Part of `[turn.quic]` is applied**: listen address, identity, `keep_alive`,
-  the session caps, and `cert_reload_secs`. The *transport* limits
-  (`max_bi_streams`, `max_uni_streams`, `enable_datagrams`,
-  `max_datagram_size`, `idle_timeout_secs`) are **not** — reaching the underlying
-  `quinn::ServerConfig` needs `ServerConfig::quic_config_mut()`, which wtransport
-  keeps behind its quinn re-export and is not in scope in this build. The
-  listener warns at startup naming exactly those keys, so the config never looks
-  effective when it isn't. `alpn` is inert by design (wtransport negotiates `h3`).
-  See `TODO(quic-wt-limits)` in `crates/transport/src/quic.rs`.
+- **Transport limits are applied on both paths** through quinn configuration.
+  WebTransport uses `h3` ALPN; the configurable raw QUIC ALPN does not override it.
 - **Pre-handshake admission control.** `IncomingSession` exposes
   `remote_address()` and `refuse()`, so `max_sessions` / `max_sessions_per_ip`
   are enforced *before* the QUIC/H3 handshake — cheaper and more useful against
-  abuse than the raw path, which can only check post-handshake.
+  abuse. The raw path also reserves admission before the handshake.
 - **Per-stream control replies.** Every accepted bidi stream's send half is
   retained under a per-session stream key, so a response goes back on the stream
   its request arrived on (previously only the first stream was kept, and every
@@ -174,10 +167,12 @@ quic = ["dep:quinn", "dep:wtransport", "dep:rustls", "dep:rustls-pemfile"]
   `max_sessions_per_ip` alone left open: a source cycling sessions never reaches
   a concurrency cap.
 
-### Missing / known gaps
+### Support scope and limitations
 
 1. **`alpn` is inert on the WebTransport path** (wtransport forces `h3`).
-2. **No loopback or browser interop test yet** — §5 remains the plan.
+2. Both paths are supported within the [recorded scope](../verification/quic-webtransport-supported-2026-09-18.md).
+   Browser interoperability is recorded for tested Chrome versions; raw QUIC
+   independent TURN-client interoperability is not established.
 
 Closed: the transport limits *are* applied on the WebTransport path. The
 wtransport dependency now enables its `quinn` feature, which exposes
@@ -187,6 +182,5 @@ same re-export would also give back the real on-wire stream ids — the opaque
 per-session counter is kept deliberately, since routing needs a stable key rather
 than the QUIC index.
 
-Note on `--all-features`: `web-transport` pulls wtransport's own bundled quinn,
-which can conflict with the standalone `quinn` dependency. Build the two QUIC
-features separately when diagnosing.
+The `quic` and `web-transport` features can be built together, as in the
+transport verification builds. This is not a claim about unrelated optional backends.

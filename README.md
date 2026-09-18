@@ -28,8 +28,8 @@ This is software other people install on machines we have never seen, so a statu
 to say what was verified and where — a bare "supported" would promise something no
 project in this position can deliver.
 
-- **Supported** — verified end to end, and its behaviour does not depend on the
-  kernel or the hardware underneath. UDP TURN/STUN on the tokio datapath, long-term
+- **Supported** — maintained and verified end to end within the documented
+  platform, backend and protocol scope. UDP TURN/STUN on the tokio datapath, long-term
   credentials and the Tarantool backend are here: three hours under load with no
   leak, 13.7 M allocations, 441 M packets
   ([docs/soak/endurance-2026-08-19.md](docs/soak/endurance-2026-08-19.md)).
@@ -52,22 +52,11 @@ project in this position can deliver.
   [docs/interop/](docs/interop/) and [docs/soak/](docs/soak/), with the exact
   configurations named.
 
-- **Beta, no independent implementation** — **QUIC only.** It carries a TURN
-  allocation and relays media in both directions, but the client that proved it was
-  written here, against the same reading of the spec as the server, so a shared
-  misreading stays invisible. That is correctness evidence, not interop evidence.
-
-  QUIC is alone here for a structural reason: no RFC defines TURN over raw QUIC, so
-  there is no second implementation to test against and none can be written from a
-  specification that does not exist. The path out is a draft and someone else's
-  implementation, not more testing — see
-  [docs/OPEN-DECISIONS.md](docs/OPEN-DECISIONS.md).
-
-  Everything else has left this group. TURNS: three browser engines. WebTransport: a
-  TURN client written in browser JavaScript, assembling every STUN byte and its own MD5
-  and HMAC. DTLS, UDP, IPv6 and RFC 6062: coturn's `turnutils_uclient`, another
-  language and another reading of the RFC
-  ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)).
+- **Supported QUIC and WebTransport** — opt-in on Linux/macOS with the tokio backend.
+  These are project-specific TURN mappings, not standardized TURN transport URIs.
+  Raw QUIC has no independent TURN-client interoperability evidence; WebTransport
+  has browser evidence for tested Chrome versions. DATAGRAM media remains
+  unreliable. [Support scope and verification](docs/verification/quic-webtransport-supported-2026-09-18.md).
 
 - **Supported on Linux — TURN-over-SCTP (`sctp`).** Opt-in native SCTP on the
   tokio backend, allowed with `production = true`. Carries TURN control and
@@ -299,8 +288,8 @@ per-feature production maturity always check
 | Session migration | RFC 8016 | Partial — tickets are issued and re-issued on the tokio datapath; cross-node migration is **unwired** (no allocation is transferred between nodes), treat as same-node |
 | TLS-over-TCP transport (`tls`) | — | **Supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, and 24 h under load ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)) |
 | DTLS transport (`dtls`) | RFC 7350 | Supported — 24 h under load with zero packet loss, a 300 000-packet spoofed-source flood that allocates no state, 20/20 handshakes at 3 % path loss, and interop with OpenSSL and coturn's client ([docs/interop/dtls-stack-2026-09-16.md](docs/interop/dtls-stack-2026-09-16.md)). Not reachable from a browser: WebRTC has no DTLS transport for TURN |
-| QUIC transport (`quic`) | — | Beta — allocation, relayed media both directions and 20 min under load, but **no independent implementation exists** (no RFC defines TURN over raw QUIC), so interop cannot be obtained |
-| WebTransport (`web-transport`) | — | Beta — browser interop recorded ([docs/interop/webtransport-browser-2026-08-20.md](docs/interop/webtransport-browser-2026-08-20.md)) plus 20 min under load |
+| QUIC (`quic`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
+| WebTransport (`web-transport`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
 | TURN-over-SCTP transport (`sctp`) | Project-specific TURN mapping | **Supported on Linux/tokio**, opt-in, allowed in production. Native SCTP without TLS; control and ChannelData, UDP relay. [Evidence](docs/verification/sctp-supported-2026-09-18.md) |
 | Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
 | NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |

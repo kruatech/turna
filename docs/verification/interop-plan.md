@@ -177,6 +177,10 @@ allows the default to flip.
 
 ### 6. QUIC / WebTransport
 
+Current status: **supported** on Linux/macOS with tokio; see
+[the support record](quic-webtransport-supported-2026-09-18.md). The account below
+describes earlier verification work, not outstanding blockers.
+
 No interop test had ever been recorded for either path, and the stated reason was
 that no off-the-shelf TURN-over-QUIC client exists. True, and not a reason to stop:
 the wire format inside a QUIC bidi stream is the same length-delimited STUN that

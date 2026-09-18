@@ -47,7 +47,7 @@ Status legend: ✅ shipped · 🚧 implemented/experimental · 📋 planned.
 | Cluster redirect/gossip | 🚧 | Implemented path; secure gossip with `cluster_secret`. |
 | TURNS / TCP/TLS | 🚧 | Feature-dependent and less exercised than UDP. |
 | DTLS | 🚧 | Optional feature; validate with your clients. |
-| QUIC/WebTransport | 🚧 | Optional/experimental. |
+| QUIC/WebTransport | Supported | Opt-in, Linux/macOS with tokio; project-specific TURN mappings. See [support scope](verification/quic-webtransport-supported-2026-09-18.md). |
 | io_uring | 🚧 | Experimental datapath; not recommended as default production path. |
 | AF_XDP | 🚧 | Explicit opt-in Linux/NIC-specific backend. |
 | OAuth RFC 7635 | 📋 | Not implemented. |

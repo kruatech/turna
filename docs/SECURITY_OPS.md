@@ -70,7 +70,7 @@ ever added, gate the auto-admin promotion behind an explicit one-time
 bootstrap token/flag before wiring it.
 
 ### 2.4 Experimental transports and B6 scope
-The bounded-queue fix (B6) matters only when the experimental `quic` /
+The bounded-queue fix (B6) matters only when the opt-in `quic` /
 `web-transport` / `af-xdp` features are compiled in. In the default production
 profile these are off. Queue caps (1024) and the AF_XDP neighbor-resolve
 drop-on-miss are safe defaults; revisit them if you enable these transports at

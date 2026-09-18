@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Promote QUIC and WebTransport to supported within the Linux/macOS tokio
+  scope. Reconcile configuration, operations and support documentation with the
+  implemented limits, routing, cleanup and recorded verification. Keep WAN loss,
+  project-specific mappings and unverified multi-day endurance explicit; see
+  `docs/verification/quic-webtransport-supported-2026-09-18.md`.
+
 - Promote native TURN-over-SCTP to **supported on Linux/tokio**, opt-in. Lift the
   production refusal while retaining platform/feature/framing validation; reject
   backend selections that do not start the SCTP listener. The channel remains

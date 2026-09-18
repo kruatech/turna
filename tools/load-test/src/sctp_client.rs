@@ -343,3 +343,71 @@ pub async fn load(
     }
     stats
 }
+
+impl crate::transport_probe::Session for Session {
+    async fn bind_peer(&mut self, peer: SocketAddr) -> Result<(), String> {
+        self.refresh(peer).await
+    }
+    async fn send_media(&mut self, payload: &[u8]) -> Result<(), String> {
+        self.send(payload).await
+    }
+    async fn receive_media(&mut self) -> Result<Vec<u8>, String> {
+        loop {
+            if let Some(m) = next_stream_message(&mut self.buf) {
+                return Ok(m);
+            }
+            let mut buf = [0u8; 4096];
+            let n = self
+                .stream
+                .read(&mut buf)
+                .await
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("SCTP media EOF".into());
+            }
+            self.buf.extend_from_slice(&buf[..n]);
+        }
+    }
+    fn pressure_packet(&self) -> Vec<u8> {
+        let mut m = Msg::request(M_REFRESH);
+        m.add_lifetime(600);
+        m.add_username(&self.user);
+        m.add_realm(&self.realm);
+        m.add_nonce(&self.nonce);
+        m.encode_with_integrity(&self.key)
+    }
+    async fn write_control(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.stream
+            .write_all(bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn close_probe(&mut self) -> Result<(), String> {
+        self.close().await
+    }
+}
+pub async fn run_probe(
+    server: SocketAddr,
+    creds: &Creds,
+    action: &str,
+    hold: u64,
+) -> Result<(), String> {
+    let session = Session::connect(server, creds, 3000).await?;
+    socket2::SockRef::from(&session.stream)
+        .set_recv_buffer_size(4096)
+        .map_err(|e| e.to_string())?;
+    let relay = session.relayed;
+    crate::transport_probe::exercise(session, relay, action, hold).await
+}
+
+/// Cross-host media probe; echo peer runs on the TURN server host.
+pub async fn run_network(
+    server: SocketAddr,
+    creds: &Creds,
+    peer: SocketAddr,
+    seconds: u64,
+    pps: u64,
+) -> Result<(), String> {
+    let session = Session::connect(server, creds, 5000).await?;
+    crate::transport_probe::network_session(session, peer, seconds, pps).await
+}

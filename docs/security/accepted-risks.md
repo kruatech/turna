@@ -4,7 +4,7 @@ Security/maintenance risks consciously accepted for the current release, with
 their compensating controls and a review point. This is a living register;
 each entry is revisited at the version named under "Review by".
 
-## RISK-001 — `rustls-pemfile` reachable only via the experimental `web-transport` feature
+## RISK-001 — `rustls-pemfile` reachable only via the opt-in `web-transport` feature
 
 - **Status:** **resolved** — `rustls-pemfile` is no longer in the dependency graph
   at all, including with `--features web-transport`
@@ -15,7 +15,7 @@ each entry is revisited at the version named under "Review by".
 - **Why it stays:** the direct dependency was removed — `turna-transport` now
   parses PEM via `rustls-pki-types` under the `tls`/`quic` features. The only
   remaining occurrence is transitive, through `wtransport` under the
-  experimental `web-transport` feature. `wtransport 0.6.1` still depended on it, so
+  opt-in `web-transport` feature. `wtransport 0.6.1` still depended on it, so
   no dependency bump removed it at the time; the workspace has since moved to
   `wtransport 0.7.1`, which does not.
 - **Compensating controls:** `cargo deny check advisories` is green because the

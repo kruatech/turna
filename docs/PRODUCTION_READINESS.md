@@ -83,7 +83,7 @@ Production checklist:
 | Third-party auth (RFC 7635 OAuth) | **Refused in production** | Same gate on `[turn.auth.oauth].enabled`. |
 | IPv6 relayed transport | Opt-in, verified | Set `[turn] external_ip6` to a routable IPv6 address. Unset (default) keeps the old behaviour: IPv6 Allocate → `440`. Relayed media verified between two **routable** global v6 addresses with the peer filter in its `lan` profile and no loopback concession (`docs/interop/relayed-media-2026-08-19.md`), plus interop against coturn's client (`docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. |
 | DTLS | Beta, optional feature | Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics, bounded accept (`accept_timeout_secs`). On the **default** path pre-handshake rate limiting is still missing — do not expose to an untrusted internet without upstream rate limiting. `[turn.dtls] demux = true` adds it, plus concurrent handshakes and certificate hot-reload, but is itself unverified. |
-| QUIC / WebTransport | Optional feature | Both **beta**. Raw QUIC: allocation, relayed media both directions and 20 min under load at zero loss — but **no independent implementation exists**, because no RFC defines TURN over raw QUIC, so interop cannot be obtained from anyone. WebTransport: browser interop on record (Chrome 151 against a real certificate, `docs/interop/webtransport-browser-2026-08-20.md`) plus 20 min under load. The full `[turn.quic]` config applies on both paths. WebTransport residual — no client has exercised it. Neither has relayed-media evidence. |
+| QUIC / WebTransport | Optional features; supported on Linux/macOS with tokio | Project-specific TURN mappings. Functional, lifecycle/limits, 20-minute load and WAN checks recorded; WebTransport also has Chrome browser evidence. DATAGRAM delivery is unreliable. No multi-day endurance or independent raw-QUIC TURN interoperability claim. See [support record](verification/quic-webtransport-supported-2026-09-18.md). |
 | io_uring | Optional backend | Usable in production when explicitly enabled, on a kernel you have tested. Endurance and relaying are both on record (`docs/soak/endurance-2026-08-19.md`, Ubuntu 24.04 / 6.14): no leak over 3 h, ~4× tokio's Allocate throughput, ChannelData relayed at ~17 000 rps with zero errors. Costs ~1 GiB resident (pre-registered buffers). Not the default recommendation: io_uring behaviour is kernel-version-sensitive, so verify on yours before relying on it. |
 | AF_XDP | Explicit opt-in backend | Never auto-selected. Correctness verified on a veth lab (`docs/interop/af-xdp-2026-08-19.md`): relayed media at three rates with zero loss after fixing an RX frame leak. Still needs a run on the target NIC — the lab attaches in SKB mode, which copies every frame and reproduces none of the kernel-bypass behaviour that AF_XDP is for. |
 | Cluster redirect/gossip | Implemented path | Useful for new-client distribution; secure gossip with `cluster_secret`. |
@@ -211,11 +211,11 @@ Known residual gaps, per transport:
   - **DTLS — beta with interop.** Allocation and media on both listener paths,
     20 min under load, and agreement with coturn's client
     (`docs/interop/coturn-2026-08-23.md`) — an implementation nobody here wrote.
-  - **WebTransport — beta with interop.** A browser drives it, with its own H3
-    stack and hand-written STUN.
-  - **QUIC — beta, and it stops there.** Correctness and endurance are recorded,
-    but no RFC defines TURN over raw QUIC, so no second implementation exists and
-    none can be written. This is not a testing gap.
+  - **WebTransport — supported.** Browser and transport verification within the
+    scope in [the support record](verification/quic-webtransport-supported-2026-09-18.md).
+  - **QUIC — supported.** Maintained project-specific TURN mapping. Independent
+    raw-QUIC TURN interoperability is not established; this is an explicit scope
+    limitation, not a claim that another implementation cannot be written.
 
   The gate is `docs/verification/encrypted-transports.md`; operator response for
   the alerts is `docs/runbooks/encrypted-transports.md`.
@@ -484,8 +484,8 @@ authoritative per-feature register is `docs/protocol-gap.md`.
 |---|---|
 | `io_uring` datapath | Beta — endurance and relaying recorded on kernels **6.8 and 6.14**; version-sensitive, verify on yours (R2) |
 | `AF_XDP` datapath | Beta (lab-verified) (R3) — correctness on a veth lab: relayed media at three rates with zero loss, ARP/NDP answered by the datapath itself. The XDP program is embedded and attached by the node (no external program), and the v6 frame path is implemented. **Not a capacity result**: veth attaches in SKB mode, which copies every frame. Validate on your NIC. |
-| QUIC (raw) | Beta — interop recorded including relayed media both directions (R4) |
-| WebTransport (H3) | Beta — browser interop (Chrome 151, real certificate) **and** 20 min under load at zero loss (R4) |
+| QUIC (`quic`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
+| WebTransport (`web-transport`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
 | TURNS | **Supported** — three-engine interop, public certificate chain, coturn interop, 24 h under load (R4) |
 | DTLS | Beta — allocation and media on both listener paths, 20 min under load, **and interop against coturn's client** (R4) |
 | DTLS demux (`demux = true`) | Opt-in, no evidence yet — concurrent handshakes, pre-handshake admission, rate limit, cert reload |
