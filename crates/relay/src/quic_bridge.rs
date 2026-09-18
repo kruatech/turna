@@ -35,6 +35,7 @@ use turna_transport::quic::QuicEvent;
 #[derive(Default)]
 pub struct StreamFramer {
     buf: Vec<u8>,
+    failed: bool,
 }
 
 /// Hard ceiling on buffered stream bytes. One logical message is at most
@@ -50,6 +51,9 @@ impl StreamFramer {
 
     /// Append freshly-received stream bytes.
     pub fn push(&mut self, data: &[u8]) {
+        if self.failed {
+            return;
+        }
         if self.buf.len().saturating_add(data.len()) > MAX_FRAMER_BUFFER {
             tracing::warn!(
                 buffered = self.buf.len(),
@@ -58,6 +62,7 @@ impl StreamFramer {
                 "QUIC stream framer buffer limit exceeded; discarding buffer (desynchronised stream)"
             );
             self.buf.clear();
+            self.failed = true;
             return;
         }
         self.buf.extend_from_slice(data);
@@ -68,8 +73,8 @@ impl StreamFramer {
     /// wire but excluded from the returned message (so the processor sees the
     /// same bytes it would off UDP).
     pub fn next_message(&mut self) -> Option<Vec<u8>> {
-        loop {
-            if self.buf.len() < 4 {
+        {
+            if self.failed || self.buf.len() < 4 {
                 return None;
             }
             let b0 = self.buf[0];
@@ -79,30 +84,36 @@ impl StreamFramer {
             // 0x000..0x3FFF). ChannelData: channel number 0x4000..0x7FFF, i.e.
             // first byte 0x40..=0x7F.
             let (wire_len, logical_len) = if b0 & 0xC0 == 0x00 {
+                if !len.is_multiple_of(4)
+                    || (self.buf.len() >= 8 && self.buf[4..8] != [0x21, 0x12, 0xa4, 0x42])
+                {
+                    self.failed = true;
+                    self.buf.clear();
+                    return None;
+                }
                 let total = 20 + len;
                 (total, total)
             } else if (0x40..=0x7f).contains(&b0) {
                 let pad = (4 - (len % 4)) % 4;
                 (4 + len + pad, 4 + len)
             } else {
-                // Unknown leading byte — resync by dropping one byte. Defensive;
-                // a well-behaved client never hits this.
-                self.buf.drain(0..1);
-                continue;
+                self.failed = true;
+                self.buf.clear();
+                return None;
             };
 
             if self.buf.len() < wire_len {
                 return None;
             }
             let msg: Vec<u8> = self.buf.drain(0..wire_len).collect();
-            return Some(msg[..logical_len].to_vec());
+            Some(msg[..logical_len].to_vec())
         }
     }
 }
 
 struct SessionCtx {
     remote: SocketAddr,
-    framer: StreamFramer,
+    framers: HashMap<u64, StreamFramer>,
     /// Bidi stream the session's most recent control message arrived on, so a
     /// response goes back on that stream rather than whichever one the client
     /// happened to open first.
@@ -110,7 +121,7 @@ struct SessionCtx {
 }
 
 /// Bridges `QuicEvent`s into the processor. Tracks per-session remote address
-/// (needed as the `src` for `process_slice`) and a per-session stream framer.
+/// (needed as the `src` for `process_slice`) and a separate framer for each stream.
 pub struct QuicBridge {
     processor: Arc<PacketProcessor>,
     sessions: HashMap<String, SessionCtx>,
@@ -118,6 +129,7 @@ pub struct QuicBridge {
     /// packet needs this lookup, and scanning the session map for each one was
     /// O(sessions) on the egress hot path.
     by_addr: HashMap<SocketAddr, String>,
+    failed_sessions: Vec<String>,
 }
 
 impl QuicBridge {
@@ -126,7 +138,12 @@ impl QuicBridge {
             processor,
             sessions: HashMap::new(),
             by_addr: HashMap::new(),
+            failed_sessions: Vec::new(),
         }
+    }
+
+    pub fn take_failed_sessions(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.failed_sessions)
     }
 
     /// Resolve which live session an outbound `Action`'s target belongs to, so a
@@ -144,12 +161,31 @@ impl QuicBridge {
 
     /// Re-key a session after a QUIC connection migration (the client's address
     /// changed but the connection survived).
-    pub fn migrate(&mut self, session_id: &str, old_addr: SocketAddr, new_addr: SocketAddr) {
-        if let Some(ctx) = self.sessions.get_mut(session_id) {
-            ctx.remote = new_addr;
+    pub fn migrate(
+        &mut self,
+        session_id: &str,
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+    ) -> bool {
+        let Some(ctx) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        if ctx.remote != old_addr
+            || self
+                .by_addr
+                .get(&new_addr)
+                .is_some_and(|id| id != session_id)
+            || self
+                .processor
+                .migrate_quic_allocation(old_addr, new_addr)
+                .is_err()
+        {
+            return false;
         }
+        ctx.remote = new_addr;
         self.by_addr.remove(&old_addr);
         self.by_addr.insert(new_addr, session_id.to_string());
+        true
     }
 
     /// Feed one `QuicEvent`. Returns the `Action`s the caller must deliver back
@@ -164,7 +200,7 @@ impl QuicBridge {
                     s.session_id.clone(),
                     SessionCtx {
                         remote: s.remote_addr,
-                        framer: StreamFramer::default(),
+                        framers: HashMap::new(),
                         last_stream: None,
                     },
                 );
@@ -199,14 +235,30 @@ impl QuicBridge {
                 if let Some(ctx) = self.sessions.get_mut(&session_id) {
                     // Remember which stream to answer on.
                     ctx.last_stream = Some(stream_id);
-                    ctx.framer.push(&data);
-                    while let Some(msg) = ctx.framer.next_message() {
+                    let framer = ctx.framers.entry(stream_id).or_default();
+                    framer.push(&data);
+                    while let Some(msg) = framer.next_message() {
                         // Owned message from the framer — see the `Datagram`
                         // arm for why `process_slice` must not be used here.
                         out.extend(processor.process_owned(msg, ctx.remote));
                     }
+                    if framer.failed {
+                        self.failed_sessions.push(session_id);
+                    }
                 }
                 out
+            }
+            QuicEvent::StreamReadClosed {
+                session_id,
+                stream_id,
+            } => {
+                if let Some(ctx) = self.sessions.get_mut(&session_id) {
+                    ctx.framers.remove(&stream_id);
+                    if ctx.last_stream == Some(stream_id) {
+                        ctx.last_stream = None;
+                    }
+                }
+                Vec::new()
             }
             // Migration is applied by the caller via `migrate()` (it also has to
             // re-key the shared client_sinks registry), so nothing to do here.
@@ -219,9 +271,152 @@ impl QuicBridge {
 mod tests {
     use super::*;
 
+    fn bridge_fixture() -> (QuicBridge, Arc<turna_session::AllocationStore>, SocketAddr) {
+        use turna_auth::{AuthMode, AuthRegistry};
+        let store = Arc::new(turna_session::AllocationStore::new(40000, 40100, 100));
+        let auth = Arc::new(AuthRegistry::new(AuthMode::SharedSecret {
+            realm: "turna".into(),
+            secret: std::env::var("TURNA_TEST_NONCE_SECRET")
+                .expect("source .env.test.example")
+                .into_bytes(),
+            previous: None,
+        }));
+        let processor = Arc::new(PacketProcessor::new(
+            store.clone(),
+            auth,
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(turna_health::Metrics::new()),
+        ));
+        let mut bridge = QuicBridge::new(processor);
+        let addr = "127.0.0.1:51000".parse().unwrap();
+        bridge.on_event(QuicEvent::NewSession(
+            turna_transport::quic::WebTransportSession {
+                session_id: "test".into(),
+                remote_addr: addr,
+                local_addr: "127.0.0.1:3479".parse().unwrap(),
+                connection_id: vec![],
+                datagrams_available: true,
+                alpn: "stun.turn".into(),
+                created_at: std::time::Instant::now(),
+            },
+        ));
+        (bridge, store, addr)
+    }
+
+    fn binding(id: u8) -> Vec<u8> {
+        let mut msg = vec![0; 20];
+        msg[1] = 1;
+        msg[4..8].copy_from_slice(&0x2112a442u32.to_be_bytes());
+        msg[8..20].fill(id);
+        msg
+    }
+
+    fn chunk(bridge: &mut QuicBridge, stream_id: u64, data: &[u8]) -> Vec<Action> {
+        bridge.on_event(QuicEvent::StreamData {
+            session_id: "test".into(),
+            stream_id,
+            data: data.to_vec(),
+        })
+    }
+
+    fn reply_tid(actions: Vec<Action>) -> Vec<u8> {
+        actions
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data[8..20].to_vec()),
+                _ => None,
+            })
+            .expect("Binding response")
+    }
+
+    #[test]
+    fn interleaved_streams_keep_frames_and_replies_separate() {
+        let (mut b, _, _) = bridge_fixture();
+        let a = binding(1);
+        let c = binding(2);
+        assert!(chunk(&mut b, 10, &a[..9]).is_empty());
+        assert_eq!(reply_tid(chunk(&mut b, 20, &c)), vec![2; 12]);
+        assert_eq!(b.control_stream_for("test"), Some(20));
+        assert_eq!(reply_tid(chunk(&mut b, 10, &a[9..])), vec![1; 12]);
+        assert_eq!(b.control_stream_for("test"), Some(10));
+    }
+
+    #[test]
+    fn stream_eof_discards_only_its_own_partial_frame() {
+        let (mut b, _, _) = bridge_fixture();
+        let msg = binding(3);
+        chunk(&mut b, 1, &msg[..8]);
+        chunk(&mut b, 2, &msg[..8]);
+        b.on_event(QuicEvent::StreamReadClosed {
+            session_id: "test".into(),
+            stream_id: 1,
+        });
+        assert!(!b.sessions["test"].framers.contains_key(&1));
+        assert_eq!(reply_tid(chunk(&mut b, 2, &msg[8..])), vec![3; 12]);
+    }
+
+    #[test]
+    fn migration_preserves_allocation_and_bidirectional_relay_indices() {
+        let (mut b, store, old) = bridge_fixture();
+        let new = "127.0.0.1:52000".parse().unwrap();
+        let relay = "127.0.0.1:40000".parse().unwrap();
+        let peer: SocketAddr = "8.8.8.8:9000".parse().unwrap();
+        store
+            .create(old, relay, "test".into(), vec![], 600)
+            .unwrap();
+        store.add_permission(&old, peer.ip()).unwrap();
+        store.add_channel(&old, 0x4000, peer).unwrap();
+        let id = store.get(&old).unwrap().allocation_id.clone();
+        assert!(b.migrate("test", old, new));
+        assert!(store.get(&old).is_none());
+        assert_eq!(store.get_by_id(&id), Some(new));
+        assert_eq!(store.get_by_relay(&relay), Some(new));
+        assert_eq!(store.get_by_channel(40000, 0x4000), Some(new));
+        assert_eq!(b.session_for_addr(new).as_deref(), Some("test"));
+        let actions = b.on_event(QuicEvent::Datagram {
+            session_id: "test".into(),
+            data: channel_data(4),
+        });
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::Forward { target, relay_port: 40000, .. } if *target == peer)
+        ));
+        b.processor.release_for_closed_connection(new);
+        assert!(store.get_by_id(&id).is_none());
+        assert!(store.get_by_relay(&relay).is_none());
+    }
+
+    #[test]
+    fn migration_collision_leaves_original_allocation_and_routing() {
+        let (mut b, store, old) = bridge_fixture();
+        let new = "127.0.0.1:52000".parse().unwrap();
+        let relay = "127.0.0.1:40000".parse().unwrap();
+        let other = "127.0.0.1:40001".parse().unwrap();
+        store
+            .create(old, relay, "first".into(), vec![], 600)
+            .unwrap();
+        store
+            .create(new, other, "second".into(), vec![], 600)
+            .unwrap();
+        assert!(!b.migrate("test", old, new));
+        assert_eq!(store.get_by_relay(&relay), Some(old));
+        assert_eq!(store.get_by_relay(&other), Some(new));
+        assert_eq!(b.session_for_addr(old).as_deref(), Some("test"));
+        assert!(b.session_for_addr(new).is_none());
+    }
+
+    #[test]
+    fn migration_before_allocate_and_stale_event() {
+        let (mut b, _, old) = bridge_fixture();
+        let new = "127.0.0.1:52000".parse().unwrap();
+        assert!(b.migrate("test", old, new));
+        assert!(!b.migrate("test", old, new));
+        assert_eq!(b.session_for_addr(new).as_deref(), Some("test"));
+    }
+
     fn stun_msg(body_len: usize) -> Vec<u8> {
         let mut m = vec![0u8; 20 + body_len];
         m[0] = 0x00; // top two bits 00 → STUN
+        m[4..8].copy_from_slice(&0x2112a442u32.to_be_bytes());
         m[2..4].copy_from_slice(&(body_len as u16).to_be_bytes());
         m
     }
@@ -310,22 +505,24 @@ mod tests {
     }
 
     #[test]
-    fn framer_recovers_after_buffer_reset() {
+    fn oversized_stream_is_terminal() {
         // After a reset the framer must still parse a fresh, well-formed message.
         let mut f = StreamFramer::default();
         f.push(&vec![0u8; MAX_FRAMER_BUFFER + 1]);
         let good = stun_msg(0);
         f.push(&good);
-        assert_eq!(f.next_message(), Some(good));
+        assert_eq!(f.next_message(), None);
+        assert!(f.failed);
     }
 
     #[test]
-    fn resyncs_past_a_garbage_leading_byte() {
+    fn garbage_stream_is_terminal() {
         let good = stun_msg(0);
         let mut wire = vec![0xFFu8]; // not STUN, not ChannelData
         wire.extend_from_slice(&good);
         let mut f = StreamFramer::default();
         f.push(&wire);
-        assert_eq!(f.next_message(), Some(good));
+        assert_eq!(f.next_message(), None);
+        assert!(f.failed);
     }
 }

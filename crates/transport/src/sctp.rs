@@ -20,8 +20,8 @@
 //! REQUIREMENTS: Linux with the `sctp` kernel module (lksctp) loaded; the
 //! `socket2` crate. Non-Linux targets have no SCTP here.
 //!
-//! Several socket-level specifics are marked `// VERIFY (on-repo):` — this is the
-//! highest-uncertainty module written without a compiler; expect to iterate.
+//! Uses independently polled reads and bounded writes. SCTP has no TCP-style
+//! half-close (RFC 6458 section 4.1.7); clients await replies before shutdown.
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -40,10 +40,11 @@ use tracing::{info, instrument, warn};
 
 use crate::tcp_tls::{TcpConnectionId, TcpFrameCodec, TcpSendCommand, TcpTransportEvent, TlsError};
 
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// IANA protocol number for SCTP (RFC 4960). socket2 may also expose
 /// `Protocol::SCTP` on some versions; the numeric form is used to avoid a
-/// version dependency. VERIFY (on-repo): `Protocol::from(IPPROTO_SCTP)` compiles
-/// with the pinned socket2; if not, use `Protocol::SCTP`.
+/// version dependency.
 const IPPROTO_SCTP: i32 = 132;
 
 #[derive(Debug, Error)]
@@ -215,8 +216,49 @@ impl SctpTransportServer {
         } else {
             Domain::IPV6
         };
-        // VERIFY (on-repo): SCTP one-to-one is SOCK_STREAM + IPPROTO_SCTP.
+        // Native SCTP one-to-one socket.
         let sock = Socket::new(domain, Type::STREAM, Some(Protocol::from(IPPROTO_SCTP)))?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // Linux accepted SCTP sockets inherit this setting from the listener.
+            // Avoid Nagle/delayed-SACK latency for small control and media frames.
+            let enabled: libc::c_int = 1;
+            // SAFETY: live SCTP socket, valid integer pointer and matching length.
+            let rc = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    IPPROTO_SCTP,
+                    libc::SCTP_NODELAY,
+                    &enabled as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&enabled) as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // This wire profile carries one ordered TURN byte stream. Negotiate
+            // one SCTP stream so records from different streams cannot interleave.
+            let init = libc::sctp_initmsg {
+                sinit_num_ostreams: 1,
+                sinit_max_instreams: 1,
+                sinit_max_attempts: 0,
+                sinit_max_init_timeo: 0,
+            };
+            // SAFETY: valid socket and correctly sized Linux SCTP_INITMSG value.
+            let rc = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    IPPROTO_SCTP,
+                    libc::SCTP_INITMSG,
+                    &init as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&init) as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
         sock.set_reuse_address(true)?;
         sock.set_nonblocking(true)?;
         sock.bind(&SockAddr::from(self.config.listen_addr))?;
@@ -254,6 +296,12 @@ impl SctpTransportServer {
         stats: Arc<SctpStats>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
+        if !cfg!(target_os = "linux") {
+            return Err(SctpError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "native SCTP requires Linux kernel SCTP support",
+            )));
+        }
         let listener = self.bind_listener()?;
         stats.listening.store(true, Relaxed);
         info!(
@@ -270,7 +318,13 @@ impl SctpTransportServer {
         let send_stats = stats.clone();
         tokio::spawn(async move {
             while let Some(cmd) = send_rx.recv().await {
-                let c = conns_send.read().await;
+                let mut c = conns_send.write().await;
+                // Empty data is the bridge's explicit close command; it is not
+                // a valid TURN message and is never written on the wire.
+                if cmd.data.is_empty() {
+                    c.remove(&cmd.conn_id);
+                    continue;
+                }
                 match c.get(&cmd.conn_id) {
                     // `try_send` rather than `send` on purpose: a blocked writer
                     // must not stall the shared command loop for every other
@@ -280,6 +334,9 @@ impl SctpTransportServer {
                     Some(tx) => {
                         if tx.try_send(cmd.data).is_err() {
                             send_stats.send_dropped.fetch_add(1, Relaxed);
+                            // A dropped control reply/FIN cannot be recovered by
+                            // continuing this byte stream. Close only this association.
+                            c.remove(&cmd.conn_id);
                         }
                     }
                     None => {
@@ -381,7 +438,7 @@ impl SctpTransportServer {
 
             {
                 let c = conns.read().await;
-                if c.len() >= self.config.max_connections {
+                if self.config.max_connections != 0 && c.len() >= self.config.max_connections {
                     stats.rejected_over_cap.fetch_add(1, Relaxed);
                     warn!(event = "peer_refused_max_connections", %peer, max = self.config.max_connections, "SCTP connection limit reached");
                     continue;
@@ -459,6 +516,7 @@ impl SctpTransportServer {
             });
         }
 
+        conns.write().await.clear();
         stats.listening.store(false, Relaxed);
         info!(
             event = "listener_draining",
@@ -472,7 +530,6 @@ impl SctpTransportServer {
 async fn recv_chunk(afd: &AsyncFd<Socket>, buf: &mut BytesMut) -> std::io::Result<usize> {
     loop {
         let mut guard = afd.readable().await?;
-        // VERIFY (on-repo): socket2 `recv` takes `&mut [MaybeUninit<u8>]`.
         let mut tmp: [MaybeUninit<u8>; 65536] = [MaybeUninit::uninit(); 65536];
         match guard.try_io(|inner| inner.get_ref().recv(&mut tmp)) {
             Ok(Ok(0)) => return Ok(0),
@@ -530,41 +587,193 @@ async fn handle_conn(
     let codec = TcpFrameCodec::new(cfg.max_frame_size);
     let mut buf = BytesMut::with_capacity(8192);
 
-    loop {
-        tokio::select! {
-            res = timeout(cfg.read_timeout, recv_chunk(&afd, &mut buf)) => {
-                match res {
-                    Ok(Ok(0)) => return Ok(()),
-                    Ok(Ok(n)) => {
-                        stats.bytes_rx.fetch_add(n as u64, Relaxed);
-                        while let Some(frame) = codec.decode(&mut buf)? {
-                            etx.send(TcpTransportEvent::PacketReceived {
-                                conn_id: id,
-                                peer_addr: peer,
-                                data: frame,
-                            })
-                            .await
-                            .map_err(|_| SctpError::Closed)?;
-                        }
+    let reader = async {
+        loop {
+            match timeout(cfg.read_timeout, recv_chunk(&afd, &mut buf)).await {
+                Ok(Ok(0)) => {
+                    if !buf.is_empty() {
+                        return Err(SctpError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "truncated SCTP TURN frame",
+                        )));
                     }
-                    Ok(Err(e)) => return Err(SctpError::Io(e)),
-                    Err(_) => {
-                        // Idle timeout. Counted rather than silent: a deployment
-                        // closing associations it thinks are alive should be able
-                        // to see it without reading logs.
-                        stats.idle_timeouts.fetch_add(1, Relaxed);
-                        return Ok(());
+                    return Ok(());
+                }
+                Ok(Ok(n)) => {
+                    stats.bytes_rx.fetch_add(n as u64, Relaxed);
+                    while let Some(frame) = codec.decode(&mut buf)? {
+                        etx.send(TcpTransportEvent::PacketReceived {
+                            conn_id: id,
+                            peer_addr: peer,
+                            data: frame,
+                        })
+                        .await
+                        .map_err(|_| SctpError::Closed)?;
                     }
                 }
+                Ok(Err(e)) => return Err(SctpError::Io(e)),
+                Err(_) => {
+                    stats.idle_timeouts.fetch_add(1, Relaxed);
+                    return Err(SctpError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "SCTP read idle timeout",
+                    )));
+                }
             }
-            Some(data) = send_rx.recv() => {
-                let mut out = BytesMut::with_capacity(data.len());
-                codec.encode(&data, &mut out)?;
-                send_all(&afd, &out).await?;
-                stats.bytes_tx.fetch_add(out.len() as u64, Relaxed);
-            }
-            else => break,
         }
+    };
+    let writer = async {
+        while let Some(data) = send_rx.recv().await {
+            let mut out = BytesMut::with_capacity(data.len() + 3);
+            codec.encode(&data, &mut out)?;
+            timeout(WRITE_TIMEOUT, send_all(&afd, &out))
+                .await
+                .map_err(|_| {
+                    SctpError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "SCTP write timeout",
+                    ))
+                })??;
+            stats.bytes_tx.fetch_add(out.len() as u64, Relaxed);
+        }
+        Ok::<(), SctpError>(())
+    };
+    tokio::pin!(reader, writer);
+    tokio::select! {
+        // SCTP shutdown closes the association, not a TCP-style half-close.
+        result = &mut reader => result,
+        result = &mut writer => result,
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Exercise the socket IO/framing machinery without requiring the SCTP kernel
+    // module in unit-test containers. Native SCTP is checked by sctp-check.
+    async fn pair() -> (tokio::net::TcpStream, Socket, SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let (server, peer) = server.unwrap();
+        (
+            client.unwrap(),
+            Socket::from(server.into_std().unwrap()),
+            peer,
+        )
+    }
+    fn request() -> Vec<u8> {
+        let mut b = vec![0; 20];
+        b[1] = 1;
+        b[4..8].copy_from_slice(&0x2112a442u32.to_be_bytes());
+        b
+    }
+    #[tokio::test]
+    async fn fragmented_frames_and_padded_reply() {
+        let (mut client, socket, peer) = pair().await;
+        let (events, mut rx) = mpsc::channel(8);
+        let (commands, send_rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            handle_conn(
+                TcpConnectionId::next(&AtomicU64::new(0)),
+                socket,
+                peer,
+                &SctpTransportConfig::default(),
+                events,
+                send_rx,
+                &SctpStats::default(),
+            )
+            .await
+        });
+        assert!(matches!(
+            rx.recv().await,
+            Some(TcpTransportEvent::ConnectionOpened { .. })
+        ));
+        let req = request();
+        client.write_all(&req[..9]).await.unwrap();
+        assert!(timeout(Duration::from_millis(20), rx.recv()).await.is_err());
+        client.write_all(&req[9..]).await.unwrap();
+        match timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            TcpTransportEvent::PacketReceived { data, .. } => assert_eq!(&data[..], &req),
+            other => panic!("unexpected event {other:?}"),
+        }
+        commands.send(vec![0x40, 0, 0, 1, 7]).await.unwrap();
+        let mut reply = [0; 8];
+        timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, [0x40, 0, 0, 1, 7, 0, 0, 0]);
+        drop(client);
+        assert!(task.await.unwrap().is_ok());
+    }
+    #[tokio::test]
+    async fn outgoing_traffic_does_not_reset_read_idle_timeout() {
+        let (_client, socket, peer) = pair().await;
+        let (events, _rx) = mpsc::channel(8);
+        let (commands, send_rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            let cfg = SctpTransportConfig {
+                read_timeout: Duration::from_millis(80),
+                ..Default::default()
+            };
+            let stats = SctpStats::default();
+            let _ = handle_conn(
+                TcpConnectionId::next(&AtomicU64::new(0)),
+                socket,
+                peer,
+                &cfg,
+                events,
+                send_rx,
+                &stats,
+            )
+            .await;
+            stats.idle_timeouts.load(Relaxed)
+        });
+        for _ in 0..3 {
+            commands.send(request()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            timeout(Duration::from_millis(80), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn malformed_frame_closes_only_its_connection() {
+        let (mut client, socket, peer) = pair().await;
+        let (events, _rx) = mpsc::channel(8);
+        let (_commands, send_rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            handle_conn(
+                TcpConnectionId::next(&AtomicU64::new(0)),
+                socket,
+                peer,
+                &SctpTransportConfig::default(),
+                events,
+                send_rx,
+                &SctpStats::default(),
+            )
+            .await
+        });
+        client.write_all(&[0xff, 0, 0, 0]).await.unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(SctpError::Framing(_))
+        ));
+    }
 }

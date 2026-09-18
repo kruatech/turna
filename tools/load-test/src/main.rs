@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand};
 use tokio::net::UdpSocket;
 use tokio::sync::Barrier;
 
+#[cfg(all(feature = "sctp", target_os = "linux"))]
+mod sctp_client;
 mod turn_client;
 // Framing and the test certificate verifier, shared by the stream transports.
 // Gated together with them: the TCP relay client used to keep the framer alive
@@ -28,7 +30,8 @@ mod turn_client;
     feature = "tls",
     feature = "quic",
     feature = "dtls",
-    feature = "web-transport"
+    feature = "web-transport",
+    all(feature = "sctp", target_os = "linux")
 ))]
 mod stream_common;
 // RFC 6062 runs over TURNS, so this needs the TLS stack like the others.
@@ -161,6 +164,17 @@ enum Mode {
         /// the attribute, and the `conformance` mode only checks the control plane.
         #[arg(long, default_value = "v4")]
         family: String,
+    },
+    #[cfg(all(feature = "sctp", target_os = "linux"))]
+    SctpCheck,
+    #[cfg(all(feature = "sctp", target_os = "linux"))]
+    Sctp {
+        #[arg(short = 'c', long, default_value = "10")]
+        concurrency: usize,
+        #[arg(long, default_value = "10")]
+        pps: u64,
+        #[arg(long, default_value = "160")]
+        payload: usize,
     },
     /// TURN over WebTransport (HTTP/3): session, control stream, allocation and
     /// relayed media both ways.
@@ -343,6 +357,10 @@ enum Mode {
 impl Mode {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(all(feature = "sctp", target_os = "linux"))]
+            Mode::SctpCheck => "sctp-check",
+            #[cfg(all(feature = "sctp", target_os = "linux"))]
+            Mode::Sctp { .. } => "sctp",
             Mode::Binding { .. } => "binding",
             Mode::Allocate { .. } => "allocate",
             Mode::ReconnectStorm { .. } => "reconnect-storm",
@@ -450,12 +468,16 @@ impl Stats {
     }
 
     fn reset(&self) {
+        self.errs.store(0, Ordering::Relaxed);
+        self.reset_preserving_errors();
+    }
+
+    fn reset_preserving_errors(&self) {
         // P0 #14: begin the steady-state window. Discard everything collected
         // during warmup so the report reflects steady state only, not
         // connection setup / allocation handshakes / ramp-up.
         self.sent.store(0, Ordering::Relaxed);
         self.recv.store(0, Ordering::Relaxed);
-        self.errs.store(0, Ordering::Relaxed);
         self.bytes_out.store(0, Ordering::Relaxed);
         self.bytes_in.store(0, Ordering::Relaxed);
         self.lat_sum.store(0, Ordering::Relaxed);
@@ -1300,9 +1322,26 @@ async fn main() {
         Creds::Rest {
             secret: cli.secret.clone(),
             uid: cli.uid.clone(),
-            ttl_s: 3600,
+            // Credentials must outlive warmup, the measured run and teardown.
+            ttl_s: cli.duration.saturating_add(cli.warmup).saturating_add(3600),
         }
     };
+
+    #[cfg(all(feature = "sctp", target_os = "linux"))]
+    if let Mode::SctpCheck = &cli.mode {
+        match sctp_client::check(cli.server, &creds, cli.rtt_timeout_ms).await {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("sctp-check: FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     #[cfg(feature = "web-transport")]
     if let Mode::WtCheck { url } = &cli.mode {
@@ -1465,7 +1504,9 @@ async fn main() {
                     println!("  ok   {s}");
                 }
                 println!("\nquic-check: OK — the QUIC ingress carries a full TURN allocation.");
-                println!("Control plane only: relayed media over QUIC is not exercised here");
+                println!(
+                    "Relayed media verified in both directions; this is not an endurance test."
+                );
                 println!("(docs/verification/interop-plan.md, Tier 2).");
                 std::process::exit(0);
             }
@@ -1535,6 +1576,27 @@ async fn main() {
                 cli.json,
                 creds,
                 cli.rtt_timeout_ms,
+            )
+            .await
+        }
+        #[cfg(all(feature = "sctp", target_os = "linux"))]
+        Mode::SctpCheck => unreachable!("handled above"),
+        #[cfg(all(feature = "sctp", target_os = "linux"))]
+        Mode::Sctp {
+            concurrency,
+            pps,
+            payload,
+        } => {
+            sctp_client::load(
+                cli.server,
+                creds,
+                cli.rtt_timeout_ms,
+                concurrency,
+                pps,
+                payload,
+                dur,
+                wu,
+                cli.json,
             )
             .await
         }

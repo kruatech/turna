@@ -200,6 +200,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the additional `web-transport` feature; `web_transport = true` is the
     // config default, so a `--features quic`-only build must say so explicitly
     // rather than fall back to raw QUIC the operator did not ask for.
+    if config.sctp.enabled && (!cfg!(feature = "sctp") || !cfg!(target_os = "linux")) {
+        return Err("[turn.sctp] requires a Linux node built with --features sctp".into());
+    }
+
     if config.quic.enabled && !turna_transport::quic::QUIC_AVAILABLE {
         return Err(
             "[turn.quic] is enabled in the configuration, but this binary \

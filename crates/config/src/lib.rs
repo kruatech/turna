@@ -377,6 +377,38 @@ impl TurnaConfig {
                 );
             }
         }
+        if self.turn.quic.enabled {
+            if self.turn.quic.idle_timeout_secs == 0 {
+                errors.push("turn.quic.idle_timeout_secs must be positive".into());
+            }
+            if !self.turn.quic.web_transport
+                && (self.turn.quic.alpn.is_empty()
+                    || self
+                        .turn
+                        .quic
+                        .alpn
+                        .iter()
+                        .any(|s| s.is_empty() || s.len() > 255))
+            {
+                errors.push("raw QUIC needs nonempty ALPN identifiers of at most 255 bytes".into());
+            }
+            if !self.turn.quic.enable_datagrams {
+                errors.push(
+                    "turn.quic.enable_datagrams must be true: relay media uses datagrams".into(),
+                );
+            }
+            if self.turn.quic.max_bi_streams == 0
+                || self.turn.quic.max_bi_streams > u32::MAX as u64
+                || self.turn.quic.max_uni_streams > u32::MAX as u64
+            {
+                errors.push(
+                    "turn.quic stream counts must fit u32, with at least one bidi stream".into(),
+                );
+            }
+            if !(4..=65535).contains(&self.turn.quic.max_datagram_size) {
+                errors.push("turn.quic.max_datagram_size must be in 4..=65535".into());
+            }
+        }
         // RFC 6156: external_ip6 must be a real IPv6 literal if set — a v4 literal
         // here would advertise a v4 address for a v6-family allocation, which is
         // exactly the mismatch the 443 check exists to prevent.
@@ -428,6 +460,17 @@ impl TurnaConfig {
         // and a connection per relayed peer — but that is a sizing decision for
         // the operator, documented in docs/feature-support.md, not something a
         // config refusal can make for them.
+        if self.turn.sctp.enabled {
+            if !cfg!(target_os = "linux") {
+                errors.push("turn.sctp requires Linux native SCTP support".into());
+            }
+            if self.turn.sctp.backlog <= 0
+                || self.turn.sctp.read_timeout_secs == 0
+                || !(20..=65555).contains(&self.turn.sctp.max_frame_size)
+            {
+                errors.push("turn.sctp requires positive backlog/read timeout and max_frame_size in 20..=65555".into());
+            }
+        }
         if prod && self.turn.sctp.enabled {
             errors.push(
                 "turn.sctp.enabled = true in production, but TURN-over-SCTP is experimental and not supported in production"
@@ -2222,6 +2265,8 @@ pub struct QuicConfigSection {
     /// Negotiate WebTransport-over-HTTP/3 (browser handshake). When `false`,
     /// only the raw-QUIC datapath runs. Requires the `web-transport` feature.
     pub web_transport: bool,
+    /// Allow validated QUIC path migration.
+    pub allow_migration: bool,
     /// Listen address (default `0.0.0.0:5350`).
     pub listen: SocketAddr,
     /// PEM certificate chain.
@@ -2269,6 +2314,7 @@ impl Default for QuicConfigSection {
         Self {
             enabled: false,
             web_transport: true,
+            allow_migration: true,
             listen: "0.0.0.0:5350".parse().unwrap(),
             cert_path: PathBuf::from("/etc/turna/tls/cert.pem"),
             key_path: PathBuf::from("/etc/turna/tls/key.pem"),
@@ -3550,6 +3596,48 @@ mod tests {
     }
 
     #[test]
+    fn quic_rejects_unusable_transport_limits() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.quic.enabled = true;
+        cfg.turn.quic.enable_datagrams = false;
+        cfg.turn.quic.max_bi_streams = 0;
+        cfg.turn.quic.max_datagram_size = 3;
+        let result = cfg.validate();
+        restore_turna_production(saved);
+        let msg = result
+            .expect_err("unusable QUIC limits must be rejected")
+            .to_string();
+        assert!(msg.contains("enable_datagrams"), "{msg}");
+        assert!(msg.contains("stream counts"), "{msg}");
+        assert!(msg.contains("max_datagram_size"), "{msg}");
+    }
+
+    #[test]
+    fn enabled_transports_reject_invalid_timeouts_and_framing() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.quic.enabled = true;
+        cfg.turn.quic.web_transport = false;
+        cfg.turn.quic.idle_timeout_secs = 0;
+        cfg.turn.quic.alpn = vec![String::new()];
+        cfg.turn.sctp.enabled = true;
+        cfg.turn.sctp.max_frame_size = 19;
+        cfg.turn.sctp.backlog = 0;
+        cfg.turn.sctp.read_timeout_secs = 0;
+        let result = cfg.validate();
+        restore_turna_production(saved);
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("idle_timeout_secs"), "{message}");
+        assert!(message.contains("ALPN"), "{message}");
+        assert!(message.contains("max_frame_size"), "{message}");
+    }
+
+    #[test]
     fn quic_section_defaults_and_parse() {
         // Off by default; when present, fields parse and unknown keys are
         // rejected (deny_unknown_fields). Lives under [turn.quic].
@@ -3558,6 +3646,7 @@ mod tests {
         assert!(q.web_transport, "WebTransport on when QUIC is enabled");
         assert_eq!(q.listen.port(), 5350);
         assert!(q.enable_datagrams);
+        assert!(q.allow_migration);
 
         let toml = r#"
             [turn]

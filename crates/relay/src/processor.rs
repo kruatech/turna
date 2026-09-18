@@ -889,6 +889,27 @@ impl PacketProcessor {
         vec![Action::CloseRelay { port }]
     }
 
+    /// Called only after QUIC has validated a new network path for the same
+    /// connection. Unlike RFC 8016 this is not a client-supplied mobility ticket.
+    /// Re-key every allocation index before the bridge starts using the new src.
+    pub fn migrate_quic_allocation(
+        &self,
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+    ) -> Result<(), SessionError> {
+        if old_addr == new_addr {
+            return Ok(());
+        }
+        if self.store.get(&old_addr).is_some() {
+            self.store.re_key(&old_addr, new_addr).map(|_| ())
+        } else if self.store.get(&new_addr).is_some() {
+            Err(SessionError::MigrationTargetInUse)
+        } else {
+            // A session may migrate before its first Allocate.
+            Ok(())
+        }
+    }
+
     /// Owned-buffer ingress for the encrypted session transports (DTLS records,
     /// QUIC datagrams, WebTransport stream messages).
     ///

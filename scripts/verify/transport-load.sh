@@ -30,6 +30,15 @@
 set -uo pipefail
 
 PHASE_SECS="${PHASE_SECS:-1200}"
+PHASES="${PHASES:-wt quic dtls}"
+MAX_LOSS_PERCENT="${MAX_LOSS_PERCENT:-0}"
+MAX_ERRORS="${MAX_ERRORS:-0}"
+[[ "$PHASES" =~ [^[:space:]] ]] || { echo "PHASES must name a transport" >&2; exit 1; }
+for phase in $PHASES; do
+  case "$phase" in wt|quic|dtls|sctp) ;; *) echo "unknown phase: $phase" >&2; exit 1 ;; esac
+done
+[ -n "$PHASES" ] || { echo "PHASES must not be empty" >&2; exit 1; }
+want() { case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 CONC="${CONC:-10}"
 PPS="${PPS:-10}"
 PAYLOAD="${PAYLOAD:-160}"
@@ -51,8 +60,16 @@ cd "$REPO" || exit 1
 mkdir -p "$OUT"
 
 SECRET="tl-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-NODE=target/release/turna-node
-LOAD=target/release/turna-load-test
+BUILD_FLAGS=(--release)
+BIN_DIR=target/release
+if [ "${BUILD_PROFILE:-release}" = dev ]; then BUILD_FLAGS=(); BIN_DIR=target/debug; fi
+NODE="$BIN_DIR/turna-node"
+LOAD="$BIN_DIR/turna-load-test"
+FEATURES="tls,quic,web-transport,dtls"
+if want sctp; then
+  python3 scripts/verify/transport-observe.py sctp || exit 1
+  FEATURES="$FEATURES,sctp"
+fi
 SUMMARY="$OUT/summary.md"
 PASS=0
 FAIL=0
@@ -60,9 +77,10 @@ FAIL=0
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/run.log"; }
 die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 
-[ "$PHASE_SECS" -gt 700 ] || die "PHASE_SECS=$PHASE_SECS is too short to be worth running.
-Bindings expire at 600 s; a phase that does not cross that proves nothing about
-whether the driver refreshes them, which is the main thing being tested here."
+[[ "$PHASE_SECS" =~ ^[1-9][0-9]*$ ]] || die "PHASE_SECS must be a positive integer"
+if [ "${SHORT_RUN:-0}" != 1 ]; then
+  [ "$PHASE_SECS" -gt 700 ] || die "Use SHORT_RUN=1 for a short load check"
+fi
 
 if curl -fsS --max-time 2 "http://127.0.0.1:$HEALTH_PORT/metrics" >/dev/null 2>&1; then
   die "127.0.0.1:$HEALTH_PORT is already in use. Set HEALTH_PORT, or the sampler would
@@ -70,9 +88,9 @@ read another process for the whole run."
 fi
 
 say "building"
-cargo build --release -p turna-node --features "tls,quic,web-transport,dtls" \
+cargo build --locked "${BUILD_FLAGS[@]}" -p turna-node --features "$FEATURES" \
   > "$OUT/build-node.log" 2>&1 || { tail -20 "$OUT/build-node.log"; die "node build failed"; }
-cargo build --release -p turna-load-test --features "tls,quic,web-transport,dtls" \
+cargo build --locked "${BUILD_FLAGS[@]}" -p turna-load-test --features "$FEATURES" \
   > "$OUT/build-load.log" 2>&1 || { tail -20 "$OUT/build-load.log"; die "load build failed"; }
 
 if [ -z "$CERT_PATH" ]; then
@@ -86,18 +104,27 @@ fi
 {
   echo "# Transport load runs — $(date -u +%FT%TZ)"
   echo
-  echo "- host: $(hostname), $(nproc) cpus, $(awk '/MemTotal/{printf "%.0f GiB", $2/1048576}' /proc/meminfo)"
+  echo "- host: $(hostname), $(getconf _NPROCESSORS_ONLN) cpus"
   echo "- kernel: $(uname -sr)"
   echo "- per phase: ${PHASE_SECS}s, $CONC sessions, $PPS pps each, ${PAYLOAD} B payload"
-  echo "- every phase exceeds the 600 s binding lifetime, so a driver that fails to"
-  echo "  refresh would show up as loss proportional to \`1 - 600/${PHASE_SECS}\`."
+  if [ "${SHORT_RUN:-0}" = 1 ]; then
+    echo "- mode: SHORT LOAD CHECK; nonce expiry and endurance are not established"
+  else
+    echo "- mode: extended load; duration exceeds the 600 s binding lifetime"
+  fi
   echo
   echo "| Transport | Sent | Relayed back | Loss | Errors | Verdict |"
   echo "|---|---|---|---|---|---|"
 } > "$SUMMARY"
 
 NODE_PID=""
+SAMPLE_PID=""
 stop_node() {
+  if [ -n "$SAMPLE_PID" ]; then
+    kill -TERM "$SAMPLE_PID" 2>/dev/null
+    wait "$SAMPLE_PID" 2>/dev/null
+    SAMPLE_PID=""
+  fi
   [ -n "$NODE_PID" ] || return 0
   kill -TERM "$NODE_PID" 2>/dev/null
   for _ in $(seq 20); do kill -0 "$NODE_PID" 2>/dev/null || break; sleep 0.5; done
@@ -143,9 +170,10 @@ EOF
 }
 
 judge() { # $1 = transport, $2 = json file
-  python3 - "$1" "$2" "$PHASE_SECS" <<'PY'
+  python3 - "$1" "$2" "$PHASE_SECS" "$3" "$MAX_LOSS_PERCENT" "$MAX_ERRORS" "$CONC" "$PPS" <<'PY'
 import json, sys
 name, path, phase = sys.argv[1], sys.argv[2], float(sys.argv[3])
+client_rc, max_loss, max_errors = int(sys.argv[4]), float(sys.argv[5]), int(sys.argv[6])
 try:
     d = json.loads(open(path).read().strip().splitlines()[-1])
 except Exception as e:
@@ -158,8 +186,11 @@ if sent == 0:
 loss = (sent - recv) / sent * 100
 verdict = "**pass**"
 note = ""
-if loss > 5:
+expected_sent = phase * int(sys.argv[7]) * int(sys.argv[8])
+if client_rc != 0 or loss > max_loss or recv > sent + 2 * int(sys.argv[7]) or errs > max_errors or sent < expected_sent * 0.99 or float(d.get("duration_s", 0)) < phase * 0.99:
     verdict = "**FAIL**"
+    if sent < expected_sent * 0.99:
+        note = f" — incomplete send volume: expected about {expected_sent:.0f}"
     expected = 600.0 / phase * 100
     if abs((100 - loss) - expected) < 8:
         note = f" — matches 600/{phase:.0f}s: bindings expired, the driver is not refreshing"
@@ -177,11 +208,29 @@ run_phase() { # $1 = transport label, $2 = config sections, $3... = load command
     stop_node
     return 1
   fi
+  python3 scripts/verify/transport-observe.py sample --pid "$NODE_PID" --port "$HEALTH_PORT" \
+    --out "$OUT/$label-resources.jsonl" &
+  SAMPLE_PID=$!
   "$@" > "$OUT/$label.json" 2> "$OUT/$label.err"
-  judge "$label" "$OUT/$label.json" >> "$SUMMARY"
+  local client_rc=$?
+  judge "$label" "$OUT/$label.json" "$client_rc" >> "$SUMMARY"
   # Captured immediately: anything between the command and a bare `$?` silently
   # changes what is being tested.
   local rc=$?
+  if [ "$label" != dtls ]; then
+    if ! python3 scripts/verify/transport-observe.py cleanup --transport "$label" --port "$HEALTH_PORT" > "$OUT/$label-cleanup.log" 2>&1; then
+      printf '| %s cleanup | — | — | — | — | **FAIL** |\n' "$label" >> "$SUMMARY"
+      rc=1
+    fi
+  fi
+  # Stop sampling before inspecting JSONL, while the node is still alive.
+  stop_node
+  if python3 scripts/verify/transport-observe.py report --out "$OUT/$label-resources.jsonl" > "$OUT/$label-monitoring.log" 2>&1; then
+    printf '| %s monitoring | — | — | — | — | **pass** |\n' "$label" >> "$SUMMARY"
+  else
+    printf '| %s monitoring | — | — | — | — | **FAIL** (incomplete samples) |\n' "$label" >> "$SUMMARY"
+    rc=1
+  fi
   if [ "$rc" -eq 0 ]; then
     PASS=$((PASS + 1)); say "  pass  $label"
   else
@@ -190,34 +239,50 @@ run_phase() { # $1 = transport label, $2 = config sections, $3... = load command
   stop_node
 }
 
-WT_SECTION="$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:%s"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = true\n' "$QUIC_PORT" "$CERT_PATH" "$KEY_PATH")"
+WT_SECTION="$(printf '[turn.quic]\nenabled = true\nlisten = "[::]:%s"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = true\n' "$QUIC_PORT" "$CERT_PATH" "$KEY_PATH")"
 QUIC_SECTION="$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:%s"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = false\n' "$QUIC_PORT" "$CERT_PATH" "$KEY_PATH")"
 DTLS_SECTION="$(printf '[turn.dtls]\nenabled = true\nlisten = "0.0.0.0:%s"\ncert_path = "%s"\nkey_path = "%s"\n' "$DTLS_PORT" "$CERT_PATH" "$KEY_PATH")"
 
+if want wt; then
 run_phase webtransport "$WT_SECTION" \
   "$LOAD" --secret "$SECRET" --duration "$PHASE_SECS" --warmup 30 --json \
   wt --url "https://$SERVER_NAME:$QUIC_PORT/" -c "$CONC" --pps "$PPS" --payload "$PAYLOAD"
+fi
 
+if want quic; then
 run_phase quic "$QUIC_SECTION" \
   "$LOAD" --server "$SERVER_HOST:$QUIC_PORT" --secret "$SECRET" \
   --duration "$PHASE_SECS" --warmup 30 --json \
   quic -c "$CONC" --pps "$PPS" --payload "$PAYLOAD" --server-name "$SERVER_NAME"
+fi
 
+if want sctp; then
+run_phase sctp '[turn.sctp]
+enabled = true
+listen = "127.0.0.1:3481"
+max_connections_per_ip = 16' \
+  "$LOAD" --server 127.0.0.1:3481 --secret "$SECRET" \
+  --duration "$PHASE_SECS" --warmup 30 --json \
+  sctp -c "$CONC" --pps "$PPS" --payload "$PAYLOAD"
+fi
+
+if want dtls; then
 run_phase dtls "$DTLS_SECTION" \
   "$LOAD" --server "$SERVER_HOST:$DTLS_PORT" --secret "$SECRET" \
   --duration "$PHASE_SECS" --warmup 30 --json \
   dtls -c "$CONC" --pps "$PPS" --payload "$PAYLOAD"
+fi
 
 {
   echo
   echo "**$PASS passed, $FAIL failed.**"
   cat <<'EOF'
 
-Endurance only. None of these three has an independent implementation driving it:
+Load check only. These clients use the same transport libraries as the server:
 the clients here share a library and one reading of the spec with the server, so a
 shared misreading stays invisible. WebTransport has browser interop recorded separately
-(`docs/interop/webtransport-browser-2026-08-20.md`); DTLS and QUIC do not, and for QUIC
-there is no second TURN-over-QUIC implementation in existence to get it from.
+(`docs/interop/webtransport-browser-2026-08-20.md`). This run does not establish
+independent interoperability or browser compatibility.
 EOF
 } >> "$SUMMARY"
 

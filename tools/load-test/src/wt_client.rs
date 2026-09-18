@@ -107,6 +107,7 @@ pub struct WtSession {
     key: [u8; 16],
     rtt_ms: u64,
     pub relayed: SocketAddr,
+    _ep: wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
 }
 
 impl WtSession {
@@ -182,6 +183,7 @@ impl WtSession {
         let relayed = relayed.ok_or("Allocate over WebTransport never succeeded")?;
 
         Ok(Self {
+            _ep: endpoint,
             conn,
             ctl,
             user,
@@ -193,18 +195,48 @@ impl WtSession {
         })
     }
 
-    async fn authed(&mut self, method: u16, build: impl FnOnce(&mut Msg)) -> Result<(), String> {
-        let mut m = Msg::request(method);
-        build(&mut m);
-        m.add_username(&self.user);
-        m.add_realm(&self.realm);
-        m.add_nonce(&self.nonce);
-        let pkt = m.encode_with_integrity(&self.key);
-        let resp = self.ctl.request(&pkt, self.rtt_ms).await?;
-        if is_success(&resp) {
-            return Ok(());
+    async fn authed(&mut self, method: u16, build: impl Fn(&mut Msg)) -> Result<(), String> {
+        // Rebuild with a new transaction ID and integrity after a stale nonce.
+        // One retry only: a rejecting server must not cause an infinite loop.
+        for attempt in 0..2 {
+            let mut m = Msg::request(method);
+            build(&mut m);
+            m.add_username(&self.user);
+            m.add_realm(&self.realm);
+            m.add_nonce(&self.nonce);
+            let pkt = m.encode_with_integrity(&self.key);
+            let resp = self.ctl.request(&pkt, self.rtt_ms).await?;
+            if is_success(&resp) {
+                return Ok(());
+            }
+            if attempt == 0 && error_code(&resp) == Some(438) {
+                self.nonce = get_nonce(&resp)
+                    .filter(|nonce| !nonce.is_empty())
+                    .ok_or("438 Stale Nonce without replacement NONCE")?;
+                continue;
+            }
+            return Err(format!("{method:#06x} rejected: {:?}", error_code(&resp)));
         }
-        Err(format!("{method:#06x} rejected: {:?}", error_code(&resp)))
+        unreachable!("bounded authenticated request loop")
+    }
+
+    /// Exercise the server's stale-nonce challenge without waiting 630 seconds.
+    async fn check_stale_nonce(&mut self, ch: u16, peer: SocketAddr) -> Result<(), String> {
+        for method in [M_REFRESH, M_CREATE_PERM, M_CHANNEL_BIND] {
+            // The server classifies an invalid nonce as stale, just like expiry.
+            self.nonce = b"turna-stale-nonce-regression".to_vec();
+            self.authed(method, |m| match method {
+                M_REFRESH => m.add_lifetime(600),
+                M_CREATE_PERM => m.add_xor_peer(peer),
+                M_CHANNEL_BIND => {
+                    m.add_channel_number(ch);
+                    m.add_xor_peer(peer);
+                }
+                _ => unreachable!(),
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn create_permission(&mut self, peer: SocketAddr) -> Result<(), String> {
@@ -233,17 +265,18 @@ impl WtSession {
     }
 
     pub async fn send_channel_data(&mut self, ch: u16, payload: &[u8]) -> Result<usize, String> {
-        let frame = channel_data_frame(ch, payload);
-        self.ctl
-            .send
-            .write_all(&frame)
-            .await
-            .map_err(|e| format!("ChannelData write: {e}"))?;
-        Ok(frame.len())
+        let mut frame = channel_data_frame(ch, payload);
+        frame.truncate(4 + payload.len()); // datagrams have no stream padding
+        let len = frame.len();
+        self.conn
+            .send_datagram(&frame)
+            .map_err(|e| format!("ChannelData datagram: {e}"))?;
+        Ok(len)
     }
 
-    pub fn close(&self) {
+    pub async fn close(&self) {
         self.conn.close(0u32.into(), b"done");
+        self._ep.wait_idle().await;
     }
 }
 
@@ -257,6 +290,34 @@ pub async fn webtransport_check(
 
     let mut sess = WtSession::connect(url, creds, rtt_ms).await?;
     log.push(format!("WebTransport session established to {url}"));
+    for _ in 0..64 {
+        let pair = async {
+            let a = sess
+                .conn
+                .open_bi()
+                .await
+                .map_err(|e| e.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+            let b = sess
+                .conn
+                .open_bi()
+                .await
+                .map_err(|e| e.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((a, b))
+        };
+        let (a, b) = tokio::time::timeout(Duration::from_secs(5), pair)
+            .await
+            .map_err(|_| "WebTransport stream credit timeout")??;
+        crate::stream_common::check_parallel_streams(a, b).await?;
+        // Binding has a per-IP unauthenticated-reply budget (8/s).
+        // Pace the probe so it exercises stream lifecycle, not that budget.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    log.push("128 streams: interleaving, reply routing, half-close and credit recovery ok".into());
+
     log.push(format!(
         "401 challenge, then Allocate ok — relayed address {}",
         sess.relayed
@@ -277,6 +338,8 @@ pub async fn webtransport_check(
     })?;
     let channel: u16 = 0x4000;
     sess.channel_bind(channel, peer_addr).await?;
+    sess.check_stale_nonce(channel, peer_addr).await?;
+    log.push("438 Stale Nonce recovery: Refresh, CreatePermission, ChannelBind ok".into());
     log.push(format!(
         "CreatePermission and ChannelBind ok for {peer_addr}"
     ));
@@ -350,7 +413,23 @@ pub async fn webtransport_check(
         back.len()
     ));
 
-    sess.close();
+    sess.close().await;
+
+    // A malformed stream must close its session, release the allocation, and
+    // leave the listener able to authenticate a fresh connection.
+    let mut bad = WtSession::connect(url, creds, rtt_ms).await?;
+    bad.ctl
+        .send
+        .write_all(&[0xff, 0, 0, 0])
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(Duration::from_secs(5), bad.conn.closed())
+        .await
+        .map_err(|_| "malformed stream did not close its session")?;
+    bad.close().await;
+    let fresh = WtSession::connect(url, creds, rtt_ms).await?;
+    fresh.close().await;
+    log.push("malformed stream rejected; reconnect and allocation ok".into());
     Ok(log)
 }
 
@@ -422,6 +501,8 @@ pub async fn run_wt_load(
             }
 
             // Receiver: what actually came out of the relay.
+            let recv_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let recv_done_task = recv_done.clone();
             let recv_stats = stats.clone();
             let recv_task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
@@ -438,7 +519,7 @@ pub async fn run_wt_load(
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
-                            if !recv_stats.is_running() {
+                            if recv_done_task.load(Ordering::Relaxed) {
                                 break;
                             }
                         }
@@ -453,8 +534,12 @@ pub async fn run_wt_load(
             let mut next_refresh = Instant::now() + Duration::from_secs(240);
             while stats.is_running() {
                 tick.tick().await;
+                if !stats.is_running() {
+                    break;
+                }
                 if Instant::now() >= next_refresh {
-                    if sess.refresh(ch, peer_addr).await.is_err() {
+                    if let Err(e) = sess.refresh(ch, peer_addr).await {
+                        eprintln!("transport refresh failed: {e}");
                         stats.errs.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -471,8 +556,10 @@ pub async fn run_wt_load(
                     }
                 }
             }
-            sess.close();
+            recv_done.store(true, Ordering::Relaxed);
+            // Let the peer drain queued media while the connection still exists.
             let _ = recv_task.await;
+            sess.close().await;
         }));
     }
 
@@ -480,7 +567,7 @@ pub async fn run_wt_load(
     crate::progress_reporter(&stats, json);
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
-        stats.reset();
+        stats.reset_preserving_errors();
     }
     tokio::time::sleep(duration).await;
     stats.stop();
