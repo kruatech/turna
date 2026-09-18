@@ -28,11 +28,9 @@ These are the areas we want to harden, in rough priority order:
      connection close). The remaining work is *evidence*: run
      [docs/verification/encrypted-transports.md](docs/verification/encrypted-transports.md)
      and record it, then they can be called supported.
-   - `quic` / `web-transport` are **experimental** with known functional gaps —
-     most `[turn.quic]` limits are not applied on the WebTransport path, there is
-     no per-stream reply routing there, and QUIC connection migration is not
-     detected. See
-     [docs/design/quic-webtransport.md](docs/design/quic-webtransport.md) §7.
+   - `quic` / `web-transport` are **supported** on Linux/macOS with tokio.
+     Limits, per-stream replies and migration handling are implemented.
+     Scope and evidence: [support record](docs/verification/quic-webtransport-supported-2026-09-18.md).
    - `io-uring` and `af-xdp` remain **experimental** and hardware/kernel
      dependent; see [docs/roadmap/af-xdp-phase2.md](docs/roadmap/af-xdp-phase2.md).
      `io-uring` is now **beta**: endurance and ChannelData relaying are both on record

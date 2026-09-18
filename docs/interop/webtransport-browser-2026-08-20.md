@@ -1,5 +1,10 @@
 # TURN over WebTransport — browser interop — 2026-08-20
 
+> Current status: **supported on Linux/macOS with tokio**. See the
+> [support scope and later verification](../verification/quic-webtransport-supported-2026-09-18.md).
+> This is the historical 2026-08-20 test record; its results and limitations
+> describe that run, not the current support status.
+
 Chrome 151 on macOS, against `https://turna.quinter.ru:3479/` with a Let's Encrypt
 certificate. Five checks, all passing.
 

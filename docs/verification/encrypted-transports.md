@@ -11,8 +11,8 @@ rather than inline here, so this stays a checklist rather than a log:
 |---|---|
 | TURNS | **supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, 24 h under load |
 | DTLS | beta with interop — both listener paths, 20 min under load, agreement with coturn's client |
-| WebTransport | beta with interop — a browser drives it end to end |
-| QUIC | beta, and structurally stuck there — no RFC defines TURN over raw QUIC, so no independent implementation exists to test against |
+| WebTransport (`web-transport`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
+| QUIC (`quic`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
 
 What remains open per transport is stated in each record and in
 `docs/OPEN-DECISIONS.md`.
@@ -81,12 +81,16 @@ only existing DTLS test covers Binding alone.
 | browser WebTransport | QUIC H3 | | | | |
 | raw QUIC test client | QUIC (`web_transport = false`) | | | | |
 
-Minimum bar to call a transport supported: two independent client stacks
-completing bidirectional media, plus §2 and §3 below.
+For standardized transports, seek two independent client stacks completing
+bidirectional media. QUIC/WT support is explicitly scoped to the project-specific
+TURN mappings: see [the support decision and evidence](quic-webtransport-supported-2026-09-18.md).
+Independent raw-QUIC TURN interoperability is not established; tested browser
+interop exists for WT. The extended soak below is a follow-up qualification
+plan, not a claim that these transports have completed it.
 
 ## 2. Behavioural checks
 
-Each of these exercises a code path that has no automated coverage. Record
+Use the current automated transport and lifecycle checks where available. Record
 pass/fail and the metric that proved it.
 
 ### TURNS
@@ -284,14 +288,17 @@ is what allows the default to flip.
 
 ## 3. Soak
 
-One run per transport, minimum 24h, on the profile you intend to operate.
+Extended qualification target: one run per transport, minimum 24h, on the profile
+you intend to operate. QUIC/WT have not completed this target; their supported
+scope and shorter recorded runs are stated in the support record.
 Record start/end values, not just "no crash".
 
 | transport | duration | sessions | offered load | RSS start/end | fds start/end | allocations leaked | verdict |
 |---|---|---|---|---|---|---|---|
 | TURNS | | | | | | | |
 | DTLS | | | | | | | |
-| QUIC | | | | | | | |
+| QUIC | not run (24h target) | | | | | | pending |
+| WebTransport | not run (24h target) | | | | | | pending |
 
 Watch for, specifically:
 

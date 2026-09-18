@@ -126,7 +126,7 @@ TURN over DTLS (RFC 7350). Disabled by default. Requires `--features dtls`.
 | `cert_path` | path | `/etc/turna/tls/cert.pem` | PEM certificate. Must be **readable** — an unreadable path aborts startup (fail-fast). |
 | `key_path` | path | `/etc/turna/tls/key.pem` | PEM private key. Must be readable. |
 | `max_sessions` | usize | `10000` | Post-handshake admission cap (`0` = unlimited). |
-| `max_sessions_per_ip` | usize | `0` | Per-source-IP session cap (`0` = unlimited). Anti slot-exhaustion; rejections counted as `turna_dtls_rejected_per_ip_total`. |
+| `max_sessions_per_ip` | usize | `16` | Per-source-IP session cap (`0` = unlimited). Anti slot-exhaustion; rejections counted as `turna_dtls_rejected_per_ip_total`. |
 | `accept_timeout_secs` | u64 | `10` | Upper bound on one DTLS `accept()`, i.e. on a single handshake. `0` disables it. **Liveness guard, not tuning:** `webrtc-dtls` runs the whole handshake inline inside `accept()` with no timeout of its own ([webrtc-rs/webrtc#614](https://github.com/webrtc-rs/webrtc/issues/614)), so one peer that starts a handshake and goes silent parks the accept loop forever — DTLS stops serving everyone while the socket stays bound and `turna_dtls_readiness` still reads Ready. On timeout the handshake is abandoned and counted (`turna_dtls_accept_timeouts_total`). Keep it comfortably above real handshake latency, or a slow client is dropped. |
 | `demux` | bool | `false` | Own the UDP socket instead of `webrtc_dtls::listen()`. `listen()` runs handshakes **serially** inside `accept()` ([#614](https://github.com/webrtc-rs/webrtc/issues/614)), which forces three compromises: caps apply only *after* the crypto, a handshake rate limit has nowhere to live, and the certificate is fixed at bind time. `demux = true` fixes all three — one task per handshake, admission before any DTLS state exists, live certificate reload. Opt-in because it replaces the path that has recorded verification (`docs/dtls/`). |
 | `max_handshakes_per_sec_per_ip` | u32 | `0` | Per-source-IP handshake **rate** limit (`turna_dtls_rejected_rate_limit_total`). **Requires `demux = true`** — startup fails otherwise, rather than silently doing nothing. |
@@ -228,7 +228,8 @@ what prevents one authenticated client hijacking another's pending connection.
 ## `[turn.quic]` — QUIC / WebTransport
 
 Requires `--features quic` (raw QUIC datapath) or `--features web-transport`
-(browser HTTP/3 CONNECT; implies `quic`). Maturity: **experimental**.
+(browser HTTP/3 CONNECT; implies `quic`). Both are **supported** on Linux/macOS
+with tokio; see [support scope](verification/quic-webtransport-supported-2026-09-18.md).
 
 | key | type | default | notes |
 |-----|------|---------|-------|
@@ -236,25 +237,23 @@ Requires `--features quic` (raw QUIC datapath) or `--features web-transport`
 | `web_transport` | bool | `true` | `true` = WebTransport over HTTP/3; `false` = raw QUIC. Needs `--features web-transport` when `true`. |
 | `listen` | socket addr | `0.0.0.0:5350` | UDP. Numerically collides with `[management].listen` (TCP) — different protocols, so the binds do not conflict. |
 | `cert_path` / `key_path` | path | `/etc/turna/tls/…` | Same PEM material as `[tls]` by default. |
-| `max_bi_streams` | u64 | `256` | Concurrent bidi streams per connection. **Raw QUIC only.** |
-| `max_uni_streams` | u64 | `256` | Concurrent uni streams per connection. **Raw QUIC only.** |
-| `enable_datagrams` | bool | `true` | QUIC datagrams (RFC 9221) for media. **Raw QUIC only.** |
-| `max_datagram_size` | usize | `1200` | Sizes the datagram receive buffer. **Raw QUIC only.** |
-| `idle_timeout_secs` | u64 | `30` | Connection idle timeout. **Raw QUIC only.** |
+| `max_bi_streams` | u64 | `256` | Concurrent bidi streams per connection. Applied on both paths. |
+| `max_uni_streams` | u64 | `256` | Concurrent uni streams per connection. Applied on both paths. |
+| `enable_datagrams` | bool | `true` | QUIC datagrams (RFC 9221) for media. Applied on both paths. |
+| `max_datagram_size` | usize | `1200` | Sizes the datagram receive buffer. Applied on both paths. |
+| `idle_timeout_secs` | u64 | `30` | Connection idle timeout. Applied on both paths. |
 | `keep_alive_secs` | u64 | `10` | Keep-alive interval. |
 | `alpn` | list | `["stun.turn"]` | **Raw QUIC only** — WebTransport negotiates `h3` itself, so this key is inert when `web_transport = true`. |
-| `max_sessions` | usize | `10000` | Session cap (`0` = unlimited), `turna_quic_rejected_over_cap_total`. Enforced **pre**-handshake on the WebTransport path, post-handshake on raw QUIC. |
-| `max_sessions_per_ip` | usize | `0` | Per-source-IP cap (`0` = unlimited), `turna_quic_rejected_per_ip_total`. Same timing as above. |
+| `max_sessions` | usize | `10000` | Session cap (`0` = unlimited), `turna_quic_rejected_over_cap_total`. Enforced before the handshake on both paths. |
+| `max_sessions_per_ip` | usize | `16` | Per-source-IP cap (`0` = unlimited), `turna_quic_rejected_per_ip_total`. Same timing as above. |
 | `cert_reload_secs` | u64 | `30` | Poll `cert_path`/`key_path` and hot-reload the certificate without dropping live sessions. Works on **both** paths (`Endpoint::reload_config` on WebTransport, `Endpoint::set_server_config` on raw QUIC); only new sessions see the new material. `0` disables. |
 | `max_handshakes_per_sec_per_ip` | u32 | `0` | Per-source-IP handshake **rate** limit (`0` = unlimited). Complements `max_sessions_per_ip`, which only bounds *concurrent* sessions: a source that opens and drops sessions in a loop never trips a concurrency cap while still costing a handshake each time. Checked before the handshake on both paths (`turna_quic_rejected_rate_limit_total`). |
 | `handshake_burst_per_ip` | u32 | `0` | Burst allowance for the rate limit. `0` = twice the rate, so a page opening several sessions at once is not penalised. |
 
-On the **WebTransport** path (`web_transport = true`) the keys marked *raw QUIC
-only* have no effect: reaching the underlying `quinn` server config requires an
-API wtransport keeps behind its quinn re-export. The listener names those keys in
-a startup warning, so the config never silently looks effective. Session caps,
-keep-alive and certificate reload do apply there. Set `web_transport = false` if
-you need the transport limits enforced.
+Both paths apply the configured transport limits and certificate reload.
+Only `alpn` is intentionally raw-QUIC-only: WebTransport negotiates `h3`.
+DATAGRAM payloads are bounded by the configured cap and negotiated peer limit;
+media delivery is unreliable and loss remains visible in test reports.
 
 Connection migration (the client's address changing mid-session) is detected by
 polling the peer address every 2s; the listener re-keys its egress registries and

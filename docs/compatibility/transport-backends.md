@@ -74,11 +74,10 @@ cargo build --release -p turna-node --features af-xdp
   Plaintext and project-specific; no WebRTC DataChannel or independent client
   interoperability claim. Other backend selections are rejected when enabled.
   See [support evidence](../verification/sctp-supported-2026-09-18.md).
-- **quic / web-transport — Experimental.** Opt-in. Both paths apply the full
-  `[turn.quic]` transport config; raw QUIC also routes control replies per stream.
-  `alpn` is inert on the H3 path (wtransport forces `h3`). No interop test yet. Build the two features separately — `web-transport` bundles its own
-  quinn, which can conflict with the standalone `quinn` dep under
-  `--all-features`.
+- **quic / web-transport — Supported on Linux/macOS with tokio.** Opt-in.
+  Both paths apply transport limits, admission and per-stream reply routing.
+  WebTransport negotiates `h3`; configured `alpn` applies only to raw QUIC.
+  Both features can be built together. [Evidence and scope](../verification/quic-webtransport-supported-2026-09-18.md).
 - **af_xdp — Experimental / Phase 1.** Opt-in (Linux + `CAP_NET_RAW` + external
   XDP). Compiles and passes startup preflight; neighbor (ARP/NDP) resolution for
   TX MACs is a placeholder/follow-up, and runtime requires a veth lab or an
@@ -121,7 +120,7 @@ cargo build --release -p turna-node --features af-xdp
 | TURNS (TLS/TCP) | Linux/macOS | `tls` | **Supported** |
 | DTLS      | Linux/macOS | `dtls`    | Beta |
 | SCTP      | Linux    | `sctp`       | Supported with tokio; native SCTP, plaintext |
-| QUIC      | Linux/macOS | `quic`    | Beta (control-plane interop recorded) |
-| WebTransport | Linux/macOS | `web-transport` | Beta (browser interop recorded) |
+| QUIC (`quic`) | Linux/macOS, tokio | `quic` | Supported; see [scope](../verification/quic-webtransport-supported-2026-09-18.md). |
+| WebTransport (`web-transport`) | Linux/macOS, tokio | `web-transport` | Supported; see [scope](../verification/quic-webtransport-supported-2026-09-18.md). |
 | AF_XDP    | Linux    | `af-xdp`     | Experimental (Phase 1) |
 ```

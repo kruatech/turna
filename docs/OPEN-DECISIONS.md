@@ -362,3 +362,12 @@ AF_XDP datapath after exactly 2015 frames. Both were resource leaks that present
 hard stop at a pool or slot count, both were invisible to every existing check, and both
 were found by comparing a counter against the size of the thing it was exhausting. If a
 third datapath appears, look there first.
+
+
+## QUIC / WebTransport support decision — resolved 2026-09-18
+
+Both are supported within the project-specific mapping and Linux/macOS tokio
+scope in [the evidence record](verification/quic-webtransport-supported-2026-09-18.md).
+Independent raw-QUIC TURN interoperability and multi-day endurance remain
+unverified, explicitly documented limitations. No claim of standardized TURN
+over raw QUIC or universal browser support is made.

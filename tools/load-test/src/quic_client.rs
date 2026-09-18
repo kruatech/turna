@@ -744,3 +744,82 @@ pub async fn quic_allocate_check(
 
     Ok(log)
 }
+
+impl crate::transport_probe::Session for QuicSession {
+    fn unreliable_media(&self) -> bool {
+        true
+    }
+    fn network_stats(&self) -> String {
+        let stats = self.conn.stats();
+        format!(
+            concat!(
+                "{{\"udp_tx\":{},\"udp_rx\":{},\"datagram_frames_tx\":{},",
+                "\"datagram_frames_rx\":{},\"path_lost_packets\":{},\"path_sent_packets\":{},",
+                "\"congestion_events\":{},\"rtt_ms\":{}}}"
+            ),
+            stats.udp_tx.datagrams,
+            stats.udp_rx.datagrams,
+            stats.frame_tx.datagram,
+            stats.frame_rx.datagram,
+            stats.path.lost_packets,
+            stats.path.sent_packets,
+            stats.path.congestion_events,
+            stats.path.rtt.as_secs_f64() * 1000.
+        )
+    }
+
+    async fn bind_peer(&mut self, peer: SocketAddr) -> Result<(), String> {
+        self.refresh(0x4000, peer).await
+    }
+    async fn send_media(&mut self, payload: &[u8]) -> Result<(), String> {
+        self.send_channel_data(0x4000, payload).await.map(|_| ())
+    }
+    async fn receive_media(&mut self) -> Result<Vec<u8>, String> {
+        self.conn
+            .read_datagram()
+            .await
+            .map(|d| d.to_vec())
+            .map_err(|e| e.to_string())
+    }
+    fn pressure_packet(&self) -> Vec<u8> {
+        let mut m = Msg::request(M_REFRESH);
+        m.add_lifetime(600);
+        m.add_username(&self.user);
+        m.add_realm(&self.realm);
+        m.add_nonce(&self.nonce);
+        m.encode_with_integrity(&self.key)
+    }
+    async fn write_control(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.ctl
+            .send
+            .write_all(bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn close_probe(&mut self) -> Result<(), String> {
+        self.close().await;
+        Ok(())
+    }
+}
+pub async fn run_probe(
+    server: SocketAddr,
+    creds: &Creds,
+    action: &str,
+    hold: u64,
+) -> Result<(), String> {
+    let (session, relay) =
+        QuicSession::connect(server, "localhost", "stun.turn", creds, 3000).await?;
+    crate::transport_probe::exercise(session, relay, action, hold).await
+}
+
+/// Cross-host media probe; echo peer runs on the TURN server host.
+pub async fn run_network(
+    server: SocketAddr,
+    creds: &Creds,
+    peer: SocketAddr,
+    seconds: u64,
+    pps: u64,
+) -> Result<(), String> {
+    let (session, _) = QuicSession::connect(server, "localhost", "stun.turn", creds, 5000).await?;
+    crate::transport_probe::network_session(session, peer, seconds, pps).await
+}
