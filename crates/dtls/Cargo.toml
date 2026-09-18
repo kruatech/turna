@@ -69,7 +69,7 @@ thiserror = "1"
 # Not optional. Upstream gated `Certificate::from_pem` behind a `pem` feature;
 # turna loads operator certificates from PEM on every DTLS path, so the gate
 # only created a way to build a crate that cannot read a certificate.
-pem = "3"
+pem = "4"
 portable-atomic = "1.6"
 
 [dev-dependencies]
