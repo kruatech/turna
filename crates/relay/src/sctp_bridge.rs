@@ -111,11 +111,36 @@ pub(crate) async fn run_sctp_bridge(
 
     info!("TURN-over-SCTP bridge started");
 
+    let mut owners = std::collections::HashMap::new();
     while let Some(ev) = event_rx.recv().await {
         match ev {
             TcpTransportEvent::ConnectionOpened { conn_id, peer_addr } => {
+                if client_sinks.contains_key(&peer_addr)
+                    || processor.store().get(&peer_addr).is_some()
+                {
+                    let _ = sctp_send_tx
+                        .send(TcpSendCommand {
+                            conn_id,
+                            data: Vec::new(),
+                        })
+                        .await;
+                    continue;
+                }
                 let (sink_tx, mut sink_rx) = mpsc::channel::<Vec<u8>>(256);
-                client_sinks.insert(peer_addr, sink_tx);
+                let inserted = client_sinks
+                    .entry(peer_addr)
+                    .or_insert_with(|| sink_tx.clone())
+                    .same_channel(&sink_tx);
+                if !inserted {
+                    let _ = sctp_send_tx
+                        .send(TcpSendCommand {
+                            conn_id,
+                            data: Vec::new(),
+                        })
+                        .await;
+                    continue;
+                }
+                owners.insert(conn_id, peer_addr);
 
                 let stx = sctp_send_tx.clone();
                 tokio::spawn(async move {
@@ -140,6 +165,9 @@ pub(crate) async fn run_sctp_bridge(
                 peer_addr,
                 data,
             } => {
+                if owners.get(&conn_id) != Some(&peer_addr) {
+                    continue;
+                }
                 // One de-framed STUN/ChannelData message — process like a UDP datagram.
                 let raw = data.freeze();
                 for action in processor.process(raw, peer_addr) {
@@ -208,6 +236,9 @@ pub(crate) async fn run_sctp_bridge(
                 peer_addr,
                 reason,
             } => {
+                if owners.remove(&conn_id) != Some(peer_addr) {
+                    continue;
+                }
                 client_sinks.remove(&peer_addr);
                 debug!(%peer_addr, %conn_id, %reason, "SCTP connection closed");
                 // Release the allocation now instead of waiting for the TTL —

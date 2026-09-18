@@ -18,8 +18,8 @@
 #
 # ~3 minutes. Everything lands in transports-<timestamp>/.
 #
-# PHASES selects which transports run (space-separated: udp turns dtls quic wt).
-# The default is all of them; CI uses a subset so QUIC/WebTransport get an
+# PHASES selects which transports run (space-separated: udp turns dtls quic wt sctp).
+# SCTP is opt-in and requires a Linux kernel with SCTP support. CI uses a subset for an
 # end-to-end gate on every PR without paying for the full matrix:
 #
 #   PHASES="quic wt" scripts/verify/transports.sh
@@ -30,8 +30,10 @@
 set -uo pipefail
 
 OUT="${OUT:-transports-$(date +%Y%m%d-%H%M%S)}"
-ALL_PHASES="udp turns dtls quic wt"
-PHASES="${PHASES:-$ALL_PHASES}"
+ALL_PHASES="udp turns dtls quic wt sctp"
+PHASES="${PHASES:-udp turns dtls quic wt}"
+HEALTH_PORT="${HEALTH_PORT:-9091}"
+[[ "$PHASES" =~ [^[:space:]] ]] || { echo "PHASES must name a transport" >&2; exit 1; }
 for _p in $PHASES; do
   case " $ALL_PHASES " in
     *" $_p "*) ;;
@@ -45,8 +47,16 @@ cd "$REPO" || exit 1
 mkdir -p "$OUT"
 
 SECRET="verify-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-NODE=target/release/turna-node
-LOAD=target/release/turna-load-test
+BUILD_FLAGS=(--release)
+BIN_DIR=target/release
+if [ "${BUILD_PROFILE:-release}" = dev ]; then BUILD_FLAGS=(); BIN_DIR=target/debug; fi
+NODE="$BIN_DIR/turna-node"
+LOAD="$BIN_DIR/turna-load-test"
+FEATURES="tls,dtls,quic,web-transport"
+if want sctp; then
+  python3 scripts/verify/transport-observe.py sctp || exit 1
+  FEATURES="$FEATURES,sctp"
+fi
 SUMMARY="$OUT/summary.md"
 PASS=0
 FAIL=0
@@ -72,13 +82,19 @@ result() { # name, exit code, log file
   echo "|---|---|---|"
 } > "$SUMMARY"
 
+# Refuse a foreign readiness endpoint instead of probing another process.
+if curl -fsS --max-time 1 "http://127.0.0.1:$HEALTH_PORT/health" >/dev/null 2>&1; then
+  echo "health port $HEALTH_PORT already serves a process; stop it or use an isolated host" >&2
+  exit 1
+fi
+
 # ── build ───────────────────────────────────────────────────────────────────
 say "building (node: all transports; load tool: all clients)"
-cargo build --release -p turna-node \
-  --features "tls,dtls,quic,web-transport" > "$OUT/build-node.log" 2>&1 || {
+cargo build --locked "${BUILD_FLAGS[@]}" -p turna-node \
+  --features "$FEATURES" > "$OUT/build-node.log" 2>&1 || {
   echo "node build failed — see $OUT/build-node.log"; exit 1; }
-cargo build --release -p turna-load-test \
-  --features "tls,dtls,quic,web-transport" > "$OUT/build-load.log" 2>&1 || {
+cargo build --locked "${BUILD_FLAGS[@]}" -p turna-load-test \
+  --features "$FEATURES" > "$OUT/build-load.log" 2>&1 || {
   echo "load-test build failed — see $OUT/build-load.log"; exit 1; }
 
 # `-addext subjectAltName`: rustls -- which both the node and every client here
@@ -89,7 +105,7 @@ cargo build --release -p turna-load-test \
 # may address the node by name or by either IP.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -keyout "$OUT/key.pem" -out "$OUT/cert.pem" -days 2 -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" 2>/dev/null
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1" 2>/dev/null || { echo "certificate generation failed" >&2; exit 1; }
 
 # ── config generator ────────────────────────────────────────────────────────
 # `allow_loopback_peers` is on because every probe here relays to a peer on
@@ -121,7 +137,7 @@ max_allocations = 800
 [turn.relay.quota]
 max_per_user = 0
 [health]
-listen = "127.0.0.1:9091"
+listen = "127.0.0.1:$HEALTH_PORT"
 $1
 EOF
 }
@@ -131,12 +147,14 @@ start_node() { # $1 = label
   "$NODE" "$OUT/turn.toml" > "$OUT/node-$1.log" 2>&1 &
   NODE_PID=$!
   for _ in $(seq 40); do
-    curl -fsS --max-time 1 http://127.0.0.1:9091/ready >/dev/null 2>&1 && return 0
+    kill -0 "$NODE_PID" 2>/dev/null || break
+    curl -fsS --max-time 1 "http://127.0.0.1:$HEALTH_PORT/ready" >/dev/null 2>&1 && return 0
     kill -0 "$NODE_PID" 2>/dev/null || break
     sleep 0.5
   done
   say "  node did not become ready — see node-$1.log"
   tail -5 "$OUT/node-$1.log"
+  result "$1 startup" 1 "$OUT/node-$1.log"
   return 1
 }
 stop_node() {
@@ -144,6 +162,7 @@ stop_node() {
   kill -TERM "$NODE_PID" 2>/dev/null
   for _ in $(seq 20); do kill -0 "$NODE_PID" 2>/dev/null || break; sleep 0.5; done
   kill -KILL "$NODE_PID" 2>/dev/null
+  wait "$NODE_PID" 2>/dev/null
   NODE_PID=""
 }
 trap 'stop_node' EXIT INT TERM
@@ -219,10 +238,12 @@ fi
 # ── 4. QUIC, then WebTransport (mutually exclusive on one listener) ─────────
 if want quic; then
 say "phase 4: raw QUIC"
-gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:3479"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = false\n' "$OUT/cert.pem" "$OUT/key.pem")"
+gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "0.0.0.0:3479"\ncert_path = "%s"\nkey_path = "%s"\nmax_bi_streams = 8\nweb_transport = false\n' "$OUT/cert.pem" "$OUT/key.pem")"
 if start_node quic; then
   run "raw QUIC (incl. relayed media)" quic-check \
     "$LOAD" --server 127.0.0.1:3479 --secret "$SECRET" quic-check
+  run "QUIC allocation/session cleanup" quic-cleanup \
+    python3 scripts/verify/transport-observe.py cleanup --port "$HEALTH_PORT"
 fi
 stop_node
 fi
@@ -236,10 +257,27 @@ say "phase 5: WebTransport"
 # so: after thirty seconds accepted=0 AND handshake_failures=0, i.e. not one
 # packet ever arrived. `quic-check` passed on the same port because it dials
 # 127.0.0.1 literally. A dual-stack socket accepts both.
-gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "[::]:3479"\ncert_path = "%s"\nkey_path = "%s"\nweb_transport = true\n' "$OUT/cert.pem" "$OUT/key.pem")"
+gen_config "$(printf '[turn.quic]\nenabled = true\nlisten = "[::]:3479"\ncert_path = "%s"\nkey_path = "%s"\nmax_bi_streams = 8\nweb_transport = true\n' "$OUT/cert.pem" "$OUT/key.pem")"
 if start_node wt; then
   run "WebTransport / H3" wt-check \
     "$LOAD" --secret "$SECRET" wt-check --url https://localhost:3479/
+  run "WebTransport allocation/session cleanup" wt-cleanup \
+    python3 scripts/verify/transport-observe.py cleanup --port "$HEALTH_PORT"
+fi
+stop_node
+fi
+
+if want sctp; then
+say "phase 6: native SCTP"
+gen_config '[turn.sctp]
+enabled = true
+listen = "127.0.0.1:3481"
+max_connections_per_ip = 16'
+if start_node sctp; then
+  run "SCTP allocation and relayed media" sctp-check \
+    "$LOAD" --server 127.0.0.1:3481 --secret "$SECRET" sctp-check
+  run "SCTP allocation/session cleanup" sctp-cleanup \
+    python3 scripts/verify/transport-observe.py cleanup --transport sctp --port "$HEALTH_PORT"
 fi
 stop_node
 fi
@@ -250,8 +288,8 @@ fi
   echo "**$PASS passed, $FAIL failed.** Phases run: \`$PHASES\`."
   echo
   echo "Not covered here: OAuth (needs a real authorization server), AF_XDP (needs a"
-  echo "dedicated NIC and root), and sustained load on anything but TURNS — the soak"
-  echo "harness drives UDP. \`wt-check\` is not a browser: client and server share"
+  echo "dedicated NIC and root), and endurance (run transport-load.sh separately)."
+  echo "\`wt-check\` is not a browser: client and server share"
   echo "\`wtransport\` and one reading of the spec, so a shared misreading stays"
   echo "invisible."
 } >> "$SUMMARY"

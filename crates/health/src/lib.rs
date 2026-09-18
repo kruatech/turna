@@ -2280,6 +2280,20 @@ pub async fn serve_on(
                         m.cluster_redirects.load(Ordering::Relaxed),
                         m.cluster_nodes.load(Ordering::Relaxed),
                     );
+                    // Count our own descriptors: PR_SET_DUMPABLE=0 intentionally
+                    // prevents same-user external samplers from reading this directory.
+                    #[cfg(target_os = "linux")]
+                    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+                        if let Ok(entries) = entries.collect::<std::io::Result<Vec<_>>>() {
+                            // Exclude the directory descriptor opened by read_dir.
+                            body.push_str(&format!(
+                                "# HELP turna_process_open_fds Open file descriptors in this node\n\
+                                 # TYPE turna_process_open_fds gauge\n\
+                                 turna_process_open_fds {}\n",
+                                entries.len().saturating_sub(1),
+                            ));
+                        }
+                    }
                     body.push_str(&m.render_tenant_metrics());
                     body.push_str(&format!(
                         "# HELP turna_processor_panics_total Packet-processing panics caught by the worker guard\n\
