@@ -67,12 +67,13 @@ cargo build --release -p turna-node --features af-xdp
   per-IP), handshake timeout, certificate hot-reload, cooperative drain,
   accept-error resilience, `turna_tls_*` metrics. This is also the control
   transport RFC 6062 TCP allocations require.
-- **sctp — Experimental, refused in production, not being matured.** Opt-in
-  client *control* transport (the relay stays UDP). No RFC defines SCTP for TURN,
-  the control channel is plaintext, and `production = true` rejects
-  `[turn.sctp].enabled`. Only wired in the tokio backend, and it has none of the
-  hardening the other listeners received. Treat it as test-only; the open question
-  is whether to delete it, not how to promote it (`docs/protocol-gap.md`).
+- **sctp — Supported on Linux/tokio.** Opt-in native one-to-one SCTP carrying
+  TURN control and ChannelData; the peer-side relay remains UDP. Allowed in
+  production, with global/per-IP caps, rate limiting, metrics, readiness and
+  cooperative drain. Requires kernel SCTP and network access for IP protocol 132.
+  Plaintext and project-specific; no WebRTC DataChannel or independent client
+  interoperability claim. Other backend selections are rejected when enabled.
+  See [support evidence](../verification/sctp-supported-2026-09-18.md).
 - **quic / web-transport — Experimental.** Opt-in. Both paths apply the full
   `[turn.quic]` transport config; raw QUIC also routes control replies per stream.
   `alpn` is inert on the H3 path (wtransport forces `h3`). No interop test yet. Build the two features separately — `web-transport` bundles its own
@@ -119,7 +120,7 @@ cargo build --release -p turna-node --features af-xdp
 | io_uring  | Linux    | `io-uring`   | Supported |
 | TURNS (TLS/TCP) | Linux/macOS | `tls` | **Supported** |
 | DTLS      | Linux/macOS | `dtls`    | Beta |
-| SCTP      | Linux    | `sctp`       | Experimental (refused in production) |
+| SCTP      | Linux    | `sctp`       | Supported with tokio; native SCTP, plaintext |
 | QUIC      | Linux/macOS | `quic`    | Beta (control-plane interop recorded) |
 | WebTransport | Linux/macOS | `web-transport` | Beta (browser interop recorded) |
 | AF_XDP    | Linux    | `af-xdp`     | Experimental (Phase 1) |

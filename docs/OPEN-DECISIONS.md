@@ -148,23 +148,15 @@ Until decided it is marked unwired in its own module header, the docs say the sa
 `scripts/check-doc-claims.sh` asserts the two agree — so it cannot quietly start
 looking supported.
 
-### 5. SCTP — keep it refused, or remove it?
+### 5. SCTP — resolved: retain and support on Linux/tokio
 
-No RFC defines TURN-over-SCTP, so interop is impossible by construction: there is
-nothing to be compatible with. The implementation has **no hardening at all** — no
-per-IP cap, no rate limit, no `turna_sctp_*` metrics, no readiness, no drain — and its
-control channel is plaintext, which is a step back from TURNS.
-
-**For removal:** dead code that has to compile and be maintained, and that carries risk
-if anyone enables it. An allocation leak was found in it this cycle
-(`ConnectionClosed` did not release the relay port) precisely because it exists.
-
-**For keeping:** if a customer ever needs it, reviving beats rewriting.
-
-**Note if kept:** bringing it to the level of the other transports is roughly one
-working session (limits, metrics, readiness, drain, a load client). That work would not
-move any readiness metric, because there is no standard to be interoperable with and the
-production gate is a decision rather than a missing prerequisite.
+TURN-over-SCTP is retained as an opt-in, project-specific native SCTP transport.
+The production refusal is lifted after the hardening and verification recorded in
+[the support evidence](verification/sctp-supported-2026-09-18.md). Per-IP/global
+caps, association rate limiting, metrics, readiness, bounded writes and cooperative
+drain are implemented. The channel remains plaintext and the peer-side relay UDP.
+No independent implementation interoperability, browser DataChannel compatibility,
+non-Linux support or multi-day endurance is claimed. QUIC/WT decisions are separate.
 
 ### 6. Is RFC 5780 (NAT behaviour discovery) wanted?
 

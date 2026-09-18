@@ -295,19 +295,14 @@ fn assert_refused_transport(what: &str, body: &str, transport: &str, expect_in_m
     );
 }
 
-/// `production = true` MUST refuse the RFC 6062 TCP relay... no longer: the gate
-/// was lifted once interop was on record. What must still hold is that the
-/// *other* production gates refuse, so this file documents which is which.
-///
-/// These tests exist because the project had exactly one startup-failure test
-/// before them (the health port, added the day before). Every other refusal —
-/// including three that exist specifically to stop an unfinished feature
-/// reaching production — rested on nobody quietly turning a `?` into a `let _`.
+/// Production policy must not hide invalid transport configuration. RFC 6062
+/// and Linux/tokio SCTP are allowed; OAuth retains its separate refusal below.
 #[test]
-fn refuses_to_start_when_sctp_is_enabled_in_production() {
+fn refuses_to_start_when_sctp_framing_config_is_invalid() {
+    // Production itself is no longer a refusal. Invalid framing still must be.
     assert_refused(
-        "SCTP under production",
-        "production = true\n[turn.sctp]\nenabled = true",
+        "SCTP invalid frame size",
+        "production = true\n[turn.sctp]\nenabled = true\nmax_frame_size = 19",
         "sctp",
     );
 }

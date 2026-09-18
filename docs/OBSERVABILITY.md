@@ -51,6 +51,7 @@ scrape_configs:
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `turna_process_open_fds` | gauge | Linux node file descriptors from `/proc/self/fd`, excluding the sampling directory descriptor. Omitted on non-Linux or read failure; absence is not zero. Used by transport cleanup monitoring. |
 | `turna_active_allocations` | gauge | Current allocation count. |
 | `turna_total_allocations` | counter | Total successful allocations since start. |
 | `turna_relay_ports_in_use` | gauge | Relay ports held by an allocation **or** by an unclaimed EVEN-PORT reservation — a reserved port is unavailable to anyone else, so counting it free would understate how full the pool is. Summed across the global pool and any tenant pools. |
@@ -279,6 +280,9 @@ it during an incident. Design and rationale: `docs/design/capacity-api.md`.
 | `turna_tls_alpn_rejected_total` | counter | Connections closed after the handshake because `alpn_required` was set and the client negotiated no ALPN. Non-zero here means either a probe or a real client that does not offer ALPN — check before assuming the former. |
 
 #### TURN-over-SCTP (`[turn.sctp]`)
+
+Supported on Linux/tokio; opt-in native SCTP without TLS. See
+[support scope and evidence](verification/sctp-supported-2026-09-18.md).
 
 Refused under `production = true`. These exist so a deployment that opts in on an
 internal network can see what the listener is doing — it shipped with no counters

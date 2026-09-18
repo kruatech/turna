@@ -100,20 +100,18 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   `docs/design/additional-address-family.md` — and v6 for RFC 6062 TCP relay.
   **Interop verified** on routable global v6 addresses, both by our own client and by coturn's (`docs/interop/relayed-media-2026-08-19.md`, `docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts.
 - **Default MTU 1280.** `PacketProcessor` defaults to `mtu = 1280`; DONT-FRAGMENT drops oversized Send-indication payloads against this value. Operators set the real path MTU at construction (`with_mtu`).
-- **Experimental transports are feature-gated and off by default.** `quic` /
-  `web-transport` (raw-QUIC / WebTransport ingress), `sctp` (client control
-  transport, no RFC defines it, plaintext channel) and `af-xdp` (kernel-bypass
+- **Optional transports are feature-gated and off by default.** `quic` /
+  `web-transport` (raw-QUIC / WebTransport ingress), `sctp` (supported on Linux/tokio, project-specific client
+  transport, plaintext channel) and `af-xdp` (kernel-bypass
   datapath) compile only under their features. The B6 bounded-queue work applies
   to those paths; the default production profile does not include them. `af-xdp`
   is Linux-only (its `build.rs` refuses to build elsewhere by design) and is the
   only feature that pulls an LGPL-licensed branch into the dependency graph —
   see §7.
-- **Two features are refused outright under `production = true`.**
-  `config::validate()` fails the start when
-  `turn.sctp.enabled` or `turn.auth.oauth.enabled` is set in a production
-  profile. This is policy, not a defect: each is implemented and testable with
-  `production = false`, and each has an exit condition
-  (`docs/protocol-gap.md`).
+- **OAuth remains refused under `production = true`.** `config::validate()`
+  rejects `turn.auth.oauth.enabled`. SCTP is now allowed on Linux/tokio;
+  [scope and verification](verification/sctp-supported-2026-09-18.md) distinguish
+  native SCTP support from standardized TURN interoperability and encryption.
 - **Nonce lifetime 630s, client-bound.** Nonces are an HMAC over client address + issue time under an ephemeral per-process key (`processor::NonceManager`): no server-side nonce table, and a restart forces a fresh 401 for outstanding nonces.
 - **Per-allocation resource caps.** 256 permissions and 256 channel bindings per allocation; 32 peers per CreatePermission (B5). Compile-time constants, not config.
 - **Credentials are not SASLprep/OpaqueString-normalized.** Long-term keys hash the raw `username:realm:password` UTF-8 bytes (`crypto/lib.rs`). ASCII credentials (the common case) interoperate fine; a client that normalizes non-ASCII credentials per RFC 8489 OpaqueString / RFC 5389 SASLprep before hashing would derive a different key and fail integrity. If non-ASCII credentials must interoperate, add normalization at both key-derivation sites (kept in parity today).
@@ -142,7 +140,7 @@ soak with no memory/fd leak (`docs/soak/`).
 
 **Not supported as stable (experimental / out of scope / unverified):** RFC 6062
 TCP relay,
-TURN-over-SCTP and RFC 7635 OAuth (implemented but refused under
+RFC 7635 OAuth (implemented but refused under
 `production = true`); QUIC / WebTransport ingress (feature-gated); AF_XDP and
 io_uring datapaths (feature-gated, not runtime-verified); TURN-over-DTLS
 (transport verified — DTLS 1.2 handshake + operator cert, `openssl s_client
