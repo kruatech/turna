@@ -69,11 +69,17 @@ project in this position can deliver.
   language and another reading of the RFC
   ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)).
 
-- **Refused in production** — TURN-over-SCTP (`[turn.sctp]`) and RFC 7635 OAuth
-  (`[turn.auth.oauth]`). Implemented and usable for testing; `production = true` makes
-  config validation **reject** them, so they cannot ship by accident. Two are refused in
-  production for different reasons: SCTP has none of the hardening the other listeners
-  received and no users, and OAuth has never run against a real authorization server.
+- **Supported on Linux — TURN-over-SCTP (`sctp`).** Opt-in native SCTP on the
+  tokio backend, allowed with `production = true`. Carries TURN control and
+  ChannelData; the peer-side relay remains UDP. Requires kernel SCTP support and
+  a network permitting IP protocol 132. This project-specific transport is
+  plaintext, not WebRTC DataChannel or SCTP-over-DTLS. Functional, lifecycle,
+  limits and 30-minute WAN verification are recorded in
+  [SCTP support evidence](docs/verification/sctp-supported-2026-09-18.md).
+
+- **Refused in production** — RFC 7635 OAuth (`[turn.auth.oauth]`). Implemented
+  and usable for testing, but has not been verified with a real authorization
+  server; `production = true` rejects it.
 
   RFC 6062 TCP relay was on this list until 2026-08-25. It came off because the evidence
   the gate was waiting for arrived — interop against coturn's own client
@@ -295,7 +301,7 @@ per-feature production maturity always check
 | DTLS transport (`dtls`) | RFC 7350 | Supported — 24 h under load with zero packet loss, a 300 000-packet spoofed-source flood that allocates no state, 20/20 handshakes at 3 % path loss, and interop with OpenSSL and coturn's client ([docs/interop/dtls-stack-2026-09-16.md](docs/interop/dtls-stack-2026-09-16.md)). Not reachable from a browser: WebRTC has no DTLS transport for TURN |
 | QUIC transport (`quic`) | — | Beta — allocation, relayed media both directions and 20 min under load, but **no independent implementation exists** (no RFC defines TURN over raw QUIC), so interop cannot be obtained |
 | WebTransport (`web-transport`) | — | Beta — browser interop recorded ([docs/interop/webtransport-browser-2026-08-20.md](docs/interop/webtransport-browser-2026-08-20.md)) plus 20 min under load |
-| TURN-over-SCTP transport (`sctp`) | none — no RFC defines it | Experimental; **refused under `production = true`**. Control channel only, the relay stays UDP |
+| TURN-over-SCTP transport (`sctp`) | Project-specific TURN mapping | **Supported on Linux/tokio**, opt-in, allowed in production. Native SCTP without TLS; control and ChannelData, UDP relay. [Evidence](docs/verification/sctp-supported-2026-09-18.md) |
 | Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
 | NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |

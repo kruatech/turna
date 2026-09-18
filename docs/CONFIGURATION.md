@@ -267,32 +267,36 @@ without `--features web-transport`, is a **startup error**.
 
 ---
 
-## `[turn.sctp]` — TURN-over-SCTP (experimental)
+## `[turn.sctp]` — TURN-over-SCTP (supported on Linux/tokio)
 
-Client **control** transport over an SCTP association: STUN/TURN framed exactly as
-TURN-over-TCP, with the relay socket to the peer staying **UDP**. Requires
-`--features sctp` and the host `sctp` kernel module. Disabled by default.
+Opt-in native SCTP client-to-server transport for STUN/TURN control and
+ChannelData. The peer-side relay stays **UDP**. Requires a Linux node built with
+`--features sctp`, kernel SCTP support (built in or loaded as a module), and
+`[turn] transport = "tokio"` (the default). Other backend selections are rejected
+when SCTP is enabled. `production = true` is allowed; normal production secret,
+address and quota checks still apply. Builds without `sctp` fail at startup.
 
-> **No RFC defines SCTP for TURN.** `TRANSPORT_SCTP = 132` is the IANA protocol
-> number (RFC 4960), not a standardised TURN relayed-transport value — it names the
-> control transport only.
->
-> **Refused in production.** `production = true` rejects `enabled = true`.
+This is a project-specific TURN mapping, not a standardized SCTP relay allocation
+or browser WebRTC DataChannel. IP protocol **132** must pass through the network;
+opening a TCP/UDP port does not open SCTP. Containers use the host kernel support.
 
 | key | type | default | notes |
 |-----|------|---------|-------|
 | `enabled` | bool | `false` | Enable the SCTP listener. |
-| `listen` | socket addr | `0.0.0.0:3478` | No standardised TURN-over-SCTP port. |
-| `max_frame_size` | usize | `65536` | Max framed STUN/ChannelData message (shares the TURNS frame codec). |
-| `read_timeout_secs` | u64 | `300` | Per-connection idle read timeout. |
-| `max_connections` | usize | `10000` | Concurrent SCTP associations. |
-| `backlog` | i32 | `1024` | `listen(2)` backlog. |
+| `listen` | socket addr | `0.0.0.0:3478` | No standardized TURN-over-SCTP port. |
+| `max_frame_size` | usize | `65536` | Framed STUN/ChannelData limit; valid range 20..65555. |
+| `read_timeout_secs` | u64 | `300` | Positive idle read timeout; outbound traffic does not reset it. |
+| `max_connections` | usize | `10000` | Concurrent association cap; 0 disables this cap. |
+| `max_connections_per_ip` | usize | `0` | Per-IP concurrent cap; 0 disables this cap. |
+| `max_associations_per_sec_per_ip` | u32 | `0` | Per-IP accepted-association rate; 0 disables limiting. |
+| `association_burst_per_ip` | u32 | `0` | 0 selects twice the configured rate. |
+| `backlog` | i32 | `1024` | Positive `listen(2)` backlog. |
 
-The control channel is **plaintext** — TLS-over-SCTP is out of scope, so anything
-an operator would protect with TURNS is unprotected here. Awkward in containers
-(needs the host kernel module) and of low real-world use; `docs/protocol-gap.md`
-rates it lowest priority and suggests it may be dropped rather than matured. Only
-wired in the tokio backend, not io_uring.
+The SCTP channel has **no TLS encryption**. TURN authentication does not add
+transport confidentiality. Only one ordered SCTP stream is used; multi-stream
+SCTP and multihoming/failover are not support claims. See
+[SCTP evidence and limitations](verification/sctp-supported-2026-09-18.md) and
+[metrics](OBSERVABILITY.md#turn-over-sctp-turnsctp).
 
 ---
 

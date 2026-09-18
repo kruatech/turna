@@ -1,5 +1,9 @@
 # Transport hardening — step 2 (2026-09-18)
 
+> Historical checkpoint: the SCTP production refusal described below has since
+> been lifted for Linux/tokio. Current scope and evidence:
+> [SCTP supported](../verification/sctp-supported-2026-09-18.md).
+
 Cumulative source patch against `01aee9d22afd0ef4fdba689478f0ec936f956f28`,
 for `feature/supported-transports`. Includes step 1 and the stale-nonce fix.
 This document supersedes step 1's remaining-work notes. No support labels or

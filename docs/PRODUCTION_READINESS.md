@@ -79,7 +79,7 @@ Production checklist:
 | UDP TURN/STUN over tokio | Mainline | Recommended baseline. Endurance re-recorded against this release (`docs/soak/endurance-2026-08-19.md`): 3 h, 13.7 M allocations, 441 M packets, RSS +0.2 %, no fd or thread growth, no dropped packets, no panics, clean drain. |
 | TURNS / TLS-over-TCP | **Supported** | Metrics (`turna_tls_*`), `max_connections_per_ip`, per-IP handshake rate limit, mTLS (verified incl. the refusal case) and ALPN strict mode, certificate hot-reload, cooperative drain. Three lines of evidence: browser interop across three engines (`docs/interop/turns-browsers-2026-08-18.md`), a Let's Encrypt chain validated by a verifying client against a public deployment, and **24 h under load** — 9.6 h of relayed media at zero loss plus 4.8 h of allocation churn at 441/s, no leak on any signal (`docs/soak/endurance-24h-2026-08-22.md`). |
 | RFC 6062 TCP relay allocations | Beta, allowed in production | The `production = true` refusal was lifted on 2026-08-25: interop is recorded against our own client and against coturn's (`docs/interop/coturn-2026-08-23.md`), including the pipelined `ConnectionBind` case that no independent client had exercised before. What the gate used to stand in for — a sizing decision, since each relayed peer costs a listener and a connection — is now yours to make. Still IPv4-only. |
-| TURN-over-SCTP | **Refused in production** | Same gate on `[turn.sctp].enabled`. No RFC defines SCTP for TURN; control channel only. Needs the host `sctp` kernel module. |
+| TURN-over-SCTP | **Supported on Linux/tokio** | Opt-in native SCTP, allowed in production; requires kernel support and IP protocol 132 reachability. Plaintext, UDP peer-side relay. [Evidence](verification/sctp-supported-2026-09-18.md). |
 | Third-party auth (RFC 7635 OAuth) | **Refused in production** | Same gate on `[turn.auth.oauth].enabled`. |
 | IPv6 relayed transport | Opt-in, verified | Set `[turn] external_ip6` to a routable IPv6 address. Unset (default) keeps the old behaviour: IPv6 Allocate → `440`. Relayed media verified between two **routable** global v6 addresses with the peer filter in its `lan` profile and no loopback concession (`docs/interop/relayed-media-2026-08-19.md`), plus interop against coturn's client (`docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. |
 | DTLS | Beta, optional feature | Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics, bounded accept (`accept_timeout_secs`). On the **default** path pre-handshake rate limiting is still missing — do not expose to an untrusted internet without upstream rate limiting. `[turn.dtls] demux = true` adds it, plus concurrent handshakes and certificate hot-reload, but is itself unverified. |
@@ -220,26 +220,16 @@ Known residual gaps, per transport:
   The gate is `docs/verification/encrypted-transports.md`; operator response for
   the alerts is `docs/runbooks/encrypted-transports.md`.
 
-### R9 — two experimental features are refused in production, and that is deliberate
+### R9 — RFC 7635 OAuth remains refused in production
 
-`config::validate()` hard-fails when `production = true` and either
-`turn.sctp.enabled` or `turn.auth.oauth.enabled` is set. The node does not start,
-with a diagnostic naming the key.
+`config::validate()` rejects `production = true` with `turn.auth.oauth.enabled`.
+OAuth still needs verification against a real authorization server. Do not
+bypass normal production checks just to enable it.
 
-`turn.tcp_relay.enabled` was on that list until 2026-08-25. It came off because
-the evidence the gate was waiting for arrived — interop against an independent
-implementation — not because the risk changed. The remaining two are refused for
-different reasons: SCTP has none of the hardening the other listeners received
-and no users, and OAuth has never been exercised against a real authorization
-server.
-
-- **Severity:** none if understood; an outage if discovered during a production
-  cutover.
-- **Mitigation:** decide before the cutover whether you need any of them. If you
-  do, the honest options are to run that deployment with `production = false`
-  (which also disables the placeholder-secret and missing-`external_ip` checks —
-  usually the wrong trade) or to keep the feature out of the production profile
-  and finish its verification first.
+The RFC 6062 gate was lifted on 2026-08-25. The SCTP gate is now lifted for
+Linux/tokio after native functional, lifecycle/limits and WAN verification;
+see [SCTP support evidence](verification/sctp-supported-2026-09-18.md).
+Platform, backend, feature availability and framing validation remain enforced.
 
 ### R10 — IPv6 relayed transport is opt-in
 
@@ -500,7 +490,8 @@ authoritative per-feature register is `docs/protocol-gap.md`.
 | DTLS | Beta — allocation and media on both listener paths, 20 min under load, **and interop against coturn's client** (R4) |
 | DTLS demux (`demux = true`) | Opt-in, no evidence yet — concurrent handshakes, pre-handshake admission, rate limit, cert reload |
 | mTLS for TURNS clients | Opt-in (`[tls] client_ca`), verified incl. the refusal case; no CRL/OCSP by design |
-| SCTP, OAuth | Refused in production (R9) |
+| SCTP | Supported on Linux/tokio; plaintext, native SCTP (R9) |
+| OAuth | Refused in production (R9) |
 | RFC 6062 TCP relay | Beta, no longer refused — gate lifted 2026-08-25 (R9) |
 | IPv6 relayed transport | Opt-in; conformance **and relayed media** recorded, loopback only (R10) |
 | Mobility (RFC 8016) | Partial — same-node only; cross-node migration is not implemented (the placeholder module was removed) |

@@ -446,21 +446,12 @@ impl TurnaConfig {
                     .into(),
             );
         }
-        // Experimental transports are not production-ready: RFC 6062 TCP relay is
-        // partial/experimental, and TURN-over-SCTP is experimental. Refuse to
-        // enable either under `production` so an unfinished datapath is never
-        // shipped as if it were supported.
-        // RFC 6062 TCP relay is no longer refused under `production`. Interop is
-        // recorded (docs/interop/transports-2026-08-19.md and
-        // docs/interop/coturn-2026-08-23.md), including the pipelined
-        // ConnectionBind case that the prebuffer in transport::tcp_tls exists to
-        // handle and that no independent client had exercised before.
-        //
-        // It still carries a different operational profile from UDP — a listener
-        // and a connection per relayed peer — but that is a sizing decision for
-        // the operator, documented in docs/feature-support.md, not something a
-        // config refusal can make for them.
+        // SCTP is supported on Linux/tokio; production uses the same safety
+        // validation as other supported listeners. See verification evidence.
         if self.turn.sctp.enabled {
+            if !matches!(self.turn.transport, TransportSelection::Tokio) {
+                errors.push("turn.sctp requires turn.transport = \"tokio\"; other backends do not start this listener".into());
+            }
             if !cfg!(target_os = "linux") {
                 errors.push("turn.sctp requires Linux native SCTP support".into());
             }
@@ -470,12 +461,6 @@ impl TurnaConfig {
             {
                 errors.push("turn.sctp requires positive backlog/read timeout and max_frame_size in 20..=65555".into());
             }
-        }
-        if prod && self.turn.sctp.enabled {
-            errors.push(
-                "turn.sctp.enabled = true in production, but TURN-over-SCTP is experimental and not supported in production"
-                    .into(),
-            );
         }
         // RFC 7635 OAuth is experimental: refuse in production, and when enabled
         // require a server_name plus at least one valid AES keyring entry.
@@ -1044,7 +1029,7 @@ pub struct TurnConfig {
     /// Requires the node binary built with `--features dtls`.
     #[serde(default)]
     pub dtls: DtlsSection,
-    /// TURN-over-SCTP control transport (experimental). Disabled by default.
+    /// TURN-over-SCTP client transport (supported on Linux/tokio). Disabled by default.
     /// Requires the node binary built with `--features sctp`.
     #[serde(default)]
     pub sctp: SctpSection,
@@ -2538,7 +2523,7 @@ impl Default for DtlsSection {
     }
 }
 
-/// TURN-over-SCTP listener (experimental client CONTROL transport; the relayed
+/// TURN-over-SCTP listener (supported Linux/tokio client transport; the relayed
 /// side stays UDP). No TURN RFC defines SCTP relaying — see docs/protocol-gap.md.
 /// Disabled by default. Requires the node binary built with `--features sctp`
 /// and a host with the SCTP kernel module.
@@ -4103,6 +4088,8 @@ shared_secret = "test-secret"
 
     #[test]
     fn port_conflict_detected() {
+        // Other config tests temporarily set the process-wide production flag.
+        let _guard = production_env_lock();
         // Until 0.5.0 this fixture collided `[turn]` with `[signaling]`, which
         // no longer exists. The check itself is unchanged and still covers the
         // three remaining listeners; health-on-the-TURN-port is the realistic
@@ -4343,6 +4330,28 @@ shared_secret = "deadbeef-this-is-a-real-secret-honest"
 allow_unlimited_bandwidth = true
 
 "#
+    }
+
+    #[test]
+    fn sctp_support_policy_matches_platform_and_backend() {
+        let _guard = production_env_lock();
+        let mut cfg: TurnaConfig = toml::from_str(prod_config_clean()).unwrap();
+        cfg.turn.sctp.enabled = true;
+        let result = cfg.validate();
+        if cfg!(target_os = "linux") {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(result.unwrap_err().to_string().contains("SCTP support"));
+        }
+        for backend in [
+            TransportSelection::Auto,
+            TransportSelection::IoUring,
+            TransportSelection::AfXdp,
+        ] {
+            cfg.turn.transport = backend;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("turn.sctp requires turn.transport"), "{err}");
+        }
     }
 
     #[test]

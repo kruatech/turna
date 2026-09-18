@@ -588,7 +588,7 @@ fn build_tcp_relay_config(
 }
 
 /// Map the config-layer [`turna_config::SctpSection`] to the transport-layer
-/// `SctpTransportConfig`. Experimental TURN-over-SCTP control transport.
+/// `SctpTransportConfig`. Supported native Linux TURN-over-SCTP transport.
 #[cfg(feature = "sctp")]
 fn build_sctp_transport_config(
     c: &turna_config::SctpSection,
@@ -2406,7 +2406,7 @@ fn run_tokio(
                 };
                 #[cfg(feature = "sctp")]
                 let server = if config.sctp.enabled {
-                    info!(listen = %config.sctp.listen, "TURN-over-SCTP (experimental) enabled");
+                    info!(listen = %config.sctp.listen, "TURN-over-SCTP enabled (Linux, plaintext)");
                     server.with_sctp(build_sctp_transport_config(&config.sctp))
                 } else {
                     server

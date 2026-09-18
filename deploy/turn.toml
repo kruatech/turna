@@ -481,23 +481,24 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # needs a node restart.
 
 # =============================================================================
-# [turn.sctp] — TURN-over-SCTP (experimental, no RFC)
+# [turn.sctp] — TURN-over-SCTP (supported on Linux/tokio)
 # =============================================================================
-# Client CONTROL transport over an SCTP association; the relay socket to the peer
-# stays UDP. Requires `--features sctp` and the host `sctp` kernel module.
-#
-# REFUSED under production = true (config validation rejects enabled = true).
-#
-# No TURN RFC defines SCTP. The control channel is PLAINTEXT — whatever you would
-# protect with TURNS is unprotected here. Low real-world use, awkward in
-# containers; see docs/protocol-gap.md, which rates it lowest priority.
+# Opt-in native SCTP for TURN control and ChannelData; peer-side relay stays UDP.
+# Requires --features sctp, Linux kernel SCTP support and turn.transport = "tokio".
+# Allowed with production = true; normal production validation still applies.
+# IP protocol 132 must pass through the network (not TCP/UDP). No TLS encryption.
+# Project-specific TURN mapping, not browser WebRTC DataChannel.
+# Evidence: docs/verification/sctp-supported-2026-09-18.md
 #
 # [turn.sctp]
 # enabled = false
-# listen  = "0.0.0.0:3478"
+# listen = "0.0.0.0:3478"
 # max_frame_size = 65536
 # read_timeout_secs = 300
 # max_connections = 10000
+# max_connections_per_ip = 0
+# max_associations_per_sec_per_ip = 0
+# association_burst_per_ip = 0
 # backlog = 1024
 
 # =============================================================================

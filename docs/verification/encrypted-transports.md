@@ -166,12 +166,12 @@ pass/fail and the metric that proved it.
 
 ### Production gate (policy, not a bug)
 
-- [ ] With `production = true`, each of `[turn.tcp_relay].enabled`,
-      `[turn.sctp].enabled` and `[turn.auth.oauth].enabled` must make config
-      validation **fail** with a message naming the key. Confirm all three, so a
-      production cutover cannot silently enable an unverified datapath.
-- [ ] With `production = false` the same configs must start normally — the gate is
-      policy, not brokenness.
+- [ ] With `production = true`, `[turn.auth.oauth].enabled` must still fail
+      validation with a diagnostic naming the key.
+- [ ] SCTP is allowed on Linux/tokio with valid production configuration and a
+      binary built with `sctp`; reject unsupported platforms/backends and invalid
+      framing configuration. See [SCTP evidence](sctp-supported-2026-09-18.md).
+- [ ] RFC 6062 is no longer production-refused; its TLS requirements still apply.
 
 ### Relayed address family
 

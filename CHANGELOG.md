@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Promote native TURN-over-SCTP to **supported on Linux/tokio**, opt-in. Lift the
+  production refusal while retaining platform/feature/framing validation; reject
+  backend selections that do not start the SCTP listener. The channel remains
+  plaintext and the peer-side relay UDP. Record native functional, lifecycle/limits
+  and 30-minute WAN evidence in `docs/verification/sctp-supported-2026-09-18.md`.
+  No QUIC/WebTransport status change or multi-day endurance claim.
+
 ### Security
 
 - **`services/admin`: the read-only API routes required no token.**
