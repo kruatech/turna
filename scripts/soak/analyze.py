@@ -73,6 +73,7 @@ THREAD_GROWTH_ABS = 8
 # explain, not necessarily a failure — hence WARN, except for panics.
 ERROR_COUNTERS = [
     "turna_send_queue_dropped_total",
+    "turna_unauth_replies_suppressed_total",
     "turna_malformed_packets_total",
     "turna_parser_rejections_total",
     "turna_tls_accept_errors_total",
@@ -239,7 +240,7 @@ def main(out_dir):
 
     # ── RSS ──
     rss = series(idle, "rss_kb")
-    warmed = [(t, v) for t, v in rss if t >= RSS_WARMUP_SECS]
+    warmed = [(r, v) for r, v in rss if (num(r, "elapsed") or 0) >= RSS_WARMUP_SECS]
     excluded = 0
     # Only skip the warm-up when enough run remains to compare halves of it.
     if dur >= RSS_WARMUP_SECS * 3 and len(warmed) >= 4:
@@ -434,6 +435,9 @@ def main(out_dir):
         elif recv == 0:
             report("FAIL", "load phase " + label,
                    f"{sent} sent, nothing received ({errs} errors) — no request succeeded")
+        elif d.get("mode") == "allocate" and (errs != 0 or sent != recv):
+            report("FAIL", "load phase " + label,
+                   f"{sent} attempts, {recv} completed, {errs} errors — allocation churn must be clean")
         elif errs > recv:
             report("WARN", "load phase " + label,
                    f"{recv} ok vs {errs} errors — more failures than successes;"
@@ -458,7 +462,7 @@ def main(out_dir):
             detail = (f"{recv} ok, {errs} errors, {d.get('rps', 0):.0f} rps,"
                       f" p99 {d.get('lat_p99_us', 0)/1000:.0f} ms{extra}")
             if lost:
-                detail += f", {loss_pct:.0f}% of sent never came back"
+                detail += f", {lost}/{sent_total} missing ({loss_pct:.3f}%)"
             if loss_pct > 20:
                 # Check the arithmetic before blaming capacity. TURN bindings expire —
                 # allocation and channel at 600 s, permission at 300 s — so a client
@@ -481,6 +485,9 @@ def main(out_dir):
                                 " binding: TURN bindings last 600 s and the client is"
                                 " not refreshing them. Not capacity.")
                 report("WARN", "load phase " + label, detail + hint)
+            elif lost > 0:
+                report("WARN", "load phase " + label,
+                       detail + " — nonzero loss; investigate before extending the run")
             elif err_pct > 10:
                 report("WARN", "load phase " + label,
                        detail + f" — {err_pct:.0f}% of attempts errored")

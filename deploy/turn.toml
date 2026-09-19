@@ -90,7 +90,8 @@ external_ip6 = "${TURNA_EXTERNAL_IP6:-}"
 realm       = "${TURNA_REALM:-turna}"
 # Transport backend: tokio | io_uring | af_xdp | auto.
 # - tokio (set below): epoll + recvmmsg/sendmmsg. The supported production path.
-# - io_uring: Linux + `--features io-uring`. Experimental.
+# - io_uring: supported on Linux, opt-in; build with `--features io-uring`.
+#   Tested scope and sizing: docs/verification/io-uring-supported-2026-09-19.md.
 # - af_xdp: Linux + `--features af-xdp` + CAP_NET_RAW. Experimental; `listen`
 #   must be a concrete IP, not 0.0.0.0.
 # - auto: pick io_uring when usable at runtime, else tokio. Convenient for dev,

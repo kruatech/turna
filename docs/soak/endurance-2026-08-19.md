@@ -1,5 +1,8 @@
 # Endurance soak — 2026-08-19
 
+> Historical run: results and defects below describe that revision. Current
+> io_uring status and later verification: [supported Linux scope](../verification/io-uring-supported-2026-09-19.md).
+
 Two datapaths, three hours each, on a 32-core / 126 GiB Linux host. Load from
 `turna-load-test` via `scripts/soak/soak.sh`, alternating load and idle phases so a
 leak shows as a floor that fails to return to baseline.

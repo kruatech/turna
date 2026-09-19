@@ -84,7 +84,7 @@ Production checklist:
 | IPv6 relayed transport | Opt-in, verified | Set `[turn] external_ip6` to a routable IPv6 address. Unset (default) keeps the old behaviour: IPv6 Allocate → `440`. Relayed media verified between two **routable** global v6 addresses with the peer filter in its `lan` profile and no loopback concession (`docs/interop/relayed-media-2026-08-19.md`), plus interop against coturn's client (`docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. |
 | DTLS | Beta, optional feature | Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics, bounded accept (`accept_timeout_secs`). On the **default** path pre-handshake rate limiting is still missing — do not expose to an untrusted internet without upstream rate limiting. `[turn.dtls] demux = true` adds it, plus concurrent handshakes and certificate hot-reload, but is itself unverified. |
 | QUIC / WebTransport | Optional features; supported on Linux/macOS with tokio | Project-specific TURN mappings. Functional, lifecycle/limits, 20-minute load and WAN checks recorded; WebTransport also has Chrome browser evidence. DATAGRAM delivery is unreliable. No multi-day endurance or independent raw-QUIC TURN interoperability claim. See [support record](verification/quic-webtransport-supported-2026-09-18.md). |
-| io_uring | Optional backend | Usable in production when explicitly enabled, on a kernel you have tested. Endurance and relaying are both on record (`docs/soak/endurance-2026-08-19.md`, Ubuntu 24.04 / 6.14): no leak over 3 h, ~4× tokio's Allocate throughput, ChannelData relayed at ~17 000 rps with zero errors. Costs ~1 GiB resident (pre-registered buffers). Not the default recommendation: io_uring behaviour is kernel-version-sensitive, so verify on yours before relying on it. |
+| io_uring | Supported on Linux, opt-in | Explicit `transport = "io_uring"`, built with `io-uring`. Tested kernels 6.8.0-87 and 6.14.0-33; 134 MiB and 1073 MiB RSS respectively in different worker/host configurations, not a kernel-only comparison. [Evidence and deployment scope](verification/io-uring-supported-2026-09-19.md). |
 | AF_XDP | Explicit opt-in backend | Never auto-selected. Correctness verified on a veth lab (`docs/interop/af-xdp-2026-08-19.md`): relayed media at three rates with zero loss after fixing an RX frame leak. Still needs a run on the target NIC — the lab attaches in SKB mode, which copies every frame and reproduces none of the kernel-bypass behaviour that AF_XDP is for. |
 | Cluster redirect/gossip | Implemented path | Useful for new-client distribution; secure gossip with `cluster_secret`. |
 | Tarantool allocation persistence/failover | Implemented path | Monitor writer drops/errors; validate failover in your environment. |
@@ -102,15 +102,18 @@ explicit so a kernel/build capability does not silently change the datapath.
 - **Mitigation:** set `transport = "tokio"` in production configs and Helm
   values unless you are intentionally validating another backend.
 
-### R2 — io_uring is experimental
+### R2 — io_uring kernel and memory requirements
 
-The io_uring datapath contains sharded ownership and drain logic, but it needs
-runtime verification on the same kernel/NIC/load profile you plan to operate.
-It is not the recommended default for a first production rollout.
+The supported UDP datapath requires kernel io_uring access and sufficient memory
+for each worker's buffers and rings. Worker count defaults to available parallelism;
+`TURNA_IOURING_WORKERS` overrides it. Support does not imply a fixed memory cost
+or verified behaviour on every kernel and security policy.
 
 - **Severity:** Medium
-- **Mitigation:** use `tokio`; validate io_uring separately with
-  `cargo test --features io-uring` and a drain-under-load run.
+- **Mitigation:** select the backend explicitly, size workers and relay capacity,
+  and run recovery/drain, functional and load checks after deployment changes.
+  See the [support record](verification/io-uring-supported-2026-09-19.md) and
+  [operator runbook](runbooks/io-uring.md). Tokio remains the default.
 
 ### R3 — AF_XDP is opt-in and environment-sensitive
 
@@ -482,7 +485,7 @@ authoritative per-feature register is `docs/protocol-gap.md`.
 
 | Area | State |
 |---|---|
-| `io_uring` datapath | Beta — endurance and relaying recorded on kernels **6.8 and 6.14**; version-sensitive, verify on yours (R2) |
+| `io_uring` datapath | **Supported on Linux**, opt-in; tested on 6.8.0-87 and 6.14.0-33. Kernel and resource configuration still require deployment validation (R2). |
 | `AF_XDP` datapath | Beta (lab-verified) (R3) — correctness on a veth lab: relayed media at three rates with zero loss, ARP/NDP answered by the datapath itself. The XDP program is embedded and attached by the node (no external program), and the v6 frame path is implemented. **Not a capacity result**: veth attaches in SKB mode, which copies every frame. Validate on your NIC. |
 | QUIC (`quic`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
 | WebTransport (`web-transport`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |

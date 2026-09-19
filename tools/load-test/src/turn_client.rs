@@ -464,18 +464,6 @@ async fn send_recv(
     timeout(deadline, fut).await.ok().flatten()
 }
 
-/// Full authenticated Allocate. Returns a Session ready for
-/// CreatePermission / ChannelBind / Refresh, plus the relayed address.
-pub async fn allocate(
-    server: SocketAddr,
-    creds: &Creds,
-    rtt_ms: u64,
-) -> Result<Session, &'static str> {
-    allocate_family(server, creds, rtt_ms, None)
-        .await
-        .map_err(|e| e.0)
-}
-
 /// Probe an unauthenticated Allocate carrying ADDITIONAL-ADDRESS-FAMILY, and
 /// report the STUN code the server answered with.
 ///
@@ -625,6 +613,42 @@ pub async fn allocate_family(
 }
 
 impl Session {
+    /// Churn retains the source socket: nonces are bound to its full address.
+    pub async fn churn_request(&mut self, allocate: bool) -> Result<(), AllocError> {
+        for _ in 0..2 {
+            let mut m = Msg::request(if allocate { M_ALLOCATE } else { M_REFRESH });
+            if allocate { m.add_requested_transport_udp(); }
+            m.add_lifetime(if allocate { 600 } else { 0 });
+            let txid = m.txid();
+            let pkt = if self.no_auth { m.encode() } else {
+                m.add_username(&self.user);
+                m.add_realm(&self.realm);
+                m.add_nonce(&self.nonce);
+                m.encode_with_integrity(&self.key)
+            };
+            let resp = send_recv(&self.sock, self.server, &pkt, &txid, self.rtt_ms)
+                .await.ok_or(AllocError("churn: response timeout", None))?;
+            if is_success(&resp) {
+                if allocate {
+                    self.relayed = get_relayed_addr(&resp, &txid)
+                        .ok_or(AllocError("churn: missing relay address", None))?;
+                } else if get_attr(&resp, A_LIFETIME) != Some(&[0, 0, 0, 0][..]) {
+                    return Err(AllocError("churn: deletion not confirmed", None));
+                }
+                return Ok(());
+            }
+            let code = error_code(&resp);
+            match code {
+                Some(438) | Some(401) if !self.no_auth => {
+                    self.nonce = get_nonce(&resp)
+                        .ok_or(AllocError("churn: challenge missing nonce", code))?;
+                }
+                _ => return Err(AllocError("churn: rejected", code)),
+            }
+        }
+        Err(AllocError("churn: nonce retry exhausted", None))
+    }
+
     /// Run one authenticated request; retries once on stale nonce.
     async fn auth_request(
         &mut self,
@@ -733,5 +757,86 @@ impl Session {
     /// repeated bench runs don't exhaust the relay port range.
     pub async fn release(&mut self) {
         let _ = self.auth_request(M_REFRESH, |m| m.add_lifetime(0)).await;
+    }
+}
+
+#[cfg(test)]
+mod churn_tests {
+    use super::*;
+
+    async fn session(server: SocketAddr) -> Session {
+        Session {
+            sock: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            server, relayed: "127.0.0.1:23000".parse().unwrap(),
+            realm: "test".into(), nonce: b"old".to_vec(), user: "user".into(),
+            key: long_term_key("user", "test", "pass"), no_auth: false, rtt_ms: 1000,
+        }
+    }
+
+    fn response(request: &[u8], kind: u16) -> Msg {
+        let mut m = Msg::request(kind);
+        m.buf[8..20].copy_from_slice(&request[8..20]);
+        m
+    }
+
+    #[tokio::test]
+    async fn churn_reuses_socket_and_recovers_stale_nonce() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sess = session(server.local_addr().unwrap()).await;
+        let source = sess.sock.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let mut buf = [0u8; 1600];
+            for step in 0..3 {
+                let (n, addr) = timeout(Duration::from_secs(2), server.recv_from(&mut buf)).await.unwrap().unwrap();
+                assert_eq!(addr, source);
+                assert!(get_attr(&buf[..n], A_MESSAGE_INTEGRITY).is_some());
+                let nonce = if step == 2 { b"fresh".as_slice() } else { b"old".as_slice() };
+                assert_eq!(get_nonce(&buf[..n]).unwrap(), nonce);
+                let mut reply = response(&buf[..n], if step == 0 { 0x0104 } else if step == 1 { 0x0113 } else { 0x0103 });
+                if step == 0 {
+                    reply.add_lifetime(0);
+                } else if step == 1 {
+                    reply.add(A_ERROR_CODE, &[0, 0, 4, 38]);
+                    reply.add_nonce(b"fresh");
+                } else {
+                    reply.add(A_XOR_RELAYED_ADDRESS, &xor_addr_encode("127.0.0.1:23001".parse().unwrap(), &reply.txid()));
+                }
+                server.send_to(&reply.encode(), addr).await.unwrap();
+            }
+        });
+        sess.churn_request(false).await.unwrap();
+        sess.churn_request(true).await.unwrap();
+        assert_eq!(sess.relayed.port(), 23001);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn churn_preserves_rejection_code() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sess = session(server.local_addr().unwrap()).await;
+        let peer = tokio::spawn(async move {
+            let mut buf = [0u8; 1600];
+            let (n, addr) = timeout(Duration::from_secs(2), server.recv_from(&mut buf)).await.unwrap().unwrap();
+            let mut reply = response(&buf[..n], 0x0113);
+            reply.add(A_ERROR_CODE, &[0, 0, 5, 8]);
+            server.send_to(&reply.encode(), addr).await.unwrap();
+        });
+        assert_eq!(sess.churn_request(true).await.unwrap_err().1, Some(508));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn churn_refuses_unconfirmed_deletion() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut sess = session(server.local_addr().unwrap()).await;
+        let peer = tokio::spawn(async move {
+            let mut buf = [0u8; 1600];
+            let (n, addr) = timeout(Duration::from_secs(2), server.recv_from(&mut buf)).await.unwrap().unwrap();
+            let mut reply = response(&buf[..n], 0x0104);
+            reply.add_lifetime(600);
+            server.send_to(&reply.encode(), addr).await.unwrap();
+        });
+        assert_eq!(sess.churn_request(false).await.unwrap_err().0, "churn: deletion not confirmed");
+        peer.await.unwrap();
     }
 }

@@ -48,7 +48,7 @@ Status legend: ✅ shipped · 🚧 implemented/experimental · 📋 planned.
 | TURNS / TCP/TLS | 🚧 | Feature-dependent and less exercised than UDP. |
 | DTLS | 🚧 | Optional feature; validate with your clients. |
 | QUIC/WebTransport | Supported | Opt-in, Linux/macOS with tokio; project-specific TURN mappings. See [support scope](verification/quic-webtransport-supported-2026-09-18.md). |
-| io_uring | 🚧 | Experimental datapath; not recommended as default production path. |
+| io_uring | ✅ | Supported Linux UDP datapath, opt-in; tokio remains default. [Tested scope](verification/io-uring-supported-2026-09-19.md). |
 | AF_XDP | 🚧 | Explicit opt-in Linux/NIC-specific backend. |
 | OAuth RFC 7635 | 📋 | Not implemented. |
 | SQL/Redis/Mongo user DB backends | 📋 | Not implemented. |
