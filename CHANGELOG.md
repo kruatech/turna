@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Promote the io_uring UDP datapath to **supported on Linux**, opt-in, with
+  tested kernels 6.8.0-87 and 6.14.0-33. Record receive/cancel recovery tests,
+  functional acceptance and shutdown, 30-minute media, four-hour authenticated
+  churn on cloud and short second-kernel churn. Document worker-dependent memory,
+  configuration limits and the earlier failed fresh-socket churn separately.
+  See `docs/verification/io-uring-supported-2026-09-19.md`.
+
 - Promote QUIC and WebTransport to supported within the Linux/macOS tokio
   scope. Reconcile configuration, operations and support documentation with the
   implemented limits, routing, cleanup and recorded verification. Keep WAN loss,

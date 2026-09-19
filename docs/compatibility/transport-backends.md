@@ -53,9 +53,12 @@ cargo build --release -p turna-node --features af-xdp
 
 - **tokio — Stable / default.** All platforms. The production default. Full TURN
   cycle covered by the integration suite.
-- **io_uring — Supported (Linux).** Opt-in via `transport = "io_uring"` + build
-  feature. Protocol behaviour verified byte-for-byte against tokio
-  (`scripts/e2e/backend_diff_bytes.sh`).
+- **io_uring — Supported (Linux).** Opt-in via `transport = "io_uring"` and the
+  `io-uring` build feature. Tested on 6.8.0-87 and 6.14.0-33; latest functional
+  comparison is suite-level, not byte-for-byte evidence. Support applies to the
+  documented UDP datapath scope, not all listener combinations.
+  [Verification](../verification/io-uring-supported-2026-09-19.md),
+  [operations](../runbooks/io-uring.md).
 - **dtls — Beta.** Opt-in listener. Fail-fast on misconfig, graceful shutdown,
   session + per-IP caps, idle reaper, bounded outbound queue (drop-newest),
   outbound MTU enforcement. TURN-over-DTLS exercised by `tests/integration`
@@ -103,7 +106,8 @@ cargo build --release -p turna-node --features af-xdp
 
 ## Differential testing
 
-- Suite-level Tokio↔io_uring parity: `scripts/e2e/backend_diff.sh <config>`.
+- Suite-level Tokio↔io_uring acceptance: `bash scripts/e2e/backend_diff.sh`
+  (isolated default config; both backends must pass, including shutdown).
 - Byte-level Tokio↔io_uring parity: `scripts/e2e/backend_diff_bytes.sh A B [--json]`
   (point at two instances differing only in `[turn].transport`).
 - vs. coturn: the same `diff-test` tool with `--coturn` aimed at a coturn instance.

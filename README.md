@@ -39,18 +39,15 @@ project in this position can deliver.
   public address, and 24 hours under load with zero relayed-frame loss and no leak on
   any signal ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)).
 
-- **Beta, verified on listed configurations** — correctness is on record, but the
-  behaviour depends on your environment in a way we cannot test for you. The
-  `io-uring` datapath is the clearest case: it is verified on Linux **6.8** and
-  **6.14** — 9.6 h of relayed media at 0.006 % loss on the former, no leak on either —
-  and io_uring semantics are version-sensitive, so that is evidence about those two
-  kernels and no others. `af-xdp` is the same with a NIC driver added —
-  the lab attaches in SKB (generic) mode, which copies every frame and reproduces
-  none of the kernel-bypass behaviour the feature exists for.
+- **io_uring — supported on Linux, opt-in.** Recovery/drain checks, live TURN
+  behaviour and load are recorded on Linux 6.8.0-87 and 6.14.0-33. The support
+  scope, resource costs and exact evidence are in the
+  [verification record](docs/verification/io-uring-supported-2026-09-19.md).
+  Revalidate after kernel or deployment changes; tokio remains the default.
 
-  Verify on your kernel and your NIC before enabling either. What is on record is in
-  [docs/interop/](docs/interop/) and [docs/soak/](docs/soak/), with the exact
-  configurations named.
+- **AF_XDP — beta, lab-verified.** The veth lab uses SKB mode and does not
+  establish native driver or zero-copy behaviour on your NIC. Validate on the
+  target NIC; see [the lab record](docs/interop/af-xdp-2026-08-19.md).
 
 - **Supported QUIC and WebTransport** — opt-in on Linux/macOS with the tokio backend.
   These are project-specific TURN mappings, not standardized TURN transport URIs.
@@ -105,7 +102,7 @@ durable terminal result rather than control-plane-local state.
   the transport/relay datapaths.
 - **Batched UDP I/O** — `SO_REUSEPORT` recv workers with `recvmmsg`/`sendmmsg`
   and per-batch arena buffers; optional `io_uring` and `AF_XDP` datapaths behind
-  features for kernel-bypass throughput.
+  features for reduced syscall overhead (io_uring) or kernel bypass (AF_XDP).
 - **Standalone-first management** — node-targeted, idempotent runtime config
   and user-limit commands with desired/observed versions and Tarantool-backed
   restart restore.
@@ -295,13 +292,12 @@ per-feature production maturity always check
 | NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
 | Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |
-| `io_uring` datapath | — | Beta — endurance and relaying recorded on Linux **6.8 and 6.14** ([docs/soak/endurance-2026-08-19.md](docs/soak/endurance-2026-08-19.md), [docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)); io_uring is version-sensitive — verify on your own kernel |
+| `io_uring` datapath | — | **Supported on Linux**, opt-in UDP datapath. Verified on **6.8.0-87 / 6.14.0-33**: recovery/drain, live TURN checks, 30-minute media and four-hour authenticated allocation churn on 6.8; functional checks and short churn on 6.14. [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md). |
 | `AF_XDP` datapath | — | Beta — correctness verified on a veth lab ([docs/interop/af-xdp-2026-08-19.md](docs/interop/af-xdp-2026-08-19.md)); validate on your NIC, the lab attaches in SKB mode |
 
-Status legend: **Supported** — exercised on the primary path and intended for
-production use. **Beta** — gated behind a Cargo feature, hardened in source
-(limits, metrics, readiness, graceful drain) but without recorded soak/interop
-evidence; test it with your own client stack first. **Experimental** — gated
+Status legend: **Supported** — maintained and verified within its stated scope;
+platform, interoperability and endurance limits remain explicit. **Beta** —
+verification or operational gaps remain for the intended scope. **Experimental** — gated
 behind a Cargo feature with known functional gaps; not for production. **Partial**
 — the protocol element is present but not the whole feature; the notes say what
 is missing. Anything marked *refused under `production = true`* is rejected by

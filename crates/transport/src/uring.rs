@@ -9,7 +9,7 @@ use crate::buffer::{BufferRing, MAX_UDP_PACKET};
 use io_uring::types::CancelBuilder;
 use io_uring::{opcode, types, IoUring};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use tracing::{info, warn};
@@ -346,6 +346,8 @@ impl RingStatsAggregate {
 
 pub struct UringEngine {
     ring: IoUring,
+    pending_recvs: Vec<(Option<u16>, u16, u16)>,
+    pending_cancels: HashSet<u16>,
     // Main socket
     main_fd: RawFd,
     _main_socket: Socket,
@@ -515,6 +517,8 @@ impl UringEngine {
 
         Ok(Self {
             ring,
+            pending_recvs: Vec::new(),
+            pending_cancels: HashSet::new(),
             main_fd,
             _main_socket: socket,
             main_addr,
@@ -583,11 +587,10 @@ impl UringEngine {
         //      loop never re-arms a slot whose CQE it has not yet reaped.
         // SAFETY: `entry` references buffers/fds that stay valid until the matching
         // completion is reaped; the SQ has a single owner (no concurrent access).
-        unsafe {
-            self.ring
-                .submission()
-                .push(&entry)
-                .map_err(|_| std::io::Error::other("SQ full"))?;
+        if unsafe { self.ring.submission().push(&entry) }.is_err() {
+            self.sq_push_failed += 1;
+            self.pending_recvs.push((None, msghdr_idx, buf_idx));
+            return Ok(());
         }
         Ok(())
     }
@@ -648,6 +651,17 @@ impl UringEngine {
         allocation_id: String,
         generation: u64,
     ) -> std::io::Result<()> {
+        if self.relay_sockets.contains_key(&port) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "relay already exists or is draining",
+            ));
+        }
+        if self.buffers.available() < RELAY_RECV_BATCH as usize {
+            return Err(std::io::Error::other(
+                "insufficient buffers for relay receives",
+            ));
+        }
         let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
@@ -695,7 +709,11 @@ impl UringEngine {
             let Some(buf_idx) = self.buffers.acquire() else {
                 break;
             };
-            self.submit_relay_recv(port, fd, recv_base + i, buf_idx)?;
+            if let Err(e) = self.submit_relay_recv(port, fd, recv_base + i, buf_idx) {
+                self.buffers.release(buf_idx);
+                self.remove_relay(port);
+                return Err(e);
+            }
         }
 
         info!(port, "relay socket added to io_uring");
@@ -719,11 +737,10 @@ impl UringEngine {
             .user_data(ud);
         // SAFETY: `entry` references buffers/fds that stay valid until the matching
         // completion is reaped; the SQ has a single owner (no concurrent access).
-        unsafe {
-            self.ring
-                .submission()
-                .push(&entry)
-                .map_err(|_| std::io::Error::other("SQ full"))?;
+        if unsafe { self.ring.submission().push(&entry) }.is_err() {
+            self.sq_push_failed += 1;
+            self.pending_recvs.push((Some(port), msghdr_idx, buf_idx));
+            return Ok(());
         }
         if let Some(relay) = self.relay_sockets.get_mut(&port) {
             relay.inflight += 1; // recv in flight
@@ -806,10 +823,29 @@ impl UringEngine {
 
     // === Shared operations ===
 
+    fn retry_pending(&mut self) -> std::io::Result<()> {
+        // Cancels take priority over receives. Taking the list ensures an SQ-full
+        // retry is retained for the next iteration, not spun on in this one.
+        let cancels = std::mem::take(&mut self.pending_cancels);
+        for port in cancels {
+            self.remove_relay(port);
+        }
+        let recvs = std::mem::take(&mut self.pending_recvs);
+        for (port, slot, buf) in recvs {
+            match port {
+                Some(port) => self.resubmit_relay_recv(port, slot, buf)?,
+                None => self.resubmit_main_recv(slot, buf)?,
+            }
+        }
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> std::io::Result<usize> {
+        self.retry_pending()?;
         self.ring.submit()
     }
     pub fn submit_and_wait(&mut self) -> std::io::Result<usize> {
+        self.retry_pending()?;
         self.ring.submit_and_wait(1)
     }
 
@@ -818,6 +854,7 @@ impl UringEngine {
     /// no ring activity, then drains its cross-worker command channel. Returns
     /// `Ok(0)` on timeout (no completion within `dur`), `Ok(n)` otherwise.
     pub fn submit_and_wait_timeout(&mut self, dur: std::time::Duration) -> std::io::Result<usize> {
+        self.retry_pending()?;
         let ts = types::Timespec::new()
             .sec(dur.as_secs())
             .nsec(dur.subsec_nanos());
@@ -944,9 +981,10 @@ impl UringEngine {
                     }
                     if result < 0 {
                         warn!(relay_port, err = result, "relay recv error");
-                        // Recv errored on an open relay: release the buffer
-                        // (the worker won't resubmit this slot).
-                        self.buffers.release(buf_or_slot);
+                        // Keep this slot owned until it can be rearmed. Closing
+                        // relays were handled above and must never be rearmed.
+                        self.pending_recvs
+                            .push((Some(relay_port), msghdr_idx, buf_or_slot));
                         continue;
                     }
                     let source = self.relay_msghdrs[msghdr_idx as usize]
@@ -987,7 +1025,18 @@ impl UringEngine {
                         result,
                     }
                 }
-                t if t == TAG_RELAY_CANCEL => continue,
+                t if t == TAG_RELAY_CANCEL => {
+                    if result < 0
+                        && result != -libc::ENOENT
+                        && self
+                            .relay_sockets
+                            .get(&relay_port)
+                            .is_some_and(|r| r.closing)
+                    {
+                        self.pending_cancels.insert(relay_port);
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             events.push(event);
@@ -1054,6 +1103,17 @@ impl UringEngine {
     /// block before the drain would let late kernel writes corrupt a reused
     /// relay's msghdrs.
     pub fn remove_relay(&mut self, port: u16) {
+        self.pending_cancels.remove(&port);
+        // Release unsubmitted receives before a port/msghdr block can be reused.
+        let buffers = &mut self.buffers;
+        self.pending_recvs.retain(|(p, _, buf)| {
+            if *p == Some(port) {
+                buffers.release(*buf);
+                false
+            } else {
+                true
+            }
+        });
         // Snapshot fd + drain state; mark closing so no new recvs are armed.
         let (fd, idle, base) = match self.relay_sockets.get_mut(&port) {
             Some(relay) => {
@@ -1084,7 +1144,9 @@ impl UringEngine {
         if unsafe { self.ring.submission().push(&entry) }.is_err() {
             // SQ full: stay closing (nothing new is armed); a later close/drain
             // pass can re-issue. The block stays reserved until drained.
-            warn!(port, "SQ full — relay cancel not submitted, will retry");
+            self.sq_push_failed += 1;
+            self.pending_cancels.insert(port);
+            warn!(port, "SQ full — relay cancel retained for retry");
         } else {
             info!(port, "io_uring relay closing — cancelling in-flight ops");
         }
@@ -1101,5 +1163,147 @@ impl UringEngine {
         self.relay_sockets
             .get(&port)
             .map(|r| (r.allocation_id.as_str(), r.generation))
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn engine(buffers: u16) -> UringEngine {
+        UringEngine::new("127.0.0.1:0".parse().unwrap(), false, buffers, 2)
+            .expect("io_uring required for recovery tests")
+    }
+    fn fill_sq(e: &mut UringEngine) {
+        while unsafe { e.ring.submission().push(&opcode::Nop::new().build()) }.is_ok() {}
+    }
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn sq_full_receive_recovers_without_losing_slot() {
+        let mut e = engine(128);
+        fill_sq(&mut e);
+        let buf = e.buffers.acquire().unwrap();
+        e.resubmit_main_recv(0, buf).unwrap();
+        assert_eq!(e.pending_recvs.len(), 1);
+        e.ring.submit_and_wait(1).unwrap();
+        e.collect_completions();
+        e.flush().unwrap();
+        assert!(e.pending_recvs.is_empty());
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"recovered", e.local_addr()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            e.submit_and_wait_timeout(std::time::Duration::from_millis(10))
+                .unwrap();
+            if e.collect_completions()
+                .iter()
+                .any(|event| matches!(event, CompletionEvent::MainRecv { len: 9, .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "receive did not recover"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_unsubmitted_relay_releases_every_buffer() {
+        let mut e = engine(128);
+        let before = e.buffers_available();
+        fill_sq(&mut e);
+        let port = free_port();
+        e.add_relay(port, "test".into(), 1).unwrap();
+        assert_eq!(e.pending_recvs.len(), RELAY_RECV_BATCH as usize);
+        e.remove_relay(port);
+        assert!(!e.has_relay(port));
+        assert!(e.pending_recvs.is_empty());
+        assert_eq!(e.buffers_available(), before);
+    }
+
+    #[test]
+    fn full_sq_cancel_is_retried_until_reclaimed() {
+        let mut e = engine(128);
+        let before = e.buffers_available();
+        let port = free_port();
+        e.add_relay(port, "test".into(), 1).unwrap();
+        e.flush().unwrap();
+        fill_sq(&mut e);
+        e.remove_relay(port);
+        assert!(e.pending_cancels.contains(&port));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while e.has_relay(port) {
+            e.submit_and_wait_timeout(std::time::Duration::from_millis(10))
+                .unwrap();
+            e.collect_completions();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "relay cancellation stalled"
+            );
+        }
+        assert_eq!(e.buffers_available(), before);
+    }
+
+    #[test]
+    fn open_relay_receive_error_is_rearmed() {
+        let mut e = engine(128);
+        let port = free_port();
+        e.add_relay(port, "test".into(), 1).unwrap();
+        e.flush().unwrap();
+        let fd = e.relay_sockets[&port].fd;
+        // Cancel receives without closing the relay to inject receive errors.
+        let cancel = opcode::AsyncCancel2::new(CancelBuilder::fd(types::Fd(fd)).all()).build();
+        unsafe {
+            e.ring.submission().push(&cancel).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            e.submit_and_wait_timeout(std::time::Duration::from_millis(10))
+                .unwrap();
+            e.collect_completions();
+            if !e.pending_recvs.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no receive error observed"
+            );
+        }
+        e.flush().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(b"recovered", (std::net::Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+        loop {
+            e.submit_and_wait_timeout(std::time::Duration::from_millis(10))
+                .unwrap();
+            if e.collect_completions()
+                .iter()
+                .any(|ev| matches!(ev, CompletionEvent::RelayRecv { len: 9, .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "relay receive did not recover"
+            );
+        }
+    }
+
+    #[test]
+    fn insufficient_buffers_does_not_publish_relay() {
+        let mut e = engine(1);
+        let port = free_port();
+        assert!(e.add_relay(port, "test".into(), 1).is_err());
+        assert!(!e.has_relay(port));
+        assert_eq!(e.buffers_available(), 1);
     }
 }

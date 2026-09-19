@@ -31,14 +31,13 @@ These are the areas we want to harden, in rough priority order:
    - `quic` / `web-transport` are **supported** on Linux/macOS with tokio.
      Limits, per-stream replies and migration handling are implemented.
      Scope and evidence: [support record](docs/verification/quic-webtransport-supported-2026-09-18.md).
-   - `io-uring` and `af-xdp` remain **experimental** and hardware/kernel
-     dependent; see [docs/roadmap/af-xdp-phase2.md](docs/roadmap/af-xdp-phase2.md).
-     `io-uring` is now **beta**: endurance and ChannelData relaying are both on record
-     (`docs/soak/endurance-2026-08-19.md`) on Ubuntu 24.04 / kernel 6.14. Getting there
-     found and fixed a relay-slot leak that made the datapath forward nothing at all
-     while its control plane ran at 10 800 Allocate/s. What remains before `supported`
-     is a run on the kernel you actually deploy — io_uring behaviour is
-     version-sensitive, and one kernel is not evidence for another.
+   - `io-uring` is **supported on Linux**, opt-in; tokio remains the default.
+     Recovery, buffer/cancellation handling, functional checks and clean shutdown
+     are verified. Load evidence includes 30-minute media and four-hour authenticated
+     churn on 6.8.0-87, plus functional checks and short churn on 6.14.0-33.
+     [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md).
+   - `af-xdp` remains **beta (lab-verified)**; native NIC/driver validation is
+     separate. See [phase 2](docs/roadmap/af-xdp-phase2.md).
    - `sctp` is **supported on Linux/tokio**, opt-in and allowed in production.
      Native functional, lifecycle/limits and 30-minute WAN checks passed.
      [Evidence and scope](docs/verification/sctp-supported-2026-09-18.md):

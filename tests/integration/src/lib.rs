@@ -1675,9 +1675,15 @@ mod tests {
     #[tokio::test]
     async fn turn_channel_data_relay() {
         let client = bind_socket().await;
-        let peer = bind_socket().await;
         let target = target_addr();
-
+        // Resolve the local interface used to reach the server.
+        let route_probe = bind_socket().await;
+        route_probe.connect(target).await.expect("peer route lookup");
+        let peer_ip = route_probe.local_addr().unwrap().ip();
+        assert!(!peer_ip.is_unspecified(), "peer address must be concrete");
+        let peer = UdpSocket::bind(SocketAddr::new(peer_ip, 0))
+            .await.expect("bind relay peer");
+        drop(route_probe);
         let peer_addr = peer.local_addr().unwrap();
 
         let (realm, nonce) = skip_if_no_server!(get_realm_nonce(&client, target).await, target);
@@ -1725,7 +1731,7 @@ mod tests {
             return;
         }
 
-        let nonce3 = extract_nonce(&perm_resp).unwrap_or_default();
+        let nonce3 = extract_nonce(&perm_resp).unwrap_or(nonce2);
 
         // ChannelBind
         let channel: u16 = 0x4001;
@@ -1764,21 +1770,33 @@ mod tests {
                 );
                 eprintln!("✓ ChannelData relay: {} bytes from {src}", n);
             }
-            _ => {
-                eprintln!(
-                    "NOTE: ChannelData relay timeout — peer may need to be on relay's network"
-                );
-            }
+            _ => panic!("ChannelData relay timeout: peer did not receive payload"),
         }
 
+        // Verify the reverse path as well: peer -> relay -> ChannelData client.
+        peer.send_to(payload, relay_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("reverse relay timeout")
+            .expect("reverse relay receive");
+        assert!(n >= 4, "short ChannelData reply");
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), channel);
+        let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        assert_eq!(length, payload.len());
+        assert!(n >= 4 + length, "truncated ChannelData reply");
+        assert_eq!(&buf[4..4 + length], payload);
+
         // Cleanup
-        let nonce4 = extract_nonce(&bind_resp).unwrap_or_default();
+        let nonce4 = extract_nonce(&bind_resp).unwrap_or(nonce3);
         let mut del = TurnMsg::request(0x0004);
         del.add_lifetime(0);
         del.add_username(&username);
         del.add_realm(&realm);
         del.add_nonce(&nonce4);
-        let _ = send_recv(&client, target, &del.encode_with_integrity(&key), 1000).await;
+        let (deleted, _) = send_recv(&client, target, &del.encode_with_integrity(&key), 1000)
+            .await
+            .expect("allocation deletion timeout");
+        assert!(is_success(&deleted), "allocation deletion failed");
         eprintln!("✓ Relay addr was: {relay_addr}");
     }
 

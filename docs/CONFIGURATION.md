@@ -27,7 +27,7 @@ constraints below are taken from `crates/config/src/lib.rs`.
 ### `transport` values
 
 - `tokio` — epoll + `recvmmsg`/`sendmmsg`. Default, safest, all platforms.
-- `io_uring` — Linux io_uring datapath. Requires a binary built with
+- `io_uring` — supported Linux UDP datapath, opt-in. Requires a binary built with
   `--features io-uring`; fails fast at startup if io_uring is unavailable.
 - `af_xdp` — AF_XDP ring datapath. Requires `--features af-xdp`, Linux,
   `CAP_NET_RAW`, and an external XDP program steering traffic to the bound NIC
@@ -107,7 +107,15 @@ at a time, so enabling IPv6 does not change port accounting or capacity.
 
 ## `[turn.io_uring]`
 
-Used only when `transport = "io_uring"`.
+Used only when `transport = "io_uring"`. See the
+[support record](verification/io-uring-supported-2026-09-19.md) and
+[runbook](runbooks/io-uring.md). Build with `--features io-uring` and select the
+backend explicitly. Kernel policy must permit ring creation.
+
+`TURNA_IOURING_WORKERS` selects a positive worker count; otherwise the node uses
+available parallelism. Buffers/rings consume memory per worker. The latest runs
+held approximately 134 MiB on cloud and 1073 MiB on the local server; these are
+configuration-specific measurements, not fixed requirements or a kernel comparison.
 
 | key | type | default | notes |
 |-----|------|---------|-------|

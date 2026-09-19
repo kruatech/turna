@@ -421,7 +421,7 @@ Unless noted, these are summed across workers, so they scale with
 |--------|------|---------|
 | `turna_uring_workers` | gauge | Worker threads in the pool. The denominator for every other series here. |
 | `turna_uring_sq_len` / `turna_uring_sq_capacity` | gauge | Last-sampled submission-queue occupancy against total capacity. Sustained `sq_len` near `sq_capacity` is the saturation signal. |
-| `turna_uring_sq_push_failed_total` | counter | Submission pushes rejected because the SQ was full. Non-zero means work was refused, not merely delayed. |
+| `turna_uring_sq_push_failed_total` | counter | Submission pushes rejected because the SQ was full. Counts failed submission attempts, not packet loss: receive and cancellation work is retained for retry. Correlate with buffer availability, send errors and verified media; sustained growth indicates SQ pressure. |
 | `turna_uring_cq_len` | gauge | Last-sampled completion-queue occupancy. |
 | `turna_uring_cqe_drained_total` | counter | Completion entries drained. |
 | `turna_uring_cqe_batches_total` | counter | Drain iterations that pulled at least one CQE. `cqe_drained_total / cqe_batches_total` is the mean batch size — a value near `1` means the ring is being polled harder than the traffic justifies. |
