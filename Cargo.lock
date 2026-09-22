@@ -4309,7 +4309,7 @@ dependencies = [
  "pem",
  "portable-atomic",
  "rand 0.8.7",
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
  "rcgen 0.13.2",
  "ring",
  "rustls",
