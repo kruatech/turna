@@ -14,7 +14,7 @@ filled with measured numbers.
 |------------|-------------------|----------------|-----------------------|----------------------------------------|
 | Tokio UDP  | `tokio`           | yes (default)  | none                  | Portable default.                      |
 | io_uring   | `io_uring`        | **no**         | none (normal UDP)     | Linux only; per-core worker pool.      |
-| AF_XDP     | `af_xdp`          | **no**         | `CAP_NET_RAW`/root    | Linux only; attaches an XDP program.   |
+| AF_XDP | `af_xdp` | **no** | XSK/BPF/XDP privileges; tested as root | Linux; node-owned embedded selective filter. |
 
 `io_uring` and `af_xdp` are **never** chosen by `auto`/default — they must be
 requested explicitly. If requested but unavailable on the host, startup logs the
@@ -30,13 +30,15 @@ These are the minimum kernel versions targeted by turna for each backend/mode:
 | AF_XDP, copy mode (`zero_copy=false`)| 5.10           |
 | AF_XDP, zero-copy / multi-queue      | 5.15           |
 
-AF_XDP attach mode is derived from `zero_copy`:
+AF_XDP is **supported within the verified Linux IPv4 UDP copy-mode scope**.
+[Evidence and limits](verification/af-xdp-supported-2026-09-22.md) cover 6.8.0-87 / `virtio_net`,
+two RX queues, SKB/copy and native/copy. Minimum-version targets above are not
+claims of successful testing on every kernel. Zero-copy is not verified.
 
-- `zero_copy = false` → SKB / generic mode (`xdpgeneric`), works on virtually any
-  driver including `veth`.
-- `zero_copy = true` → native / driver (DRV) mode, requires NIC driver support.
-
-Verified during testing on kernel 6.14, clang 18, in SKB mode on a `veth` pair.
+`attach_mode` selects `skb`, `native`, or legacy `auto`. `zero_copy = false`
+forces copy mode; native/copy is valid. `zero_copy = true` requires native
+attach and driver support. `auto` selects native for zero-copy and SKB otherwise.
+The kernel-reported socket mode is checked at startup.
 
 ## Build prerequisites
 
@@ -108,18 +110,19 @@ external_ip = "10.0.0.1"
 
 [turn.af_xdp]
 interface = "eth0"
-queue_id  = 0
-zero_copy = false        # false = SKB/copy mode; true = native/zero-copy
+queue_ids = [0]          # example for a one-RX-queue interface; cover ALL actual queues
+attach_mode = "native"   # or "skb"; validate on the selected interface
+zero_copy = false        # copy in either attach mode; zero-copy is unverified
 need_wakeup = true
 # src_mac / dst_mac: optional static overrides. If dst_mac is unset and no
 # default-route MAC can be resolved at startup, the datapath resolves next-hop
 # MACs dynamically per destination (ARP/NDP) at send time.
 ```
 
-Other `[turn.af_xdp]` fields control UMEM and ring sizing: `frame_count`,
-`frame_size`, `fill_ring_size`, `comp_ring_size`, `rx_ring_size`,
-`tx_ring_size`. Run `turna-node <config> --dump-config` to see the
-fully-resolved values and defaults in effect.
+Current geometry is fixed: `frame_size = 4096`, all four ring sizes = 2048,
+`frame_count` at most 4096 per queue. Unsupported overrides are rejected, not
+silently ignored. See [configuration](CONFIGURATION.md#turnaf_xdp) and the
+[runbook](runbooks/af-xdp.md) for queue coverage and deployment requirements.
 
 ### io_uring-specific configuration
 
@@ -155,12 +158,12 @@ Metrics are exposed by the health server at `/metrics` (Prometheus text format).
 |-----------------------------------------|---------|----------------------------------------------------------------|
 | `turna_afxdp_rx_frames_total`           | counter | Frames received off the queue (redirected into the xsk).       |
 | `turna_afxdp_rx_bytes_total`            | counter | Received TURN payload bytes.                                   |
-| `turna_afxdp_tx_frames_total`           | counter | Frames sent.                                                   |
-| `turna_afxdp_tx_bytes_total`            | counter | Bytes sent.                                                    |
+| `turna_afxdp_tx_frames_total`           | counter | Frames submitted to TX.                                                   |
+| `turna_afxdp_tx_bytes_total`            | counter | TURN payload bytes submitted to TX.                                                    |
 | `turna_afxdp_parse_drops_total`         | counter | Frames matching no TURN/relay port (undemuxable).              |
 | `turna_afxdp_tx_drops_total`            | counter | Send failures.                                                 |
 | `turna_afxdp_relay_ports_registered`    | gauge   | Relay ports currently demuxed by the datapath (BPF port map).  |
-| `turna_afxdp_umem_free_frames`          | gauge   | Free UMEM frames available for RX/TX.                          |
+| `turna_afxdp_umem_free_frames` | gauge | Free TX frames, aggregated across queues; not RX fill capacity. |
 | `turna_afxdp_arp_replies_total`         | counter | ARP replies sent for the datapath's own IP.                    |
 | `turna_afxdp_ndp_replies_total`         | counter | IPv6 Neighbour Advertisements sent for the datapath's own IP.  |
 | `turna_afxdp_neighbor_unresolved`       | gauge   | Static next-hop MAC unresolved (1 = zero placeholder).         |

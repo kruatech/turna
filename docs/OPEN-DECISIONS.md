@@ -271,15 +271,17 @@ mTLS works, and `docs/MTLS.md` says the same of the management plane.
 Still out of scope, deliberately: revocation. No CRL, no OCSP, consistent with the
 management plane — revoking means rotating the CA.
 
-### AF_XDP on a real NIC
+### AF_XDP deployment coverage and unexplained WAN timeouts
 
-Correctness is verified on a veth lab (`docs/interop/af-xdp-2026-08-19.md`): conformance
-plus relayed media at three rates, 7124 frames, zero loss.
+SKB/copy and native/copy now have WAN evidence on Linux 6.8.0-87 / `virtio_net`
+with two RX queues. Native has four-hour media and 15-minute zero-error churn.
+See [support scope](verification/af-xdp-supported-2026-09-22.md). This is a virtual NIC result,
+not proof for a physical NIC, every driver or zero-copy.
 
-But the lab attaches in **SKB (generic) mode**, which copies every frame and reproduces
-none of the kernel-bypass behaviour AF_XDP exists for. Numbers from it are not capacity
-figures. A real NIC needs a dedicated interface: the XDP program intercepts traffic
-below the stack, so it cannot share the interface carrying your traffic.
+Earlier native and SKB churn runs had rare control timeouts. Later native runs
+with and without tracing passed; the root cause remains unknown. Do not describe
+these as fixed, or turn successful TX submissions into proof of wire delivery.
+Cold-neighbor/route-change behavior, IPv6 WAN and other hardware remain follow-ups.
 
 ### OAuth (RFC 7635)
 
@@ -323,29 +325,19 @@ Observed 2026-08-23 during the load runs (`docs/soak/transport-load-2026-08-23.m
 
 ## In the roadmap rather than open
 
-### AF_XDP ring-size keys are accepted and ignored
+### AF_XDP configurable ring geometry remains limited
 
-`[turn.af_xdp]` exposes `fill_ring_size`, `comp_ring_size`, `rx_ring_size` and
-`tx_ring_size`; the rings are pinned to the library defaults. This also creates a trap:
-`frame_count` above twice the ring size leaves the fill ring unseedable and RX stops
-silently (`docs/roadmap/af-xdp-phase2.md`).
+The active implementation uses fixed 4096-byte frames and 2048-entry rings.
+Unsupported overrides and frame_count above 4096 are rejected at startup rather
+than ignored. Dynamic ring sizing remains future work; it must include ownership,
+refill and live regression tests. The August silent-acceptance finding is historical.
 
-**Attempted and reverted 2026-08-19.** Wiring the keys through is a few lines, but it
-moves the UMEM geometry, which means reconciling the shipped defaults (4096 frames does
-not satisfy `fill + tx + scratch`), the validation, and the lab script's own
-`FRAME_COUNT` — all at once. The change was correct and still landed as a regression
-because it went out without a lab run. Not cheap; treat it as a task with a test plan.
+### AF_XDP attach mode and copy mode — separated
 
-### `zero_copy` conflates two orthogonal settings
-
-It drives both the XSK bind flag (`XDP_ZEROCOPY` vs `XDP_COPY`) and the XDP attach mode
-(NATIVE vs SKB). Those are independent, and the coupling means a native attach cannot be
-requested without also requesting zero-copy — which veth refuses, so the lab is stuck in
-SKB mode.
-
-Fix is separate keys with the current flag kept as a compatible default. Nothing has
-verified which combinations the target NIC supports, so this wants a NIC before it wants
-code.
+`attach_mode = "skb"|"native"|"auto"` is independent of `zero_copy`.
+`auto` retains legacy behavior: native for zero-copy, otherwise SKB. Native/copy
+has now been tested; zero-copy still requires a separate driver-specific run.
+The kernel-reported copy mode is checked, so no silent downgrade counts as PASS.
 
 ---
 

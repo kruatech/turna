@@ -45,9 +45,11 @@ project in this position can deliver.
   [verification record](docs/verification/io-uring-supported-2026-09-19.md).
   Revalidate after kernel or deployment changes; tokio remains the default.
 
-- **AF_XDP — beta, lab-verified.** The veth lab uses SKB mode and does not
-  establish native driver or zero-copy behaviour on your NIC. Validate on the
-  target NIC; see [the lab record](docs/interop/af-xdp-2026-08-19.md).
+- **AF_XDP — supported within the verified Linux IPv4 UDP copy-mode scope.**
+  SKB/copy and native/copy are verified on Linux 6.8.0-87 with `virtio_net`,
+  two RX queues. Native evidence includes four-hour WAN media and 15-minute churn.
+  Zero-copy and other NIC/kernel combinations need separate validation.
+  [Evidence and known limitations](docs/verification/af-xdp-supported-2026-09-22.md).
 
 - **Supported QUIC and WebTransport** — opt-in on Linux/macOS with the tokio backend.
   These are project-specific TURN mappings, not standardized TURN transport URIs.
@@ -293,7 +295,7 @@ per-feature production maturity always check
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
 | Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |
 | `io_uring` datapath | — | **Supported on Linux**, opt-in UDP datapath. Verified on **6.8.0-87 / 6.14.0-33**: recovery/drain, live TURN checks, 30-minute media and four-hour authenticated allocation churn on 6.8; functional checks and short churn on 6.14. [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md). |
-| `AF_XDP` datapath | — | Beta — correctness verified on a veth lab ([docs/interop/af-xdp-2026-08-19.md](docs/interop/af-xdp-2026-08-19.md)); validate on your NIC, the lab attaches in SKB mode |
+| `AF_XDP` datapath | — | **Supported within verified Linux IPv4 UDP copy-mode scope** — SKB/native on 6.8.0-87, `virtio_net`, two queues. Zero-copy unverified; historical WAN churn timeouts remain unexplained. [Evidence and limits](docs/verification/af-xdp-supported-2026-09-22.md). |
 
 Status legend: **Supported** — maintained and verified within its stated scope;
 platform, interoperability and endurance limits remain explicit. **Beta** —

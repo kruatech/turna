@@ -86,6 +86,8 @@ pub struct AfXdpConfig {
     pub tx_ring_size: u32,
     /// Use zero-copy mode (requires driver support).
     pub zero_copy: bool,
+    /// Native XDP attachment, independent of copy versus zero-copy bind.
+    pub native_mode: bool,
     /// Use NEED_WAKEUP flag for efficiency.
     pub need_wakeup: bool,
 }
@@ -104,6 +106,7 @@ impl Default for AfXdpConfig {
             rx_ring_size: 2048,
             tx_ring_size: 2048,
             zero_copy: false,
+            native_mode: false,
             need_wakeup: true,
         }
     }
@@ -621,13 +624,21 @@ pub mod frame {
         if u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0 {
             return None;
         }
+        let total_len = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+        if total_len < ihl + 8 || total_len > ip.len() || ones_complement(&ip[..ihl]) != 0 {
+            return None;
+        }
+        let ip = &ip[..total_len];
         let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
         let dst_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
         let udp = &ip[ihl..];
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
-        if udp_len < 8 || udp.len() < udp_len {
+        if udp_len < 8 || udp.len() != udp_len {
+            return None;
+        }
+        if udp[6..8] != [0, 0] && udp_checksum_v4(&src_ip, &dst_ip, &udp[..udp_len]) != 0 {
             return None;
         }
         let payload_len = udp_len - 8;
@@ -829,16 +840,23 @@ pub mod frame {
         s.copy_from_slice(&ip[8..24]);
         let mut d = [0u8; 16];
         d.copy_from_slice(&ip[24..40]);
-        let udp = &ip[40..];
+        let payload_len = u16::from_be_bytes([ip[4], ip[5]]) as usize;
+        if payload_len < 8 || ip.len() < 40 + payload_len {
+            return None;
+        }
+        let udp = &ip[40..40 + payload_len];
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let udp_len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
-        if udp_len < 8 {
+        if udp_len < 8
+            || udp_len != udp.len()
+            || udp[6..8] == [0, 0]
+            || udp_checksum_v6(&Ipv6Addr::from(s), &Ipv6Addr::from(d), udp) != 0
+        {
             return None;
         }
         let payload_offset = ETH_HDR_LEN + 40 + 8;
-        let avail = frame.len().saturating_sub(payload_offset);
-        let payload_len = (udp_len - 8).min(avail);
+        let payload_len = udp_len - 8;
         Some(ParsedUdpV6 {
             src: SocketAddrV6::new(Ipv6Addr::from(s), src_port, 0, 0),
             dst: SocketAddrV6::new(Ipv6Addr::from(d), dst_port, 0, 0),
@@ -993,6 +1011,38 @@ pub mod frame {
         }
 
         #[test]
+        fn rejects_truncated_v6_and_invalid_lengths() {
+            let src = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1, 0, 0);
+            let dst = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 2, 0, 0);
+            let frame = build_eth_ipv6_udp([0; 6], [0; 6], src, dst, b"payload");
+            assert!(parse_eth_ipv6_udp(&frame).is_some());
+            for len in 0..frame.len() {
+                assert!(parse_eth_ipv6_udp(&frame[..len]).is_none());
+            }
+            let mut bad = frame.clone();
+            bad[ETH_HDR_LEN + 5] = 8;
+            assert!(parse_eth_ipv6_udp(&bad).is_none());
+            let mut bad = frame;
+            bad[ETH_HDR_LEN + 46] = 0;
+            bad[ETH_HDR_LEN + 47] = 0;
+            assert!(parse_eth_ipv6_udp(&bad).is_none());
+        }
+
+        #[test]
+        fn rejects_corrupt_ipv4_payload_and_header() {
+            let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+            let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2);
+            let frame = build_eth_ipv4_udp([0; 6], [0; 6], src, dst, b"payload");
+            assert!(parse_eth_ipv4_udp(&frame).is_some());
+            let mut bad = frame.clone();
+            bad[ETH_HDR_LEN + 8] ^= 1;
+            assert!(parse_eth_ipv4_udp(&bad).is_none());
+            let mut bad = frame;
+            *bad.last_mut().unwrap() ^= 1;
+            assert!(parse_eth_ipv4_udp(&bad).is_none());
+        }
+
+        #[test]
         fn build_then_parse_v6_roundtrips() {
             let src = SocketAddrV6::new("2001:db8::10".parse().unwrap(), 50000, 0, 0);
             let dst = SocketAddrV6::new("2001:db8::5".parse().unwrap(), 3478, 0, 0);
@@ -1118,7 +1168,7 @@ mod tests {
     fn config_defaults() {
         let c = AfXdpConfig::default();
         assert_eq!(c.frame_count, 4096);
-        assert_eq!(c.frame_size, 2048);
+        assert_eq!(c.frame_size, 4096);
     }
 }
 
@@ -1152,6 +1202,43 @@ pub mod xsk {
         CompQueue, FillQueue, FrameDesc, RxQueue, Socket, TxQueue, Umem,
     };
 
+    fn refill_owned<T>(pending: &mut Vec<T>, produce: impl FnOnce(&[T]) -> usize) -> usize {
+        let n = produce(pending);
+        assert!(n <= pending.len(), "fill ring returned invalid count");
+        pending.drain(..n);
+        pending.len()
+    }
+
+    #[derive(Debug)]
+    enum TxSubmitError {
+        Full,
+        Fatal(String),
+    }
+
+    fn submit_owned<T: Copy, E: std::fmt::Display>(
+        free: &mut Vec<T>,
+        inflight: &mut u64,
+        desc: T,
+        submit: impl FnOnce(T) -> std::result::Result<usize, E>,
+    ) -> std::result::Result<(), TxSubmitError> {
+        match submit(desc) {
+            Ok(1) => {
+                *inflight += 1;
+                Ok(())
+            }
+            Ok(0) => {
+                free.push(desc);
+                Err(TxSubmitError::Full)
+            }
+            Ok(n) => Err(TxSubmitError::Fatal(format!(
+                "invalid TX submission count: {n}"
+            ))),
+            Err(e) => Err(TxSubmitError::Fatal(format!(
+                "TX submission/wakeup failed: {e}"
+            ))),
+        }
+    }
+
     /// 1.1: load/attach the embedded selective XDP program and manage its maps
     /// (`xsks_map`, `ports`). All libxdp/libbpf FFI is isolated here; the handle
     /// detaches the program and frees the object on Drop (graceful unload).
@@ -1177,6 +1264,7 @@ pub mod xsk {
             ifindex: c_int,
             mode: c_uint,
             ports_fd: c_int,
+            xsks_fd: i32,
         }
 
         impl XdpProgram {
@@ -1188,7 +1276,7 @@ pub mod xsk {
                 ifindex: u32,
                 xsk_fd: i32,
                 queue_id: u32,
-                listen_port: u16,
+                listen: std::net::SocketAddr,
                 native: bool,
             ) -> Result<Self> {
                 let mode = if native {
@@ -1206,14 +1294,14 @@ pub mod xsk {
                         XDP_OBJ.len(),
                         std::ptr::null(),
                     );
-                    if obj.is_null() {
+                    if obj.is_null() || (-4095..0).contains(&(obj as isize)) {
                         return Err(AfXdpError::Xdp("bpf_object__open_mem failed".into()));
                     }
                     // Pass a null section name: the object has a single SEC("xdp")
                     // program, which libxdp auto-selects. (If your libxdp build
                     // requires an explicit name, pass b"xdp\0".)
                     let prog = xdp_program__from_bpf_obj(obj, std::ptr::null::<c_char>());
-                    if prog.is_null() {
+                    if prog.is_null() || (-4095..0).contains(&(prog as isize)) {
                         bpf_object__close(obj);
                         return Err(AfXdpError::Xdp("xdp_program__from_bpf_obj failed".into()));
                     }
@@ -1255,10 +1343,61 @@ pub mod xsk {
                         ifindex: ifindex as c_int,
                         mode,
                         ports_fd,
+                        xsks_fd,
                     };
-                    me.set_port(listen_port, true)?;
+                    let addr_map = bpf_object__find_map_by_name(obj, c"local_addr".as_ptr());
+                    if addr_map.is_null() {
+                        return Err(AfXdpError::Xdp("local_addr map missing".into()));
+                    }
+                    let mut addr = [0u8; 20];
+                    match listen.ip() {
+                        std::net::IpAddr::V4(ip) => {
+                            addr[..4].copy_from_slice(&4u32.to_ne_bytes());
+                            addr[4..8].copy_from_slice(&ip.octets());
+                        }
+                        std::net::IpAddr::V6(ip) => {
+                            addr[..4].copy_from_slice(&6u32.to_ne_bytes());
+                            addr[4..20].copy_from_slice(&ip.octets());
+                        }
+                    }
+                    let key = 0u32;
+                    if bpf_map_update_elem(
+                        bpf_map__fd(addr_map),
+                        &key as *const _ as *const _,
+                        addr.as_ptr() as *const _,
+                        BPF_ANY as u64,
+                    ) != 0
+                    {
+                        return Err(AfXdpError::Xdp("local_addr update failed".into()));
+                    }
+                    me.set_port(listen.port(), true)?;
                     Ok(me)
                 }
+            }
+
+            pub fn remove_socket(&self, queue: u32) {
+                // SAFETY: live map, valid scalar key. Remove kernel reference before UMEM teardown.
+                let rc =
+                    unsafe { bpf_map_delete_elem(self.xsks_fd, &queue as *const _ as *const _) };
+                if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                    tracing::error!(queue, rc, "AF_XDP XSK map deletion failed");
+                }
+            }
+
+            pub fn add_socket(&self, queue: u32, fd: i32) -> Result<()> {
+                // SAFETY: live map and scalar key/value of the declared map types.
+                let rc = unsafe {
+                    bpf_map_update_elem(
+                        self.xsks_fd,
+                        &queue as *const _ as *const _,
+                        &fd as *const _ as *const _,
+                        BPF_ANY as u64,
+                    )
+                };
+                if rc != 0 {
+                    return Err(AfXdpError::Xdp("xskmap update failed".into()));
+                }
+                Ok(())
             }
 
             /// Add (`add=true`) or remove a UDP destination port from the `ports`
@@ -1280,7 +1419,9 @@ pub mod xsk {
                 };
                 // Deletes can legitimately fail with -ENOENT (already gone); only
                 // surface add failures.
-                if add && rc != 0 {
+                if rc != 0
+                    && (add || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT))
+                {
                     return Err(AfXdpError::Xdp(format!(
                         "ports map update failed (rc={rc})"
                     )));
@@ -1295,7 +1436,10 @@ pub mod xsk {
                 // interface to its prior (no-turna-XDP) state — task 1.1 graceful
                 // unload.
                 unsafe {
-                    xdp_program__detach(self.prog, self.ifindex, self.mode, 0);
+                    let rc = xdp_program__detach(self.prog, self.ifindex, self.mode, 0);
+                    if rc != 0 {
+                        tracing::error!(rc, "AF_XDP program detach failed");
+                    }
                     xdp_program__close(self.prog);
                     bpf_object__close(self.obj);
                 }
@@ -1320,12 +1464,107 @@ pub mod xsk {
     /// from the fill ring, and this is only the buffer their descriptors land in.
     const RX_BATCH_MAX: usize = 256;
 
+    // Diagnostic metadata only: no usernames, nonces, integrity attributes or payloads.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct StunTrace {
+        src: SocketAddr,
+        dst: SocketAddr,
+        id: [u8; 12],
+        kind: u16,
+        bytes: usize,
+    }
+
+    fn stun_trace(bytes: &[u8]) -> Option<StunTrace> {
+        let (src, dst, offset, len) = if let Some(p) = frame::parse_eth_ipv4_udp(bytes) {
+            (
+                SocketAddr::V4(p.src),
+                SocketAddr::V4(p.dst),
+                p.payload_offset,
+                p.payload_len,
+            )
+        } else if let Some(p) = frame::parse_eth_ipv6_udp(bytes) {
+            (
+                SocketAddr::V6(p.src),
+                SocketAddr::V6(p.dst),
+                p.payload_offset,
+                p.payload_len,
+            )
+        } else {
+            return None;
+        };
+        let data = &bytes[offset..offset + len];
+        if len < 20
+            || data[0] & 0xc0 != 0
+            || data[4..8] != [0x21, 0x12, 0xa4, 0x42]
+            || usize::from(u16::from_be_bytes([data[2], data[3]])) + 20 != len
+        {
+            return None;
+        }
+        Some(StunTrace {
+            src,
+            dst,
+            id: data[8..20].try_into().ok()?,
+            kind: u16::from_be_bytes([data[0], data[1]]),
+            bytes: len,
+        })
+    }
+
+    struct PendingTrace {
+        meta: StunTrace,
+        submitted: std::time::Instant,
+        desc: FrameDesc,
+        expected: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct TxTrace {
+        events: usize,
+        // Entries exist only between a successful submission and its completion.
+        // Consequently bounded by the UMEM pool, not the number of transactions.
+        pending: std::collections::HashMap<u64, PendingTrace>,
+    }
+
+    impl TxTrace {
+        fn event(
+            &mut self,
+            queue: u32,
+            stage: &'static str,
+            addr: u64,
+            meta: StunTrace,
+            age_us: u128,
+        ) {
+            const LIMIT: usize = 100_000;
+            if self.events >= LIMIT {
+                return;
+            }
+            self.events += 1;
+            let txid = meta
+                .id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            tracing::info!(queue, stage, addr, txid, src = %meta.src, dst = %meta.dst,
+                kind = meta.kind, bytes = meta.bytes, age_us, "AF_XDP STUN trace");
+            if self.events == LIMIT {
+                tracing::warn!(
+                    queue,
+                    limit = LIMIT,
+                    "AF_XDP STUN trace capped; later events omitted"
+                );
+            }
+        }
+    }
+
     pub struct XskDatapath {
-        umem: Umem,
+        // Drop queue handles before the backing UMEM; Drop removes the XSK map entry first.
         rx: RxQueue,
         tx: TxQueue,
         fill: FillQueue,
         comp: CompQueue,
+        umem: Umem,
+        queue_id: u32,
+        trace: Option<TxTrace>,
+        parse_drops: u64,
         /// Descriptors not currently owned by a kernel ring — available for TX.
         free_frames: Vec<FrameDesc>,
         /// Pre-allocated buffer the completion ring overwrites with the
@@ -1371,7 +1610,18 @@ pub mod xsk {
         /// 1.1: the selective XDP program attached to the NIC for this datapath.
         /// Detached/unloaded when this datapath drops. `None` is never the case
         /// after a successful `bind`, but kept optional for clarity.
-        xdp_prog: Option<loader::XdpProgram>,
+        xdp_prog: Option<std::rc::Rc<loader::XdpProgram>>,
+        pending_fill: Vec<FrameDesc>,
+        fatal_io: Option<String>,
+    }
+
+    impl Drop for XskDatapath {
+        fn drop(&mut self) {
+            if let Some(program) = self.xdp_prog.take() {
+                program.remove_socket(self.queue_id);
+                // The last queue owner detaches the shared program before fields drop.
+            }
+        }
     }
 
     /// Parse "aa:bb:cc:dd:ee:ff" into 6 octets.
@@ -1481,6 +1731,36 @@ pub mod xsk {
             src_mac: [u8; 6],
             dst_mac: [u8; 6],
         ) -> Result<Self> {
+            Self::bind_inner(cfg, local_addr, src_mac, dst_mac, None)
+        }
+
+        pub fn bind_sibling(
+            &self,
+            cfg: &AfXdpConfig,
+            src_mac: [u8; 6],
+            dst_mac: [u8; 6],
+        ) -> Result<Self> {
+            Self::bind_inner(
+                cfg,
+                self.local_addr,
+                src_mac,
+                dst_mac,
+                self.xdp_prog.clone(),
+            )
+        }
+
+        fn bind_inner(
+            cfg: &AfXdpConfig,
+            local_addr: SocketAddr,
+            src_mac: [u8; 6],
+            dst_mac: [u8; 6],
+            shared: Option<std::rc::Rc<loader::XdpProgram>>,
+        ) -> Result<Self> {
+            if local_addr.ip().is_unspecified() {
+                return Err(AfXdpError::Xdp(
+                    "AF_XDP requires a concrete listen IP".into(),
+                ));
+            }
             // Phase-1 neighbor resolution: fill empty MACs from sysfs (src) and
             // the default-gateway ARP entry (dst). Configured non-zero values win.
             let src_mac = resolve_src_mac(&cfg.interface, src_mac);
@@ -1548,13 +1828,35 @@ pub mod xsk {
             // SAFETY: these descriptors point at frames we own and are not in
             // any other ring; handing them to the fill ring transfers them to
             // the kernel for RX DMA.
-            unsafe {
-                fill.produce(&for_rx);
-            }
+            let produced = unsafe { fill.produce(&for_rx) } as usize;
+            let pending_fill = for_rx[produced..].to_vec();
 
             // 1.1: attach the selective XDP program and wire its xskmap to this
             // socket's queue. Must follow socket creation (we need the xsk fd).
             let xsk_fd = rx.fd().as_raw_fd();
+            // Linux UAPI: SOL_XDP=283, XDP_OPTIONS=8, struct xdp_options { u32 flags; }.
+            let mut options = 0u32;
+            let mut options_len = std::mem::size_of_val(&options) as libc::socklen_t;
+            // SAFETY: options is writable for options_len bytes; xsk_fd is live.
+            let rc = unsafe {
+                libc::getsockopt(
+                    xsk_fd,
+                    283,
+                    8,
+                    &mut options as *mut _ as *mut _,
+                    &mut options_len,
+                )
+            };
+            if rc != 0 {
+                return Err(AfXdpError::Socket(std::io::Error::last_os_error()));
+            }
+            let actual_zero_copy = options & 1 != 0;
+            if actual_zero_copy != cfg.zero_copy {
+                return Err(AfXdpError::Xdp(
+                    "kernel XDP copy mode differs from requested mode".into(),
+                ));
+            }
+
             let ifname = std::ffi::CString::new(cfg.interface.clone())
                 .map_err(|e| AfXdpError::Xdp(format!("interface name: {e}")))?;
             // SAFETY: `ifname` is a valid NUL-terminated C string for the call.
@@ -1565,23 +1867,39 @@ pub mod xsk {
                     cfg.interface
                 )));
             }
-            let xdp_prog = loader::XdpProgram::load(
-                ifindex,
-                xsk_fd,
-                cfg.queue_id,
-                local_addr.port(),
-                cfg.zero_copy,
-            )?;
+            let xdp_prog = if let Some(program) = shared {
+                program.add_socket(cfg.queue_id, xsk_fd)?;
+                program
+            } else {
+                std::rc::Rc::new(loader::XdpProgram::load(
+                    ifindex,
+                    xsk_fd,
+                    cfg.queue_id,
+                    local_addr,
+                    cfg.native_mode,
+                )?)
+            };
             tracing::info!(
                 iface = %cfg.interface,
                 queue = cfg.queue_id,
-                mode = if cfg.zero_copy { "drv" } else { "skb" },
+                mode = if cfg.native_mode { "native" } else { "skb" },
+                zero_copy = actual_zero_copy,
                 main_port = local_addr.port(),
                 "AF_XDP: selective XDP filter attached (xsks_map + ports)"
             );
 
+            if std::env::var("TURNA_AFXDP_TRACE").as_deref() == Ok("1") {
+                tracing::warn!(
+                    queue = cfg.queue_id,
+                    "AF_XDP STUN tracing enabled; completions do not prove wire delivery"
+                );
+            }
             Ok(Self {
                 umem,
+                queue_id: cfg.queue_id,
+                trace: (std::env::var("TURNA_AFXDP_TRACE").as_deref() == Ok("1"))
+                    .then(TxTrace::default),
+                parse_drops: 0,
                 rx,
                 tx,
                 fill,
@@ -1599,7 +1917,13 @@ pub mod xsk {
                 comp_consumed: 0,
                 neighbor: None,
                 xdp_prog: Some(xdp_prog),
+                pending_fill,
+                fatal_io: None,
             })
+        }
+
+        pub fn parse_drops(&self) -> u64 {
+            self.parse_drops
         }
 
         pub fn local_addr(&self) -> SocketAddr {
@@ -1608,18 +1932,99 @@ pub mod xsk {
 
         /// 1.1: register an allocation relay port so the XDP filter redirects its
         /// ingress into the xsk. Called when a relay port is registered.
-        pub fn add_relay_port(&self, port: u16) {
-            if let Some(p) = &self.xdp_prog {
-                if let Err(e) = p.set_port(port, true) {
-                    tracing::warn!(port, %e, "AF_XDP: failed to add relay port to XDP filter");
-                }
-            }
+        pub fn add_relay_port(&self, port: u16) -> Result<()> {
+            self.xdp_prog
+                .as_ref()
+                .ok_or_else(|| AfXdpError::Xdp("missing program".into()))?
+                .set_port(port, true)
         }
 
-        /// 1.1: drop a relay port from the XDP filter (allocation released).
-        pub fn del_relay_port(&self, port: u16) {
-            if let Some(p) = &self.xdp_prog {
-                let _ = p.set_port(port, false);
+        pub fn del_relay_port(&self, port: u16) -> Result<()> {
+            self.xdp_prog
+                .as_ref()
+                .ok_or_else(|| AfXdpError::Xdp("missing program".into()))?
+                .set_port(port, false)
+        }
+
+        pub fn drain_tx(&mut self, timeout: std::time::Duration) -> Result<()> {
+            let deadline = std::time::Instant::now() + timeout;
+            while self.tx_inflight() != 0 {
+                self.check_io()?;
+                self.reclaim_completions();
+                if std::time::Instant::now() >= deadline {
+                    return Err(AfXdpError::Xdp("TX drain deadline exceeded".into()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(())
+        }
+
+        pub fn check_io(&self) -> Result<()> {
+            if let Some(e) = &self.fatal_io {
+                return Err(AfXdpError::Xdp(e.clone()));
+            }
+            Ok(())
+        }
+
+        fn refill(&mut self) {
+            if self.pending_fill.is_empty() {
+                return;
+            }
+            // SAFETY: pending descriptors are exclusively user-owned, never published elsewhere.
+            let fill = &mut self.fill;
+            self.fill_ring_full +=
+                refill_owned(
+                    &mut self.pending_fill,
+                    |frames| unsafe { fill.produce(frames) } as usize,
+                ) as u64;
+        }
+
+        fn submit_tx(&mut self, desc: FrameDesc) -> Result<()> {
+            self.check_io()?;
+            // Read only while the descriptor is still exclusively user-owned.
+            let meta = if self.trace.is_some() {
+                let data = unsafe { self.umem.data(&desc) };
+                stun_trace(data.contents()).map(|m| (m, data.contents().to_vec()))
+            } else {
+                None
+            };
+            let addr = desc.addr() as u64;
+            if self
+                .trace
+                .as_ref()
+                .is_some_and(|t| t.pending.contains_key(&addr))
+            {
+                self.fatal_io = Some(format!("TX descriptor reused before completion: {addr}"));
+                return self.check_io();
+            }
+            let tx = &mut self.tx;
+            // SAFETY: desc was removed from the free pool and is exclusively owned.
+            match submit_owned(&mut self.free_frames, &mut self.tx_produced, desc, |d| {
+                unsafe { tx.produce_and_wakeup(&[d]) }.map(|n| n as usize)
+            }) {
+                Ok(()) => {
+                    if let (Some(trace), Some((meta, expected))) = (&mut self.trace, meta) {
+                        trace.pending.insert(
+                            addr,
+                            PendingTrace {
+                                meta,
+                                submitted: std::time::Instant::now(),
+                                desc,
+                                expected,
+                            },
+                        );
+                        trace.event(self.queue_id, "tx_submitted", addr, meta, 0);
+                    }
+                    Ok(())
+                }
+                Err(TxSubmitError::Full) => {
+                    Err(AfXdpError::Umem("TX ring full; frame reclaimed".into()))
+                }
+                Err(TxSubmitError::Fatal(e)) => {
+                    // Publication may precede a wakeup error. Never recycle this descriptor.
+                    self.fatal_io = Some(e);
+                    self.check_io()
+                }
             }
         }
 
@@ -1707,6 +2112,8 @@ pub mod xsk {
         /// Drain up to `max` received frames: poll RX, parse ETH+IPv4+UDP, emit
         /// the TURN payloads, then return the descriptors to the fill ring.
         pub fn recv_batch(&mut self, max: usize) -> Vec<ReceivedFrame> {
+            self.reclaim_completions();
+            self.refill();
             // Receive capacity is the fill ring's business, not the TX pool's. Tying
             // it to `free_frames` also meant a busy TX path could starve RX.
             let want = self.rx_scratch.len().min(max);
@@ -1720,7 +2127,14 @@ pub mod xsk {
             // Non-blocking poll (timeout 0). Returns how many descs were filled.
             // SAFETY: `rx_descs` is a valid mutable buffer; the RX queue is owned
             // solely by this datapath, no aliasing.
-            let n = unsafe { self.rx.poll_and_consume(&mut rx_descs, 0) }.unwrap_or(0);
+            let n = match unsafe { self.rx.poll_and_consume(&mut rx_descs, 0) } {
+                Ok(n) => n,
+                Err(e) => {
+                    self.fatal_io = Some(format!("RX poll failed: {e}"));
+                    self.rx_scratch = rx_descs;
+                    return Vec::new();
+                }
+            };
 
             let mut out = Vec::with_capacity(n);
             let mut arp_reqs: Vec<Vec<u8>> = Vec::new();
@@ -1730,6 +2144,11 @@ pub mod xsk {
                 // read it immutably and copy out the payload.
                 let data = unsafe { self.umem.data(desc) };
                 let bytes = data.contents();
+                if let Some(trace) = &mut self.trace {
+                    if let Some(meta) = stun_trace(bytes) {
+                        trace.event(self.queue_id, "rx", desc.addr() as u64, meta, 0);
+                    }
+                }
                 if let Some(p) = frame::parse_eth_ipv4_udp(bytes) {
                     out.push(ReceivedFrame {
                         data: bytes[p.payload_offset..p.payload_offset + p.payload_len].to_vec(),
@@ -1753,28 +2172,15 @@ pub mod xsk {
                 } else if frame::parse_icmpv6_ns(bytes).is_some() {
                     // IPv6 Neighbour Solicitation — deferred like ARP.
                     ndp_reqs.push(bytes.to_vec());
+                } else {
+                    self.parse_drops += 1;
                 }
             }
 
-            // Hand the frames the kernel just filled back to the fill ring so it can
-            // receive into them again.
-            //
-            // `produce` returns how many it actually placed; a full fill ring accepts
-            // fewer than offered. Those are still ours and must not be dropped on the
-            // floor — that was the second half of the leak. They stay in the scratch
-            // and are offered again on the next batch, which is safe because the
-            // scratch is not a frame pool: its entries are placeholders the ring
-            // overwrites.
-            // SAFETY: as in `bind` — these frames are ours and ring-free.
-            let produced = unsafe { self.fill.produce(&rx_descs[..n]) } as usize;
-            if produced < n {
-                // Not fatal, but worth seeing: it means the fill ring is smaller than
-                // the batch or the kernel is behind.
-                self.fill_ring_full += (n - produced) as u64;
-            }
-            // The scratch goes back whole. Nothing is taken from or added to
-            // `free_frames` here: RX frames live in the fill ring, TX frames in the
-            // pool, and the two no longer trade places.
+            // Save every consumed descriptor before reusing scratch; partial refill
+            // must survive the next RX poll overwriting that scratch.
+            self.pending_fill.extend_from_slice(&rx_descs[..n]);
+            self.refill();
             self.rx_scratch = rx_descs;
 
             // The XDP redirect funnels ALL ingress (including ARP) into the xsk,
@@ -1839,14 +2245,16 @@ pub mod xsk {
                 }
             }
 
-            let batch = [desc];
-            // SAFETY: descriptors in `batch` reference frames we own (popped from
-            // the free pool) and not in any ring.
-            let produced = unsafe { self.tx.produce_and_wakeup(&batch) }.map_err(|e| {
-                AfXdpError::Socket(std::io::Error::other(format!("tx produce: {e}")))
-            })?;
-            self.tx_produced += produced as u64;
-            Ok(())
+            if self.trace.is_some() {
+                // SAFETY: no TX publication yet; we still own the descriptor.
+                let matches = unsafe { self.umem.data(&desc) }.contents() == pkt.as_slice();
+                if !matches {
+                    self.free_frames.push(desc);
+                    self.fatal_io = Some("TX UMEM readback differs from constructed frame".into());
+                    return self.check_io();
+                }
+            }
+            self.submit_tx(desc)
         }
 
         /// Like [`send_to`] but with an explicit UDP source port. Used to emit
@@ -1900,14 +2308,16 @@ pub mod xsk {
                 }
             }
 
-            let batch = [desc];
-            // SAFETY: descriptors in `batch` reference frames we own (popped from
-            // the free pool) and not in any ring.
-            let produced = unsafe { self.tx.produce_and_wakeup(&batch) }.map_err(|e| {
-                AfXdpError::Socket(std::io::Error::other(format!("tx produce: {e}")))
-            })?;
-            self.tx_produced += produced as u64;
-            Ok(())
+            if self.trace.is_some() {
+                // SAFETY: no TX publication yet; we still own the descriptor.
+                let matches = unsafe { self.umem.data(&desc) }.contents() == pkt.as_slice();
+                if !matches {
+                    self.free_frames.push(desc);
+                    self.fatal_io = Some("TX UMEM readback differs from constructed frame".into());
+                    return self.check_io();
+                }
+            }
+            self.submit_tx(desc)
         }
 
         /// Answer an ARP request for our own IP. The XDP redirect funnels ARP
@@ -1969,14 +2379,7 @@ pub mod xsk {
                     return false;
                 }
             }
-            let batch = [desc];
-            // SAFETY: descriptors in `batch` reference frames we own (popped from
-            // the free pool) and not in any ring.
-            match unsafe { self.tx.produce_and_wakeup(&batch) } {
-                Ok(produced) => self.tx_produced += produced as u64,
-                Err(_) => return false,
-            }
-            true
+            self.submit_tx(desc).is_ok()
         }
 
         /// Answer an ICMPv6 Neighbour Solicitation for our own IPv6 address
@@ -2014,14 +2417,7 @@ pub mod xsk {
                     return false;
                 }
             }
-            let batch = [desc];
-            // SAFETY: descriptors in `batch` reference frames we own (popped
-            // from the free pool) and not in any ring.
-            match unsafe { self.tx.produce_and_wakeup(&batch) } {
-                Ok(produced) => self.tx_produced += produced as u64,
-                Err(_) => return false,
-            }
-            true
+            self.submit_tx(desc).is_ok()
         }
 
         /// Move completed TX descriptors from the completion ring back to free.
@@ -2036,8 +2432,107 @@ pub mod xsk {
             self.comp_consumed += c as u64;
             for i in 0..c {
                 // FrameDesc is Copy in xsk-rs 0.6 — verify; else `.clone()`.
+                let addr = self.comp_scratch[i].addr() as u64;
+                if let Some(trace) = &mut self.trace {
+                    if let Some(saved) = trace.pending.remove(&addr) {
+                        // SAFETY: completion returned this frame to us. Use its saved
+                        // descriptor length; completion entries themselves carry addresses.
+                        let matches = unsafe { self.umem.data(&saved.desc) }.contents()
+                            == saved.expected.as_slice();
+                        trace.event(
+                            self.queue_id,
+                            if matches {
+                                "tx_completed"
+                            } else {
+                                "tx_corrupted"
+                            },
+                            addr,
+                            saved.meta,
+                            saved.submitted.elapsed().as_micros(),
+                        );
+                        if !matches {
+                            self.fatal_io =
+                                Some(format!("TX UMEM changed before completion: {addr}"));
+                        }
+                    }
+                }
                 self.free_frames.push(self.comp_scratch[i]);
             }
+        }
+    }
+    #[cfg(test)]
+    mod ownership_tests {
+        use super::*;
+        #[test]
+        fn trace_decodes_stun_without_attributes() {
+            let src = "192.0.2.1:13478".parse().unwrap();
+            let dst = "192.0.2.2:40000".parse().unwrap();
+            let mut payload = vec![0u8; 24];
+            payload[..8].copy_from_slice(&[1, 3, 0, 4, 0x21, 0x12, 0xa4, 0x42]);
+            payload[8..20].copy_from_slice(&[7; 12]);
+            let packet = frame::build_eth_ipv4_udp([1; 6], [2; 6], src, dst, &payload);
+            let meta = stun_trace(&packet).unwrap();
+            assert_eq!(meta.id, [7; 12]);
+            assert_eq!(meta.kind, 0x0103);
+            assert_eq!(meta.bytes, 24);
+            assert_eq!(meta.src, SocketAddr::V4(src));
+            assert_eq!(meta.dst, SocketAddr::V4(dst));
+            // Malformed STUN length must not create a misleading trace entry.
+            payload[3] = 0;
+            let packet = frame::build_eth_ipv4_udp([1; 6], [2; 6], src, dst, &payload);
+            assert!(stun_trace(&packet).is_none());
+            assert!(stun_trace(&[0; 10]).is_none());
+        }
+        #[test]
+        fn trace_distinguishes_retries_from_distinct_transactions() {
+            let src = "192.0.2.1:13478".parse().unwrap();
+            let dst = "192.0.2.2:40000".parse().unwrap();
+            let mut p = vec![0u8; 20];
+            p[..8].copy_from_slice(&[1, 4, 0, 0, 0x21, 0x12, 0xa4, 0x42]);
+            let first =
+                stun_trace(&frame::build_eth_ipv4_udp([1; 6], [2; 6], src, dst, &p)).unwrap();
+            let retry =
+                stun_trace(&frame::build_eth_ipv4_udp([1; 6], [2; 6], src, dst, &p)).unwrap();
+            assert_eq!(first, retry);
+            p[19] = 1;
+            let next =
+                stun_trace(&frame::build_eth_ipv4_udp([1; 6], [2; 6], src, dst, &p)).unwrap();
+            assert_ne!(first.id, next.id);
+        }
+        #[test]
+        fn partial_refill_survives_new_batch() {
+            let mut pending = vec![10, 11, 12];
+            assert_eq!(refill_owned(&mut pending, |_| 1), 2);
+            pending.extend([20, 21]);
+            assert_eq!(pending, [11, 12, 20, 21]);
+            assert_eq!(refill_owned(&mut pending, |_| 0), 4);
+            assert_eq!(refill_owned(&mut pending, |p| p.len()), 0);
+        }
+        #[test]
+        fn full_tx_returns_frame_without_counting_send() {
+            let mut free = vec![];
+            let mut sent = 0;
+            let result = submit_owned(&mut free, &mut sent, 42, |_| Ok::<_, &str>(0));
+            assert!(matches!(result, Err(TxSubmitError::Full)));
+            assert_eq!(free, [42]);
+            assert_eq!(sent, 0);
+        }
+        #[test]
+        fn published_tx_waits_for_completion() {
+            let mut free = vec![];
+            let mut sent = 0;
+            submit_owned(&mut free, &mut sent, 42, |_| Ok::<_, &str>(1)).unwrap();
+            assert!(free.is_empty());
+            assert_eq!(sent, 1);
+        }
+        #[test]
+        fn uncertain_tx_error_never_recycles_frame() {
+            let mut free = vec![];
+            let mut sent = 0;
+            let result = submit_owned(&mut free, &mut sent, 42, |_| Err::<usize, _>("wakeup"));
+            assert!(matches!(result, Err(TxSubmitError::Fatal(_))));
+            assert!(free.is_empty());
+            assert_eq!(sent, 0);
         }
     }
 }

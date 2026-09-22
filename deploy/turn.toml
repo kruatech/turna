@@ -92,8 +92,9 @@ realm       = "${TURNA_REALM:-turna}"
 # - tokio (set below): epoll + recvmmsg/sendmmsg. The supported production path.
 # - io_uring: supported on Linux, opt-in; build with `--features io-uring`.
 #   Tested scope and sizing: docs/verification/io-uring-supported-2026-09-19.md.
-# - af_xdp: Linux + `--features af-xdp` + CAP_NET_RAW. Experimental; `listen`
-#   must be a concrete IP, not 0.0.0.0.
+# - af_xdp: supported within verified Linux IPv4 UDP copy-mode scope; opt-in.
+#   Requires `--features af-xdp`, XSK/BPF/XDP privileges and a concrete listen IP.
+#   Scope: docs/verification/af-xdp-supported-2026-09-22.md.
 # - auto: pick io_uring when usable at runtime, else tokio. Convenient for dev,
 #   but docs/PRODUCTION_READINESS.md R1 advises against it in production —
 #   a kernel/build capability change would silently move your datapath.

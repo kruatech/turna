@@ -36,8 +36,11 @@ These are the areas we want to harden, in rough priority order:
      are verified. Load evidence includes 30-minute media and four-hour authenticated
      churn on 6.8.0-87, plus functional checks and short churn on 6.14.0-33.
      [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md).
-   - `af-xdp` remains **beta (lab-verified)**; native NIC/driver validation is
-     separate. See [phase 2](docs/roadmap/af-xdp-phase2.md).
+   - `af-xdp` is **supported within the verified Linux IPv4 UDP copy-mode scope**.
+     SKB/native copy-mode evidence is recorded on 6.8.0-87 / `virtio_net`;
+     zero-copy, additional hardware and cold-neighbor/route-change validation remain.
+     Earlier WAN control timeouts remain unexplained despite later passing runs.
+     [Scope and evidence](docs/verification/af-xdp-supported-2026-09-22.md).
    - `sctp` is **supported on Linux/tokio**, opt-in and allowed in production.
      Native functional, lifecycle/limits and 30-minute WAN checks passed.
      [Evidence and scope](docs/verification/sctp-supported-2026-09-18.md):

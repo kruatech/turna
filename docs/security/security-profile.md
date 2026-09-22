@@ -45,9 +45,8 @@ No configuration changes this; it is the protocol.
 rotating the CA. Deliberate, documented in `docs/security/mtls-revocation.md`,
 and the thing a customer asks about first.
 
-**AF_XDP accepts five configuration keys it does not apply.** They are now
-refused at startup rather than ignored, but the underlying limitation stands: ring
-sizes come from the library.
+**AF_XDP geometry is fixed.** Frame size is 4096 bytes and rings have 2048 entries.
+Unsupported overrides are refused at startup; configurable geometry remains limited.
 
 ## Verifying rather than assuming
 

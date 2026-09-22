@@ -914,21 +914,23 @@ async fn run_allocate(
         let creds = creds.clone();
         let measuring = measuring.clone();
         handles.push(tokio::spawn(async move {
-            let mut session = None;
+            let mut session: Option<turn_client::Session> = None;
             let mut failures = 0u64;
             barrier.wait().await;
             while stats.is_running() {
                 let measured = measuring.load(Ordering::Acquire);
                 let t = Instant::now();
                 let result = async {
-                    if session.is_none() {
-                        session = Some(turn_client::allocate_family(server, &creds, rtt_ms, None).await?);
+                    if let Some(current) = session.as_mut() {
+                        current.churn_request(true).await?;
                     } else {
-                        session.as_mut().unwrap().churn_request(true).await?;
+                        session =
+                            Some(turn_client::allocate_family(server, &creds, rtt_ms, None).await?);
                     }
                     // Count success only after the server confirms deletion.
                     session.as_mut().unwrap().churn_request(false).await
-                }.await;
+                }
+                .await;
                 if measured {
                     stats.sent.fetch_add(1, Ordering::Relaxed);
                     match &result {
@@ -936,16 +938,23 @@ async fn run_allocate(
                             stats.recv.fetch_add(1, Ordering::Relaxed);
                             stats.record_latency(t.elapsed());
                         }
-                        Err(_) => { stats.errs.fetch_add(1, Ordering::Relaxed); }
+                        Err(_) => {
+                            stats.errs.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 if let Err(error) = result {
                     failures += 1;
                     if failures <= 8 || failures.is_power_of_two() {
-                        eprintln!("allocate worker={worker} failure={failures} stage={} stun_code={:?}", error.0, error.1);
+                        eprintln!(
+                            "allocate worker={worker} failure={failures} stage={} stun_code={:?}",
+                            error.0, error.1
+                        );
                     }
                     // A timed-out operation has uncertain state. Do not reuse it.
-                    if let Some(mut sess) = session.take() { sess.release().await; }
+                    if let Some(mut sess) = session.take() {
+                        sess.release().await;
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -968,7 +977,10 @@ async fn run_allocate(
     for h in handles {
         failures += match h.await {
             Ok(n) => n,
-            Err(error) => { eprintln!("allocate worker failed: {error}"); 1 }
+            Err(error) => {
+                eprintln!("allocate worker failed: {error}");
+                1
+            }
         };
     }
     stats.errs.store(failures, Ordering::Relaxed);

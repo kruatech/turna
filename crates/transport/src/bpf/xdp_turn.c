@@ -45,6 +45,14 @@ struct {
     __type(value, __u8);
 } ports SEC(".maps");
 
+struct local_address { __u32 family; __u8 bytes[16]; };
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct local_address);
+} local_addr SEC(".maps");
+
 SEC("xdp")
 int xdp_turn(struct xdp_md *ctx)
 {
@@ -56,10 +64,17 @@ int xdp_turn(struct xdp_md *ctx)
         return XDP_PASS;
 
     __u16 dport_be;
+    __u32 zero = 0;
+    struct local_address *local = bpf_map_lookup_elem(&local_addr, &zero);
+    if (!local) return XDP_PASS;
 
     if (eth->h_proto == __bpf_htons(ETH_P_IP)) {
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
+            return XDP_PASS;
+        if (local->family != 4 || __builtin_memcmp(&ip->daddr, local->bytes, 4) != 0)
+            return XDP_PASS;
+        if (ip->version != 4 || (ip->frag_off & __bpf_htons(0x3fff)))
             return XDP_PASS;
         if (ip->protocol != IPPROTO_UDP)
             return XDP_PASS;
@@ -73,6 +88,8 @@ int xdp_turn(struct xdp_md *ctx)
     } else if (eth->h_proto == __bpf_htons(ETH_P_IPV6)) {
         struct ipv6hdr *ip6 = (void *)(eth + 1);
         if ((void *)(ip6 + 1) > data_end)
+            return XDP_PASS;
+        if (local->family != 6 || __builtin_memcmp(&ip6->daddr, local->bytes, 16) != 0)
             return XDP_PASS;
         // No extension-header walk yet (task 1.4): only plain UDP is accelerated.
         if (ip6->nexthdr != IPPROTO_UDP)

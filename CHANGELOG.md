@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Document AF_XDP as **supported within the verified Linux IPv4 UDP copy-mode scope**
+  (SKB/native, Linux 6.8.0-87, `virtio_net`, two RX queues). Record four-hour
+  native WAN media and 15-minute churn, resource cleanup and XDP detach. Keep
+  zero-copy unverified and earlier control timeouts unresolved; no root-cause
+  fix is claimed. Reconcile loader, queue, geometry and metric documentation.
+  See `docs/verification/af-xdp-supported-2026-09-22.md`.
+
 - Promote the io_uring UDP datapath to **supported on Linux**, opt-in, with
   tested kernels 6.8.0-87 and 6.14.0-33. Record receive/cancel recovery tests,
   functional acceptance and shutdown, 30-minute media, four-hour authenticated

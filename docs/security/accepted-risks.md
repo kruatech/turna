@@ -59,11 +59,13 @@ each entry is revisited at the version named under "Review by".
 - **Mitigation:** Turna elects the permissive branch, `BSD-2-Clause`, pinned
   explicitly via `[[licenses.clarify]]` in `deny.toml` so the check is real and
   the election is machine-readable. Recorded for audit in `docs/COMPLIANCE.md` §6.
-  `af-xdp` is absent from default and production builds and is Linux-only.
+  `af-xdp` is absent from the default build and is Linux-only; explicitly enabled
+  production builds must retain the license election and required notices.
 - **Planned remediation:** none needed while the election holds. If a binary is
   shipped with `--features af-xdp`, add the BSD-2-Clause notice for
   `libxdp`/`libbpf` to `NOTICE`.
-- **Review by:** whenever `af-xdp` graduates from experimental.
+- **Review by:** each release shipping `af-xdp`; copy-mode support promotion does
+  not replace dependency/license checks or the notice requirement above.
 
 ## RISK-006 — the DTLS stack is a maintained copy, not a tracked dependency
 

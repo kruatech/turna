@@ -177,6 +177,28 @@ impl TurnaConfig {
             const MAX_FRAME_COUNT: u32 = LIB_RING_SIZE * 2;
 
             let a = &self.turn.af_xdp;
+            if !matches!(a.attach_mode.as_str(), "auto" | "skb" | "native") {
+                errors.push("turn.af_xdp.attach_mode must be auto, skb or native".into());
+            }
+            if a.zero_copy && a.attach_mode == "skb" {
+                errors.push("turn.af_xdp.zero_copy requires native attach mode".into());
+            }
+            let mut queues = HashSet::new();
+            for q in a
+                .queue_ids
+                .iter()
+                .copied()
+                .chain(std::iter::once(a.queue_id))
+            {
+                if q >= 64 {
+                    errors.push("turn.af_xdp queue IDs must be below 64".into());
+                }
+            }
+            for q in &a.queue_ids {
+                if !queues.insert(*q) {
+                    errors.push("turn.af_xdp.queue_ids contains duplicates".into());
+                }
+            }
             if a.frame_size != LIB_FRAME_SIZE {
                 errors.push(format!(
                     "turn.af_xdp.frame_size = {} is not applied: the UMEM is built with the library default of {LIB_FRAME_SIZE}. Set it to {LIB_FRAME_SIZE} or remove the key.",
@@ -2350,6 +2372,10 @@ pub struct AfXdpSection {
     pub interface: String,
     /// NIC queue id to bind the AF_XDP socket to.
     pub queue_id: u32,
+    /// Explicit RX queues. Empty preserves queue_id; all active RX queues must be covered.
+    pub queue_ids: Vec<u32>,
+    /// XDP attach mode: auto (legacy zero_copy choice), skb, or native.
+    pub attach_mode: String,
     /// UMEM frame count.
     pub frame_count: u32,
     /// UMEM frame size, bytes.
@@ -2379,6 +2405,8 @@ impl Default for AfXdpSection {
         Self {
             interface: "eth0".into(),
             queue_id: 0,
+            queue_ids: Vec::new(),
+            attach_mode: "auto".into(),
             frame_count: 4096,
             // 4096, not 2048: this is the size the UMEM is actually created
             // with. The old default described a geometry that never existed.
@@ -3828,6 +3856,17 @@ mod tests {
         "#;
         let cfg: TurnaConfig = toml::from_str(toml).expect("io_uring section parses");
         assert_eq!(cfg.turn.io_uring.relay_socket_capacity_per_worker, 512);
+    }
+
+    #[test]
+    fn af_xdp_native_copy_and_multiple_queues_parse() {
+        let section: AfXdpSection = toml::from_str(
+            "interface = 'ens3'\nqueue_ids = [0, 1]\nattach_mode = 'native'\nzero_copy = false",
+        )
+        .unwrap();
+        assert_eq!(section.queue_ids, vec![0, 1]);
+        assert_eq!(section.attach_mode, "native");
+        assert!(!section.zero_copy);
     }
 
     #[test]

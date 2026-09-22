@@ -1678,11 +1678,15 @@ mod tests {
         let target = target_addr();
         // Resolve the local interface used to reach the server.
         let route_probe = bind_socket().await;
-        route_probe.connect(target).await.expect("peer route lookup");
+        route_probe
+            .connect(target)
+            .await
+            .expect("peer route lookup");
         let peer_ip = route_probe.local_addr().unwrap().ip();
         assert!(!peer_ip.is_unspecified(), "peer address must be concrete");
         let peer = UdpSocket::bind(SocketAddr::new(peer_ip, 0))
-            .await.expect("bind relay peer");
+            .await
+            .expect("bind relay peer");
         drop(route_probe);
         let peer_addr = peer.local_addr().unwrap();
 
