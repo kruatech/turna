@@ -50,6 +50,15 @@ impl NeighborCache {
 
     pub fn put(&self, target: IpAddr, mac: Mac) {
         if let Ok(mut g) = self.inner.write() {
+            if g.len() >= 4096 && !g.contains_key(&target) {
+                if let Some(oldest) = g
+                    .iter()
+                    .min_by_key(|(_, (_, learned))| *learned)
+                    .map(|(ip, _)| *ip)
+                {
+                    g.remove(&oldest);
+                }
+            }
             g.insert(target, (mac, Instant::now()));
         }
     }
@@ -114,7 +123,7 @@ fn connect() -> std::io::Result<Handle> {
 
 /// Ask the kernel for the route to `target`; return its next hop: the route's
 /// gateway if present (off-link), otherwise `target` itself (on-link).
-async fn next_hop(handle: &Handle, target: IpAddr) -> Option<IpAddr> {
+async fn next_hop(handle: &Handle, target: IpAddr, interface: Option<u32>) -> Option<IpAddr> {
     let req = match target {
         IpAddr::V4(v4) => RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(v4, 32)
@@ -125,6 +134,15 @@ async fn next_hop(handle: &Handle, target: IpAddr) -> Option<IpAddr> {
     };
     let mut routes = handle.route().get(req).execute();
     if let Ok(Some(msg)) = routes.try_next().await {
+        if let Some(index) = interface {
+            if !msg
+                .attributes
+                .iter()
+                .any(|a| matches!(a, RouteAttribute::Oif(i) if *i == index))
+            {
+                return None;
+            }
+        }
         for a in &msg.attributes {
             if let RouteAttribute::Gateway(g) = a {
                 if let Some(ip) = ra_ip(g) {
@@ -140,7 +158,7 @@ async fn next_hop(handle: &Handle, target: IpAddr) -> Option<IpAddr> {
 
 /// Look up the MAC of `next_hop` in the neighbour table. Skips entries that
 /// cannot have a usable address (INCOMPLETE / FAILED / NOARP).
-async fn neigh_mac(handle: &Handle, next_hop: IpAddr) -> Option<Mac> {
+async fn neigh_mac(handle: &Handle, next_hop: IpAddr, interface: Option<u32>) -> Option<Mac> {
     // rtnetlink 0.23 renamed `set_family(IpVersion)` to
     // `set_address_family(AddressFamily)`; the old name is deprecated and the
     // af-xdp jobs deny warnings, so it is a hard error there while the
@@ -155,6 +173,9 @@ async fn neigh_mac(handle: &Handle, next_hop: IpAddr) -> Option<Mac> {
         .set_address_family(family)
         .execute();
     while let Ok(Some(msg)) = ns.try_next().await {
+        if interface.is_some_and(|i| msg.header.ifindex != i) {
+            continue;
+        }
         if matches!(
             msg.header.state,
             NeighbourState::Incomplete | NeighbourState::Failed | NeighbourState::Noarp
@@ -188,8 +209,8 @@ async fn neigh_mac(handle: &Handle, next_hop: IpAddr) -> Option<Mac> {
 /// path uses [`run_resolver`] + [`NeighborCache`] instead.
 pub async fn resolve_mac(target: IpAddr) -> std::io::Result<Option<Mac>> {
     let handle = connect()?;
-    let nh = next_hop(&handle, target).await.unwrap_or(target);
-    Ok(neigh_mac(&handle, nh).await)
+    let nh = next_hop(&handle, target, None).await.unwrap_or(target);
+    Ok(neigh_mac(&handle, nh, None).await)
 }
 
 /// Discard port (RFC 863) for the inert kick datagram.
@@ -225,16 +246,23 @@ fn kick(next_hop: IpAddr) {
 /// Resolve one target: route → next-hop → neighbour MAC. On a table miss,
 /// actively kick ARP/NDP and poll until the entry appears or the retry
 /// budget runs out. Caches on success (keyed by target).
-async fn resolve_one(handle: &Handle, cache: &NeighborCache, target: IpAddr) {
-    let nh = next_hop(handle, target).await.unwrap_or(target);
-    if let Some(mac) = neigh_mac(handle, nh).await {
+async fn resolve_one(
+    handle: &Handle,
+    cache: &NeighborCache,
+    target: IpAddr,
+    interface: Option<u32>,
+) {
+    let Some(nh) = next_hop(handle, target, interface).await else {
+        return;
+    };
+    if let Some(mac) = neigh_mac(handle, nh, interface).await {
         cache.put(target, mac);
         return;
     }
     kick(nh);
     for _ in 0..RETRY_POLLS {
         tokio::time::sleep(RETRY_DELAY).await;
-        if let Some(mac) = neigh_mac(handle, nh).await {
+        if let Some(mac) = neigh_mac(handle, nh, interface).await {
             cache.put(target, mac);
             return;
         }
@@ -247,26 +275,46 @@ async fn resolve_one(handle: &Handle, cache: &NeighborCache, target: IpAddr) {
 /// cache entries. Returns when the request channel closes.
 pub async fn run_resolver(
     cache: NeighborCache,
+    rx: tokio::sync::mpsc::Receiver<IpAddr>,
+) -> std::io::Result<()> {
+    resolver_loop(cache, rx, None).await
+}
+
+pub async fn run_resolver_on_interface(
+    cache: NeighborCache,
+    rx: tokio::sync::mpsc::Receiver<IpAddr>,
+    interface: &str,
+) -> std::io::Result<()> {
+    let index = std::fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(std::io::Error::other)?;
+    resolver_loop(cache, rx, Some(index)).await
+}
+
+async fn resolver_loop(
+    cache: NeighborCache,
     mut rx: tokio::sync::mpsc::Receiver<IpAddr>,
+    interface: Option<u32>,
 ) -> std::io::Result<()> {
     let handle = connect()?;
     let mut last_attempt: HashMap<IpAddr, Instant> = HashMap::new();
+    let mut eviction = tokio::time::interval(EVICT_INTERVAL);
+    eviction.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match tokio::time::timeout(EVICT_INTERVAL, rx.recv()).await {
-            Ok(Some(target)) => {
-                // Suppress duplicate work for a target we just tried.
-                if let Some(t) = last_attempt.get(&target) {
-                    if t.elapsed() < RESOLVE_SUPPRESS {
-                        continue;
-                    }
-                }
-                last_attempt.insert(target, Instant::now());
-                resolve_one(&handle, &cache, target).await;
-            }
-            Ok(None) => return Ok(()),
-            Err(_) => {
+        tokio::select! {
+            biased;
+            _ = eviction.tick() => {
                 cache.evict_older_than(EVICT_MAX_AGE);
                 last_attempt.retain(|_, t| t.elapsed() < EVICT_MAX_AGE);
+            }
+            item = rx.recv() => {
+                let Some(target) = item else { return Ok(()); };
+                if last_attempt.get(&target).is_some_and(|t| t.elapsed() < RESOLVE_SUPPRESS) { continue; }
+                // Bound unique peer growth even when the input never becomes idle.
+                if last_attempt.len() >= 4096 && !last_attempt.contains_key(&target) { continue; }
+                last_attempt.insert(target, Instant::now());
+                resolve_one(&handle, &cache, target, interface).await;
             }
         }
     }
@@ -275,6 +323,17 @@ pub async fn run_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_is_bounded_under_unique_peer_churn() {
+        let cache = NeighborCache::new();
+        for i in 0..5000u32 {
+            cache.put(IpAddr::V4(Ipv4Addr::from(i)), [1, 2, 3, 4, 5, 6]);
+        }
+        assert_eq!(cache.len(), 4096);
+        assert_eq!(cache.evict_older_than(Duration::ZERO), 4096);
+        assert!(cache.is_empty());
+    }
 
     #[test]
     fn cache_put_get_ttl() {

@@ -29,9 +29,9 @@ constraints below are taken from `crates/config/src/lib.rs`.
 - `tokio` — epoll + `recvmmsg`/`sendmmsg`. Default, safest, all platforms.
 - `io_uring` — supported Linux UDP datapath, opt-in. Requires a binary built with
   `--features io-uring`; fails fast at startup if io_uring is unavailable.
-- `af_xdp` — AF_XDP ring datapath. Requires `--features af-xdp`, Linux,
-  `CAP_NET_RAW`, and an external XDP program steering traffic to the bound NIC
-  queue. Never auto-selected.
+- `af_xdp` — opt-in Linux AF_XDP datapath. Requires `--features af-xdp` and
+  privileges to bind XSK sockets and load/attach the embedded selective XDP
+  program. Never auto-selected. See [the runbook](runbooks/af-xdp.md).
 - `auto` — io_uring when available at runtime, else tokio. Opt-in (dev/bench).
 
 ---
@@ -309,29 +309,33 @@ SCTP and multihoming/failover are not support claims. See
 
 ## `[turn.af_xdp]`
 
-AF_XDP ring datapath. Used only when `transport = "af_xdp"`. Requires
-`--features af-xdp`, Linux, `CAP_NET_RAW`, and an external XDP program steering
-the chosen NIC queue (see `docs/runbooks/af-xdp.md`). **Experimental** — see the
-support tier in `docs/compatibility/transport-backends.md`.
+AF_XDP ring datapath. Used only when `transport = "af_xdp"`. Requires a Linux
+`--features af-xdp` build and privileges for XSK/BPF/XDP setup. The node loads
+its own address/port-selective program. **Supported within the verified Linux
+IPv4 UDP copy-mode scope**; see [evidence and limitations](verification/af-xdp-supported-2026-09-22.md)
+and [the runbook](runbooks/af-xdp.md). Native attach does not imply zero-copy.
 
 | key | type | notes |
 |-----|------|-------|
 | `interface` | string | NIC name, e.g. `eth0`. |
-| `queue_id` | u32 | NIC queue id to bind the AF_XDP socket to. |
-| `frame_count` | u32 | UMEM frame count. |
-| `frame_size` | u32 | UMEM frame size, bytes. Must be ≥ 2048 and ≥ MTU+14. |
-| `fill_ring_size` | u32 | Fill ring size (power of two). |
+| `queue_id` | u32 | Legacy single queue (default 0), used when `queue_ids` is empty. |
+| `queue_ids` | array of u32 | Explicit RX queues; must cover every RX queue reported by the interface. Unique IDs below 64. Empty preserves `queue_id`. |
+| `attach_mode` | string | `auto` (legacy: native if zero-copy, otherwise SKB), `skb`, or `native`. Native + copy is supported as a selectable mode; hardware verification remains required. |
+| `frame_count` | u32 | UMEM frames per queue, at most 4096 with current ring geometry. |
+| `frame_size` | u32 | Fixed at 4096; must fit MTU+14. Inert overrides are rejected. |
+| `fill_ring_size` | u32 | Fixed at 2048, as are completion/RX/TX rings. |
 | `comp_ring_size` | u32 | Completion ring size. |
 | `rx_ring_size` | u32 | RX ring size. |
 | `tx_ring_size` | u32 | TX ring size. |
-| `zero_copy` | bool | Zero-copy mode (requires driver support). |
+| `zero_copy` | bool | Force zero-copy bind (requires driver support and native attach). False forces copy. Actual socket mode is checked with XDP_OPTIONS; no silent fallback. |
 | `need_wakeup` | bool | Use the `NEED_WAKEUP` flag. |
-| `src_mac` | string | Source MAC for TX frames. Empty → placeholder until neighbor resolution lands. |
-| `dst_mac` | string | Next-hop (gateway) MAC. Empty → placeholder. |
+| `src_mac` | string | Source MAC for TX frames. Empty reads the configured interface MAC. |
+| `dst_mac` | string | Fallback next-hop MAC. Empty attempts default-gateway ARP lookup; unresolved fallback remains observable. |
 
-A startup preflight validates ring geometry (power-of-two, `frame_size ≥ 2048`),
-that the interface exists and is up, that the queue exists, `frame_size ≥ MTU+14`,
-and `CAP_NET_RAW`. Any failure aborts startup.
+Validation/preflight checks fixed ring geometry, interface/queue coverage, MTU,
+mode compatibility and `CAP_NET_RAW`. Binding and BPF attach must also succeed;
+NET_RAW alone does not grant all required BPF/XDP privileges. A concrete listen
+IP is required. Readiness follows initialization of every configured queue.
 
 ---
 

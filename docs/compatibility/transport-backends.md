@@ -45,7 +45,7 @@ cargo build --release -p turna-node --features af-xdp
 |---------|:-----:|:-----:|----------------------|
 | tokio   | ✅ | ✅ | none |
 | io_uring | ✅ | ❌ | kernel io_uring; fails fast if unavailable |
-| af_xdp  | ✅ | ❌ | `CAP_NET_RAW`, external XDP program on the bound NIC queue |
+| af_xdp  | ✅ | ❌ | Privileges for XSK/BPF/XDP; node-owned embedded filter; all RX queues configured |
 | dtls    | ✅ | ✅ | ECDSA P-256 cert/key (readable) |
 | sctp    | ✅ | ❌ | host `sctp` kernel module; plaintext control channel |
 
@@ -81,10 +81,12 @@ cargo build --release -p turna-node --features af-xdp
   Both paths apply transport limits, admission and per-stream reply routing.
   WebTransport negotiates `h3`; configured `alpn` applies only to raw QUIC.
   Both features can be built together. [Evidence and scope](../verification/quic-webtransport-supported-2026-09-18.md).
-- **af_xdp — Experimental / Phase 1.** Opt-in (Linux + `CAP_NET_RAW` + external
-  XDP). Compiles and passes startup preflight; neighbor (ARP/NDP) resolution for
-  TX MACs is a placeholder/follow-up, and runtime requires a veth lab or an
-  XDP-capable NIC (`scripts/lab/af_xdp_*.sh`). Not recommended for production yet.
+- **af_xdp — Supported within the verified Linux IPv4 UDP copy-mode scope.**
+  Opt-in; embedded selective filter, all RX queues covered, fixed ring geometry.
+  Linux 6.8.0-87 / `virtio_net`: SKB/copy and native/copy. Four-hour native
+  media and 15-minute native churn passed the documented criteria. Zero-copy
+  and other NIC/kernel combinations remain unverified; earlier WAN control
+  timeouts remain unexplained. [Evidence](../verification/af-xdp-supported-2026-09-22.md).
 
 ## Lifecycle (all backends)
 
@@ -126,5 +128,5 @@ cargo build --release -p turna-node --features af-xdp
 | SCTP      | Linux    | `sctp`       | Supported with tokio; native SCTP, plaintext |
 | QUIC (`quic`) | Linux/macOS, tokio | `quic` | Supported; see [scope](../verification/quic-webtransport-supported-2026-09-18.md). |
 | WebTransport (`web-transport`) | Linux/macOS, tokio | `web-transport` | Supported; see [scope](../verification/quic-webtransport-supported-2026-09-18.md). |
-| AF_XDP    | Linux    | `af-xdp`     | Experimental (Phase 1) |
+| AF_XDP    | Linux | `af-xdp` | Supported within verified IPv4 UDP copy-mode scope; see support evidence above |
 ```

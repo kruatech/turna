@@ -49,7 +49,7 @@ Status legend: ✅ shipped · 🚧 implemented/experimental · 📋 planned.
 | DTLS | 🚧 | Optional feature; validate with your clients. |
 | QUIC/WebTransport | Supported | Opt-in, Linux/macOS with tokio; project-specific TURN mappings. See [support scope](verification/quic-webtransport-supported-2026-09-18.md). |
 | io_uring | ✅ | Supported Linux UDP datapath, opt-in; tokio remains default. [Tested scope](verification/io-uring-supported-2026-09-19.md). |
-| AF_XDP | 🚧 | Explicit opt-in Linux/NIC-specific backend. |
+| AF_XDP | ✅ scoped | Opt-in Linux IPv4 UDP copy-mode backend; [verified environment and limitations](verification/af-xdp-supported-2026-09-22.md). |
 | OAuth RFC 7635 | 📋 | Not implemented. |
 | SQL/Redis/Mongo user DB backends | 📋 | Not implemented. |
 | Full coturn flag parity | 📋 | Not a near-term goal. |

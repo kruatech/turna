@@ -147,10 +147,15 @@ implemented. ✅ = in code; ⚠ = partial / follow-up; ❌ = not done.
 
 ## AF_XDP
 
-- ✅ Requires `CAP_NET_RAW` and an operator-owned external XDP program; the
-  server never loads/removes XDP programs.
-- ⚠ TX neighbor (ARP/NDP) MAC resolution is a placeholder (Phase 1); src/dst MAC
-  are static config.
+- Supported within the [verified Linux IPv4 UDP copy-mode scope](../verification/af-xdp-supported-2026-09-22.md).
+- The node loads and detaches its own embedded IP/UDP-port-selective XDP filter;
+  XSK bind, BPF load and attach need appropriate privileges. NET_RAW alone is insufficient.
+- All enumerated RX queues must be configured; each has its own UMEM.
+- Application auth, rate limits and peer policy remain required. Redirected packets
+  do not use the normal kernel UDP INPUT admission path.
+- Neighbor resolution exists with static/gateway fallback; cold-neighbor and route
+  changes remain unverified. Zero-copy and IPv6 WAN are not covered by this support record.
+- Earlier WAN churn timeouts are unresolved; later native churn passed with cleanup.
 
 ## Lifecycle
 

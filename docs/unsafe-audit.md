@@ -1,5 +1,13 @@
 # Unsafe Code Audit — first pass
 
+> AF_XDP update, 2026-09-19: the active XSK path now retains pending refill
+> descriptors, quarantines ambiguous TX submissions, shares the program across
+> queues within one thread, and removes XSK map entries before queue/UMEM teardown.
+> XDP_OPTIONS checks the actual socket mode. These changes still require Rust and
+> kernel verification; this note is not a completed soundness audit. See
+> [the verification record](verification/af-xdp-hardening-2026-09-19.md).
+
+
 **Дата:** 2026-05-16
 **Скоуп:** все `unsafe` блоки в `crates/{transport,relay}/src/`.
 **Примечание:** документ сокращён до крейтов, входящих в этот репозиторий; записи исходного прохода по не вошедшим крейтам удалены, нумерация пунктов сохранена (поэтому в ней есть пропуски), агрегированные счётчики ниже могут отражать исходный объём.

@@ -121,7 +121,8 @@ production migration, not a formality.
 
 **io_uring / AF_XDP.** Migrate on `transport = "tokio"` first and evaluate
 backend changes separately. io_uring is now [supported on Linux](verification/io-uring-supported-2026-09-19.md)
-for the stated UDP scope; AF_XDP remains lab-verified beta. This does not extend
+for the stated UDP scope; AF_XDP is [supported within its verified Linux IPv4 UDP
+copy-mode scope](verification/af-xdp-supported-2026-09-22.md). This does not extend
 support to every listener/backend combination. In particular SCTP requires tokio.
 Validate the full configuration and required listeners before cutover.
 

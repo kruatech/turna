@@ -64,7 +64,7 @@
       ],
       "review_status": "FIXED",
       "notes": "SUSPECT #2 (OOB) fixed: checked_add + assert in frame_slice/_mut. Sync soundness (kernel RX-DMA vs userspace read) is now a documented, reviewed invariant on `unsafe impl Sync for Umem` (frame ownership is RX-ring-mediated: read only post-dequeue, pre-refill, no aliasing). Umem is owned by value in a single socket and not shared as &Umem across threads, so Sync may alternatively be removed.",
-      "remaining_concern": "NEEDS-REVIEW: Sync impl allows shared refs across threads; AF_XDP ordering is semantic, not structural"
+      "remaining_concern": "NEEDS-REVIEW: Sync impl allows shared refs across threads; AF_XDP ordering is semantic, not structural. 2026-09-19 active XSK hardening: per-queue UMEM, shared Rc program within one thread, pending refill ownership, ambiguous TX-error quarantine, XSK-map removal before queue/UMEM teardown, XDP_OPTIONS getsockopt. Runtime copy-mode evidence is now recorded in docs/verification/af-xdp-supported-2026-09-22.md; this does not close the separate unsafe/Sync review concern."
     },
     {
       "id": "USF-004",

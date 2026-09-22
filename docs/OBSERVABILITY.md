@@ -399,12 +399,12 @@ route table (see below).
 |--------|------|---------|
 | `turna_afxdp_readiness` | gauge | Datapath readiness, same encoding as the listener gauges (`0`=starting, `1`=ready, `2`=degraded, `3`=draining). Reads `starting` when AF_XDP is not the selected backend, so `0` here does **not** mean a stuck datapath unless you have actually selected AF_XDP. |
 | `turna_afxdp_rx_frames_total` / `turna_afxdp_rx_bytes_total` | counter | Frames taken off the RX queue, and TURN payload bytes within them. |
-| `turna_afxdp_tx_frames_total` / `turna_afxdp_tx_bytes_total` | counter | Frames and bytes sent. |
+| `turna_afxdp_tx_frames_total` / `turna_afxdp_tx_bytes_total` | counter | Successful TX submissions and TURN payload bytes; neither submission nor completion proves peer delivery. |
 | `turna_afxdp_tx_drops_total` | counter | Send failures. A sustained rate is packet loss the client will see. |
 | `turna_afxdp_tx_inflight` | gauge | Frames pushed to the TX ring but not yet completed. A value that climbs and does not fall means completions are not being reaped. |
-| `turna_afxdp_umem_free_frames` | gauge | Free UMEM frames left for RX/TX. Approaching `0` is the exhaustion signal — RX will start dropping before anything else reports an error. |
-| `turna_afxdp_parse_drops_total` | counter | Received frames matching no TURN or relay port. Steady background noise is normal on a shared NIC; a spike correlated with client complaints means relay-port registration is lagging. |
-| `turna_afxdp_relay_ports_registered` | gauge | Relay ports currently demuxed by the datapath. Compare against `turna_allocations_active` — a persistent gap is the previous line's cause. |
+| `turna_afxdp_umem_free_frames` | gauge | Free TX frames aggregated across queues. RX buffers are managed separately; this is not RX fill-ring capacity. |
+| `turna_afxdp_parse_drops_total` | counter | Rejected/undemuxable frames after redirect, including malformed IP/UDP framing or checksums. Inspect logs and packet evidence before assigning a cause. |
+| `turna_afxdp_relay_ports_registered` | gauge | Relay ports registered for AF_XDP. Compare with `turna_active_allocations`; check both return to zero after cleanup. |
 | `turna_afxdp_neighbor_unresolved` | gauge | `1` = the next-hop TX MAC is still the zero placeholder and **TX will not deliver**; `0` = resolved. This is a hard outage indicator, not a warning. |
 | `turna_afxdp_neighbor_cache_entries` | gauge | Resolved next-hop MAC entries cached. |
 | `turna_afxdp_arp_replies_total` | counter | ARP replies the datapath sent for its own IP. |
