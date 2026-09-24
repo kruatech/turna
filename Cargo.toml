@@ -47,7 +47,7 @@ members = [
     "tests/integration",
     "tests/soak",
     "services/admin",]
-# fuzz — isolated workspace for cargo-fuzz (as before)
+# fuzz — изолированный workspace для cargo-fuzz (как и было)
 exclude = ["fuzz"]
 
 [workspace.package]
