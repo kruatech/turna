@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — network and deployment
+
+- `[turn] listen_extra`: serve TURN/STUN on additional UDP addresses (coturn's
+  repeated `listening-ip`); relayed data returns through the listener the client
+  used. Tokio datapath only; refused with io_uring/AF_XDP/auto and with
+  `[turn.migration]`.
+- `external_ip` / `external_ip6` accept coturn's `PUBLIC/PRIVATE` form for 1:1 NAT:
+  PUBLIC is advertised, relay sockets bind PRIVATE.
+- `[turn.tcp]`: opt-in plain TURN over TCP (`transport=tcp`), off by default; RFC
+  6062 TCP relay works over it. `turna_tcp_*` metrics.
+- HAProxy PROXY protocol v1/v2 on `[tls]` and `[turn.tcp]`, honoured only from
+  `proxy_protocol_trusted_cidrs`; the proxied client address is what caps, rate
+  limits, auth and logs see. Trusted ranges are refused as relay peers, and
+  connections waiting for their header count against `max_connections`.
+- `[tls] min_version` ("1.2" default, or "1.3") and a `[tls] cipher_suites`
+  allowlist; an allowlist unusable with the certificate's key type stops the TURNS
+  listener. Defaults unchanged.
+
 ### Changed
 
 - Document AF_XDP as **supported within the verified Linux IPv4 UDP copy-mode scope**
