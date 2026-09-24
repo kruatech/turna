@@ -152,3 +152,27 @@ IP/range per node; use drain for planned maintenance, monitor remaining
 allocations, and treat cluster StatefulSet mode as experimental.
 **Exit condition:** a separately verified socket/port ownership protocol and
 end-to-end media continuity tests across process/node death.
+
+## RISK-007 — auto-ban's rate-limit trigger can be aimed at a victim by spoofing
+
+- **Status:** accepted, and **off by default** (`[turn.auto_ban]
+  rate_limit_violations = 0`). The auth-failure trigger does not carry this risk.
+- **Description:** with `rate_limit_violations > 0`, a source is banned after
+  that many rate-limiter refusals in the window. Rate limits refuse raw packets,
+  and a UDP packet can carry any source address, so an attacker able to spoof
+  can flood with a victim's address and get the victim banned for `ban_secs` —
+  a customer, a partner's NAT, a monitoring probe.
+- **Why it is offered anyway:** where spoofing is filtered upstream (BCP 38 on
+  the provider edge, or a node reachable only through a load balancer that
+  terminates the path), it bans flooders that never attempt authentication,
+  which the auth-failure trigger cannot see.
+- **Compensating controls:** off by default; config validation warns when it is
+  enabled; `allowlist` and `exempt_trusted_prefixes` keep an operator's own
+  ranges out of reach; bans expire on their own; every ban is a
+  `SOURCE_BANNED` syslog event with the reason, so a mistaken ban is visible.
+  The auth-failure trigger counts only requests behind a valid client-bound
+  NONCE (a completed round trip), and Binding requests with bad
+  MESSAGE-INTEGRITY — which skip the nonce — are deliberately not counted.
+- **Review by:** if a cluster-wide ban table is ever added, since that would
+  multiply the reach of a forged ban across nodes.
+
