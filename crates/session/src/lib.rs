@@ -538,6 +538,46 @@ fn relay_bind_v6() -> std::net::Ipv6Addr {
         .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED)
 }
 
+/// The configured v6 relay bind address (`[turn.relay] bind_ip6`, wildcard when
+/// unset) — the v6 twin of [`relay_bind_addr_v4`].
+pub fn relay_bind_addr_v6() -> std::net::Ipv6Addr {
+    relay_bind_v6()
+}
+
+/// Bind the RFC 6062 relayed TCP listener for a TCP allocation in `family`, on
+/// the same address the UDP relay sockets use for that family.
+///
+/// The v4 path is exactly the `std::net::TcpListener::bind` the TCP relay has
+/// always used, so a v4 allocation is byte-for-byte unchanged. The v6 path is
+/// bound `IPV6_V6ONLY` for the reason [`bind_relay_socket`] is: without it a v6
+/// wildcard listener on Linux also accepts v4 connections, and a v6 allocation
+/// would take peer-initiated connections from the other family — which RFC 6156
+/// forbids and which no v4 permission could ever cover. `SO_REUSEADDR` and a
+/// 128 backlog match what `std` does for the v4 listener.
+pub fn bind_relay_tcp_listener(
+    family: RelayFamily,
+    port: u16,
+) -> std::io::Result<std::net::TcpListener> {
+    match family {
+        RelayFamily::V4 => std::net::TcpListener::bind((relay_bind_v4(), port)),
+        #[cfg(unix)]
+        RelayFamily::V6 => {
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            sock.set_only_v6(true)?;
+            sock.set_reuse_address(true)?;
+            sock.bind(&std::net::SocketAddr::from((relay_bind_v6(), port)).into())?;
+            sock.listen(128)?;
+            Ok(sock.into())
+        }
+        #[cfg(not(unix))]
+        RelayFamily::V6 => std::net::TcpListener::bind((relay_bind_v6(), port)),
+    }
+}
+
 /// Buffer sizes for relay sockets, in bytes. 0 = leave the kernel default.
 ///
 /// Separate from `turna-transport`'s equivalent because this crate does not
@@ -634,6 +674,32 @@ fn bind_relay_socket_inner(family: RelayFamily, port: u16) -> std::io::Result<st
 #[cfg(all(test, unix))]
 mod v6only_tests {
     use super::*;
+
+    /// The RFC 6062 v6 listener must leave the same v4 port free, or a v6 TCP
+    /// allocation would accept peer connections from IPv4 peers.
+    #[test]
+    fn v6_relay_tcp_listener_is_v6_only() {
+        let v6 = match bind_relay_tcp_listener(RelayFamily::V6, 0) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipping: no IPv6 on this host ({e})");
+                return;
+            }
+        };
+        let port = v6.local_addr().expect("local_addr").port();
+        assert!(v6.local_addr().unwrap().is_ipv6());
+        let v4 = std::net::TcpListener::bind(("0.0.0.0", port));
+        assert!(
+            v4.is_ok(),
+            "v4 TCP bind on port {port} must still be possible: {v4:?}"
+        );
+    }
+
+    #[test]
+    fn v4_relay_tcp_listener_is_unchanged() {
+        let l = bind_relay_tcp_listener(RelayFamily::V4, 0).expect("v4 bind");
+        assert!(l.local_addr().unwrap().is_ipv4());
+    }
 
     #[test]
     fn v6_relay_socket_is_v6_only() {
