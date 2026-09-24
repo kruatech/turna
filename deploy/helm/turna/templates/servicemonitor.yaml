@@ -1,0 +1,25 @@
+{{- /*
+ServiceMonitor for the Prometheus Operator. Rendered only when enabled and
+the cluster serves monitoring.coreos.com/v1, so installing the chart on a
+cluster without the operator does not fail on an unknown kind. It scrapes the
+internal ClusterIP service (health + /metrics), never the public TURN service.
+*/ -}}
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: turna
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: turna
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: internal
+  endpoints:
+    - port: health
+      path: /metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

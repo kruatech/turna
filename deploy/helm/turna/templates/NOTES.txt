@@ -1,0 +1,17 @@
+turna {{ .Chart.AppVersion }} is installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+TURN/STUN (public):  service {{ .Release.Name }}-turn, port {{ .Values.turn.listenPort }} (UDP and TCP)
+Health and metrics:  service {{ .Release.Name }}-internal, port {{ .Values.turn.healthPort }} (cluster-internal)
+
+Check the node is ready:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-internal {{ .Values.turn.healthPort }}:{{ .Values.turn.healthPort }}
+  curl -s http://127.0.0.1:{{ .Values.turn.healthPort }}/ready
+
+Scope of this chart: plain UDP TURN only. TURNS, DTLS and QUIC/WebTransport are
+not configurable here, and no control-plane or admin workload is deployed.
+See docs/DEPLOY.md.
+{{- if and .Values.metrics.serviceMonitor.enabled (not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1")) }}
+
+WARNING: metrics.serviceMonitor.enabled is true, but this cluster does not serve
+monitoring.coreos.com/v1 (Prometheus Operator), so no ServiceMonitor was created.
+{{- end }}
