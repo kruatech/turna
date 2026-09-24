@@ -884,6 +884,81 @@ CFGPY
 fi
 
 # ---------------------------------------------------------------------------
+section "coturn migration table names only config keys that exist"
+# ---------------------------------------------------------------------------
+
+# docs/migrating-from-coturn.md maps every coturn option to a turna key. A key
+# that is misspelled or later renamed turns the table into instructions that
+# fail at startup (deny_unknown_fields). This resolves every `[section] key` in
+# the table's turna column against the config structs *by path* — not just by
+# field name, so `[management.rbac]` (the struct field lives under [grpc]) fails
+# even though a field called `rbac` exists somewhere.
+MIG=docs/migrating-from-coturn.md
+if [ -f "$MIG" ] && [ -f "$CFG_SRC" ]; then
+  MIG_BAD=$(python3 - "$CFG_SRC" "$MIG" <<'MIGPY'
+import re, sys
+src, doc = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+structs = {}
+for m in re.finditer(r"pub struct (\w+)\s*\{(.*?)\n\}", src, re.S):
+    fields = {}
+    for fm in re.finditer(r'(?:#\[serde\(rename\s*=\s*"([^"]+)"\)\][^\n]*\n\s*)?pub (?:r#)?(\w+)\s*:\s*([^\n]+?),?\s*$', m.group(2), re.M):
+        fields[fm.group(1) or fm.group(2)] = fm.group(3)
+    structs[m.group(1)] = fields
+if "TurnaConfig" not in structs or len(structs) < 20:
+    print("PARSER"); raise SystemExit(0)
+
+def child(struct, field):
+    ty = structs.get(struct, {}).get(field)
+    if ty is None:
+        return None, False
+    inner = [t for t in re.findall(r"\w+", ty) if t in structs]
+    return (inner[-1] if inner else ""), True
+
+def resolve(path):
+    cur = "TurnaConfig"
+    for seg in path:
+        cur, ok = child(cur, seg)
+        if not ok:
+            return None
+    return cur
+
+bad, seen = [], 0
+for line in doc.splitlines():
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 3 or not cells[0].startswith("`"):
+        continue
+    section = None
+    for tok in re.findall(r"`([^`]+)`", cells[1]):
+        m = re.match(r"^\[\[?([a-z0-9_.]+)\]\]?(?:\s+([a-z0-9_]+))?$", tok)
+        if m:
+            section = m.group(1)
+            st = resolve(section.split("."))
+            if st is None:
+                bad.append("[" + section + "]"); section = None; continue
+            if m.group(2):
+                seen += 1
+                if m.group(2) not in structs.get(st, {}):
+                    bad.append("[" + section + "] " + m.group(2))
+        elif section and re.match(r"^[a-z0-9_]+$", tok):
+            seen += 1
+            st = resolve(section.split("."))
+            if tok not in structs.get(st, {}):
+                bad.append("[" + section + "] " + tok)
+if seen < 30:
+    print("PARSER"); raise SystemExit(0)
+print("; ".join(bad))
+MIGPY
+)
+  case "$MIG_BAD" in
+    PARSER) fail "the migration-table key extractor found too little to judge" \
+              "Either the table format or the config structs changed shape; fix the extractor rather than skipping the check." ;;
+    "") pass "every turna key in the coturn mapping table exists at its path" ;;
+    *) fail "the coturn mapping table names keys the config does not have: $MIG_BAD" \
+         "Correct the row in $MIG (or restore the key); an operator copying it gets a startup failure." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
 section "SIGHUP: docs must not deny a handler the node has"
 # ---------------------------------------------------------------------------
 
