@@ -2342,15 +2342,28 @@ impl PacketProcessor {
     /// the peer must be in its relayed family (the v6 listener is v6-only, so
     /// that last check is belt and braces).
     ///
+    /// `relay_port` is the port of the listener that accepted the connection,
+    /// and it must be the allocation's current relayed port. The client's
+    /// 5-tuple alone is not enough: after an allocation expires, a new one on the
+    /// same TLS connection gets a different port, and a listener left over from
+    /// the old one must not announce connections — tagged with the old port —
+    /// on the new allocation's permissions.
+    ///
     /// A `false` is counted in `turna_tcp_relay_peer_refused_total`; the caller
     /// drops (closes) the stream.
-    pub fn peer_connection_permitted(&self, client: SocketAddr, peer: SocketAddr) -> bool {
+    pub fn peer_connection_permitted(
+        &self,
+        client: SocketAddr,
+        relay_port: u16,
+        peer: SocketAddr,
+    ) -> bool {
         let peer = normalize_addr(peer);
         let permitted = !is_forbidden_peer(peer.ip())
             && match self.store.get(&client) {
                 Some(a) => {
                     !a.is_expired()
                         && a.transport == TransportProto::Tcp
+                        && a.relay_addr.port() == relay_port
                         && a.relay_addr.is_ipv6() == peer.is_ipv6()
                         && a.has_permission(&peer)
                 }
@@ -2367,6 +2380,19 @@ impl PacketProcessor {
             );
         }
         permitted
+    }
+
+    /// Does `client` still own a live TCP allocation on `relay_port`? The
+    /// relayed-TCP accept loop polls this and stops its listener when it turns
+    /// false, which is how a listener ends when its allocation *expires* — the
+    /// explicit paths (Refresh 0, control connection closed) emit `CloseRelay`,
+    /// but the expiry sweep only reconciles UDP relay sockets.
+    pub fn tcp_listener_live(&self, client: SocketAddr, relay_port: u16) -> bool {
+        self.store.get(&client).is_some_and(|a| {
+            !a.is_expired()
+                && a.transport == TransportProto::Tcp
+                && a.relay_addr.port() == relay_port
+        })
     }
 
     /// Build a signed RFC 6062 CONNECT success response carrying CONNECTION-ID.
@@ -4028,9 +4054,17 @@ mod tcp_relay_ipv6_tests {
         ));
         // RFC 6062 §5.3 on the v6 listener: the permitted v6 peer may be
         // announced; a v4 peer and an unpermitted v6 peer may not.
-        assert!(p.peer_connection_permitted(src, "[2001:4860:4860::8888]:5000".parse().unwrap()));
-        assert!(!p.peer_connection_permitted(src, "8.8.8.8:5000".parse().unwrap()));
-        assert!(!p.peer_connection_permitted(src, "[2001:4860:4860::8844]:5000".parse().unwrap()));
+        assert!(p.peer_connection_permitted(
+            src,
+            addr.port(),
+            "[2001:4860:4860::8888]:5000".parse().unwrap()
+        ));
+        assert!(!p.peer_connection_permitted(src, addr.port(), "8.8.8.8:5000".parse().unwrap()));
+        assert!(!p.peer_connection_permitted(
+            src,
+            addr.port(),
+            "[2001:4860:4860::8844]:5000".parse().unwrap()
+        ));
     }
 }
 
@@ -4150,6 +4184,7 @@ mod tcp_relay_peer_permission_tests {
             &p,
             &sinks,
             id,
+            port,
             client,
             b"k",
             server_side,
@@ -4174,6 +4209,7 @@ mod tcp_relay_peer_permission_tests {
             &p,
             &sinks,
             id,
+            port,
             client,
             b"k",
             server_side,
@@ -4191,6 +4227,7 @@ mod tcp_relay_peer_permission_tests {
             &p,
             &sinks,
             id,
+            port,
             client,
             b"k",
             server_side,
@@ -4210,12 +4247,89 @@ mod tcp_relay_peer_permission_tests {
         assert_eq!(p.metrics.tcp_relay_peer_refused.load(Ordering::Relaxed), 2);
     }
 
+    /// The listener's port must be the allocation's current port: a leftover
+    /// listener from an earlier allocation on the same control connection must
+    /// not announce peers against the new allocation's permissions.
+    #[tokio::test]
+    async fn stale_listener_port_is_refused_and_listener_stops_on_expiry() {
+        let p = Arc::new(processor());
+        let mgr = p.tcp_relay.clone().unwrap();
+        let client: SocketAddr = "127.0.0.1:43010".parse().unwrap();
+        let actions = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::Allocate,
+                vec![Attribute::RequestedTransport(turn::TRANSPORT_TCP)],
+            ),
+            client,
+        );
+        assert!(is_success(&actions));
+        let (listener, port) = actions
+            .into_iter()
+            .find_map(|a| match a {
+                Action::RegisterTcpListener {
+                    listener,
+                    relay_port,
+                    ..
+                } => Some((listener, relay_port)),
+                _ => None,
+            })
+            .expect("TCP allocation hands over its listener");
+        let perm = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::CreatePermission,
+                vec![Attribute::XorPeerAddress("8.8.8.8:0".parse().unwrap())],
+            ),
+            client,
+        );
+        assert!(is_success(&perm));
+        let peer: SocketAddr = "8.8.8.8:1".parse().unwrap();
+        assert!(p.peer_connection_permitted(client, port, peer));
+        assert!(
+            !p.peer_connection_permitted(client, port.wrapping_add(1), peer),
+            "a listener on another port must not use this allocation's permissions"
+        );
+
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let task = tokio::spawn(crate::tcp_relay::run_relayed_listener(
+            mgr,
+            p.clone(),
+            crate::server::new_client_sinks(),
+            listener,
+            port,
+            client,
+            b"k".to_vec(),
+            Duration::from_millis(50),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "listener must run while the allocation lives"
+        );
+
+        // Expire it the way the sweep would: the allocation is gone, and no
+        // CloseRelay reaches the listener.
+        p.store.refresh(&client, 0).unwrap();
+        assert!(!p.tcp_listener_live(client, port));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("listener must stop once its allocation is gone")
+            .unwrap();
+        // The port is free again: the listener socket was closed.
+        assert!(std::net::TcpListener::bind(("0.0.0.0", port)).is_ok());
+    }
+
     /// No allocation, or a UDP allocation, on that 5-tuple: refused.
     #[tokio::test]
     async fn peer_for_missing_or_udp_allocation_is_refused() {
         let p = processor();
         assert!(!p.peer_connection_permitted(
             "127.0.0.1:43002".parse().unwrap(),
+            31000,
             "8.8.8.8:1".parse().unwrap()
         ));
         let client: SocketAddr = "127.0.0.1:43003".parse().unwrap();
@@ -4239,7 +4353,8 @@ mod tcp_relay_peer_permission_tests {
             client,
         );
         assert!(is_success(&perm));
-        assert!(!p.peer_connection_permitted(client, "8.8.8.8:1".parse().unwrap()));
+        let port = p.store.get(&client).unwrap().relay_addr.port();
+        assert!(!p.peer_connection_permitted(client, port, "8.8.8.8:1".parse().unwrap()));
     }
 }
 

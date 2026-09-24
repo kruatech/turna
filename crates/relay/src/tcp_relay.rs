@@ -169,12 +169,13 @@ pub async fn handle_peer_initiated(
     processor: &crate::processor::PacketProcessor,
     sinks: &crate::server::ClientSinks,
     alloc: AllocationId,
+    relay_port: u16,
     client_addr: SocketAddr,
     owner_key: &[u8],
     stream: TcpStream,
     peer: SocketAddr,
 ) -> PeerAcceptOutcome {
-    if !processor.peer_connection_permitted(client_addr, peer) {
+    if !processor.peer_connection_permitted(client_addr, relay_port, peer) {
         drop(stream);
         return PeerAcceptOutcome::Refused;
     }
@@ -202,6 +203,66 @@ pub async fn handle_peer_initiated(
         // never be bound — drop it.
         mgr.release(id).await;
         PeerAcceptOutcome::Dropped
+    }
+}
+
+/// How often a relayed TCP listener checks that its allocation is still live.
+/// Matches the 5 s expiry sweep that reconciles UDP relay sockets.
+pub const LISTENER_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The accept loop of one TCP allocation's relayed listener (RFC 6062 §5.3).
+///
+/// Ends when `accept()` fails, when the task is aborted (`CloseRelay`, control
+/// connection closed), or — checked every `liveness` — when the allocation it
+/// belongs to is gone, expired or replaced by one on another port. The last
+/// case is the expiry path: the sweep removes the allocation and reconciles UDP
+/// relay sockets, but nothing emitted `CloseRelay` for a TCP listener, so one
+/// outlived its allocation and kept accepting. Pending and bound peer
+/// connections of the allocation are cleaned up when it ends that way.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_relayed_listener(
+    mgr: Arc<TcpRelayManager>,
+    processor: Arc<crate::processor::PacketProcessor>,
+    sinks: crate::server::ClientSinks,
+    listener: tokio::net::TcpListener,
+    relay_port: u16,
+    client_addr: SocketAddr,
+    owner_key: Vec<u8>,
+    liveness: Duration,
+) {
+    let alloc = AllocationId(relay_port as u64);
+    let mut tick = tokio::time::interval(liveness);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    handle_peer_initiated(
+                        &mgr,
+                        &processor,
+                        &sinks,
+                        alloc,
+                        relay_port,
+                        client_addr,
+                        &owner_key,
+                        stream,
+                        peer,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(port = relay_port, error = %e, "relayed TCP accept failed; stopping listener");
+                    return;
+                }
+            },
+            _ = tick.tick() => {
+                if !processor.tcp_listener_live(client_addr, relay_port) {
+                    debug!(port = relay_port, "relayed TCP listener stopped: allocation expired or replaced");
+                    mgr.cleanup_allocation(alloc).await;
+                    return;
+                }
+            }
+        }
     }
 }
 
