@@ -36,8 +36,8 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **`transport` naming collision.** In config, `transport` already means the
   **datapath backend** (`tokio` / `io_uring` / `af_xdp`), a third meaning distinct
   from *client transport* (listeners) and *relayed transport*. Relayed transport is
-  currently **UDP-only**. When TCP relay (6062) lands, the client-vs-relayed split
-  the roadmap requires must avoid reusing the `transport` name (§40.1).
+  UDP by default; RFC 6062 TCP relay has since landed under its own section,
+  `[turn.tcp_relay]`, so the `transport` name was not reused (§40.1).
 - **SSRF/peer policy is already first-class**: `crates/relay/src/peer_filter.rs`
   (`is_forbidden_peer`, `normalize_ip`) + a validated peer-filter config profile.
   New relayed transports must route through it, not around it.
@@ -56,11 +56,11 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 | Mobility (RFC 8016) | partial | `Attribute::MobilityTicket` issue+reissue |
 | DTLS (RFC 7350) | present, **interop verified** | `DtlsSection` (feature-gated); allocation, media both directions on both listener paths, 20 min under load, and agreement with coturn's client (`docs/interop/coturn-2026-08-23.md`) |
 | TLS 1.3 / TURNS | present, audit needed | `[tls]` listener config |
-| ALPN (RFC 7443) | partial | referenced in config + node main |
+| ALPN (RFC 7443) | partial | TURNS: `stun.turn` / `stun.nat-discovery` offered when `[tls] enable_alpn`, strict mode `[tls] alpn_required`; over DTLS unverified |
 | TURN REST credentials | present (compat) | `AuthMode::SharedSecret` HMAC |
 | Multi-realm / tenant | present, isolation tests needed | per-tenant range + disjointness validation + realm match |
 | Peer filtering (SSRF) | present | `peer_filter` module |
-| TCP relay (RFC 6062) | **near-complete (experimental)** | Allocate(TCP)+CONNECT+ConnectionBind raw-detach over TLS + **peer-initiated relayed TCP listener + accept loop + CONNECTION-ATTEMPT indication + ConnectionBind on peer-initiated conns**; ConnectionBind ownership-bound (O#1), leak-safe detach (O#2); off by default; remaining: pipelined-client hardening + interop verification; **still refused under `production=true`** pending interop verification |
+| TCP relay (RFC 6062) | **beta, interop verified** | Allocate(TCP)+CONNECT+ConnectionBind raw-detach over TLS + **peer-initiated relayed TCP listener + accept loop + CONNECTION-ATTEMPT indication + ConnectionBind on peer-initiated conns**; ConnectionBind ownership-bound (O#1), leak-safe detach (O#2); off by default; pipelined and non-pipelined clients verified (`docs/interop/transports-2026-08-19.md`) and agreement with coturn's client (`docs/interop/coturn-2026-08-23.md`); **the `production=true` refusal was lifted 2026-08-25** — `[tls]` is still required; IPv4 only |
 | NAT discovery (RFC 5780) | **absent** | no codec in the tree — see the section below; the earlier "codec done" claim was wrong |
 | OAuth (RFC 7635) | **done** (stages 1–3) | codec + AuthMode::OAuth (AEAD decrypt + MI-by-mac_key; token-time = §6.2 fixed-point + clock skew) + config wiring + 401 THIRD-PARTY-AUTHORIZATION challenge + §6.1 lifetime cap incl. zero-remaining 401 + **`kid`-from-USERNAME key selection (RFC 7635 §6.1): kid-tagged keys select one AS-RS key directly; `strict_kid` opt-in rejects unknown/absent kid, default keeps trial-decrypt fallback for rotation**. Remaining: RFC 6062 TCP-allocate binding |
 | ORIGIN | **present (codec)** | `Attribute::Origin` (0x802F) parse/encode/getter |
@@ -349,15 +349,21 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   enforcement and idle reaper cannot drift between the two paths.
   **Default off**: it displaces the only DTLS path with recorded verification
   (`docs/dtls/`). `partial→stable` for DTLS now means an interop run on the demux
-  path, after which the default can flip.
+  path, after which the default can flip. **It flipped: `demux = true` is the
+  default since 2026-09-01** (`DtlsSection::demux`, after
+  `scripts/verify/dtls-demux.sh` and `docs/soak/soak-24h-dtls-2026-09-01.md`), so
+  the rate limit and certificate hot-reload below are on the default path.
 - **Verified 2026-08-23**: DTLS 1.2 interop against coturn's `turnutils_uclient`
   (`docs/interop/coturn-2026-08-23.md`) — an implementation written elsewhere — plus
   allocation and relayed media on both listener paths and 20 min under load.
-- **Absent/unverified**: in-code handshake **rate**
-  bound (the handshake runs below `accept()`, so it needs a UDP demultiplexer in
-  front — currently an ops mitigation via `iptables hashlimit`), loss/reorder/
-  duplicate handling, ALPN over DTLS, **certificate hot-reload** (the stack fixes
-  its config at `listen()`; rotation logs a warning and needs a restart), DTLS 1.3
+- **Present on the demux path (the default), absent on the stock path
+  (`demux = false`)**: the in-code handshake **rate** bound
+  (`max_handshakes_per_sec_per_ip` / `handshake_burst_per_ip`) and **certificate
+  hot-reload** (`cert_reload_secs`, polled in `dtls_demux.rs`). On the stock
+  `listen()` path the handshake runs below `accept()` and the config is fixed at
+  bind time, which is why validation refuses both keys with `demux = false`.
+  (This bullet used to list both as absent; that predates the demux listener.)
+- **Absent/unverified**: loss/reorder/duplicate handling, ALPN over DTLS, DTLS 1.3
   (RFC 9147) and Connection ID (RFC 9146) are not in the stack at all.
 - **Required tests**: 1.2 allocation; loss/reorder in handshake; invalid cookie;
   handshake timeout; cert rotation; ALPN.
@@ -366,8 +372,10 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 
 ### ALPN — RFC 7443
 - **Confirmed**: referenced in config and node main.
-- **Absent/unverified**: `stun.turn` / `stun.nat-discovery` labels advertised and
-  selected; strict vs compatible mode; SNI/ALPN kept separate.
+- **Present on TURNS**: `stun.turn` and `stun.nat-discovery` are offered when
+  `[tls] enable_alpn` (default true, `crates/transport/src/tcp_tls.rs`); strict
+  mode is `[tls] alpn_required` (default false = compatible) — see the TLS section.
+- **Absent/unverified**: ALPN over DTLS; SNI/ALPN kept separate.
 - **Required tests**: TLS/DTLS with each label; missing ALPN in strict vs compatible;
   unknown ALPN rejected.
 - **partial→stable**: label selection + strict/compatible modes proven on TLS+DTLS.
@@ -377,7 +385,11 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 
 ## absent (greenfield — do not start before Gate B/C/D, see production plan)
 
-### TCP relay — RFC 6062 — partial (engine exists, wiring remains)
+### TCP relay — RFC 6062 — beta, interop verified, allowed in production
+
+(Listed under "absent" for history: it was greenfield when this register was
+written. Every bullet below is present in the code now.)
+
 - **Present** (`crates/relay/src/tcp_relay.rs`): `TcpRelayManager` with `handle_connect()`
   (§4.3, opens TCP to peer, returns CONNECTION-ID) and a two-phase ConnectionBind
   (§4.4) — `claim(id, owner)` (atomic `WaitingForBind`→`Claimed`, and now verifies the
@@ -434,14 +446,17 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   =TCP` request over any non-TCP ingress is rejected with **400 Bad Request** (RFC 6062
   §4.1) before any port is reserved — previously it created a half-working allocation
   whose relayed listener was then dropped.
-- **Remaining**: pipelined-client hardening — a non-conformant client sending app bytes
-  before the ConnectionBind success could have them mis-framed (RFC clients wait for
-  success; the prebuffer captures any leftover). Verify against a real server with
-  `cargo` + an interop harness before lifting the `production=true` gate.
+- **Pipelined clients — verified**: the case RFC 6062 §5.4 permits, first
+  application bytes in the same write as ConnectionBind, passes against the detach
+  prebuffer (`turna-load-test tcp-relay-check --pipelined`,
+  `docs/interop/transports-2026-08-19.md`), and coturn's client agrees about the
+  wire (`docs/interop/coturn-2026-08-23.md`). The `production=true` gate this
+  bullet was waiting on was lifted on 2026-08-25; `[tls]` remains required.
+- **Remaining**: IPv6 (a v6 TCP allocation answers 440 — see the IPv6 section).
 - **Scope reality**: a TCP-relay socket is **node-local** and cannot migrate via the
   backend — seamless failover for TCP relay must not be claimed (§45.6).
-- **Priority**: medium-high (enterprise/firewalled clients). Now a wiring job, not a
-  from-scratch build.
+- **Priority**: medium-high (enterprise/firewalled clients). The remaining work is
+  IPv6, not wiring.
 
 ### NAT behavior discovery — RFC 5780 — ABSENT (this entry was wrong)
 - **Correction (2026-08-18).** This section previously claimed the codec was done,
@@ -503,7 +518,7 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   Tests: `kid_username_selects_matching_key`,
   `strict_kid_rejects_unknown_and_missing_username` (auth).
 - **Remaining**: RFC 6062 TCP-allocate lifetime binding (the TCP relay datapath is
-  experimental/off).
+  beta and off by default).
 - **Priority**: low-medium (long-term + REST cover common cases).
 
 ### ORIGIN — present (codec)
@@ -547,7 +562,9 @@ verified scope.
 2. Promote the `partial` set to `stable` where ROI is high: IPv6 (full matrix),
    REST rotation, multi-tenant isolation tests, ALPN, DTLS 1.2 interop, mobility.
 3. Only then greenfield, by ROI: TCP relay (6062) → OAuth (7635) → NAT discovery
-   (5780) / ORIGIN → SCTP (or drop SCTP).
+   (5780) / ORIGIN → SCTP (or drop SCTP). *Since written:* 6062, 7635 (refused
+   in production), the ORIGIN codec and SCTP have been implemented — see the
+   summary table; RFC 5780 is still not started.
 
 Do not begin greenfield RFCs while production Gates B (config), C (networking, #9),
 D (capacity, #14) are open — hardening the existing UDP profile outranks widening

@@ -212,10 +212,13 @@ UDP. Disabled by default. **Requires `[tls]` enabled:** RFC 6062 §4.1 mandates 
 TCP/TLS control connection, and an Allocate with `REQUESTED-TRANSPORT = 6`
 arriving over UDP, DTLS or QUIC is refused with `400 Bad Request`.
 
-> **Refused in production.** With `production = true`, config validation rejects
-> `enabled = true` and the node does not start. The feature is implemented and
-> testable with `production = false`; the gate lifts once interop and
-> pipelined-client hardening are done (`docs/protocol-gap.md` → TCP relay).
+> **Allowed in production since 2026-08-25.** Until then `production = true`
+> rejected `enabled = true`; the gate was lifted once interop with coturn's client
+> and the pipelined-client case were on record (`docs/interop/coturn-2026-08-23.md`,
+> `docs/interop/transports-2026-08-19.md`). What validation still does: with
+> `production = true`, `enabled = true` without `[tls]` enabled is a startup error
+> (a warning otherwise) — there would be no connection to carry the allocation.
+> IPv4 only: a v6 TCP allocation answers `440`.
 
 | key | type | default | notes |
 |-----|------|---------|-------|

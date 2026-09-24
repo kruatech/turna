@@ -244,6 +244,61 @@ if [ -f "$CONFIG" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+section "Lifted and implemented features: docs must not still call them refused or missing"
+# ---------------------------------------------------------------------------
+
+# The reverse check above watches the code. This one watches the prose: after the
+# RFC 6062 gate was lifted on 2026-08-25, docs/migrating-from-coturn.md,
+# docs/COMPLIANCE.md, docs/protocol-gap.md and docs/CONFIGURATION.md went on
+# telling operators it was "refused under production = true" — a migration
+# blocker that did not exist. Same shape for OAuth, which docs/why-turna.md
+# listed as "Not implemented" while `AuthMode::OAuth` shipped.
+#
+# Claims wrap across lines, so this reads paragraphs, list items and table rows
+# rather than lines, and attributes a "refused in production" to the nearest
+# feature named before it — a sentence listing TCP relay and then OAuth "(refused
+# under production = true)" is about OAuth. Paragraphs that carry a retraction
+# marker ("lifted", "until 2026-…", "used to") are history, not claims. Verified
+# to flag the three stale RFC 6062 sites on the pre-fix tree.
+if ! grep -qF "turn.tcp_relay.enabled = true in production" "$CONFIG"; then
+  STALE_6062=$(python3 - <<'PYEOF'
+import glob, re
+feature = re.compile(r'6062|tcp_relay|TCP relay|OAuth|7635|SCTP|QUIC|WebTransport|io_uring|AF_XDP|DTLS', re.I)
+claim = re.compile(r'refus\w*\s+(?:\*\*)?\s*(?:under|in)\s+`?production|production\s*=\s*true`?\s+refuses', re.I)
+retract = re.compile(r'lifted|until 20|no longer|used to|was refused|previously|reintroduc|came back|come back|earlier', re.I)
+for f in sorted(glob.glob('docs/**/*.md', recursive=True)) + ['README.md']:
+    text = open(f, encoding='utf-8').read()
+    for block in re.split(r'\n\s*\n|\n(?=\|)|\n(?=\s*[-*] )', text):
+        flat = ' '.join(block.split())
+        if retract.search(flat):
+            continue
+        for m in claim.finditer(flat):
+            before = list(feature.finditer(flat[:m.start()]))
+            if before and re.match(r'6062|tcp_relay|TCP relay', before[-1].group(0), re.I):
+                print(f + ': ' + flat[:100])
+                break
+PYEOF
+)
+  if [ -n "$STALE_6062" ]; then
+    fail "docs still say RFC 6062 TCP relay is refused in production; validate() no longer refuses it" \
+      "Correct the doc (the gate was lifted 2026-08-25), or mark the sentence as history. $(printf '%s' "$STALE_6062" | head -3 | tr '\n' ';')"
+  else
+    pass "no doc calls RFC 6062 TCP relay refused in production"
+  fi
+fi
+
+if grep -qE 'OAuth \{' crates/auth/src/lib.rs 2>/dev/null; then
+  STALE_OAUTH=$(grep -rniE '(oauth|7635).*not implemented' docs README.md 2>/dev/null |
+    grep -viE 'previously|was wrong|used to|correction|earlier')
+  if [ -n "$STALE_OAUTH" ]; then
+    fail "docs say RFC 7635 OAuth is not implemented, but AuthMode::OAuth exists" \
+      "It is implemented and refused under production = true — say that. Lines: $(printf '%s' "$STALE_OAUTH" | head -3 | tr '\n' ';')"
+  else
+    pass "no doc calls OAuth unimplemented while AuthMode::OAuth exists"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 section "Every exported metric is described in docs/OBSERVABILITY.md"
 # ---------------------------------------------------------------------------
 

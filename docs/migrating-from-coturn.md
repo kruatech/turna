@@ -26,13 +26,14 @@ reload or a database row. So a migration has three parts:
 |---|---|---|
 | `listening-port=3478` | `[turn] listen = "0.0.0.0:3478"` | address and port are one value |
 | `listening-ip=1.2.3.4` | same `[turn] listen` | multiple `listening-ip` lines have no single-key equivalent — run one process per public IP, which is the canonical topology here |
-| `tls-listening-port=5349` | `[tls] listen = "0.0.0.0:5349"` | plus `[tls] enabled = true`, and the binary must be built `--features tls` |
+| `tls-listening-port=5349` | `[tls] listen = "0.0.0.0:5349"` | plus `[tls] enabled = true`. `tls` is a default feature of `turna-node`, so a standard build has it |
 | `external-ip=1.2.3.4` | `[turn] external_ip = "1.2.3.4"` | required under `production = true`; empty is refused |
 | `external-ip=PUBLIC/PRIVATE` | `[turn] external_ip` = the public one | the NAT-mapping form has no direct equivalent; set `listen` to the private address and `external_ip` to the public one |
-| `relay-ip=…` | — | relay sockets bind on the same interface as `listen` |
+| `relay-ip=…` | `[turn.relay] bind_ip` / `bind_ip6` | one address per family. Empty (the default) binds relay sockets on the wildcard address |
 | `min-port` / `max-port` | `[turn.relay] min_port` / `max_port` | same meaning. Keep the range and the firewall in agreement — `scripts/check-deploy-consistency.sh` checks the three places it is declared |
 | `realm=turn.example.com` | `[turn] realm` | same |
-| `no-udp` / `no-tcp` / `no-tls` / `no-dtls` | omit the corresponding section, or `enabled = false` | there is no "start everything then switch bits off" model |
+| `no-tls` / `no-dtls` | leave `[tls]` / `[turn.dtls]` disabled — the default | there is no "start everything then switch bits off" model |
+| `no-udp` / `no-tcp` | — | the UDP listener (`[turn] listen`) is always on; there is no plain TURN-over-TCP listener at all, so `no-tcp` is effectively always in force |
 
 ## Authentication
 
@@ -43,7 +44,7 @@ reload or a database row. So a migration has three parts:
 | `static-auth-secret` in a DB table | — | no SQL backend exists. Use the file/env form: `shared_secret = "file:///run/secrets/turn"` or `"${TURNA_SHARED_SECRET}"` |
 | users in MySQL/PostgreSQL/SQLite/Redis | Tarantool backend + `turnactl user add` | this is the biggest structural change in a migration. `AddUser`/`RemoveUser` persist pre-derived long-term keys, never a plaintext password |
 | `oauth` (RFC 7635) | `[turn.auth.oauth]` | implemented including `kid` key selection and the §6.1 lifetime cap, **but the validator refuses it under `production = true`** pending interop against a real Authorization Server. coturn's own model expects an external program to manage keys in the database; turna reads them from config |
-| `max-allocate-lifetime` | `[turn.relay.quota]` lifetime overrides, per user/tenant | also settable at runtime via `set_user_limits` |
+| `max-allocate-lifetime` | no config key | the ceiling is fixed at 3600 s (`turn::MAX_LIFETIME`). A lower global, per-tenant or per-user cap is `max_lifetime_secs` in the gRPC `SetUserLimits` call — there is no `[turn.relay.quota]` lifetime key |
 
 ## Peer access control
 
@@ -87,22 +88,23 @@ What is worth porting is any *business* deny/allow list specific to your network
 |---|---|
 | `cert=` / `pkey=` | `[tls] cert_path` / `key_path` |
 | `no-tlsv1`, `no-tlsv1_1` | not needed — the listener does not offer them |
-| `dh2066`, `cipher-list` | not exposed |
-| certificate reload | automatic on mtime change, no restart and no signal |
+| `dh566` / `dh1066` / `dh-file`, `cipher-list`, `ec-curve-name` | not exposed — rustls with its safe defaults |
+| certificate reload | automatic: `[tls] cert_reload_secs` (default 30) polls the files, no restart and no signal |
 
 DTLS is a separate section, `[turn.dtls]`, and needs `--features dtls`. Note
-`handshake_timeout_secs` there: it has no coturn equivalent because coturn does
-not have the unbounded-handshake problem `turna` had to bound.
+`accept_timeout_secs` there: it has no coturn equivalent because coturn does
+not have the unbounded-handshake problem `turna` had to bound. (`handshake_timeout_secs`
+is the `[tls]` key, for TURNS.)
 
 ## Operations
 
 | coturn | turna |
 |---|---|
 | `prometheus`, `prometheus-port=9641` | always on, at `[health] listen` → `/metrics` |
-| `verbose`, `log-file`, `syslog`, `simple-log` | `[turn.observability] json_logs`; logs go to stdout, for the init system to route |
-| `no-cli` (disable the telnet admin) | nothing to disable — there is no telnet CLI. Management is gRPC at `[management] listen`, loopback by default |
-| `turnadmin` | `turnactl` |
-| edit config + `systemctl restart` for a limit change | `turnactl` / gRPC `update_config`, no restart, versioned and idempotent |
+| `verbose`, `log-file`, `syslog`, `simple-log` | `[turn.observability] json_logs`; logs go to stdout, for the init system to route. `[turn.observability] syslog_endpoint` forwards security events only (RFC 5424), not the general log |
+| `no-cli` (disable the telnet admin) | nothing to disable — there is no telnet CLI. Management is gRPC, served by `turna-control-plane` at `[management] listen`, loopback by default |
+| `turnadmin` | `turnactl` (`user add` / `user remove`) and the gRPC API |
+| edit config + `systemctl restart` for a limit change | gRPC `UpdateConfig` / `SetUserLimits` on `turna-control-plane`, no restart, versioned and idempotent. `turnactl` has no command for it |
 | `pidfile` | leave it to the init system |
 
 ## Things that are not a translation
@@ -115,9 +117,14 @@ and shared allocation metadata, but read the honest boundary first: it does
 setup. Do not treat cluster mode as a prerequisite for migrating.
 
 **TCP relay (RFC 6062).** If you relied on `no-tcp-relay` being *off* — i.e. you
-actually relay TCP — note that `[turn.tcp_relay]` is **refused under
-`production = true`** pending interop verification. That is a real blocker for a
-production migration, not a formality.
+actually relay TCP — enable `[turn.tcp_relay]`. It is beta and off by default.
+It was refused under `production = true` until 2026-08-25, when interop with
+coturn's own client put the missing evidence on record
+(`docs/interop/coturn-2026-08-23.md`); it is allowed now. Two conditions: `[tls]`
+must be enabled, because turna has no plain-TCP listener and RFC 6062's control
+connection therefore runs over TURNS (validation refuses the combination under
+`production = true`); and it is IPv4 only. Size for it first — a listener and a
+connection per relayed peer is a different profile from UDP relaying.
 
 **io_uring / AF_XDP.** Migrate on `transport = "tokio"` first and evaluate
 backend changes separately. io_uring is now [supported on Linux](verification/io-uring-supported-2026-09-19.md)
