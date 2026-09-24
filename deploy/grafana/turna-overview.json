@@ -1036,6 +1036,367 @@
         "y": 73
       },
       "id": 24
+    },
+    {
+      "type": "row",
+      "title": "Media quality (RTP) \u2014 measured from relayed headers",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 77
+      },
+      "id": 25
+    },
+    {
+      "type": "timeseries",
+      "title": "RTP loss rate",
+      "description": "Packets missing from sequence over packets expected, across every RTP stream the node relays. Loss upstream of the relay shows here too: the relay sees what arrived, not where it was lost. Late packets that fill a gap within the 5 s sample are not counted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(turna_rtp_packets_lost_total[5m])) / sum by (instance) (rate(turna_rtp_packets_expected_total[5m]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 78
+      },
+      "id": 26
+    },
+    {
+      "type": "timeseries",
+      "title": "RTP jitter (per-stream samples)",
+      "description": "RFC 3550 interarrival jitter, one observation per stream per 5 s. The clock rate is guessed from the payload type (48 kHz for PT 0/8/111, 90 kHz otherwise), so compare over time rather than against client getStats().",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(turna_rtp_stream_jitter_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(turna_rtp_stream_jitter_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 78
+      },
+      "id": 27
+    },
+    {
+      "type": "timeseries",
+      "title": "Stream-intervals above 2% loss",
+      "description": "Share of 5 s per-stream samples (streams with at least 10 packets in the interval) whose loss exceeded 2%. Where the loss-rate panel is an average, this shows whether the loss is spread thin or concentrated in a few bad streams.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "1 - (sum(rate(turna_rtp_stream_loss_ratio_bucket{le=\"0.020000\"}[5m])) / sum(rate(turna_rtp_stream_loss_ratio_count[5m])))",
+          "legendFormat": "> 2% loss",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 86
+      },
+      "id": 28
+    },
+    {
+      "type": "timeseries",
+      "title": "RTP reordering",
+      "description": "Packets that arrived with a sequence number below the highest seen, as a share of RTP packets relayed. Reordering is not loss, but a jitter buffer has to absorb it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(turna_rtp_packets_out_of_order_total[5m])) / sum by (instance) (rate(turna_rtp_packets_total[5m]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 86
+      },
+      "id": 29
+    },
+    {
+      "type": "row",
+      "title": "Accounting and log sinks \u2014 zero when not configured",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 94
+      },
+      "id": 30
+    },
+    {
+      "type": "timeseries",
+      "title": "Usage records",
+      "description": "Records handed to the accounting sinks. stop grows by one per allocation that ended; interim by one per live allocation per interim tick.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(turna_accounting_records_total[5m]))",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 95
+      },
+      "id": 31
+    },
+    {
+      "type": "timeseries",
+      "title": "Lost usage records",
+      "description": "Any non-zero value is unbilled usage. queue_full / webhook_queue_full: a sink is behind; webhook_failed: rejected or out of retries; file_error: the append failed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(turna_accounting_records_dropped_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(turna_accounting_webhook_retries_total[5m])",
+          "legendFormat": "webhook retries",
+          "refId": "B"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 95
+      },
+      "id": 32
+    },
+    {
+      "type": "timeseries",
+      "title": "Log sinks",
+      "description": "Lines lost by the optional file and full-log syslog sinks. A file write error is lost log; syslog drops mean the queue overflowed or the collector is unreachable \u2014 the relay is never slowed by either.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(turna_log_file_write_errors_total[5m])",
+          "legendFormat": "file write errors",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(turna_log_syslog_dropped_total[5m])",
+          "legendFormat": "syslog dropped",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(turna_log_syslog_sent_total[5m])",
+          "legendFormat": "syslog sent",
+          "refId": "C"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 103
+      },
+      "id": 33
     }
   ]
 }
