@@ -73,6 +73,33 @@ impl StunMessage {
             .any(|a| matches!(a, Attribute::Username(_) | Attribute::UserHash(_)))
     }
 
+    /// RFC 5780 §7.2 CHANGE-REQUEST flags `(change_ip, change_port)`, if present.
+    pub fn get_change_request(&self) -> Option<(bool, bool)> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::ChangeRequest {
+                change_ip,
+                change_port,
+            } => Some((*change_ip, *change_port)),
+            _ => None,
+        })
+    }
+
+    /// RFC 5780 §7.3 RESPONSE-ORIGIN, if present (Binding responses).
+    pub fn get_response_origin(&self) -> Option<std::net::SocketAddr> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::ResponseOrigin(addr) => Some(*addr),
+            _ => None,
+        })
+    }
+
+    /// RFC 5780 §7.4 OTHER-ADDRESS, if present (Binding responses).
+    pub fn get_other_address(&self) -> Option<std::net::SocketAddr> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::OtherAddress(addr) => Some(*addr),
+            _ => None,
+        })
+    }
+
     pub fn get_realm(&self) -> Option<&str> {
         self.attributes.iter().find_map(|a| match a {
             Attribute::Realm(r) => Some(r.as_str()),
