@@ -76,10 +76,15 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   *unless* `[turn.tcp_relay]` is enabled, in which case `REQUESTED-TRANSPORT = TCP`
   (RFC 6062) is accepted. Two conditions apply to that path: the request must
   arrive over the TCP/TLS control connection (RFC 6062 §4.1) or it is rejected
-  with **400**, and `production = true` refuses to start with
-  `[turn.tcp_relay].enabled = true` at all. So on a production profile the
-  constraint still reads "UDP relay only" — but it is now a config gate, not an
-  absence of implementation. TLS/DTLS *relay-leg* transports remain unoffered.
+  with **400**. (The `production = true` refusal once described here was lifted on
+  2026-08-25.) TLS/DTLS *relay-leg* transports remain unoffered.
+  **Fixed 2026-09-24 (security), RFC 6062 §5.3:** a peer-initiated TCP connection to
+  a relayed address is now closed immediately, with no ConnectionAttempt, unless the
+  allocation holds an unexpired permission for the peer's IP and the peer filter
+  allows it (`PacketProcessor::peer_connection_permitted`, counted in
+  `turna_tcp_relay_peer_refused_total`). Before the fix every such connection was
+  announced to the client. **Open, RFC 6062 §5.2:** an outbound CONNECT does not use
+  the relayed address as its local endpoint (see `docs/protocol-gap.md` → RFC 6062).
   This concerns the turna↔peer leg only. The *client↔turna* leg supports TURNS
   (TURN-over-TLS-over-TCP) via the `tls` feature — verified end-to-end with
   Chrome, Firefox and Safari (see `docs/interop/`).
@@ -99,7 +104,8 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   express), so the family separation is explicit at the socket rather than resting
   only on the checks above. Still missing for a complete v6 story:
   `ADDITIONAL-ADDRESS-FAMILY` — blocked on a storage decision, see
-  `docs/design/additional-address-family.md` — and v6 for RFC 6062 TCP relay.
+  `docs/design/additional-address-family.md`. v6 for RFC 6062 TCP relay is opt-in
+  (`[turn.tcp_relay] allow_ipv6`) and not yet exercised on a v6 host.
   **Interop verified** on routable global v6 addresses, both by our own client and by coturn's (`docs/interop/relayed-media-2026-08-19.md`, `docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts.
 - **Default MTU 1280.** `PacketProcessor` defaults to `mtu = 1280`; DONT-FRAGMENT drops oversized Send-indication payloads against this value. Operators set the real path MTU at construction (`with_mtu`).
 - **Optional transports are feature-gated and off by default.** `quic` /

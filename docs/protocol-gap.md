@@ -302,10 +302,8 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   allocation is IPv4 by RFC 8656 §7.2 step 7, and would otherwise advertise an address
   the v4 listener never serves). **Not exercised at runtime yet**: the development
   container has no IPv6, so the v6 bind path is covered by tests that skip without v6.
-  Two pre-existing RFC 6062 gaps apply to both families and are unchanged: outbound
-  CONNECT does not bind the relayed address as its local endpoint (§5.2), and a
-  peer-initiated connection is not checked against the permission list before the
-  ConnectionAttempt (§5.3).
+  The §5.3 permission check (fixed 2026-09-24, see the RFC 6062 section) applies to
+  both families; the §5.2 local-endpoint gap documented there applies to both too.
 - **Verified 2026-08-18** (`docs/interop/conformance-2026-08-18.md`): the control
   plane, in both configurations — 440 with `external_ip6` unset, an IPv6 relayed
   address when set, 443 in both directions on a cross-family peer, and all four
@@ -458,6 +456,35 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   aborts the accept loop; if the client is gone the pending peer conn is `release`d.
   The listener is dropped without panic if a TCP allocation ever reaches the UDP /
   SCTP dispatch path.
+- **Fixed 2026-09-24 — §5.3 permission check on peer-initiated connections
+  (security).** Until then the accept loop registered *every* connection to a
+  relayed port and sent the client a ConnectionAttempt for it, without looking at
+  the allocation's permissions; anyone who found a relayed TCP port could open
+  connections the client was then invited to bind, bypassing the permission model
+  CONNECT enforces. RFC 6062 §5.3: "If no permission for this peer has been installed
+  for this allocation, the server MUST close the connection with the peer immediately
+  after it has been accepted." Every accepted connection now goes through
+  `tcp_relay::handle_peer_initiated` (the only relayed-TCP accept path; the TLS
+  bridge calls it), which first asks `PacketProcessor::peer_connection_permitted`:
+  the peer must pass the peer filter and hold an unexpired permission in the
+  allocation's own permission table (the one CreatePermission writes and CONNECT
+  reads), and the allocation must be a live TCP allocation of the peer's family.
+  Otherwise the stream is dropped (closed) before it is registered or counted against
+  `max_total`, no ConnectionAttempt is sent, and
+  `turna_tcp_relay_peer_refused_total` is incremented. Both address families. Tests:
+  `processor::tcp_relay_peer_permission_tests` (real TCP streams and client sink:
+  unpermitted and filter-denied peers closed and not announced, permitted peer
+  announced), the v6 variant in `tcp_relay_ipv6_tests` (skips without IPv6), and an
+  end-to-end TURNS probe against a node, `scripts/verify/rfc6062_peer_permission.py`.
+- **Open — §5.2 local endpoint of CONNECT.** "The local endpoint is the relayed
+  transport address associated with the allocation." `TcpRelayManager::handle_connect`
+  uses `TcpStream::connect(peer)`, so the outbound connection leaves from an
+  ephemeral port on whatever address the kernel picks, not from the relayed address
+  the client advertised. A peer that filters or correlates by source address sees a
+  different address than the one in the client's candidate. Fixing it means binding
+  the outbound socket to (relay address, relay port) with `SO_REUSEADDR`/`SO_REUSEPORT`
+  alongside the relayed listener on the same port. Applies to both families. Not
+  fixed.
 - **Ingress-transport gating — done**: `handle_allocate` now takes an `ingress_tcp`
   flag. `process` (UDP / SCTP / borrowed-slice ingress) passes `false`; the TURNS
   bridge calls a new `process_tcp_control` which passes `true`. A `REQUESTED-TRANSPORT

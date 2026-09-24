@@ -139,6 +139,73 @@ enum ConnState {
 }
 
 // ---------------------------------------------------------------------------
+// Peer-initiated connections (RFC 6062 §5.3)
+// ---------------------------------------------------------------------------
+
+/// What happened to one connection accepted on a relayed TCP listener.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerAcceptOutcome {
+    /// No permission for the peer (or the peer filter denies it): closed at
+    /// once, nothing sent to the client.
+    Refused,
+    /// Registered, and the ConnectionAttempt was queued to the client.
+    Announced(TcpConnectionId),
+    /// Permitted, but not registered (limits, duplicate) or the client could
+    /// not be told (gone, queue full, encode error): closed.
+    Dropped,
+}
+
+/// Handle one connection accepted on the relayed TCP listener of the
+/// allocation owned by `client_addr`.
+///
+/// Every relayed-TCP accept loop goes through here, so the §5.3 permission
+/// check cannot be skipped by a second listener variant. The permission check
+/// comes first, before the connection is registered or counted against
+/// `max_total`, so an unpermitted peer can neither occupy a connection slot nor
+/// cause a ConnectionAttempt. Dropping `stream` closes it.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_peer_initiated(
+    mgr: &TcpRelayManager,
+    processor: &crate::processor::PacketProcessor,
+    sinks: &crate::server::ClientSinks,
+    alloc: AllocationId,
+    client_addr: SocketAddr,
+    owner_key: &[u8],
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> PeerAcceptOutcome {
+    if !processor.peer_connection_permitted(client_addr, peer) {
+        drop(stream);
+        return PeerAcceptOutcome::Refused;
+    }
+    let id = match mgr
+        .register_incoming(alloc, peer, stream, owner_key.to_vec())
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            debug!(%peer, error = %e, "RFC 6062 peer connection rejected");
+            return PeerAcceptOutcome::Dropped;
+        }
+    };
+    let delivered = match processor.build_connection_attempt_indication(id.value(), peer) {
+        Some(bytes) => sinks
+            .get(&client_addr)
+            .map(|s| s.try_send(bytes).is_ok())
+            .unwrap_or(false),
+        None => false,
+    };
+    if delivered {
+        PeerAcceptOutcome::Announced(id)
+    } else {
+        // Client gone / queue full / encode error: the pending peer conn would
+        // never be bound — drop it.
+        mgr.release(id).await;
+        PeerAcceptOutcome::Dropped
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
 
