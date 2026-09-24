@@ -1048,7 +1048,10 @@ fn run_tokio(
                     };
                     // `replace_base` refuses a realm change: the realm is hashed
                     // into every long-term key, so swapping it would invalidate
-                    // credentials rather than rotate a secret.
+                    // credentials rather than rotate a secret. It also refuses a
+                    // change of credential mechanism that would alter RFC 8489
+                    // USERHASH eligibility (logged by the registry): the nonce
+                    // cookie decided at startup would otherwise lie.
                     if rotate_auth.replace_base(new_base) {
                         rotated += 1;
                     } else {
@@ -1056,8 +1059,9 @@ fn run_tokio(
                         warn!(
                             event = "secret_reload_rejected",
                             realm = %root.turn.realm,
-                            "SIGHUP: base realm changed in the config; a realm cannot be \
-                             rotated under live clients. Base secret left unchanged."
+                            "SIGHUP: base realm or its credential mechanism changed in the \
+                             config; neither can change under live clients. Base secret left \
+                             unchanged."
                         );
                     }
                 } else {

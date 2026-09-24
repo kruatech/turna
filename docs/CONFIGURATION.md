@@ -43,7 +43,7 @@ constraints below are taken from `crates/config/src/lib.rs`.
 | `shared_secret` | string | (built-in placeholder) | coturn-style `lt-cred-mech` (time-limited credentials). |
 | `token_ttl` | u64 | `86400` | Token lifetime, seconds. |
 | `static_users` | array of `{ username, password }` | `[]` | Long-term static credentials. |
-| `advertise_userhash` | bool | `false` | RFC 8489 username anonymity. When true every nonce carries the §9.2 nonce cookie with "Username anonymity" set, so conforming clients send `USERHASH` instead of `USERNAME`. **Refused** unless the base realm and every tenant use `static_users` (TURN REST / OAuth cannot resolve a hash). A `USERHASH` request is *accepted* on long-term realms whatever this says. |
+| `advertise_userhash` | bool | `false` | RFC 8489 username anonymity. When true every nonce carries the §9.2 nonce cookie with "Username anonymity" set, so conforming clients send `USERHASH` instead of `USERNAME`. **Refused** unless the base realm and every tenant use `static_users` (TURN REST / OAuth cannot resolve a hash). A `USERHASH` request is *accepted* on long-term realms whatever this says. A SIGHUP reload that would switch a realm between `static_users` and a shared secret (or back) is refused for that realm and logged — the mechanism, and with it USERHASH eligibility, changes only on restart. |
 
 Use **one** of: `static_users` (long-term) or `shared_secret` (time-limited).
 
