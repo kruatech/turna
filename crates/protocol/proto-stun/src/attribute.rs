@@ -551,35 +551,37 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                     .map_err(|_| StunError::AttributeParse("USERNAME is not valid UTF-8".into()))?;
                 Attribute::Username(name.to_string())
             }
-            ATTR_USERHASH => {
+            // The four attributes below were `Attribute::Unknown` before they
+            // had typed variants, and a malformed value keeps it that way
+            // rather than failing the whole message: typing them must not turn
+            // what used to be an answered request (420 for the two
+            // comprehension-required ones) or an ignored attribute (the two
+            // comprehension-optional ones) into a silent drop on every
+            // listener. The relay layer then answers an Unknown below 0x8000
+            // with 420, exactly as it did before.
+            ATTR_USERHASH => match <[u8; 32]>::try_from(value) {
                 // RFC 8489 §14.4: fixed length of 32 bytes.
-                if value.len() != 32 {
-                    return Err(StunError::AttributeParse(format!(
-                        "USERHASH must be 32 bytes, got {}",
-                        value.len()
-                    )));
-                }
-                let mut h = [0u8; 32];
-                h.copy_from_slice(value);
-                Attribute::UserHash(h)
-            }
-            ATTR_CHANGE_REQUEST => {
-                // RFC 5780 §7.2: exactly 32 bits. Only the A and B flags are
-                // defined; the other bits are not checked, consistent with the
-                // reserved bytes of REQUESTED-TRANSPORT.
-                if value.len() != 4 {
-                    return Err(StunError::AttributeParse(format!(
-                        "CHANGE-REQUEST must be 4 bytes, got {}",
-                        value.len()
-                    )));
-                }
-                Attribute::ChangeRequest {
-                    change_ip: value[3] & 0x04 != 0,
-                    change_port: value[3] & 0x02 != 0,
-                }
-            }
-            ATTR_RESPONSE_ORIGIN => Attribute::ResponseOrigin(decode_address(value)?),
-            ATTR_OTHER_ADDRESS => Attribute::OtherAddress(decode_address(value)?),
+                Ok(h) => Attribute::UserHash(h),
+                Err(_) => Attribute::Unknown {
+                    attr_type,
+                    value: value.to_vec(),
+                },
+            },
+            // RFC 5780 §7.2: exactly 32 bits. Only the A and B flags are
+            // defined; the other bits are not checked, consistent with the
+            // reserved bytes of REQUESTED-TRANSPORT.
+            ATTR_CHANGE_REQUEST if value.len() == 4 => Attribute::ChangeRequest {
+                change_ip: value[3] & 0x04 != 0,
+                change_port: value[3] & 0x02 != 0,
+            },
+            ATTR_RESPONSE_ORIGIN | ATTR_OTHER_ADDRESS => match decode_address(value) {
+                Ok(a) if attr_type == ATTR_RESPONSE_ORIGIN => Attribute::ResponseOrigin(a),
+                Ok(a) => Attribute::OtherAddress(a),
+                Err(_) => Attribute::Unknown {
+                    attr_type,
+                    value: value.to_vec(),
+                },
+            },
             ATTR_MESSAGE_INTEGRITY => {
                 if value.len() != 20 {
                     return Err(StunError::AttributeParse(format!(
@@ -1128,12 +1130,17 @@ mod userhash_and_rfc5780_codec {
             while buf.len() % 4 != 0 {
                 buf.push(0);
             }
+            // Not a parse error: it stays the Unknown it was before the
+            // typed variant existed, so the relay still answers 420.
             assert!(
                 matches!(
-                    parse_attributes(&buf, &TID),
-                    Err(StunError::AttributeParse(_))
+                    parse_attributes(&buf, &TID).unwrap().as_slice(),
+                    [Attribute::Unknown {
+                        attr_type: ATTR_USERHASH,
+                        ..
+                    }]
                 ),
-                "USERHASH of {len} bytes must be rejected"
+                "USERHASH of {len} bytes must decode as Unknown"
             );
         }
     }
@@ -1162,12 +1169,45 @@ mod userhash_and_rfc5780_codec {
                     if *change_ip == ip && *change_port == port
             ));
         }
-        // Wrong length is malformed, not silently truncated.
+        // Wrong length is not silently truncated: it stays Unknown (→ 420).
         let mut bad = Vec::new();
         bad.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
         bad.extend_from_slice(&8u16.to_be_bytes());
         bad.extend_from_slice(&[0u8; 8]);
-        assert!(parse_attributes(&bad, &TID).is_err());
+        assert!(matches!(
+            parse_attributes(&bad, &TID).unwrap().as_slice(),
+            [Attribute::Unknown {
+                attr_type: ATTR_CHANGE_REQUEST,
+                ..
+            }]
+        ));
+    }
+
+    /// Regression: RESPONSE-ORIGIN / OTHER-ADDRESS are comprehension-optional
+    /// and were ignored as Unknown before they were typed. A malformed value
+    /// (bad family, short) must still not fail the message.
+    #[test]
+    fn malformed_optional_addresses_stay_unknown() {
+        for typ in [ATTR_RESPONSE_ORIGIN, ATTR_OTHER_ADDRESS] {
+            for value in [
+                &[0u8, 0x07, 0, 1, 1, 2, 3, 4][..],
+                &[0u8, 1, 0][..],
+                &[][..],
+            ] {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&typ.to_be_bytes());
+                buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                buf.extend_from_slice(value);
+                while buf.len() % 4 != 0 {
+                    buf.push(0);
+                }
+                let attrs = parse_attributes(&buf, &TID).expect("must not fail the message");
+                assert!(
+                    matches!(attrs.as_slice(), [Attribute::Unknown { attr_type, .. }] if *attr_type == typ),
+                    "{typ:#06x} {value:?}"
+                );
+            }
+        }
     }
 
     #[test]
