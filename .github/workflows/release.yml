@@ -2,8 +2,8 @@ name: release
 
 # Cut a release on a version tag: build and publish a multi-arch container
 # image to GHCR (cosign-signed, with SLSA provenance + SBOM attestations),
-# build standalone linux/amd64 binaries with checksums + SBOM + provenance,
-# and create a GitHub Release.
+# build standalone linux/amd64 binaries and .deb/.rpm packages with checksums +
+# SBOM + provenance, and create a GitHub Release.
 on:
   push:
     tags:
@@ -240,10 +240,130 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Create the GitHub Release once both builds succeed.
+  # linux/amd64 .deb and .rpm for turna-node -> SHA256 + SBOM + provenance,
+  # the same evidence the tarballs carry.
+  #
+  # Metadata lives in services/node/Cargo.toml ([package.metadata.deb] and
+  # [package.metadata.generate-rpm]). Both tools are installed with
+  # `cargo install --locked --version <exact>`: a pinned crate version with its
+  # own lockfile, rather than an action or a downloaded binary. Neither needs
+  # rpmbuild or a spec file.
+  # ---------------------------------------------------------------------------
+  packages:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout
+      id-token: write      # provenance attestation (OIDC)
+      attestations: write  # build-provenance attestation
+    env:
+      CARGO_DEB_VERSION: 3.8.0
+      CARGO_GENERATE_RPM_VERSION: 0.21.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.95.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # dpkg-dev: dpkg-shlibdeps for cargo-deb's $auto depends.
+          # rpm: only to inspect the built package below.
+          sudo apt-get install -y --no-install-recommends \
+            cmake libclang-dev pkg-config protobuf-compiler dpkg-dev rpm
+
+      - name: Install packaging tools (pinned)
+        run: |
+          cargo install --locked cargo-deb --version "${CARGO_DEB_VERSION}"
+          cargo install --locked cargo-generate-rpm --version "${CARGO_GENERATE_RPM_VERSION}"
+
+      - name: Build release binary
+        run: |
+          # Same reproducibility flags as the `binaries` job; see there.
+          export RUSTFLAGS="--remap-path-prefix=$PWD= --remap-path-prefix=$HOME/.cargo="
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          cargo build --locked --release -p turna-node
+
+      - name: Build .deb
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          mkdir -p dist
+          # --no-build: package the binary built above (cargo-deb strips it).
+          cargo deb --no-build --locked -p turna-node --output dist/
+
+      - name: Build .rpm
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          # cargo-generate-rpm packages the file as it is; cargo-deb stripped
+          # its own copy, so strip here for the same payload.
+          strip -s target/release/turna-node
+          cargo generate-rpm -p services/node -o dist/
+
+      - name: Inspect packages
+        run: |
+          set -euo pipefail
+          deb=$(ls dist/*.deb); rpm=$(ls dist/*.rpm)
+          dpkg-deb --info "$deb"
+          dpkg-deb -c "$deb" | tee deb-contents.txt
+          for f in ./usr/bin/turna-node ./etc/turna/turn.toml \
+                   ./usr/lib/systemd/system/turna-node.service \
+                   ./usr/lib/systemd/system/turna-node.service.d/10-package.conf \
+                   ./usr/lib/sysctl.d/99-turna.conf ./usr/lib/sysusers.d/turna-node.conf; do
+            grep -q " ${f}\$" deb-contents.txt || { echo "::error::.deb is missing ${f}"; exit 1; }
+          done
+          dpkg-deb -e "$deb" debctl
+          grep -qx '/etc/turna/turn.toml' debctl/conffiles
+          grep -q 'systemd-sysusers' debctl/postinst
+          rpm -qpl "$rpm" | tee rpm-contents.txt
+          for f in /usr/bin/turna-node /etc/turna/turn.toml \
+                   /usr/lib/systemd/system/turna-node.service \
+                   /usr/lib/systemd/system/turna-node.service.d/10-package.conf \
+                   /usr/lib/sysctl.d/99-turna.conf /usr/lib/sysusers.d/turna-node.conf; do
+            grep -qx "$f" rpm-contents.txt || { echo "::error::.rpm is missing ${f}"; exit 1; }
+          done
+          rpm -qp --configfiles "$rpm" | grep -qx /etc/turna/turn.toml
+          # cargo-generate-rpm takes a script path that does not exist as the
+          # script TEXT, so check the scriptlets really are the files' contents.
+          rpm -qp --scripts "$rpm" | tee rpm-scripts.txt
+          grep -q 'useradd -r' rpm-scripts.txt
+          grep -q 'systemctl daemon-reload' rpm-scripts.txt
+
+      - name: Checksums
+        run: |
+          cd dist
+          for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done
+
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/turna-node-packages-${{ github.ref_name }}.spdx.json
+
+      - name: Attest package provenance (GitHub)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.sha256
+            dist/*.spdx.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Create the GitHub Release once every build succeeds.
   # ---------------------------------------------------------------------------
   release:
-    needs: [docker, docker-admin, binaries]
+    needs: [docker, docker-admin, binaries, packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the GitHub Release and upload assets
@@ -254,12 +374,20 @@ jobs:
           name: release-binaries
           path: dist
 
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-packages
+          path: dist
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
             dist/*.sha256
             dist/*.spdx.json
           body: |
@@ -279,3 +407,17 @@ jobs:
 
             Binary tarballs ship with `.sha256` checksums and an SPDX SBOM
             (`*.spdx.json`), plus a GitHub build-provenance attestation.
+
+            ## Packages (linux/amd64)
+
+            `turna-node_*.deb` (Debian/Ubuntu) and `turna-node-*.rpm`
+            (Fedora/RHEL family) install the node binary, a hardened systemd
+            unit (**not enabled or started** — edit `/etc/turna/turn.toml`
+            first), the config as a conffile, a sysctl drop-in and the
+            `turna` system user. See docs/DEPLOY.md. Each has a `.sha256`
+            and a build-provenance attestation:
+
+            ```
+            sha256sum -c turna-node_*.deb.sha256
+            gh attestation verify turna-node_*.deb --repo ${{ github.repository }}
+            ```

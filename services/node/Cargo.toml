@@ -3,6 +3,11 @@ publish = false
 name = "turna-node"
 version.workspace = true
 edition.workspace = true
+# Read by cargo-deb / cargo-generate-rpm for the package metadata below.
+description = "High-performance TURN/STUN server (RFC 8656) in Rust"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [features]
 tls = ["turna-relay/tls", "turna-transport/tls"]
@@ -59,3 +64,89 @@ sysinfo = "0.39"
 # ring as the process default before building the client.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+# ---------------------------------------------------------------------------
+# Distribution packages: .deb (cargo-deb) and .rpm (cargo-generate-rpm).
+#
+# Built by the `packages` job in .github/workflows/release.yml; docs/DEPLOY.md
+# "Installing from a .deb or .rpm" says what they contain and do. Asset paths in
+# the deb section are relative to this crate (cargo-deb resolves them against
+# services/node); `target/release/` is cargo-deb's placeholder for the real
+# target dir and must be written exactly like that.
+#
+# Neither package enables or starts the service: the shipped config uses a
+# placeholder shared secret, and a TURN server that mints credentials from a
+# public placeholder must not come up on its own.
+# ---------------------------------------------------------------------------
+[package.metadata.deb]
+name = "turna-node"
+maintainer = "turna maintainers <a@krutilin.pro>"
+copyright = "the turna authors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+turna is a TURN/STUN relay server (RFC 8656, RFC 5389/8489) for WebRTC. This \
+package installs the node binary, a hardened systemd unit (not enabled), the \
+annotated configuration as /etc/turna/turn.toml and a sysctl drop-in sized for \
+a dedicated media relay (applied at the next boot or `sysctl --system`)."""
+section = "net"
+priority = "optional"
+# $auto: shared-library dependencies found by dpkg-shlibdeps. systemd-sysusers
+# creates the service user in postinst.
+depends = "$auto, systemd | systemd-standalone-sysusers | systemd-sysusers"
+maintainer-scripts = "../../deploy/packaging/debian/"
+assets = [
+    ["target/release/turna-node", "usr/bin/", "755"],
+    # Under /etc, so a dpkg conffile: an edited config survives upgrades.
+    ["../../deploy/turn.toml", "etc/turna/turn.toml", "644"],
+    ["../../deploy/sysctl.d/99-turna.conf", "usr/lib/sysctl.d/99-turna.conf", "644"],
+    ["../../deploy/packaging/turna-node.service.d/10-package.conf", "usr/lib/systemd/system/turna-node.service.d/10-package.conf", "644"],
+    ["../../deploy/packaging/sysusers.d/turna-node.conf", "usr/lib/sysusers.d/turna-node.conf", "644"],
+    ["../../deploy/logrotate/turna-node", "usr/share/doc/turna-node/examples/logrotate-turna-node", "644"],
+    ["../../README.md", "usr/share/doc/turna-node/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/turna-node/NOTICE", "644"],
+]
+
+# The unit itself comes from deploy/systemd unchanged (cargo-deb finds
+# turna-node.service there and installs it to /usr/lib/systemd/system/). The
+# drop-in above repoints ExecStart at /usr/bin.
+[package.metadata.deb.systemd-units]
+unit-scripts = "../../deploy/systemd/"
+unit-name = "turna-node"
+enable = false
+start = false
+restart-after-upgrade = true
+
+[package.metadata.generate-rpm]
+name = "turna-node"
+# Explicit so the file name is turna-node-<version>-1.x86_64.rpm, matching the
+# .deb's "-1" revision.
+release = "1"
+summary = "High-performance TURN/STUN server (RFC 8656) in Rust"
+# Paths below are relative to the workspace root, where the release job runs
+# `cargo generate-rpm -p services/node`.
+assets = [
+    { source = "target/release/turna-node", dest = "/usr/bin/turna-node", mode = "755" },
+    # %config(noreplace): an edited config survives upgrades (the new one lands
+    # as turn.toml.rpmnew). Group turna exists by then: %pre creates it.
+    { source = "deploy/turn.toml", dest = "/etc/turna/turn.toml", mode = "640", config = "noreplace", user = "root", group = "turna" },
+    { source = "deploy/systemd/turna-node.service", dest = "/usr/lib/systemd/system/turna-node.service", mode = "644" },
+    { source = "deploy/packaging/turna-node.service.d/10-package.conf", dest = "/usr/lib/systemd/system/turna-node.service.d/10-package.conf", mode = "644" },
+    { source = "deploy/sysctl.d/99-turna.conf", dest = "/usr/lib/sysctl.d/99-turna.conf", mode = "644" },
+    { source = "deploy/packaging/sysusers.d/turna-node.conf", dest = "/usr/lib/sysusers.d/turna-node.conf", mode = "644" },
+    { source = "deploy/logrotate/turna-node", dest = "/usr/share/doc/turna-node/examples/logrotate-turna-node", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/turna-node/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/turna-node/LICENSE", mode = "644", doc = true },
+    { source = "NOTICE", dest = "/usr/share/licenses/turna-node/NOTICE", mode = "644", doc = true },
+]
+# A path that does not exist is taken as the script TEXT by cargo-generate-rpm,
+# so a typo here would ship a scriptlet that runs a filename. The release job
+# checks the built package's scriptlets with `rpm -qp --scripts`.
+pre_install_script = "deploy/packaging/rpm/pre_install.sh"
+post_install_script = "deploy/packaging/rpm/post_install.sh"
+pre_uninstall_script = "deploy/packaging/rpm/pre_uninstall.sh"
+post_uninstall_script = "deploy/packaging/rpm/post_uninstall.sh"
+
+[package.metadata.generate-rpm.requires]
+# groupadd / useradd in %pre.
+shadow-utils = "*"
+systemd = "*"
