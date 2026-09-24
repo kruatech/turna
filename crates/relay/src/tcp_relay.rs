@@ -206,6 +206,46 @@ pub async fn handle_peer_initiated(
     }
 }
 
+/// Source address for an outbound CONNECT (RFC 6062 §5.2): the relay bind
+/// address of the peer's family — `[turn.relay] bind_ip` / `bind_ip6`, the
+/// same address the relayed listener and the UDP relay sockets bind. The peer's
+/// family is the allocation's (CreatePermission refuses a cross-family peer
+/// with 443, and CONNECT requires a permission). Unset bind addresses are the
+/// wildcard, which leaves the choice to the kernel exactly as before.
+pub fn relay_source_ip(peer: &SocketAddr) -> std::net::IpAddr {
+    if peer.is_ipv6() {
+        std::net::IpAddr::V6(turna_session::relay_bind_addr_v6())
+    } else {
+        std::net::IpAddr::V4(turna_session::relay_bind_addr_v4())
+    }
+}
+
+/// Connect to `peer` from `local_ip` (port chosen by the kernel).
+///
+/// RFC 6062 §5.2 says the local endpoint is the relayed transport address —
+/// address *and* port. The address is honoured here; the port is not, and
+/// cannot be without `SO_REUSEPORT` on the relayed listener: Linux refuses to
+/// bind a second socket to a port with a listener on it otherwise
+/// (`EADDRINUSE`, even with `SO_REUSEADDR`), and `SO_REUSEPORT` on the
+/// listener would let any other same-UID reuseport listener on that port —
+/// including a stale listener of an expired allocation during the 5 s before
+/// it notices — join the group and take half the incoming SYNs. See
+/// docs/protocol-gap.md → RFC 6062.
+pub async fn connect_from(
+    local_ip: std::net::IpAddr,
+    peer: SocketAddr,
+) -> std::io::Result<TcpStream> {
+    let socket = if local_ip.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    if !local_ip.is_unspecified() {
+        socket.bind(SocketAddr::new(local_ip, 0))?;
+    }
+    socket.connect(peer).await
+}
+
 /// How often a relayed TCP listener checks that its allocation is still live.
 /// Matches the 5 s expiry sweep that reconciles UDP relay sockets.
 pub const LISTENER_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -318,13 +358,16 @@ impl TcpRelayManager {
             });
         }
 
-        let stream = timeout(self.config.connect_timeout, TcpStream::connect(peer))
-            .await
-            .map_err(|_| TcpRelayError::ConnectTimeout {
-                addr: peer,
-                timeout: self.config.connect_timeout,
-            })?
-            .map_err(TcpRelayError::Io)?;
+        let stream = timeout(
+            self.config.connect_timeout,
+            connect_from(relay_source_ip(&peer), peer),
+        )
+        .await
+        .map_err(|_| TcpRelayError::ConnectTimeout {
+            addr: peer,
+            timeout: self.config.connect_timeout,
+        })?
+        .map_err(TcpRelayError::Io)?;
 
         let id = self.next_id();
         self.conns.write().await.insert(
@@ -701,5 +744,44 @@ mod tests {
             m.claim(id, &owner).await.is_ok(),
             "owner binds the peer-initiated conn"
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_source_tests {
+    use super::*;
+
+    /// RFC 6062 §5.2: the outbound CONNECT leaves from the relay bind address.
+    /// 127.0.0.2 stands in for a configured `bind_ip`: the peer must see it,
+    /// not the kernel's default choice (127.0.0.1 for a 127.0.0.1 peer).
+    #[tokio::test]
+    async fn connect_leaves_from_the_relay_bind_address() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let out = match connect_from("127.0.0.2".parse().unwrap(), addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: cannot bind 127.0.0.2 ({e})");
+                return;
+            }
+        };
+        let (_, seen) = peer.accept().await.unwrap();
+        assert_eq!(seen.ip(), "127.0.0.2".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(out.local_addr().unwrap().ip(), seen.ip());
+    }
+
+    /// Unset bind address (wildcard): no explicit bind, the kernel chooses,
+    /// exactly the pre-existing behaviour.
+    #[tokio::test]
+    async fn wildcard_bind_address_leaves_the_choice_to_the_kernel() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let _out = connect_from("0.0.0.0".parse().unwrap(), addr)
+            .await
+            .unwrap();
+        let (_, seen) = peer.accept().await.unwrap();
+        assert!(seen.ip().is_loopback());
+        // Without a configured bind_ip this is what the node uses.
+        assert!(relay_source_ip(&addr).is_unspecified());
     }
 }
