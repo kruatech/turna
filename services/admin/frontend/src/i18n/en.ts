@@ -262,6 +262,7 @@ export const en: Record<string, string> = {
   'diag.backend': 'Backend',
   'diag.transport': 'Transport',
   'diag.histograms': 'Latency histograms',
+  'diag.histogramsNote': 'histogram metrics. Full data is on the Metrics page.',
   'diag.tenantTraffic': 'Per-tenant traffic',
   'diag.bytes': 'Bytes',
   'diag.packets': 'Packets',

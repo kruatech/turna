@@ -262,6 +262,7 @@ export const ru: Record<string, string> = {
   'diag.backend': 'Backend',
   'diag.transport': 'Transport',
   'diag.histograms': 'Гистограммы задержки',
+  'diag.histogramsNote': 'histogram метрик. Полные данные — в разделе Метрики.',
   'diag.tenantTraffic': 'Трафик по тенантам',
   'diag.bytes': 'Байт',
   'diag.packets': 'Пакетов',

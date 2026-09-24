@@ -199,7 +199,7 @@ export function DiagnosticsPage({ status, metrics, frozen }: PanelProps) {
       {hasHist && (
         <Card title={t('diag.histograms')} frozen={frozen}>
           <p className="text-sm text-[--muted] mb-3">
-            {histKeys.length} histogram метрик. Полные данные — в разделе Метрики.
+            {histKeys.length} {t('diag.histogramsNote')}
           </p>
           <div className="flex flex-wrap gap-2">
             {[...new Set(histKeys.map(k => k.replace(/_bucket$|_count$|_sum$/, '')))].map(name => (
