@@ -1,8 +1,23 @@
-# Minimal turna config for the benchmark — no auth, no TLS, plain STUN
-# binding on a dedicated port. Used by bench/run.sh against an
-# identically-configured coturn instance.
+# turna config for the benchmark harness (bench/run.sh, bench/matrix.sh).
+# Plain UDP on 3478, TURN REST auth, no TLS — the same surface as
+# bench/coturn.conf, bench/eturnal.yml and bench/pion-turn.
 #
-# Listens on 3478 to match coturn's default; bench/run.sh manages this.
+# Two deliberate departures from turna's defaults, both so the harness measures
+# the server rather than an admission policy that coturn does not have:
+#
+#   - [turn.rate_limit.default]: every load-test client comes from 127.0.0.1,
+#     and the default per-IP Allocate limit (burst 32, 16/s) would turn the
+#     allocate scenario into a measurement of that limiter. coturn applies no
+#     Allocate rate limit by default. 16_000_000 stays under the token bucket's
+#     24-bit ceiling (crates/qos, TOKEN_MASK); there is no "unlimited" value.
+#   - [turn.relay.quota] max_per_user = 0: REST usernames are
+#     "<expiry>:bench", so every allocation in the same second shares one
+#     username and the default of 100 per user would cap the relay and memory
+#     scenarios. coturn's user-quota default is also 0 (unlimited).
+#
+# These replace the TURNA_RATE_LIMIT_* / TURNA_PREFIX_* environment overrides the
+# scripts used to export: those are deprecated and warn at startup
+# (crates/relay/src/processor.rs, RateLimitSettings::env_overrides).
 
 production = false
 
@@ -21,7 +36,27 @@ token_ttl     = 86400
 [turn.relay]
 min_port        = 50000
 max_port        = 65535
-max_allocations = 20000
+max_allocations = 15000   # below the 15 536 ports in the range; validation refuses more
+
+[turn.relay.quota]
+max_per_user = 0
+
+[turn.rate_limit.default]
+per_ip_burst            = 16000000
+per_ip_rps              = 16000000
+per_prefix_burst        = 16000000
+per_prefix_rps          = 16000000
+allocate_burst          = 16000000
+allocate_rps            = 16000000
+create_permission_burst = 16000000
+create_permission_rps   = 16000000
+channel_bind_burst      = 16000000
+channel_bind_rps        = 16000000
+
+[turn.peer_filter]
+# The relay scenario's peer sockets are on loopback. coturn gets the matching
+# allow-loopback-peers in bench/coturn.conf.
+allow_loopback_peers = true
 
 [health]
 listen = "0.0.0.0:9190"

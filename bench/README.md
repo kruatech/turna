@@ -1,152 +1,167 @@
 # Benchmark — turna vs coturn
 
-Three back-to-back STUN binding runs on the same machine:
+One command runs the same scenarios, with the same client, the same TURN REST
+credentials and the same source-address spread, against turna and coturn — and,
+when installed, eturnal and pion/turn:
 
-1. **`turna-bpf-on`** — turna with the in-kernel BPF filter active
-   (production setup).
-2. **`turna-bpf-off`** — turna with the filter disabled, so every packet
-   reaches userspace. This is the apples-to-apples comparison with
-   coturn, which doesn't use a kernel filter.
-3. **`coturn`** — reference implementation.
+```sh
+bash bench/matrix.sh
+```
 
-The goal is "is turna in the same ballpark as coturn", not 0.1%-precision
-microbenchmarks. See the disclaimer at the top of `run.sh` for what
-the script does and does not control.
+**Numbers from this harness are only meaningful when produced on dedicated,
+prepared hardware** (see [PLAN.md](PLAN.md): core isolation, governor, socket
+buffers, file descriptors). Nothing in this repository was measured that way
+yet; `RESULTS.md` is a template until someone does. A laptop, a CI runner or a
+shared VM produces numbers that measure the neighbours. `SMOKE=1` exists to
+prove the harness works end to end and is labelled as such in every output file.
+
+## What it measures
+
+| Scenario | What the client does | Reported |
+|---|---|---|
+| `memory` | Establish `HOLD_ALLOCS` allocations (default 5 000), each with one permission and one channel; hold; release all with Refresh(lifetime=0). A fresh server for each repeat. | server `VmRSS` before, while held and after release; **resident bytes per active allocation** = (held − before) / established |
+| `binding` | Closed-loop unauthenticated STUN Binding from `CONCURRENCY` tasks, each rotating over `BINDING_SOCKETS` sockets | Binding RPS, p50/p99 latency, errors, server CPU % |
+| `allocate` | Every cycle a new client (new socket): Allocate → 401 challenge → authenticated Allocate → Refresh(lifetime=0), deletion confirmed | **allocations/s**, p50/p99 of the whole cycle, errors, server CPU % |
+| `relay` | `CHANNELS` concurrent allocations, each sending ChannelData at `PPS` through the relay to a local peer socket; once per payload size in `PAYLOADS` (default 160 B and 1200 B) | sent and delivered **pps**, **Mbit/s** out of the relay, **loss %**, one-way p50/p99, **server CPU % during the relay phase** |
+
+Every scenario is driven by `turna-load-test` (`tools/load-test`), modes
+`hold`, `binding`, `allocate --fresh` and `channel-data`. Server CPU and RSS come
+from `/proc/<pid>/stat` (utime + stime) and `/proc/<pid>/status` (`VmRSS`), and
+are sampled **by the load generator itself** at the start and end of the measured
+window — after allocation setup and after the warm-up is discarded — because only
+it knows where that window is (`--server-pid`, `tools/load-test/src/procfs.rs`).
+CPU is percent of one core, so a multi-threaded server can exceed 100.
+
+### Output
+
+`bench/results/matrix-<timestamp>/`:
+
+| File | Content |
+|---|---|
+| `results.csv` | one row per server × scenario, medians across repeats (machine-readable) |
+| `results.json` | `meta` + every raw run + the same summary |
+| `summary.md` | the summary as Markdown tables — what goes into `RESULTS.md` |
+| `meta.json` | kernel, CPU model, governor, relevant sysctls, `ulimit -n`, turna commit (and whether the tree was dirty), exact coturn build, every parameter |
+| `<server>__<scenario>__r<N>.json` | raw `turna-load-test --json` output per run; a failed run is kept as `….json.failed` and excluded from medians |
+| `server-<name>.log` | the server's own output |
+
+The `runs` column says how many repeats a median is over, so a row built from
+fewer surviving repeats than requested is visible.
+
+## Reproducibility
+
+- **coturn is pinned.** `COTURN_SOURCE=docker` (default) runs
+  `coturn/coturn:4.7.0-r4-debian` by digest
+  (`sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93`,
+  the multi-arch index as published on Docker Hub) with host networking and the
+  same CPU set. `COTURN_SOURCE=native` uses the distro package and refuses to run
+  unless it is exactly `COTURN_NATIVE_VERSION` (default `4.6.1-1build4`, Ubuntu
+  24.04) — `COTURN_ALLOW_UNPINNED=1` overrides, and `meta.json` records what
+  actually ran either way.
+- **Same configuration surface.** `turna.toml`, `coturn.conf`, `eturnal.yml` and
+  `pion-turn/main.go` all serve plain UDP with the REST secret `bench-secret` and
+  realm `bench`. turna and coturn additionally run with quotas off and loopback
+  peers allowed (the relay scenario's peer sockets are on `127.0.0.1`); eturnal's
+  default peer blacklist was not checked against that.
+- **Warm-up, duration, repetitions.** `WARMUP` seconds (default 5) of traffic are
+  discarded before each measured `DURATION` (default 30); `REPEATS` (default 3;
+  5 for publication) and the **median** is reported. Servers run one at a time,
+  pinned to `SERVER_CPUS`; the client is pinned to `CLIENT_CPUS`.
+- **Host tuning** is in [PLAN.md](PLAN.md#host-preparation-run-before-measuring).
+  The script records the relevant settings in `meta.json` and warns when
+  `net.core.rmem_max` or `ulimit -n` are below what the plan requires; it does
+  not change host settings itself.
+
+### Why the load comes from 65 534 loopback addresses
+
+Two server behaviours would otherwise be measured instead of throughput, so the
+harness spreads client sockets over `127.0.0.1`–`127.0.255.254` (`SOURCE_IPS`,
+`--source-ips`) for every server alike:
+
+- **turna's unauthenticated-reply budget.** A node answers at most 8
+  unauthenticated replies per second per source address (burst 64;
+  `unauth_reply_limiter` in `crates/relay/src/processor.rs`, not configurable).
+  It is an anti-reflection control, and every Binding response and every 401
+  challenge draws on it. From one address, the binding and allocate scenarios
+  would report that budget. `CONCURRENCY × BINDING_SOCKETS × 8` per second is the
+  ceiling the binding scenario can observe against turna (409 600/s with the
+  defaults); errors in the binding row mean a source reached it and the spread
+  must widen.
+- **coturn's hold on a deleted allocation's 5-tuple.** After Refresh(0),
+  coturn 4.6.1 answers a new Allocate from the same 5-tuple with 437 for more
+  than 120 s (observed with a one-socket probe). A fresh client per cycle from one
+  address soon lands on a recently used ephemeral port and collects those 437s.
+  This is also why `allocate` without `--fresh` — one socket per worker, Allocate
+  and Refresh(0) repeated on it — is not usable against coturn.
+
+turna's configurable limits are raised in `turna.toml` (`[turn.rate_limit.default]`,
+`[turn.relay.quota] max_per_user = 0`) for the same reason: coturn has no
+Allocate rate limit and no per-user quota by default. The file says why for each.
 
 ## Prerequisites
 
-- Linux. (BPF is Linux-only; on macOS the filter run reduces to the
-  same code path as `turna-bpf-off`.)
-- `coturn` installed (`apt install coturn` on Debian/Ubuntu;
-  `dnf install coturn` on Fedora/RHEL).
-- `jq` installed (`apt install jq`).
-- turna built in release mode:
-
-  ```sh
-  cargo build --release
-  ```
-
-- Ports `3478`, `3479`, `9101`, `9190`, `5350` free.
+- Linux (procfs, `taskset`; all of 127.0.0.0/8 routed to `lo`).
+- `jq`, `python3`.
+- turna built in release mode: `cargo build --release` (binaries are looked up in
+  `$TARGET_DIR`, default `$CARGO_TARGET_DIR/release` or `target/release`).
+- coturn: docker with a running daemon, or the pinned distro package.
+- Optional: eturnal (`ETURNAL_BIN`), a Go toolchain for pion.
 
 ## Running
 
-From the repo root:
-
 ```sh
-bash bench/run.sh
+bash bench/matrix.sh                                         # everything, defaults
+DURATION=60 REPEATS=5 bash bench/matrix.sh                   # publication settings
+SERVERS="turna-bpf-off coturn" SCENARIOS="relay" bash bench/matrix.sh
+CHANNELS=1000 PPS=50 PAYLOADS=1200 SCENARIOS=relay bash bench/matrix.sh
+SMOKE=1 SERVERS="turna-bpf-off coturn" COTURN_SOURCE=native bash bench/matrix.sh
 ```
 
-Defaults: concurrency 200, duration 30 seconds per run. Override with
-env vars:
+Every knob is an environment variable documented at the top of `matrix.sh`.
+`turna-bpf-on` and `turna-bpf-off` are the same binary with the in-kernel BPF
+pre-filter on or off (`TURNA_BPF_FILTER`); `turna-bpf-off` is the like-for-like
+comparison with servers that have no kernel filter.
 
-```sh
-CONCURRENCY=500 DURATION=60 bash bench/run.sh
-```
-
-Skip the coturn run (e.g. on a machine without coturn installed):
-
-```sh
-SKIP_COTURN=1 bash bench/run.sh
-```
-
-## What you'll see
-
-Stderr shows live progress as each run executes; stdout is a Markdown
-table you can paste into a doc:
-
-```
-## Benchmark results — concurrency=200, duration=30s
-
-| Run | RPS | p50 (µs) | p95 (µs) | p99 (µs) | Errors |
-|---|---:|---:|---:|---:|---:|
-| turna-bpf-on  | 47832 |  500 |  1000 |  5000 | 0 |
-| turna-bpf-off | 45104 |  500 |  1000 |  5000 | 0 |
-| coturn      | 38217 |  500 |  5000 | 10000 | 12 |
-```
-
-The example numbers above are illustrative only. Do not quote them as a
-performance claim; fill in actual values from your machine in
-`bench/RESULTS.md` once you have run the suite.
-
-Raw per-run JSON lives in `bench/results/`, e.g. `turna-bpf-on.json`.
-Server logs in `/tmp/turna-bench.log` and `/tmp/coturn-bench*.log`.
+`bench/run.sh` is the older quick path: STUN Binding only, three runs (BPF on,
+BPF off, coturn), a Markdown table on stdout. It uses the same source spread.
 
 ## Interpreting the numbers
 
-**RPS (responses per second)** is the throughput of the binding loop.
-Each iteration is one Binding Request out, one Binding Response back.
-Higher is better. With concurrency 200 and a fast loopback, both turna
-and coturn should comfortably exceed 30k RPS. The CPU/network stack
-becomes the bottleneck, not parsing.
+- **Binding RPS** is the cheapest request path — parser, dispatcher, response
+  encoding. It says little about relay capacity.
+- **Allocations/s** includes two round trips, HMAC verification, relay-port
+  allocation and deletion. p50/p99 are for the whole cycle.
+- **Relay pps / Mbit/s / loss** is the data plane. `Mbit/s` is relayed UDP payload
+  arriving at the peer (ChannelData framing is stripped by the relay). Loss is
+  `(sent − delivered) / sent`; on an unprepared host it is dominated by kernel
+  socket-buffer drops (`nstat -az UdpRcvbufErrors`), not by the server.
+- **Server CPU %** in the relay table is the figure to compare against delivered
+  pps: CPU per relayed packet is the efficiency number. At low offered load
+  every server delivers everything and only the CPU column differs.
+- **Bytes per allocation** is resident-set growth divided by allocations held. It
+  includes allocator retention and excludes kernel socket buffers (not in RSS).
+  Compare servers at the same `HOLD_ALLOCS`; the `after release` column shows how
+  much the allocator kept.
+- **Latency percentiles** come from a bucketed histogram (bounds in the raw JSON):
+  good for order-of-magnitude comparison, not for microsecond claims.
 
-**p50 / p95 / p99 latency** is the request-to-response round-trip
-inside the binding loop. Resolution is bucketed (next bucket boundary
-above the actual value), so don't read tiny differences as significant.
-Order-of-magnitude comparisons are reliable.
+## Methodology caveats
 
-**Errors** are timeouts (no response in 2s) and socket failures. On a
-healthy loopback this should be zero. Non-zero errors usually mean the
-server hit a saturation point (queue full, ephemeral port range
-exhausted on the client side).
+- **One client process.** A single `turna-load-test` can saturate before the
+  server does. Watch the client cores; if they are pegged, the server figures are
+  a lower bound.
+- **Loopback only.** No NIC, driver, IRQ or real-network cost. Relative ordering
+  on the same box is what this measures, not deployment capacity — for that, see
+  `scripts/verify/capacity-profile.sh` and `[turn.relay] max_packets_per_sec`.
+- **One process sampled.** CPU and RSS are for the server's main PID (turna and
+  coturn are single-process, multi-threaded). eturnal is sampled at its Erlang VM
+  (`beam.smp`), not at `eturnalctl`.
+- **Defaults, not tuned configurations.** coturn runs with its default thread
+  model; a tuned coturn (`relay-threads`, `cpus`) may do better. The configs are
+  in this directory so anyone can re-tune and re-run.
 
-## BPF on vs off — what to expect
+## Results
 
-On a normal benchmark workload (every packet is a real STUN binding),
-the BPF filter should add a tiny constant overhead to the in-kernel
-path and otherwise be invisible. **The big win shows up when the
-server is also receiving garbage packets** (scan traffic, broken
-clients, malformed data). With BPF on, the garbage is dropped before
-the kernel-to-userspace copy. Without BPF, every garbage packet costs
-us a context switch and a parse-then-reject in userspace.
-
-The bench script doesn't (currently) generate garbage traffic
-alongside the real binding requests. If you want to demonstrate the
-BPF benefit, run turna in production with the filter on and watch
-`/proc/net/snmp` Udp errors trend down compared to filter-off.
-
-## Re-running with stricter controls
-
-For "publishable" numbers, tighten the methodology:
-
-```sh
-# Pin both server and client to specific cores
-sudo cset shield -c 1,3,5,7 --kthread on
-taskset -c 1 ./target/release/turna-node bench/turna.toml &
-sleep 1
-taskset -c 3 ./target/release/turna-load-test --server 127.0.0.1:3478 \
-    --duration 60 --json binding -c 200
-
-# Disable turbo boost (Intel)
-echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
-
-# Bigger socket buffers (both ends)
-sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216
-
-# Repeat 5 times and report the median, not the mean.
-```
-
-`run.sh` doesn't do any of this — that's deliberate, to keep the
-script readable for the "is it in the ballpark" use case.
-
-## Methodology caveats (honest list)
-
-- **One client process.** A single `turna-load-test` instance with high
-  concurrency may itself be the bottleneck before the server is. If
-  RPS plateaus around `concurrency / round_trip`, you're saturating
-  the client. Try a second client process or higher concurrency.
-- **Loopback only.** Real network has different costs (NIC interrupt,
-  IRQ steering, real bandwidth). Loopback numbers are useful for "did
-  we regress the parsing path" but not for "how many calls can we
-  serve from this VM".
-- **STUN Binding only.** TURN Allocate/Refresh/Send paths are different
-  in both servers. This benchmark is focused on Binding unless the load-test mode you choose
-  explicitly exercises Allocate/ChannelData in your current checkout. Treat
-  Binding results as parser/control-path data, not as full TURN relay capacity.
-- **Single host.** A real TURN node lives behind a NAT/firewall and
-  receives off-network traffic. We aren't measuring that here.
-
-## RESULTS.md template
-
-Once you've run it on your hardware, commit your numbers to
-`bench/RESULTS.md` with the date, machine spec, and any deviations
-from defaults. That way the comparison stays meaningful over time.
+Once a run on prepared hardware exists, paste `summary.md` and the host block
+from `meta.json` into `bench/RESULTS.md`, with the date and any deviation from
+the defaults.

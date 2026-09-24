@@ -79,7 +79,7 @@ turna-bench --warmup 10 --duration 60 --json binding    -c <C>
 # Allocate lifecycle
 turna-bench --warmup 10 --duration 60 --json allocate   -c <C>
 # ChannelData relay
-turna-bench --warmup 10 --duration 60 --json channeldata -n <N> --pps <P>
+turna-bench --warmup 10 --duration 60 --json channel-data -n <N> --pps <P>
 ```
 
 ## Measure per profile
