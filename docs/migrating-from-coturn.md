@@ -68,13 +68,13 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 
 | coturn | turna | kind | note |
 |---|---|---|---|
-| `relay-device` | — | no equivalent | bind by address with `bind_ip` |
+| `relay-device` | — | no equivalent | bind by address with `[turn.relay] bind_ip` |
 | `relay-ip` | `[turn.relay] bind_ip`, `bind_ip6` | key | one address per family. Empty (the default) binds relay sockets on the wildcard address |
 | `relay-threads` | — | by design | no config key; the `TURNA_WORKERS` environment variable sets the runtime's worker threads (`services/node/src/main.rs`) |
 | `cpus` | — | by design | as `relay-threads` |
 | `min-port` / `max-port` | `[turn.relay] min_port`, `max_port` | key | same meaning. Keep range and firewall in agreement — `scripts/check-deploy-consistency.sh` checks where it is declared. Per-tenant pools: `[[tenants]] relay_port_range` |
-| `sock-buf-size` | `[turn] socket_recv_buffer_bytes`, `socket_send_buffer_bytes` | key | separate receive and send sizes; 0 leaves the kernel default. Raise `net.core.rmem_max` / `wmem_max` first |
-| `udp-recvmmsg` | `[turn] transport` | by design | the default `tokio` backend batches with `recvmmsg`/`sendmmsg` on Linux, with no switch; `io_uring` and `af_xdp` are the alternatives |
+| `sock-buf-size` | `[turn] socket_recv_buffer_bytes`, `socket_send_buffer_bytes` | key | separate receive and send sizes; 0 leaves the kernel default. Raise `net.core.rmem_max` / `net.core.wmem_max` first |
+| `udp-recvmmsg` | `[turn] transport` | by design | the default `tokio` backend batches with `recvmmsg`/`sendmmsg` on Linux, with no switch; `"io_uring"` and `"af_xdp"` are the alternatives |
 | `udp-recvmmsg-log` | — | no equivalent | batching is not reported separately |
 | `udp-gso` | — | no equivalent | no UDP segmentation offload on the relay send path |
 | `multiplex-peer` | — | no equivalent | one relay socket per allocation |
@@ -125,7 +125,7 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `permission-lifetime` | — | by design | fixed at 300 s (RFC 8656) |
 | `max-allocate-timeout` | — | no equivalent | each request is bounded, the whole handshake is not |
 | `unauthorized-ratelimit` | — | by design | always on and not configurable: at most 8 unauthenticated replies (401s and Binding responses alike) per second per source address, burst 64 |
-| `unauthorized-ratelimit-rps` | — | by design | fixed at 8/s; see above. The configurable tiers are `[turn.rate_limit.default]` / `[turn.rate_limit.trusted]` with `trusted_prefixes` for NAT-heavy sources |
+| `unauthorized-ratelimit-rps` | — | by design | fixed at 8/s; see above. The configurable tiers are `[turn.rate_limit.default]` / `[turn.rate_limit.trusted]` with `[turn.rate_limit] trusted_prefixes` for NAT-heavy sources |
 
 ### STUN and TURN protocol behaviour
 
@@ -390,7 +390,10 @@ they are the default and cannot be configured away.
 
 The option list is coturn's, at the date above; a newer coturn may add options
 that are not here. The turna side is checked: `scripts/check-doc-claims.sh`
-extracts every `[section] key` named in the tables and fails if the section or
-the key does not exist in `crates/config/src/lib.rs`. What it cannot check is a
+resolves every `[section]` and `[section] key` named in the tables' turna and
+note columns against the config structs in `crates/config/src/lib.rs`, by path,
+and every bare `snake_case` key in a note against its row's turna-column
+section (a gRPC field is accepted only where the note says gRPC). Prose outside
+the tables is not checked. What it cannot check is a
 "no equivalent" that has become wrong because turna gained the feature — the
 `parity-pr` markers flag the rows where that is expected soon.

@@ -254,31 +254,67 @@ section "Lifted and implemented features: docs must not still call them refused 
 # blocker that did not exist. Same shape for OAuth, which docs/why-turna.md
 # listed as "Not implemented" while `AuthMode::OAuth` shipped.
 #
-# Claims wrap across lines, so this reads paragraphs, list items and table rows
-# rather than lines, and attributes a "refused in production" to the nearest
-# feature named before it — a sentence listing TCP relay and then OAuth "(refused
-# under production = true)" is about OAuth. Paragraphs that carry a retraction
-# marker ("lifted", "until 2026-…", "used to") are history, not claims. Verified
-# to flag the three stale RFC 6062 sites on the pre-fix tree.
-if ! grep -qF "turn.tcp_relay.enabled = true in production" "$CONFIG"; then
-  STALE_6062=$(python3 - <<'PYEOF'
-import glob, re
-feature = re.compile(r'6062|tcp_relay|TCP relay|OAuth|7635|SCTP|QUIC|WebTransport|io_uring|AF_XDP|DTLS', re.I)
-claim = re.compile(r'refus\w*\s+(?:\*\*)?\s*(?:under|in)\s+`?production|production\s*=\s*true`?\s+refuses', re.I)
-retract = re.compile(r'lifted|until 20|no longer|used to|was refused|previously|reintroduc|came back|come back|earlier', re.I)
-for f in sorted(glob.glob('docs/**/*.md', recursive=True)) + ['README.md']:
-    text = open(f, encoding='utf-8').read()
-    for block in re.split(r'\n\s*\n|\n(?=\|)|\n(?=\s*[-*] )', text):
-        flat = ' '.join(block.split())
-        if retract.search(flat):
-            continue
-        for m in claim.finditer(flat):
-            before = list(feature.finditer(flat[:m.start()]))
-            if before and re.match(r'6062|tcp_relay|TCP relay', before[-1].group(0), re.I):
-                print(f + ': ' + flat[:100])
+# How a claim is found (the scanner is shared by both checks):
+#   - Claims wrap across lines, so text is read as blocks — paragraphs, list
+#     items, table rows — flattened to one line, then split into sentences and
+#     table cells.
+#   - A claim is attributed to the nearest feature named before it in the
+#     block, or failing that in the heading the block sits under: a sentence listing TCP relay and then OAuth "(refused under
+#     production = true)" is about OAuth; a table row "OAuth | 📋 | Not
+#     implemented." is about OAuth although the cell does not say so.
+#   - A retraction marker ("lift(ed)", "until 2026-…", "used to", …) exempts only
+#     the sentence it is in, so a paragraph cannot launder a live claim by
+#     mentioning history in another sentence.
+#   - Text in double quotes is a mention of a phrase, not a claim.
+#   - For 6062, "refused/rejected … under/with/in production" may have up to
+#     six words in between ("refused by config validation under …"), and a
+#     sentence about the remaining [tls] condition ("refuses it without
+#     [tls]") is not the lifted gate.
+# Verified: flags each stale site on the pre-fix tree, and planted variants
+# (wrapped, words in between, retraction in a neighbouring sentence).
+# shellcheck disable=SC2016  # Python source: the backticks and $ are regex text.
+STALE_SCAN='
+import glob, re, sys
+mode = sys.argv[1]
+FEATURE = re.compile(r"6062|tcp_relay|TCP relay|OAuth|7635|SCTP|QUIC|WebTransport|io_uring|AF_XDP|DTLS|5780|USERHASH|ADDITIONAL-ADDRESS-FAMILY|SQL|Redis|Mongo", re.I)
+RETRACT = re.compile(r"\blift|until 20|no longer|used to|was refused|previously|reintroduc|came back|come back|earlier|was wrong|correction", re.I)
+if mode == "6062":
+    TARGET = re.compile(r"6062|tcp_relay|TCP relay", re.I)
+    CLAIM = re.compile(r"\b(?:refus|reject)\w*\b(?:\W+[\w=`.\[\]]+){0,6}?\W+(?:under|with|in)\W+`?production"
+                       r"|production\s*=\s*true`?\W+(?:\w+\W+){0,4}?(?:refus|reject)", re.I)
+    EXEMPT = re.compile(r"without|\[tls\]", re.I)
+else:
+    TARGET = re.compile(r"OAuth|7635", re.I)
+    CLAIM = re.compile(r"\bnot\s+(?:yet\s+)?implemented\b|\bunimplemented\b", re.I)
+    EXEMPT = re.compile(r"$^")
+SPLIT = re.compile(r"(?<=[.;!?])\s+(?=[A-Z*`(\[_])|\s\|\s")
+for f in sorted(glob.glob("docs/**/*.md", recursive=True)) + ["README.md"]:
+    text = open(f, encoding="utf-8").read()
+    heading = ""
+    for block in re.split(r"\n\s*\n|\n(?=\|)|\n(?=\s*[-*] )", text):
+        flat = " ".join(block.split())
+        if flat.startswith("#"):
+            heading = flat
+        pos = 0
+        for sent in SPLIT.split(flat):
+            start = flat.find(sent, pos)
+            pos = start + len(sent)
+            if RETRACT.search(sent) or EXEMPT.search(sent):
+                continue
+            # A quoted phrase is a mention (\"the refused in production
+            # wording\"), not a claim; blank it, keeping offsets.
+            m = CLAIM.search(re.sub(r"\"[^\"]*\"", lambda q: " " * len(q.group(0)), sent))
+            if not m:
+                continue
+            # Nearest feature before the claim in this block, else in the
+            # section heading the block sits under.
+            before = list(FEATURE.finditer(flat[: start + m.start()])) or list(FEATURE.finditer(heading))
+            if before and TARGET.fullmatch(before[-1].group(0)):
+                print(f + ": " + sent[:110])
                 break
-PYEOF
-)
+'
+if ! grep -qF "turn.tcp_relay.enabled = true in production" "$CONFIG"; then
+  STALE_6062=$(python3 -c "$STALE_SCAN" 6062)
   if [ -n "$STALE_6062" ]; then
     fail "docs still say RFC 6062 TCP relay is refused in production; validate() no longer refuses it" \
       "Correct the doc (the gate was lifted 2026-08-25), or mark the sentence as history. $(printf '%s' "$STALE_6062" | head -3 | tr '\n' ';')"
@@ -288,11 +324,10 @@ PYEOF
 fi
 
 if grep -qE 'OAuth \{' crates/auth/src/lib.rs 2>/dev/null; then
-  STALE_OAUTH=$(grep -rniE '(oauth|7635).*not implemented' docs README.md 2>/dev/null |
-    grep -viE 'previously|was wrong|used to|correction|earlier')
+  STALE_OAUTH=$(python3 -c "$STALE_SCAN" oauth)
   if [ -n "$STALE_OAUTH" ]; then
     fail "docs say RFC 7635 OAuth is not implemented, but AuthMode::OAuth exists" \
-      "It is implemented and refused under production = true — say that. Lines: $(printf '%s' "$STALE_OAUTH" | head -3 | tr '\n' ';')"
+      "It is implemented and refused under production = true — say that. $(printf '%s' "$STALE_OAUTH" | head -3 | tr '\n' ';')"
   else
     pass "no doc calls OAuth unimplemented while AuthMode::OAuth exists"
   fi
@@ -889,62 +924,86 @@ section "coturn migration table names only config keys that exist"
 
 # docs/migrating-from-coturn.md maps every coturn option to a turna key. A key
 # that is misspelled or later renamed turns the table into instructions that
-# fail at startup (deny_unknown_fields). This resolves every `[section] key` in
-# the table's turna column against the config structs *by path* — not just by
-# field name, so `[management.rbac]` (the struct field lives under [grpc]) fails
-# even though a field called `rbac` exists somewhere.
+# fail at startup (deny_unknown_fields). This resolves config references in the
+# table rows — the turna column AND the note column — against the config
+# structs *by path*, not just by field name, so `[management.rbac]` (the struct
+# field lives under [grpc]) fails even though a field called `rbac` exists:
+#
+#   - `[section]`, `[[section]]`, `[section] key`, `[section] key = value`,
+#     anywhere in the row: section and key must resolve;
+#   - a bare `snake_case` token after a `[section]` in the turna column
+#     (`[turn.relay] min_port`, `max_port`), or in the note column: a key of the
+#     row's last turna-column section. With no such section — or when it is
+#     not a key there — it passes only as a field of the management proto and
+#     only if the note says gRPC (`max_lifetime_secs` in `SetUserLimits`).
+#
+# Prose outside the tables is not checked, and the doc says so.
 MIG=docs/migrating-from-coturn.md
 if [ -f "$MIG" ] && [ -f "$CFG_SRC" ]; then
-  MIG_BAD=$(python3 - "$CFG_SRC" "$MIG" <<'MIGPY'
-import re, sys
-src, doc = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+  MIG_BAD=$(python3 - "$CFG_SRC" "$MIG" crates/control/proto <<'MIGPY'
+import glob, os, re, sys
+src, doc, proto_dir = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
 structs = {}
 for m in re.finditer(r"pub struct (\w+)\s*\{(.*?)\n\}", src, re.S):
     fields = {}
     for fm in re.finditer(r'(?:#\[serde\(rename\s*=\s*"([^"]+)"\)\][^\n]*\n\s*)?pub (?:r#)?(\w+)\s*:\s*([^\n]+?),?\s*$', m.group(2), re.M):
         fields[fm.group(1) or fm.group(2)] = fm.group(3)
     structs[m.group(1)] = fields
-if "TurnaConfig" not in structs or len(structs) < 20:
+proto_fields = set()
+for p in glob.glob(os.path.join(proto_dir, "*.proto")):
+    proto_fields |= set(re.findall(r"^\s*(?:optional\s+|repeated\s+)?[\w.]+\s+(\w+)\s*=\s*\d+;", open(p).read(), re.M))
+if "TurnaConfig" not in structs or len(structs) < 20 or len(proto_fields) < 20:
     print("PARSER"); raise SystemExit(0)
-
-def child(struct, field):
-    ty = structs.get(struct, {}).get(field)
-    if ty is None:
-        return None, False
-    inner = [t for t in re.findall(r"\w+", ty) if t in structs]
-    return (inner[-1] if inner else ""), True
 
 def resolve(path):
     cur = "TurnaConfig"
     for seg in path:
-        cur, ok = child(cur, seg)
-        if not ok:
+        ty = structs.get(cur, {}).get(seg)
+        if ty is None:
             return None
+        inner = [t for t in re.findall(r"\w+", ty) if t in structs]
+        cur = inner[-1] if inner else ""
     return cur
 
+SECTION = re.compile(r"^\[\[?([a-z0-9_.]+)\]\]?(?:\s+([a-z0-9_]+)(?:\s*=.*)?)?$")
+BARE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$|^[a-z][a-z0-9]+$")
+SNAKE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
 bad, seen = [], 0
 for line in doc.splitlines():
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     if len(cells) < 3 or not cells[0].startswith("`"):
         continue
-    section = None
-    for tok in re.findall(r"`([^`]+)`", cells[1]):
-        m = re.match(r"^\[\[?([a-z0-9_.]+)\]\]?(?:\s+([a-z0-9_]+))?$", tok)
-        if m:
-            section = m.group(1)
-            st = resolve(section.split("."))
-            if st is None:
-                bad.append("[" + section + "]"); section = None; continue
-            if m.group(2):
+    note = cells[3] if len(cells) > 3 else ""
+    grpc = "gRPC" in note
+    row_section = None          # last [section] in the turna column
+    for col, text in ((1, cells[1]), (3, note)):
+        section = row_section
+        for tok in re.findall(r"`([^`]+)`", text):
+            m = SECTION.match(tok)
+            if m:
+                st = resolve(m.group(1).split("."))
                 seen += 1
-                if m.group(2) not in structs.get(st, {}):
-                    bad.append("[" + section + "] " + m.group(2))
-        elif section and re.match(r"^[a-z0-9_]+$", tok):
+                if st is None:
+                    bad.append("[" + m.group(1) + "]"); continue
+                if m.group(2) and m.group(2) not in structs.get(st, {}):
+                    bad.append("[" + m.group(1) + "] " + m.group(2)); continue
+                if col == 1:
+                    section = row_section = m.group(1)
+                continue
+            # In the turna column any bare word after a section is a key; in a
+            # note only snake_case words are (plain words there are prose).
+            if not (BARE.match(tok) if col == 1 else SNAKE.match(tok)):
+                continue
+            if col == 1 and section is None:
+                continue
             seen += 1
-            st = resolve(section.split("."))
-            if tok not in structs.get(st, {}):
-                bad.append("[" + section + "] " + tok)
-if seen < 30:
+            st = resolve(section.split(".")) if section else None
+            if st is not None and tok in structs.get(st, {}):
+                continue
+            if grpc and tok in proto_fields:
+                continue
+            bad.append(("[" + section + "] " if section else "(no section) ") + tok)
+if seen < 40:
     print("PARSER"); raise SystemExit(0)
 print("; ".join(bad))
 MIGPY
@@ -952,7 +1011,7 @@ MIGPY
   case "$MIG_BAD" in
     PARSER) fail "the migration-table key extractor found too little to judge" \
               "Either the table format or the config structs changed shape; fix the extractor rather than skipping the check." ;;
-    "") pass "every turna key in the coturn mapping table exists at its path" ;;
+    "") pass "every config reference in the coturn mapping table exists at its path" ;;
     *) fail "the coturn mapping table names keys the config does not have: $MIG_BAD" \
          "Correct the row in $MIG (or restore the key); an operator copying it gets a startup failure." ;;
   esac
