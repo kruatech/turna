@@ -1103,7 +1103,9 @@ impl PacketProcessor {
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
-        alloc.add_bytes(data.len() as u64);
+        // Peer→client: the direction share feeds usage records and the gRPC
+        // per-direction traffic fields.
+        alloc.add_bytes_to_client(data.len() as u64);
         let ca = alloc.client_addr;
         let channel = alloc.get_peer_channel(&peer_addr);
         drop(alloc);

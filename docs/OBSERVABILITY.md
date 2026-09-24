@@ -217,6 +217,30 @@ are emitted unconditionally and read `0` when the sink is off.
 | `turna_log_syslog_sent_total` | counter | Lines written to the full-log syslog sink. |
 | `turna_log_syslog_dropped_total` | counter | Lines lost by the full-log syslog sink: its queue (`queue_capacity`) was full, or the transport failed. Lines are formatted on the logging thread and sent by one background thread, so a slow collector drops lines rather than stalling the relay. |
 
+#### Usage accounting (`[turn.accounting]`)
+
+Off by default; see `docs/CONFIGURATION.md` for the record schema. All series
+are emitted unconditionally and read `0` while accounting is off. Labels are
+fixed sets — record type and drop reason — never a user or tenant.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_accounting_records_total{type="stop"\|"interim"}` | counter | Records handed to the sinks. `stop` grows by one per allocation that ended; compare with the allocation churn to see that none are missing. |
+| `turna_accounting_records_dropped_total{reason=…}` | counter | Records lost. `queue_full`: the datapath→dispatcher queue (`queue_capacity`) was full; `webhook_queue_full`: the webhook sender was behind by more than `max_pending_batches`; `webhook_failed`: a batch was rejected (4xx) or retries ran out; `file_error`: the append failed. **Alert on any increase** — a lost record is unbilled usage. |
+| `turna_accounting_webhook_batches_total` | counter | Batches the webhook accepted (2xx). |
+| `turna_accounting_webhook_retries_total` | counter | Retries after a transient failure (transport error, 5xx, 408, 429). A steady rate with no `webhook_failed` drops means the endpoint is flaky but the backoff is absorbing it. |
+
+Per-tenant cumulative traffic was already exported and is what a
+per-tenant billing view graphs:
+`turna_tenant_bytes_relayed_total{tenant}`,
+`turna_tenant_packets_relayed_total{tenant}` and
+`turna_tenant_allocations_closed_total{tenant}`, accrued when an allocation
+closes (so live allocations appear once they end — use interim records for
+long sessions). Tenants come from `[[tenants]]` in the config, so the label set
+is bounded; above the per-family cap the smallest are folded into `__other`
+(`turna_tenant_series_omitted`). Users are never a label. The tenant totals and
+the `stop` records are fed by the same teardown hook, so they agree.
+
 #### Dashboard
 
 `deploy/grafana/turna-overview.json`. Schema 39, which loads on Grafana 10 and 11.

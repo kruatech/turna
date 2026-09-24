@@ -4,6 +4,7 @@
 //! - tokio (default): multi-threaded async, works everywhere
 //! - io_uring (--features io-uring): io_uring for main socket + tokio for relay sockets
 
+mod accounting;
 mod af_xdp_listener;
 mod audit_layer;
 mod bulk_load;
@@ -1545,6 +1546,50 @@ fn run_tokio(
         let mut failover_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut command_log_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // ── Usage accounting ([turn.accounting]) ──────────────────────────────
+        // Off by default. Started before the datapath so no allocation can end
+        // unrecorded, and refused outright when a configured sink cannot be
+        // opened: billing that silently records nothing is found at the end of
+        // the month.
+        let accounting_handle: Option<tokio::task::JoinHandle<()>> =
+            match accounting::AccountingSettings::from_config(&config.accounting, &cluster.node_id)
+            {
+                Some(settings) => {
+                    let acct = accounting::start(settings, store.clone(), shutdown_rx.clone())
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    let counters = acct.counters.clone();
+                    let metrics = metrics.clone();
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let mut tick = tokio::time::interval(Duration::from_secs(5));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tick.tick().await;
+                            let m = &metrics;
+                            let c = &counters;
+                            m.accounting_stop_records.store(c.stop_records.load(Relaxed), Relaxed);
+                            m.accounting_interim_records
+                                .store(c.interim_records.load(Relaxed), Relaxed);
+                            m.accounting_dropped_queue_full
+                                .store(store.usage_dropped_count(), Relaxed);
+                            m.accounting_dropped_webhook_queue_full
+                                .store(c.dropped_webhook_queue_full.load(Relaxed), Relaxed);
+                            m.accounting_dropped_webhook_failed
+                                .store(c.dropped_webhook_failed.load(Relaxed), Relaxed);
+                            m.accounting_dropped_file_error
+                                .store(c.dropped_file_error.load(Relaxed), Relaxed);
+                            m.accounting_webhook_batches
+                                .store(c.webhook_batches.load(Relaxed), Relaxed);
+                            m.accounting_webhook_retries
+                                .store(c.webhook_retries.load(Relaxed), Relaxed);
+                        }
+                    });
+                    Some(acct.handle)
+                }
+                None => None,
+            };
+
         // ── PR2: write-behind writer task ─────────────────────────────────────
         // P0 #16: hoisted so the readiness monitor (spawned below, outside this
         // block) can run reconciliation against the backend after write-drops.
@@ -2772,6 +2817,15 @@ fn run_tokio(
             Duration::from_secs(PERSISTENCE_FLUSH_TIMEOUT_SECS),
         )
         .await;
+        // Accounting writes its shutdown snapshot and drains its queue; the
+        // webhook sender may still be retrying after that and is not waited for
+        // beyond this budget.
+        join_within_budget(
+            "accounting",
+            accounting_handle,
+            Duration::from_secs(TASK_JOIN_TIMEOUT_SECS),
+        )
+        .await;
         join_within_budget(
             "heartbeat",
             heartbeat_handle,
@@ -3095,6 +3149,19 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("max_size_mb = {}", lf.max_size_mb);
     println!("max_files   = {}", lf.max_files);
     println!("level       = \"{}\"", lf.level);
+    println!();
+    let ac = &t.accounting;
+    println!("[turn.accounting]");
+    println!("enabled               = {}", ac.enabled);
+    println!("interim_interval_secs = {}", ac.interim_interval_secs);
+    println!("include_addresses     = {}", ac.include_addresses);
+    println!("queue_capacity        = {}", ac.queue_capacity);
+    println!("file.path             = \"{}\"", ac.file.path);
+    println!("webhook.url           = \"{}\"", ac.webhook.url);
+    println!(
+        "webhook.authorization = \"{}\"",
+        mask(&ac.webhook.authorization)
+    );
     println!();
     let ls = &t.observability.log_syslog;
     println!("[turn.observability.log_syslog]");

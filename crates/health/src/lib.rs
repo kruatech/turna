@@ -157,6 +157,17 @@ pub struct Metrics {
     pub log_syslog_sent: AtomicU64,
     pub log_syslog_dropped: AtomicU64,
 
+    /// Usage accounting (`[turn.accounting]`), mirrored by the node. All 0 when
+    /// accounting is off.
+    pub accounting_stop_records: AtomicU64,
+    pub accounting_interim_records: AtomicU64,
+    pub accounting_dropped_queue_full: AtomicU64,
+    pub accounting_dropped_webhook_queue_full: AtomicU64,
+    pub accounting_dropped_webhook_failed: AtomicU64,
+    pub accounting_dropped_file_error: AtomicU64,
+    pub accounting_webhook_batches: AtomicU64,
+    pub accounting_webhook_retries: AtomicU64,
+
     pub host_cpu_percent: AtomicU64,
     pub host_memory_percent: AtomicU64,
 
@@ -473,6 +484,14 @@ impl Metrics {
             log_file_write_errors: AtomicU64::new(0),
             log_syslog_sent: AtomicU64::new(0),
             log_syslog_dropped: AtomicU64::new(0),
+            accounting_stop_records: AtomicU64::new(0),
+            accounting_interim_records: AtomicU64::new(0),
+            accounting_dropped_queue_full: AtomicU64::new(0),
+            accounting_dropped_webhook_queue_full: AtomicU64::new(0),
+            accounting_dropped_webhook_failed: AtomicU64::new(0),
+            accounting_dropped_file_error: AtomicU64::new(0),
+            accounting_webhook_batches: AtomicU64::new(0),
+            accounting_webhook_retries: AtomicU64::new(0),
             host_cpu_percent: AtomicU64::new(u64::MAX),
             host_memory_percent: AtomicU64::new(u64::MAX),
             relay_ports_in_use: AtomicU64::new(0),
@@ -744,6 +763,38 @@ impl Metrics {
             l(&self.log_file_write_errors),
             l(&self.log_syslog_sent),
             l(&self.log_syslog_dropped),
+        )
+    }
+
+    /// Usage-accounting counters. Label values are fixed sets (record type,
+    /// drop reason), never a user or tenant, so cardinality is constant.
+    fn render_accounting_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_accounting_records_total Usage records handed to the accounting sinks ([turn.accounting]; 0 when off)\n\
+             # TYPE turna_accounting_records_total counter\n\
+             turna_accounting_records_total{{type=\"stop\"}} {}\n\
+             turna_accounting_records_total{{type=\"interim\"}} {}\n\
+             # HELP turna_accounting_records_dropped_total Usage records lost, by where: queue_full (datapath to dispatcher), webhook_queue_full, webhook_failed (retries exhausted or rejected), file_error\n\
+             # TYPE turna_accounting_records_dropped_total counter\n\
+             turna_accounting_records_dropped_total{{reason=\"queue_full\"}} {}\n\
+             turna_accounting_records_dropped_total{{reason=\"webhook_queue_full\"}} {}\n\
+             turna_accounting_records_dropped_total{{reason=\"webhook_failed\"}} {}\n\
+             turna_accounting_records_dropped_total{{reason=\"file_error\"}} {}\n\
+             # HELP turna_accounting_webhook_batches_total Accounting webhook batches accepted (2xx)\n\
+             # TYPE turna_accounting_webhook_batches_total counter\n\
+             turna_accounting_webhook_batches_total {}\n\
+             # HELP turna_accounting_webhook_retries_total Accounting webhook POST retries after a transient failure\n\
+             # TYPE turna_accounting_webhook_retries_total counter\n\
+             turna_accounting_webhook_retries_total {}\n",
+            l(&self.accounting_stop_records),
+            l(&self.accounting_interim_records),
+            l(&self.accounting_dropped_queue_full),
+            l(&self.accounting_dropped_webhook_queue_full),
+            l(&self.accounting_dropped_webhook_failed),
+            l(&self.accounting_dropped_file_error),
+            l(&self.accounting_webhook_batches),
+            l(&self.accounting_webhook_retries),
         )
     }
 
@@ -2340,6 +2391,7 @@ pub async fn serve_on(
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
                     body.push_str(&m.render_log_sink_metrics());
+                    body.push_str(&m.render_accounting_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());

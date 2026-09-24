@@ -15,7 +15,9 @@
 // audited surface, which is confined to turna-transport and turna-relay.
 #![forbid(unsafe_code)]
 
+pub mod usage;
 pub mod write_op;
+pub use usage::{AllocationUsage, UsageEndReason, UsageRecord, UsageRecordKind};
 pub use write_op::{now_ms as epoch_ms, WriteOp};
 
 use dashmap::DashMap;
@@ -305,10 +307,20 @@ pub struct Allocation {
     /// When allocation expires.
     pub expires_at: Instant,
     pub created_at: Instant,
-    /// Bytes relayed total.
+    /// Wall-clock creation time, ms since the Unix epoch. For usage records,
+    /// which leave the process and need a time a billing system can read;
+    /// `created_at` is an `Instant` and means nothing outside it.
+    pub created_at_ms: u64,
+    /// Bytes relayed total, both directions (payload, not TURN framing).
     pub bytes_relayed: AtomicU64,
-    /// Packets relayed total.
+    /// Packets relayed total, both directions.
     pub packets_relayed: AtomicU64,
+    /// The peer→client share of `bytes_relayed`. The client→peer share is the
+    /// difference, so the direction split costs one extra counter pair on the
+    /// peer→client path and nothing on the other.
+    pub bytes_to_client: AtomicU64,
+    /// The peer→client share of `packets_relayed`.
+    pub packets_to_client: AtomicU64,
     /// Bytes in current second (for bandwidth limiting).
     bandwidth_window_bytes: AtomicU64,
     bandwidth_window_start: Mutex<Instant>,
@@ -343,10 +355,37 @@ impl Allocation {
         })
     }
 
+    /// Count one relayed packet of `n` payload bytes, client→peer.
     pub fn add_bytes(&self, n: u64) {
         self.bytes_relayed.fetch_add(n, Ordering::Relaxed);
         self.packets_relayed.fetch_add(1, Ordering::Relaxed);
         self.bandwidth_window_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count one relayed packet of `n` payload bytes, peer→client. Same totals
+    /// and bandwidth window as [`Self::add_bytes`], plus the direction share.
+    pub fn add_bytes_to_client(&self, n: u64) {
+        self.add_bytes(n);
+        self.bytes_to_client.fetch_add(n, Ordering::Relaxed);
+        self.packets_to_client.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Relayed payload so far, split by direction. Reads four relaxed counters
+    /// that the datapath keeps anyway; nothing here touches the packet path.
+    pub fn usage(&self) -> AllocationUsage {
+        // Direction share first: it can only lag the total, so the subtraction
+        // below cannot go negative even without the saturating guard. The
+        // guard is there anyway because the loads are Relaxed.
+        let to_client_bytes = self.bytes_to_client.load(Ordering::Relaxed);
+        let to_client_packets = self.packets_to_client.load(Ordering::Relaxed);
+        let bytes = self.bytes_relayed.load(Ordering::Relaxed);
+        let packets = self.packets_relayed.load(Ordering::Relaxed);
+        AllocationUsage {
+            bytes_from_client: bytes.saturating_sub(to_client_bytes),
+            packets_from_client: packets.saturating_sub(to_client_packets),
+            bytes_to_client: to_client_bytes,
+            packets_to_client: to_client_packets,
+        }
     }
 
     /// Check if bandwidth quota is exceeded. Returns current bps.
@@ -1099,6 +1138,12 @@ pub struct AllocationStore {
     /// `Arc<Metrics>` — so the crate stays free of a `turna-health` dependency
     /// (same rationale as `dropped_writes`).
     tenant_traffic: std::sync::Mutex<std::collections::HashMap<String, TenantTraffic>>,
+    /// Optional sink for usage (accounting) records. `None` — the default —
+    /// means no record is built and teardown costs what it did before. Same
+    /// shape as `write_tx`: a bounded channel the node drains elsewhere.
+    usage_tx: OnceLock<mpsc::Sender<UsageRecord>>,
+    /// Usage records dropped because the accounting channel was full.
+    usage_dropped: AtomicU64,
 }
 
 struct CounterReservation<'a> {
@@ -1195,6 +1240,8 @@ impl AllocationStore {
             write_tx: OnceLock::new(),
             dropped_writes: AtomicU64::new(0),
             tenant_traffic: std::sync::Mutex::new(std::collections::HashMap::new()),
+            usage_tx: OnceLock::new(),
+            usage_dropped: AtomicU64::new(0),
         }
     }
 
@@ -1648,6 +1695,63 @@ impl AllocationStore {
         }
     }
 
+    /// Attach the usage-accounting sink. At most once; later calls are
+    /// ignored. Without it no usage record is ever built.
+    pub fn attach_usage_sink(&self, tx: mpsc::Sender<UsageRecord>) {
+        if self.usage_tx.set(tx).is_err() {
+            tracing::warn!("attach_usage_sink called more than once — ignoring");
+        }
+    }
+
+    /// Usage records dropped because the accounting channel was full.
+    pub fn usage_dropped_count(&self) -> u64 {
+        self.usage_dropped.load(Ordering::Relaxed)
+    }
+
+    /// An `Interim` record for every live allocation, cumulative since the
+    /// allocation started on this node. Called by the node's accounting task on
+    /// its interim tick and at shutdown; a read-only pass over the map, like
+    /// `live_relay_ports`.
+    pub fn interim_usage_records(&self) -> Vec<UsageRecord> {
+        let now = epoch_ms();
+        self.allocations
+            .iter()
+            .map(|e| UsageRecord::from_allocation(e.value(), UsageRecordKind::Interim, None, now))
+            .collect()
+    }
+
+    /// Build and queue the `Stop` record for an allocation that is going away.
+    /// Called from `on_allocation_closed`, i.e. every whole-allocation removal.
+    fn emit_usage_stop(&self, alloc: &Allocation, reason: UsageEndReason) {
+        let Some(tx) = self.usage_tx.get() else {
+            return;
+        };
+        let rec =
+            UsageRecord::from_allocation(alloc, UsageRecordKind::Stop, Some(reason), epoch_ms());
+        match tx.try_send(rec) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let prev = self.usage_dropped.fetch_add(1, Ordering::Relaxed);
+                if prev == 0 || (prev + 1).is_power_of_two() {
+                    tracing::warn!(
+                        dropped_total = prev + 1,
+                        "accounting channel full — usage record dropped"
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.usage_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Everything that happens once per allocation teardown, whichever path
+    /// tore it down: tenant totals, then the usage record.
+    fn on_allocation_closed(&self, alloc: &Allocation, reason: UsageEndReason) {
+        self.accrue_tenant_traffic(alloc);
+        self.emit_usage_stop(alloc, reason);
+    }
+
     /// Number of `WriteOp` events that were dropped because the writer's
     /// bounded channel was full. Monotonically increasing.
     pub fn dropped_writes_count(&self) -> u64 {
@@ -1948,8 +2052,11 @@ impl AllocationStore {
             channels_reverse: HashMap::new(),
             expires_at: now + Duration::from_secs(lifetime as u64),
             created_at: now,
+            created_at_ms: epoch_ms(),
             bytes_relayed: AtomicU64::new(0),
             packets_relayed: AtomicU64::new(0),
+            bytes_to_client: AtomicU64::new(0),
+            packets_to_client: AtomicU64::new(0),
             bandwidth_window_bytes: AtomicU64::new(0),
             bandwidth_window_start: Mutex::new(now),
         };
@@ -2153,8 +2260,19 @@ impl AllocationStore {
             channels_reverse: chans_reverse,
             expires_at,
             created_at,
+            // The persisted creation time when there is one: a rehydrated
+            // allocation began on the previous owner, and its usage records
+            // should say so. Its byte counters restart at 0 here, which the
+            // record's `node` field makes visible (one segment per owner).
+            created_at_ms: if created_at_ms == 0 {
+                now_epoch
+            } else {
+                created_at_ms
+            },
             bytes_relayed: AtomicU64::new(0),
             packets_relayed: AtomicU64::new(0),
+            bytes_to_client: AtomicU64::new(0),
+            packets_to_client: AtomicU64::new(0),
             bandwidth_window_bytes: AtomicU64::new(0),
             bandwidth_window_start: Mutex::new(now_inst),
         };
@@ -2355,7 +2473,7 @@ impl AllocationStore {
                 // here and leaking the relay port until restart. Runs with no
                 // `allocations` guard held.
                 self.release_counters(&alloc.realm, alloc.tenant_id.as_deref(), &alloc.username);
-                self.accrue_tenant_traffic(&alloc);
+                self.on_allocation_closed(&alloc, UsageEndReason::MigrationLost);
                 for ch in &channels {
                     self.channel_to_client.remove(&(relay_port, *ch));
                 }
@@ -2578,7 +2696,14 @@ impl AllocationStore {
     ) -> Result<(), SessionError> {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
             self.release_counters(&alloc.realm, alloc.tenant_id.as_deref(), &alloc.username);
-            self.accrue_tenant_traffic(&alloc);
+            // Expired vs released: `remove` serves both the sweep (which only
+            // removes what has expired) and an explicit Refresh(lifetime=0).
+            let reason = if alloc.is_expired() {
+                UsageEndReason::Expired
+            } else {
+                UsageEndReason::Released
+            };
+            self.on_allocation_closed(&alloc, reason);
             for &ch in alloc.channel_bindings.keys() {
                 self.channel_to_client.remove(&(relay_addr.port(), ch));
             }
@@ -2770,7 +2895,7 @@ impl AllocationStore {
     pub fn force_remove(&self, client_addr: &std::net::SocketAddr) {
         if let Some((_, alloc)) = self.allocations.remove(client_addr) {
             self.release_counters(&alloc.realm, alloc.tenant_id.as_deref(), &alloc.username);
-            self.accrue_tenant_traffic(&alloc);
+            self.on_allocation_closed(&alloc, UsageEndReason::AdminDeleted);
             self.relay_to_client.remove(&alloc.relay_addr);
             self.id_to_client.remove(&alloc.allocation_id);
             for &ch in alloc.channel_bindings.keys() {

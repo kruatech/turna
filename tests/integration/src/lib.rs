@@ -2858,3 +2858,150 @@ fn metric_value(health: &SocketAddr, name: &str) -> f64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0)
 }
+
+/// Usage accounting through the real binary: an Allocate followed by a
+/// Refresh(lifetime = 0) produces one `stop` record with reason `released` in
+/// the JSON-lines file, and the metric counts it.
+#[cfg(test)]
+mod accounting_it {
+    use super::*;
+
+    #[tokio::test]
+    async fn released_allocation_writes_a_stop_record() {
+        let bin = node_binary();
+        if !bin.exists() {
+            eprintln!("skipping: {bin:?} not built — run `cargo build -p turna-node`");
+            return;
+        }
+        let turn_port = free_port(true);
+        let health_port = free_port(false);
+        let dir = std::env::temp_dir().join(format!("turna-acct-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let usage = dir.join("usage.jsonl");
+        let cfg_path = dir.join("turn.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "production = false\n\
+                 [turn]\n\
+                 listen = \"127.0.0.1:{turn_port}\"\n\
+                 external_ip = \"127.0.0.1\"\n\
+                 realm = \"turna\"\n\
+                 transport = \"tokio\"\n\
+                 [[turn.auth.static_users]]\n\
+                 username = \"testuser\"\n\
+                 password = \"testpass\"\n\
+                 [turn.relay]\n\
+                 min_port = 24800\n\
+                 max_port = 24900\n\
+                 max_allocations = 32\n\
+                 [turn.accounting]\n\
+                 enabled = true\n\
+                 [turn.accounting.file]\n\
+                 path = \"{}\"\n\
+                 [health]\n\
+                 listen = \"127.0.0.1:{health_port}\"\n",
+                usage.display()
+            ),
+        )
+        .expect("write config");
+
+        let mut child = std::process::Command::new(&bin)
+            .arg(&cfg_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn node");
+        let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !http_ready(&health) {
+            assert!(
+                std::time::Instant::now() < deadline
+                    && child.try_wait().expect("try_wait").is_none(),
+                "node with [turn.accounting] did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let target: SocketAddr = format!("127.0.0.1:{turn_port}").parse().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let (resp, _) = send_recv(&socket, target, &probe.encode(), 2000)
+            .await
+            .expect("probe answered");
+        let realm = extract_realm(&resp).expect("realm");
+        let nonce = extract_nonce(&resp).expect("nonce");
+        let key = long_term_key("testuser", &realm, "testpass");
+
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username("testuser");
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let (resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
+            .expect("allocate answered");
+        assert!(
+            is_success(&resp),
+            "Allocate: {:?}",
+            extract_error_code(&resp)
+        );
+        let nonce2 = extract_nonce(&resp).unwrap_or(nonce);
+
+        let mut del = TurnMsg::request(0x0004);
+        del.add_lifetime(0);
+        del.add_username("testuser");
+        del.add_realm(&realm);
+        del.add_nonce(&nonce2);
+        let (resp, _) = send_recv(&socket, target, &del.encode_with_integrity(&key), 2000)
+            .await
+            .expect("refresh answered");
+        assert!(
+            is_success(&resp),
+            "Refresh(0): {:?}",
+            extract_error_code(&resp)
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut text = String::new();
+        while std::time::Instant::now() < deadline {
+            text = std::fs::read_to_string(&usage).unwrap_or_default();
+            if text.contains("\"type\":\"stop\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Metrics are mirrored on a 5 s tick.
+        let deadline = std::time::Instant::now() + Duration::from_secs(12);
+        let mut stops = 0.0;
+        while std::time::Instant::now() < deadline {
+            stops = metric_value(&health, "turna_accounting_records_total{type=\"stop\"}");
+            if stops >= 1.0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let line = text
+            .lines()
+            .find(|l| l.contains("\"type\":\"stop\""))
+            .unwrap_or_else(|| panic!("no stop record in the accounting file:\n{text}"));
+        assert!(line.contains("\"username\":\"testuser\""), "{line}");
+        assert!(line.contains("\"end_reason\":\"released\""), "{line}");
+        assert!(line.contains("\"transport\":\"udp\""), "{line}");
+        assert!(
+            !line.contains("client_addr"),
+            "include_addresses defaults to false: {line}"
+        );
+        assert!(
+            stops >= 1.0,
+            "turna_accounting_records_total{{type=\"stop\"}} = {stops}"
+        );
+    }
+}

@@ -533,6 +533,95 @@ describe, and syslog puts them where a compromised node cannot reach them.
 
 ---
 
+## `[turn.accounting]` — usage records for billing
+
+Off by default. When enabled, every allocation that ends produces a `stop`
+record, and — with `interim_interval_secs` — every live allocation produces an
+`interim` record on that interval. On a clean shutdown each still-live
+allocation gets a final `interim` record, because no `stop` will follow on this
+node.
+
+```toml
+[turn.accounting]
+enabled = true
+interim_interval_secs = 300     # 0 = stop records only; otherwise >= 60
+include_addresses = false       # client IP:port in each record
+queue_capacity = 10000
+
+[turn.accounting.file]          # JSON lines; SIGHUP reopens (rotate externally)
+path = "/var/lib/turna/usage.jsonl"
+
+[turn.accounting.webhook]       # POST batches as a JSON array
+url = "https://billing.example/v1/turn-usage"
+authorization = "Bearer ${TURNA_ACCOUNTING_TOKEN}"
+batch_size = 100
+flush_interval_secs = 5
+max_retries = 5                 # backoff 1, 2, 4 … 60 s
+timeout_secs = 10
+max_pending_batches = 64
+```
+
+| key | default | notes |
+|-----|---------|-------|
+| `enabled` | `false` | Refused with neither a file nor a webhook. |
+| `interim_interval_secs` | `0` | `0` or `>= 60`. |
+| `include_addresses` | `false` | Off because an address is personal data with its own retention rules, and billing needs the user and the bytes. |
+| `queue_capacity` | `10000` | Datapath→dispatcher queue. Full = record dropped and counted, never a stalled teardown. |
+| `file.path` | `""` | Created `0640`. The node refuses to start if it cannot be opened. |
+| `webhook.url` | `""` | `http://` or `https://` (system trust store). Plain `http://` warns under `production = true`. |
+| `webhook.authorization` | `""` | Sent as the `Authorization` header. `${VAR}`/`file:///` substitution applies; `--dump-config` masks it. |
+| `webhook.batch_size` | `100` | 1..=10000 records per POST. |
+| `webhook.flush_interval_secs` | `5` | Longest a record waits for its batch. |
+| `webhook.max_retries` | `5` | Retries on transport errors, 5xx, 408, 429. Any other 4xx drops the batch immediately. |
+| `webhook.timeout_secs` | `10` | Per request. |
+| `webhook.max_pending_batches` | `64` | Webhook backlog before records are dropped. |
+
+### Record schema (`v = 1`)
+
+One JSON object per line in the file; a JSON array of them per POST.
+
+| field | meaning |
+|-------|---------|
+| `v` | Schema version, `1`. |
+| `record_id` | `<node>:<allocation_id>:<type>:<event_ms>` — deterministic; **deduplicate on it**, delivery is at least once. |
+| `type` | `stop` or `interim`. |
+| `end_reason` | `stop` only: `expired`, `released` (Refresh lifetime 0), `admin_deleted` (management API), `migration_lost`. |
+| `node` | `[cluster] node_id` of the node that relayed the bytes. |
+| `allocation_id` | Stable across RFC 8016 migration and failover. |
+| `username`, `realm` | As authenticated. |
+| `tenant` | `[[tenants]] id`, or `null` for the base realm. |
+| `transport` | Relayed transport: `udp` (RFC 8656) or `tcp` (RFC 6062). The client-leg protocol (UDP/TLS/DTLS/QUIC) is not recorded. |
+| `relay_addr` | The relayed transport address (server side). |
+| `client_addr` | Only with `include_addresses = true`. |
+| `start_ms`, `event_ms` | ms since the Unix epoch: allocation start, and this record's time (the end, for `stop`). |
+| `duration_secs` | `event_ms - start_ms`, whole seconds. |
+| `bytes_from_client`, `packets_from_client` | Payload relayed client → peer. |
+| `bytes_to_client`, `packets_to_client` | Payload relayed peer → client. |
+| `bytes_counted` | `false` for RFC 6062 TCP allocations, whose spliced data path does not feed these counters — their byte fields read 0 and mean "not measured", not "idle". |
+
+**What the byte counts are.** Relayed *payload*: the data inside ChannelData or
+Send/Data indications, excluding TURN framing and STUN control traffic. Each
+direction's payload crosses both legs, so `bytes_from_client` is both "in on the
+client leg" and "out on the peer leg". Packets dropped by the bandwidth quota or
+a missing permission are not counted.
+
+**Segments.** Counters live on the node. An allocation that fails over to
+another node restarts at 0 there and its records carry that node's `node`, so
+sum per `(allocation_id, node)`. `interim` records are cumulative for their
+segment — take the latest, do not add them up.
+
+**Cost.** Nothing new on the ChannelData hot path except the peer→client
+direction share (two relaxed atomic increments on the peer→client path; the
+client→peer figure is derived). Records are built at teardown and on the interim
+tick, never per packet.
+
+The same direction split now fills the gRPC `TrafficStats.bytes_to_client` /
+`packets_to_client` fields of `ListAllocations`/`WatchAllocations`, which read
+`0` before; `bytes_from_client` is now client→peer only (it used to carry both
+directions).
+
+---
+
 ## Metrics (Prometheus)
 
 Exposed on `[health].listen` `/metrics`. Transport-relevant series:

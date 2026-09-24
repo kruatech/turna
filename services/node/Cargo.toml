@@ -52,3 +52,10 @@ serde.workspace = true
 serde_json.workspace = true
 # PR A (task 2.4): system resource metrics in heartbeat.
 sysinfo = "0.39"
+# Usage-accounting webhook ([turn.accounting.webhook]). Already in the workspace
+# graph through turna-admin, so no new crate or licence enters Cargo.lock.
+# `rustls-no-provider` rather than `rustls`: the latter pins aws-lc-rs, and this
+# binary's rustls uses ring everywhere (turna-transport). accounting.rs installs
+# ring as the process default before building the client.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

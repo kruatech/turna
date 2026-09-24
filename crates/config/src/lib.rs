@@ -348,6 +348,68 @@ impl TurnaConfig {
             }
         }
 
+        // Usage accounting.
+        {
+            let a = &self.turn.accounting;
+            if a.enabled {
+                if a.file.path.is_empty() && a.webhook.url.is_empty() {
+                    errors.push(
+                        "[turn.accounting] enabled = true with neither file.path nor \
+                         webhook.url: records would be built and thrown away"
+                            .into(),
+                    );
+                }
+                if a.interim_interval_secs != 0 && a.interim_interval_secs < 60 {
+                    errors.push(format!(
+                        "[turn.accounting] interim_interval_secs = {} must be 0 (off) or \
+                         at least 60",
+                        a.interim_interval_secs
+                    ));
+                }
+                if a.queue_capacity == 0 {
+                    errors.push("[turn.accounting] queue_capacity must be > 0".into());
+                }
+                let w = &a.webhook;
+                if !w.url.is_empty() {
+                    if !(w.url.starts_with("http://") || w.url.starts_with("https://")) {
+                        errors.push(format!(
+                            "[turn.accounting.webhook] url = {:?} must start with http:// \
+                             or https://",
+                            w.url
+                        ));
+                    }
+                    if w.batch_size == 0 || w.batch_size > 10_000 {
+                        errors
+                            .push("[turn.accounting.webhook] batch_size must be 1..=10000".into());
+                    }
+                    if w.flush_interval_secs == 0 || w.timeout_secs == 0 {
+                        errors.push(
+                            "[turn.accounting.webhook] flush_interval_secs and timeout_secs \
+                             must be > 0"
+                                .into(),
+                        );
+                    }
+                    if w.max_pending_batches == 0 {
+                        errors.push(
+                            "[turn.accounting.webhook] max_pending_batches must be > 0".into(),
+                        );
+                    }
+                    if prod && w.url.starts_with("http://") {
+                        warn!(
+                            "[turn.accounting.webhook] url is plain http:// in production: \
+                             usage records (usernames, byte counts) and the authorization \
+                             header travel unencrypted"
+                        );
+                    }
+                }
+            } else if !a.file.path.is_empty() || !a.webhook.url.is_empty() {
+                warn!(
+                    "[turn.accounting] has a sink configured but enabled = false; \
+                     no usage records will be written"
+                );
+            }
+        }
+
         // Check port conflicts
         let all_ports = [
             ("turn", self.turn.listen),
@@ -1128,6 +1190,9 @@ pub struct TurnConfig {
     /// relaying. See `docs/security/peer-filter.md`.
     #[serde(default)]
     pub peer_filter: PeerFilterConfig,
+    /// Usage accounting for billing (`[turn.accounting]`). Off by default.
+    #[serde(default)]
+    pub accounting: AccountingConfig,
 }
 
 impl Default for TurnConfig {
@@ -1154,6 +1219,7 @@ impl Default for TurnConfig {
             tcp_relay: TcpRelaySection::default(),
             rate_limit: RateLimitConfig::default(),
             peer_filter: PeerFilterConfig::default(),
+            accounting: AccountingConfig::default(),
         }
     }
 }
@@ -1924,6 +1990,98 @@ impl Default for LogSyslogSection {
             endpoint: String::new(),
             level: "info".into(),
             queue_capacity: 8192,
+        }
+    }
+}
+
+/// `[turn.accounting]` — per-allocation usage records for billing.
+///
+/// Off by default. When enabled, every allocation that ends produces a `stop`
+/// record (user, realm, tenant, relayed transport, start/end time, payload bytes
+/// and packets in each direction), and optionally an `interim` record every
+/// `interim_interval_secs` while it lives. Records go to a JSON-lines file, an
+/// HTTP(S) webhook, or both. The counters they read are the ones the datapath
+/// already keeps; nothing is added per packet beyond the peer→client direction
+/// share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountingConfig {
+    pub enabled: bool,
+    /// Seconds between interim records for live allocations. 0 (the default)
+    /// sends none; otherwise at least 60.
+    pub interim_interval_secs: u64,
+    /// Put the client's IP:port in each record. Off by default: a billing
+    /// pipeline needs the user and the bytes, and an address is personal data
+    /// with its own retention obligations.
+    pub include_addresses: bool,
+    /// Records buffered between the datapath and the sinks. A full queue drops
+    /// the record and counts it in `turna_accounting_records_dropped_total`
+    /// rather than stalling allocation teardown. Default 10000.
+    pub queue_capacity: usize,
+    #[serde(default)]
+    pub file: AccountingFileConfig,
+    #[serde(default)]
+    pub webhook: AccountingWebhookConfig,
+}
+
+impl Default for AccountingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interim_interval_secs: 0,
+            include_addresses: false,
+            queue_capacity: 10_000,
+            file: AccountingFileConfig::default(),
+            webhook: AccountingWebhookConfig::default(),
+        }
+    }
+}
+
+/// `[turn.accounting.file]` — append one JSON object per line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountingFileConfig {
+    /// Empty disables the file sink. Rotate it externally (the node reopens the
+    /// path on SIGHUP, like the log file).
+    pub path: String,
+}
+
+/// `[turn.accounting.webhook]` — POST batches of records as a JSON array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountingWebhookConfig {
+    /// `http://` or `https://` URL. Empty disables the webhook. HTTPS uses the
+    /// system trust store.
+    pub url: String,
+    /// Sent verbatim as the `Authorization` header when non-empty, e.g.
+    /// `"Bearer ${TURNA_ACCOUNTING_TOKEN}"`. `${VAR}` / `file:///` substitution
+    /// applies; `--dump-config` masks it.
+    pub authorization: String,
+    /// Records per POST. Default 100.
+    pub batch_size: usize,
+    /// Longest a record waits for a batch to fill, in seconds. Default 5.
+    pub flush_interval_secs: u64,
+    /// Attempts after the first failure, with exponential backoff (1 s, 2 s,
+    /// 4 s … capped at 60 s). A batch that still fails is dropped and counted.
+    /// Default 5.
+    pub max_retries: u32,
+    /// Per-request timeout in seconds. Default 10.
+    pub timeout_secs: u64,
+    /// Batches waiting for the sender. Beyond this, records are dropped and
+    /// counted. Default 64.
+    pub max_pending_batches: usize,
+}
+
+impl Default for AccountingWebhookConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            authorization: String::new(),
+            batch_size: 100,
+            flush_interval_secs: 5,
+            max_retries: 5,
+            timeout_secs: 10,
+            max_pending_batches: 64,
         }
     }
 }
@@ -4798,7 +4956,7 @@ shared_secret = \"a-real-secret-not-the-placeholder\"
 }
 
 #[cfg(test)]
-mod log_sink_tests {
+mod ops_config_tests {
     // The env lock is the one `tests` uses: TURNA_PRODUCTION is process-global,
     // and a second lock would let a test there flip production mode under a
     // validation running here.
@@ -4900,5 +5058,55 @@ mod log_sink_tests {
         assert!(msg.contains("log nowhere"), "{msg}");
         cfg.turn.observability.log_file.path = "/var/log/turna/turna.log".into();
         validate_dev(&cfg).unwrap();
+    }
+
+    // ── usage accounting ─────────────────────────────────────────────────
+
+    #[test]
+    fn accounting_is_off_by_default() {
+        let a = AccountingConfig::default();
+        assert!(!a.enabled);
+        assert_eq!(a.interim_interval_secs, 0);
+        assert!(!a.include_addresses);
+        assert!(a.file.path.is_empty() && a.webhook.url.is_empty());
+        validate_dev(&TurnaConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn accounting_section_parses_and_validates() {
+        let cfg: TurnaConfig = toml::from_str(
+            "[turn.accounting]\nenabled = true\ninterim_interval_secs = 300\n\
+             [turn.accounting.file]\npath = \"/var/lib/turna/usage.jsonl\"\n\
+             [turn.accounting.webhook]\nurl = \"https://billing.example/v1/usage\"\n\
+             authorization = \"Bearer x\"\nbatch_size = 50\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.turn.accounting.webhook.batch_size, 50);
+        assert_eq!(cfg.turn.accounting.webhook.max_retries, 5);
+        validate_dev(&cfg).unwrap();
+
+        let mut no_sink = cfg.clone();
+        no_sink.turn.accounting.file.path.clear();
+        no_sink.turn.accounting.webhook.url.clear();
+        assert!(validate_dev(&no_sink)
+            .unwrap_err()
+            .to_string()
+            .contains("neither file.path nor webhook.url"));
+
+        let mut bad = cfg.clone();
+        bad.turn.accounting.interim_interval_secs = 10;
+        bad.turn.accounting.webhook.url = "ftp://x".into();
+        bad.turn.accounting.webhook.batch_size = 0;
+        let msg = validate_dev(&bad).unwrap_err().to_string();
+        assert!(msg.contains("interim_interval_secs"), "{msg}");
+        assert!(msg.contains("http://"), "{msg}");
+        assert!(msg.contains("batch_size"), "{msg}");
+    }
+
+    #[test]
+    fn accounting_rejects_unknown_keys() {
+        let r: std::result::Result<TurnaConfig, _> =
+            toml::from_str("[turn.accounting.webhook]\nuri = \"https://x\"\n");
+        assert!(r.is_err());
     }
 }
