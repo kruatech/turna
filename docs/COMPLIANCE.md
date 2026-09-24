@@ -83,8 +83,9 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   allocation holds an unexpired permission for the peer's IP and the peer filter
   allows it (`PacketProcessor::peer_connection_permitted`, counted in
   `turna_tcp_relay_peer_refused_total`). Before the fix every such connection was
-  announced to the client. **Open, RFC 6062 §5.2:** an outbound CONNECT does not use
-  the relayed address as its local endpoint (see `docs/protocol-gap.md` → RFC 6062).
+  announced to the client. **RFC 6062 §5.2, partly:** an outbound CONNECT now leaves
+  from the relay bind address (`bind_ip` / `bind_ip6`); the relayed *port* is still
+  kernel-chosen (see `docs/protocol-gap.md` → RFC 6062 for why).
   This concerns the turna↔peer leg only. The *client↔turna* leg supports TURNS
   (TURN-over-TLS-over-TCP) via the `tls` feature — verified end-to-end with
   Chrome, Firefox and Safari (see `docs/interop/`).

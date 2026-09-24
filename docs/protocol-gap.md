@@ -303,7 +303,7 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   the v4 listener never serves). **Not exercised at runtime yet**: the development
   container has no IPv6, so the v6 bind path is covered by tests that skip without v6.
   The §5.3 permission check (fixed 2026-09-24, see the RFC 6062 section) applies to
-  both families; the §5.2 local-endpoint gap documented there applies to both too.
+  both families; the §5.2 local-endpoint change (address bound, port still open) applies to both too.
 - **Verified 2026-08-18** (`docs/interop/conformance-2026-08-18.md`): the control
   plane, in both configurations — 440 with `external_ip6` unset, an IPv6 relayed
   address when set, 443 in both directions on a cross-family peer, and all four
@@ -485,15 +485,22 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   unpermitted and filter-denied peers closed and not announced, permitted peer
   announced), the v6 variant in `tcp_relay_ipv6_tests` (skips without IPv6), and an
   end-to-end TURNS probe against a node, `scripts/verify/rfc6062_peer_permission.py`.
-- **Open — §5.2 local endpoint of CONNECT.** "The local endpoint is the relayed
-  transport address associated with the allocation." `TcpRelayManager::handle_connect`
-  uses `TcpStream::connect(peer)`, so the outbound connection leaves from an
-  ephemeral port on whatever address the kernel picks, not from the relayed address
-  the client advertised. A peer that filters or correlates by source address sees a
-  different address than the one in the client's candidate. Fixing it means binding
-  the outbound socket to (relay address, relay port) with `SO_REUSEADDR`/`SO_REUSEPORT`
-  alongside the relayed listener on the same port. Applies to both families. Not
-  fixed.
+- **§5.2 local endpoint of CONNECT — address fixed 2026-09-24, port still open.**
+  "The local endpoint is the relayed transport address associated with the
+  allocation." `TcpRelayManager::handle_connect` used `TcpStream::connect(peer)`, so the
+  kernel chose both source address and port. It now connects through
+  `tcp_relay::connect_from`, bound to the relay bind address of the peer's family
+  (`[turn.relay] bind_ip` / `bind_ip6` — the address the relayed listener and the UDP
+  relay sockets use; unset = wildcard = the kernel's choice, as before). Both families.
+  Test: `connect_source_tests` (a 127.0.0.2 bind is what the peer sees).
+  **Still open: the port.** Linux refuses to bind a second socket to a port that has a
+  listener on it (`EADDRINUSE`, even with `SO_REUSEADDR` — checked on 6.18). It works
+  only with `SO_REUSEPORT` on both sockets, and `SO_REUSEPORT` on the relayed listener
+  would let any other same-UID reuseport listener on that port join its group and
+  receive a share of the incoming SYNs — including a stale listener from an expired
+  allocation during the up-to-5 s before it stops. Not worth that. A peer that
+  correlates the CONNECT source port with the client's relayed candidate will see a
+  different port.
 - **Ingress-transport gating — done**: `handle_allocate` now takes an `ingress_tcp`
   flag. `process` (UDP / SCTP / borrowed-slice ingress) passes `false`; the TURNS
   bridge calls a new `process_tcp_control` which passes `true`. A `REQUESTED-TRANSPORT
