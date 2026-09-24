@@ -1,0 +1,25 @@
+[package]
+name    = "turna-oauth-verify"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "RFC 7635 OAuth verification kit: mint/inspect self-contained tokens and exercise a node"
+
+# The library is what the integration test drives; the binary is the operator's
+# tool (docs/runbooks/oauth-verification.md).
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "turna-oauth-verify"
+path = "src/main.rs"
+
+[dependencies]
+# All already in the workspace graph; this crate adds no package to Cargo.lock
+# beyond itself.
+turna-auth.workspace       = true
+turna-crypto.workspace     = true
+turna-proto-stun.workspace = true
+base64.workspace           = true
+clap = { version = "4", features = ["derive"] }

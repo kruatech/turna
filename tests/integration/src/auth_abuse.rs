@@ -493,3 +493,69 @@ fn auth_webhook_fails_closed_when_the_endpoint_is_down() {
     assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(500));
     assert!(metric_value(&node.health, "turna_auth_webhook_unavailable_total") >= 1.0);
 }
+
+/// The OAuth verification kit against a node with `[turn.auth.oauth]`
+/// (production = false): tokens it mints are accepted through Allocate,
+/// Refresh, CreatePermission and release, responses are signed with the
+/// token's mac_key, and tampered, wrong-key, expired and other-server tokens
+/// are refused. This is the kit's `selftest`; it proves the plumbing, not
+/// interop with a real authorization server (docs/runbooks/oauth-verification.md).
+#[test]
+fn oauth_verification_kit_selftest_passes_against_the_node() {
+    use turna_oauth_verify::{exercise, expect_refused, mint, now_secs, to_hex, ExerciseOptions};
+    let as_rs: [u8; 32] = rand::random();
+    let Some(node) = boot_with_users(
+        &format!(
+            "[turn.auth.oauth]\nenabled = true\nserver_name = \"turn.test\"\n\
+             as_rs_keys = [\"{}\"]\n",
+            to_hex(&as_rs)
+        ),
+        "",
+        "",
+        false,
+    ) else {
+        return;
+    };
+    let timeout = Duration::from_millis(1000);
+    for (mac_len, sha256) in [(20usize, false), (32, true)] {
+        let m = mint(&as_rs, "turn.test", mac_len, now_secs(), 600).unwrap();
+        let steps = exercise(&ExerciseOptions {
+            server: node.turn,
+            token: m.token,
+            mac_key: m.mac_key,
+            kid: None,
+            sha256,
+            peer: "8.8.8.8".parse().unwrap(),
+            timeout,
+            negative: true,
+        });
+        let failed: Vec<String> = steps
+            .iter()
+            .filter(|s| !s.ok)
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            failed.is_empty() && steps.len() >= 7,
+            "kit steps failed:\n{}",
+            failed.join("\n")
+        );
+    }
+    let expired = mint(&as_rs, "turn.test", 20, now_secs() - 7_200, 60).unwrap();
+    let s = expect_refused(
+        node.turn,
+        timeout,
+        &expired.token,
+        &expired.mac_key,
+        "expired",
+    );
+    assert!(s.ok, "{s}");
+    let other = mint(&as_rs, "elsewhere.test", 20, now_secs(), 600).unwrap();
+    let s = expect_refused(
+        node.turn,
+        timeout,
+        &other.token,
+        &other.mac_key,
+        "other server",
+    );
+    assert!(s.ok, "{s}");
+}
