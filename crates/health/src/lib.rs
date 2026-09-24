@@ -314,6 +314,17 @@ pub struct Metrics {
     /// Bans refused because `max_bans` live bans were already in force.
     pub autoban_refused_full: AtomicU64,
 
+    // ── Node-wide bandwidth cap (`[turn.relay] max_total_bytes_per_sec`) ───────
+    /// The configured cap, bytes/second (gauge; 0 = no cap).
+    pub capacity_bytes_per_sec: AtomicU64,
+    /// Relayed packets dropped because the node-wide cap was exhausted.
+    pub capacity_dropped_packets: AtomicU64,
+    /// Bytes in those packets.
+    pub capacity_dropped_bytes: AtomicU64,
+    /// Binding requests without credentials answered with 401 because
+    /// `[turn.auth] require_binding_auth` is on.
+    pub binding_auth_challenges: AtomicU64,
+
     // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
     // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
     // task in the node listeners (the transport crate is leaf-level and cannot
@@ -552,6 +563,10 @@ impl Metrics {
             autoban_dropped: AtomicU64::new(0),
             autoban_active: AtomicU64::new(0),
             autoban_refused_full: AtomicU64::new(0),
+            capacity_bytes_per_sec: AtomicU64::new(0),
+            capacity_dropped_packets: AtomicU64::new(0),
+            capacity_dropped_bytes: AtomicU64::new(0),
+            binding_auth_challenges: AtomicU64::new(0),
             quic_active: AtomicU64::new(0),
             quic_sessions_total: AtomicU64::new(0),
             quic_closed_total: AtomicU64::new(0),
@@ -782,7 +797,8 @@ impl Metrics {
         )
     }
 
-    /// Abuse controls: `[turn.auto_ban]`. Emitted unconditionally (zero while
+    /// Abuse controls: `[turn.auto_ban]`, the node-wide bandwidth cap and
+    /// authenticated Binding. Emitted unconditionally (zero while
     /// the feature is off) so scrapes have a stable series set.
     fn render_abuse_metrics(&self) -> String {
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -798,11 +814,27 @@ impl Metrics {
              turna_autoban_dropped_total {}\n\
              # HELP turna_autoban_refused_full_total Bans not imposed because max_bans live bans were already in force\n\
              # TYPE turna_autoban_refused_full_total counter\n\
-             turna_autoban_refused_full_total {}\n",
+             turna_autoban_refused_full_total {}\n\
+             # HELP turna_relay_capacity_bytes_per_sec Configured node-wide relay bandwidth cap, bytes/second (0 = none)\n\
+             # TYPE turna_relay_capacity_bytes_per_sec gauge\n\
+             turna_relay_capacity_bytes_per_sec {}\n\
+             # HELP turna_relay_capacity_dropped_packets_total Relayed packets dropped because the node-wide bandwidth cap was exhausted\n\
+             # TYPE turna_relay_capacity_dropped_packets_total counter\n\
+             turna_relay_capacity_dropped_packets_total {}\n\
+             # HELP turna_relay_capacity_dropped_bytes_total Bytes in relayed packets dropped by the node-wide bandwidth cap\n\
+             # TYPE turna_relay_capacity_dropped_bytes_total counter\n\
+             turna_relay_capacity_dropped_bytes_total {}\n\
+             # HELP turna_binding_auth_challenges_total Binding requests without credentials challenged because require_binding_auth is on\n\
+             # TYPE turna_binding_auth_challenges_total counter\n\
+             turna_binding_auth_challenges_total {}\n",
             l(&self.autoban_bans),
             l(&self.autoban_active),
             l(&self.autoban_dropped),
             l(&self.autoban_refused_full),
+            l(&self.capacity_bytes_per_sec),
+            l(&self.capacity_dropped_packets),
+            l(&self.capacity_dropped_bytes),
+            l(&self.binding_auth_challenges),
         )
     }
 

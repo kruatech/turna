@@ -28,7 +28,7 @@ pub use processor::{PacketProcessor, RateLimitSettings};
 // adding one just to name a struct of five (burst, rate) pairs is not a trade
 // worth making.
 pub use server::RelayServer;
-pub use turna_qos::TieredLimits;
+pub use turna_qos::{ByteRateLimiter, TieredLimits};
 #[cfg(target_os = "linux")]
 pub mod splice;
 

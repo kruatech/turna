@@ -838,6 +838,8 @@ fn rate_limit_settings(cfg: &turna_config::RateLimitConfig) -> turna_relay::Rate
         trusted: tier(&cfg.trusted),
         trusted_prefixes: cfg.trusted_prefixes.clone(),
         auto_ban: None,
+        bandwidth_cap: None,
+        require_binding_auth: false,
     }
 }
 
@@ -910,6 +912,25 @@ fn run_tokio(
     // on UDP is banned on TURNS, DTLS and QUIC as well. Its sweeper is spawned
     // inside the runtime below.
     rate_limits.auto_ban = auto_ban_table(&config);
+    // `[turn.relay] max_total_bytes_per_sec`: one bucket for the whole node.
+    if config.relay.max_total_bytes_per_sec > 0 {
+        info!(
+            bytes_per_sec = config.relay.max_total_bytes_per_sec,
+            "node-wide relay bandwidth cap active"
+        );
+        rate_limits.bandwidth_cap = Some(Arc::new(turna_relay::ByteRateLimiter::new(
+            config.relay.max_total_bytes_per_sec,
+        )));
+    }
+    metrics.capacity_bytes_per_sec.store(
+        config.relay.max_total_bytes_per_sec,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // `[turn.auth] require_binding_auth` (coturn `secure-stun`).
+    rate_limits.require_binding_auth = config.auth.require_binding_auth;
+    if config.auth.require_binding_auth {
+        info!("STUN Binding requires credentials (require_binding_auth = true)");
+    }
 
     let node_audit = {
         let path = &config.observability.node_audit_path;

@@ -89,6 +89,15 @@ All four read 0 while the feature is off, which is the default.
 | `turna_autoban_dropped_total` | counter | Packets dropped because their source was banned, before any other processing. The cost the bans are saving. |
 | `turna_autoban_refused_full_total` | counter | Bans **not** imposed because `max_bans` live bans were already in force. Non-zero means the table is too small for the attack, or the attack is distributed enough that per-source bans are the wrong tool. |
 
+#### Node-wide bandwidth cap and authenticated Binding
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `turna_relay_capacity_bytes_per_sec` | gauge | `[turn.relay] max_total_bytes_per_sec` as configured; 0 means no cap (the default), in which case the two counters below stay 0 by construction. |
+| `turna_relay_capacity_dropped_packets_total` | counter | Relayed packets (either direction) dropped because the node-wide byte bucket was empty. Any sustained rate means every call on the node is losing media — the cap is doing its job, but it is the users who feel it. |
+| `turna_relay_capacity_dropped_bytes_total` | counter | Bytes in those packets. Divided by the interval, how far over the cap demand is. |
+| `turna_binding_auth_challenges_total` | counter | Binding requests without credentials answered with 401 because `[turn.auth] require_binding_auth` is on. A steady rate after enabling it usually means a client that uses this node as its STUN server — the case the option breaks. |
+
 ### RTP/QoS metrics
 
 | Metric | Type | Meaning |

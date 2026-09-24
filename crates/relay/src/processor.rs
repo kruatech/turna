@@ -554,6 +554,10 @@ pub struct PacketProcessor {
     trusted_prefixes: Vec<crate::peer_filter::Cidr>,
     /// `[turn.auto_ban]`. `None` unless configured; see [`crate::abuse`].
     auto_ban: Option<Arc<crate::abuse::AutoBan>>,
+    /// `[turn.relay] max_total_bytes_per_sec`. `None` unless configured.
+    bandwidth_cap: Option<Arc<turna_qos::ByteRateLimiter>>,
+    /// `[turn.auth] require_binding_auth`.
+    require_binding_auth: bool,
     /// Budget for replies sent to an address that has not authenticated:
     /// Binding responses and 401 challenges.
     ///
@@ -612,6 +616,14 @@ pub struct RateLimitSettings {
     /// the AF_XDP loop and the QUIC/DTLS processor beside io_uring — and the
     /// table is shared (`Arc`) so a ban on one path is a ban on all of them.
     pub auto_ban: Option<Arc<crate::abuse::AutoBan>>,
+    /// `[turn.relay] max_total_bytes_per_sec`: one byte budget for everything
+    /// the node relays, both directions, all datapaths. `None` (the default) is
+    /// no cap. Shared (`Arc`) for the same reason as `auto_ban`.
+    pub bandwidth_cap: Option<Arc<turna_qos::ByteRateLimiter>>,
+    /// `[turn.auth] require_binding_auth` (coturn's `secure-stun`): a Binding
+    /// without MESSAGE-INTEGRITY is challenged with 401 instead of answered.
+    /// `false` (the default) keeps anonymous Binding.
+    pub require_binding_auth: bool,
 }
 
 impl RateLimitSettings {
@@ -695,7 +707,27 @@ impl PacketProcessor {
             Some(TieredRateLimiter::new(settings.trusted))
         };
         self.auto_ban = settings.auto_ban.clone();
+        self.bandwidth_cap = settings.bandwidth_cap.clone();
+        self.require_binding_auth = settings.require_binding_auth;
         self
+    }
+
+    /// Node-wide bandwidth cap: may `len` more relayed bytes go out? Always
+    /// true when no cap is configured.
+    #[inline]
+    fn within_capacity(&self, len: usize) -> bool {
+        match &self.bandwidth_cap {
+            Some(cap) if !cap.try_consume(len as u64) => {
+                self.metrics
+                    .capacity_dropped_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .capacity_dropped_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                false
+            }
+            _ => true,
+        }
     }
 
     /// Count one offence against `src` for `[turn.auto_ban]`, and announce the
@@ -801,6 +833,8 @@ impl PacketProcessor {
             trusted_limiter: None,
             trusted_prefixes: Vec::new(),
             auto_ban: None,
+            bandwidth_cap: None,
+            require_binding_auth: false,
             // (64, 8): a legitimate client needs single digits of these, ever.
             // Only `per_ip` is consulted; the other tiers are set to the same
             // values rather than left at their generous defaults so that a
@@ -1166,6 +1200,9 @@ impl PacketProcessor {
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
+        if !self.within_capacity(data.len()) {
+            return vec![Action::None];
+        }
         alloc.add_bytes(data.len() as u64);
         let ca = alloc.client_addr;
         let channel = alloc.get_peer_channel(&peer_addr);
@@ -1242,6 +1279,9 @@ impl PacketProcessor {
         if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
             debug!(src = %loggable_addr(&src), "bandwidth quota exceeded, dropping packet");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if !self.within_capacity(data_slice.len()) {
             return None;
         }
 
@@ -1572,12 +1612,34 @@ impl PacketProcessor {
         // SHA-1 variant let a SHA256-only Binding through unauthenticated (I6).
         let has_integrity =
             msg.get_message_integrity().is_some() || msg.get_message_integrity_sha256().is_some();
-        if has_integrity && self.auth_validate(msg, raw).is_err() {
-            self.metrics
-                .auth_failures
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return self.encode_auth_challenge(msg, src);
+        if self.require_binding_auth {
+            // coturn's `secure-stun`: Binding is served only to a client that
+            // holds credentials, with the same nonce discipline as Allocate.
+            // The 401 below spends the same unauthenticated-reply budget
+            // (checked above) as any other challenge.
+            if !has_integrity || msg.get_username().is_none() {
+                self.metrics
+                    .binding_auth_challenges
+                    .fetch_add(1, Ordering::Relaxed);
+                return self.encode_auth_challenge(msg, src);
+            }
+            if let Some(stale) = self.validate_nonce(msg, src) {
+                return stale;
+            }
         }
+        let binding_key = if has_integrity {
+            match self.auth_validate(msg, raw) {
+                Ok(r) => Some(r.key),
+                Err(_) => {
+                    // Counted, but never auto-ban evidence: without the nonce
+                    // check above this source address may be forged.
+                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    return self.encode_auth_challenge(msg, src);
+                }
+            }
+        } else {
+            None
+        };
 
         let mut resp = StunMessage::with_transaction_id(
             Method::Binding,
@@ -1599,7 +1661,15 @@ impl PacketProcessor {
         }
 
         let mut buf = [0u8; 256];
-        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
+        // An authenticated Binding gets an authenticated answer (RFC 8489
+        // §9.2.4) when the operator requires authentication. Otherwise the
+        // response is left exactly as it was, unsigned, so existing clients see
+        // no change.
+        let encoded = match (&binding_key, self.require_binding_auth) {
+            (Some(key), true) => encode_with_integrity_auto(&resp, &mut buf, key, msg),
+            _ => resp.encode(&mut buf),
+        };
+        let len = encode_or_drop!(encoded, vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -2709,6 +2779,9 @@ impl PacketProcessor {
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
+        if !self.within_capacity(data.len()) {
+            return vec![Action::None];
+        }
 
         alloc.add_bytes(data.len() as u64);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -3235,6 +3308,8 @@ mod auto_ban_tests {
             trusted: TieredLimits::default(),
             trusted_prefixes: Vec::new(),
             auto_ban: Some(ban),
+            bandwidth_cap: None,
+            require_binding_auth: false,
         })
     }
 
@@ -3338,5 +3413,213 @@ mod auto_ban_tests {
         }
         assert!(answered(&p.process(binding(), src)));
         assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// `[turn.relay] max_total_bytes_per_sec` and `[turn.auth] require_binding_auth`.
+#[cfg(test)]
+mod capacity_and_binding_auth_tests {
+    use super::*;
+
+    fn password() -> &'static str {
+        static PW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PW.get_or_init(|| {
+            turna_crypto::random_key_32()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+    }
+
+    fn processor(cap: Option<u64>, require_binding_auth: bool) -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(27000, 27999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "cap-test",
+                [("carol", password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: None,
+            bandwidth_cap: cap.map(|c| Arc::new(turna_qos::ByteRateLimiter::with_burst(c, c))),
+            require_binding_auth,
+        })
+    }
+
+    fn send_indication(peer: SocketAddr, payload: &[u8]) -> Bytes {
+        let mut msg = StunMessage::new(Method::Send, MessageClass::Indication);
+        msg.attributes.push(Attribute::XorPeerAddress(peer));
+        msg.attributes.push(Attribute::Data(payload.to_vec()));
+        let mut buf = [0u8; 1500];
+        let n = msg.encode(&mut buf).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn relayed(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendViaRelay { .. }))
+    }
+
+    /// The cap is node-wide: two allocations share one budget, and what is over
+    /// it is dropped and counted.
+    #[test]
+    fn node_wide_cap_is_shared_across_allocations_and_drops_the_excess() {
+        let p = processor(Some(2_000), false);
+        let peer: SocketAddr = "8.8.8.8:7000".parse().unwrap();
+        let clients: [SocketAddr; 2] = [
+            "127.0.0.1:50001".parse().unwrap(),
+            "127.0.0.1:50002".parse().unwrap(),
+        ];
+        for (i, c) in clients.iter().enumerate() {
+            let relay: SocketAddr = format!("127.0.0.1:{}", 27000 + i).parse().unwrap();
+            p.store()
+                .create(*c, relay, "carol".into(), vec![1], 600)
+                .unwrap();
+            p.store().add_permission(c, peer.ip()).unwrap();
+        }
+        let payload = [0u8; 600];
+        // 600 + 600 + 600 fits in 2000; the fourth does not, whichever client.
+        assert!(relayed(
+            &p.process(send_indication(peer, &payload), clients[0])
+        ));
+        assert!(relayed(
+            &p.process(send_indication(peer, &payload), clients[1])
+        ));
+        assert!(relayed(
+            &p.process(send_indication(peer, &payload), clients[0])
+        ));
+        assert!(!relayed(
+            &p.process(send_indication(peer, &payload), clients[1])
+        ));
+        assert_eq!(
+            p.metrics.capacity_dropped_packets.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            p.metrics.capacity_dropped_bytes.load(Ordering::Relaxed),
+            600
+        );
+    }
+
+    #[test]
+    fn no_cap_by_default() {
+        let p = processor(None, false);
+        let peer: SocketAddr = "8.8.8.8:7000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:50003".parse().unwrap();
+        p.store()
+            .create(
+                c,
+                "127.0.0.1:27010".parse().unwrap(),
+                "carol".into(),
+                vec![1],
+                600,
+            )
+            .unwrap();
+        p.store().add_permission(&c, peer.ip()).unwrap();
+        for _ in 0..100 {
+            assert!(relayed(&p.process(send_indication(peer, &[0u8; 1200]), c)));
+        }
+    }
+
+    fn binding(creds: Option<(&str, &PacketProcessor, SocketAddr)>) -> Bytes {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        let mut buf = [0u8; 256];
+        let n = match creds {
+            None => msg.encode(&mut buf).unwrap(),
+            Some((nonce_kind, p, src)) => {
+                msg.add(Attribute::Username("carol".into()));
+                msg.add(Attribute::Realm("cap-test".into()));
+                if nonce_kind == "valid" {
+                    msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+                }
+                let key = turna_crypto::long_term_key("carol", "cap-test", password());
+                msg.encode_with_integrity(&mut buf, &key).unwrap()
+            }
+        };
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn error_code(m: &StunMessage) -> Option<u16> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    fn mapped(m: &StunMessage) -> Option<SocketAddr> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::XorMappedAddress(x) => Some(*x),
+            _ => None,
+        })
+    }
+
+    fn reply(actions: &[Action]) -> StunMessage {
+        let data = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("a reply");
+        StunMessage::decode(&data).unwrap()
+    }
+
+    #[test]
+    fn anonymous_binding_is_served_by_default() {
+        let p = processor(None, false);
+        let src: SocketAddr = "203.0.113.1:4000".parse().unwrap();
+        let r = reply(&p.process(binding(None), src));
+        assert!(matches!(r.class, MessageClass::SuccessResponse));
+        assert!(
+            r.get_message_integrity().is_none(),
+            "the default response is unchanged: unsigned"
+        );
+    }
+
+    #[test]
+    fn require_binding_auth_challenges_anonymous_binding() {
+        let p = processor(None, true);
+        let src: SocketAddr = "203.0.113.2:4000".parse().unwrap();
+        let r = reply(&p.process(binding(None), src));
+        assert!(matches!(r.class, MessageClass::ErrorResponse));
+        assert_eq!(error_code(&r), Some(401));
+        assert!(r.get_nonce().is_some() && r.get_realm().is_some());
+        assert_eq!(p.metrics.binding_auth_challenges.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn require_binding_auth_serves_and_signs_an_authenticated_binding() {
+        let p = processor(None, true);
+        let src: SocketAddr = "203.0.113.3:4000".parse().unwrap();
+        let actions = p.process(binding(Some(("valid", &p, src))), src);
+        let data = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let r = StunMessage::decode(&data).unwrap();
+        assert!(matches!(r.class, MessageClass::SuccessResponse));
+        assert_eq!(mapped(&r), Some(src));
+        let key = turna_crypto::long_term_key("carol", "cap-test", password());
+        assert!(
+            r.verify_integrity(&data, &key),
+            "the response must be signed with the client's key"
+        );
+    }
+
+    #[test]
+    fn require_binding_auth_demands_a_nonce() {
+        let p = processor(None, true);
+        let src: SocketAddr = "203.0.113.4:4000".parse().unwrap();
+        let r = reply(&p.process(binding(Some(("none", &p, src))), src));
+        assert!(matches!(r.class, MessageClass::ErrorResponse));
     }
 }

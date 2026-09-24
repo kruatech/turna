@@ -6,6 +6,10 @@
 // audited surface, which is confined to turna-transport and turna-relay.
 #![forbid(unsafe_code)]
 
+pub mod capacity;
+
+pub use capacity::ByteRateLimiter;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Instant;

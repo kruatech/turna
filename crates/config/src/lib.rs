@@ -866,6 +866,15 @@ impl TurnaConfig {
             }
         }
         errors.extend(self.turn.auto_ban.validate());
+        // A node-wide cap below one full-size datagram per second would drop
+        // every packet: that is never what anyone means, so say so at startup.
+        let cap = self.turn.relay.max_total_bytes_per_sec;
+        if cap != 0 && cap < 1_500 {
+            errors.push(format!(
+                "turn.relay.max_total_bytes_per_sec = {cap} is below one 1500-byte packet \
+                 per second, so nothing could be relayed. Use 0 for no cap."
+            ));
+        }
         if self.turn.auto_ban.enabled && self.turn.auto_ban.rate_limit_violations > 0 {
             warn!(
                 "turn.auto_ban.rate_limit_violations is set: a UDP flood can carry any \
@@ -1291,6 +1300,20 @@ pub struct AuthConfig {
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
     pub oauth: OAuthConfig,
+    /// Require credentials on STUN Binding (coturn's `secure-stun`).
+    ///
+    /// Off by default, and it must stay off wherever this node is also the
+    /// STUN server clients use to learn their reflexive address: browsers send
+    /// that Binding unauthenticated, so with this on they get a 401 and no
+    /// server-reflexive candidate. Turn it on for a TURN-only node whose clients
+    /// authenticate Binding (or never send one), to stop the node answering
+    /// anonymous Binding floods at all.
+    ///
+    /// When on: a Binding without MESSAGE-INTEGRITY is challenged with 401
+    /// (REALM + NONCE, from the same unauthenticated-reply budget as every
+    /// challenge); one with credentials must carry a valid NONCE and is answered
+    /// with a response signed with the same MESSAGE-INTEGRITY variant.
+    pub require_binding_auth: bool,
 }
 
 impl Default for AuthConfig {
@@ -1304,6 +1327,7 @@ impl Default for AuthConfig {
             credential_clock_skew_secs: default_credential_clock_skew(),
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
+            require_binding_auth: false,
         }
     }
 }
@@ -1712,6 +1736,19 @@ pub struct RelayConfig {
     /// inside it — see the stall detection in `relay::server::drain`, which now
     /// cuts that case short without shortening the wait for live traffic.
     pub drain_timeout_secs: u64,
+    /// Node-wide cap on relayed bytes per second, both directions and every
+    /// allocation combined. 0 (the default) is no cap.
+    ///
+    /// The node-level counterpart of `quota.max_bytes_per_sec_per_allocation`,
+    /// and the equivalent of coturn's `bps-capacity` — with one difference an
+    /// operator should know: coturn reserves bandwidth per session at
+    /// allocation time and refuses new sessions when it runs out; turna drops
+    /// packets once the node-wide bucket is empty, so existing calls degrade
+    /// together rather than new calls being refused. Burst is one second's
+    /// worth. Dropped traffic is counted in
+    /// `turna_relay_capacity_dropped_{packets,bytes}_total`.
+    #[serde(default)]
+    pub max_total_bytes_per_sec: u64,
 }
 
 impl Default for RelayConfig {
@@ -1728,6 +1765,7 @@ impl Default for RelayConfig {
             rate_soft_percent: 60,
             rate_hard_percent: 80,
             drain_timeout_secs: 30,
+            max_total_bytes_per_sec: 0,
         }
     }
 }
@@ -4804,5 +4842,24 @@ mod abuse_controls_tests {
             .expect_err("bad CIDR must be refused")
             .to_string();
         assert!(err.contains("turn.auto_ban.allowlist"), "{err}");
+    }
+
+    #[test]
+    fn capacity_cap_and_binding_auth_are_off_by_default() {
+        let cfg = parse_dev("").expect("empty config loads");
+        assert_eq!(cfg.turn.relay.max_total_bytes_per_sec, 0);
+        assert!(!cfg.turn.auth.require_binding_auth);
+
+        let cfg = parse_dev(
+            "[turn.auth]\nrequire_binding_auth = true\n[turn.relay]\nmax_total_bytes_per_sec = 125000000\n",
+        )
+        .expect("both keys parse");
+        assert!(cfg.turn.auth.require_binding_auth);
+        assert_eq!(cfg.turn.relay.max_total_bytes_per_sec, 125_000_000);
+
+        let err = parse_dev("[turn.relay]\nmax_total_bytes_per_sec = 10\n")
+            .expect_err("a cap below one packet must be refused")
+            .to_string();
+        assert!(err.contains("max_total_bytes_per_sec"), "{err}");
     }
 }

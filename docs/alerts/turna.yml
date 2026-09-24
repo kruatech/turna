@@ -104,6 +104,24 @@ groups:
             Clients are repeatedly hitting bandwidth quotas. May be normal under
             load, or a sign quotas are too tight for legitimate usage.
 
+      # Node-wide cap ([turn.relay] max_total_bytes_per_sec). Reads 0 while no
+      # cap is configured. Unlike the per-allocation quota above, a drop here
+      # hits every call on the node at once, so any sustained rate is worth a
+      # warning: either demand has outgrown the cap or the cap was set as
+      # admission control, which it is not.
+      - alert: TurnaNodeBandwidthCapDropping
+        expr: rate(turna_relay_capacity_dropped_packets_total[5m]) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna is dropping media at the node-wide bandwidth cap on {{ $labels.instance }}"
+          description: >-
+            Relayed packets are being dropped because the node-wide byte budget
+            (turna_relay_capacity_bytes_per_sec) is exhausted. Every call on this
+            node degrades together. Raise max_total_bytes_per_sec, add capacity,
+            or steer new clients elsewhere.
+
   # ── Relay routing health (io_uring sharded ownership) ───────────────────────
   - name: turna.relay_routing
     rules:

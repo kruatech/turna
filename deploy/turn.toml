@@ -108,6 +108,11 @@ transport   = "tokio"
 shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
 token_ttl     = 86400
 
+# coturn's secure-stun: answer an anonymous STUN Binding with a 401 challenge.
+# Leave off where browsers use this node as their STUN server — they send
+# Binding without credentials and would lose their reflexive candidate.
+# require_binding_auth = false
+
 # Static long-term credentials — uncomment if you want fixed users
 # instead of (or in addition to) shared-secret. When non-empty,
 # AuthMode::LongTerm is selected in main.rs.
@@ -143,6 +148,11 @@ max_allocations = 8192
 [turn.relay.quota]
 max_bytes_per_sec_per_allocation = 0     # 0 = unlimited
 max_per_user      = 100   # 0 = unlimited (NOT recommended for prod)
+
+# Node-wide cap on relayed bytes/second (both directions, all allocations) — the
+# counterpart of coturn's bps-capacity, but packets over it are DROPPED rather
+# than new sessions refused. 0 (default) = no cap. Goes in [turn.relay] above:
+# max_total_bytes_per_sec = 125000000   # ~1 Gbit/s
 
 # =============================================================================
 # [turn.observability] — telemetry & tracing
