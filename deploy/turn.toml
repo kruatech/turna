@@ -126,6 +126,12 @@ token_ttl     = 86400
 # timeout_ms = 2000
 # positive_ttl_secs = 300
 # negative_ttl_secs = 30
+# Per-source budget for lookups a client may start (one host naming random
+# users must not fill the shared queue). Raise for a large office behind one NAT.
+# lookups_per_ip_burst = 16
+# lookups_per_ip_rps = 2
+# lookups_per_prefix_burst = 64
+# lookups_per_prefix_rps = 8
 
 # Static long-term credentials — uncomment if you want fixed users
 # instead of (or in addition to) shared-secret. When non-empty,
@@ -244,6 +250,7 @@ max_spans_per_second = 1000
 # enabled = true
 # auth_failures = 10
 # rate_limit_violations = 0
+# credential_lookups = 20         # [turn.auth.webhook] lookups started per source
 # window_secs = 60
 # ban_secs = 600
 # scope = "ip"                    # or "prefix": count and ban per /24 or /48

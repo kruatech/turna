@@ -79,6 +79,8 @@ in flight are in **[auth-webhook.md](auth-webhook.md)**.
 | `negative_ttl_secs` | u64 | `30` | Cache lifetime of a 404. |
 | `error_ttl_secs` | u64 | `2` | How long a failed lookup keeps failing (500) before it is retried. ≥ 1. |
 | `max_entries` | usize | `100000` | Cap on cached users. |
+| `lookups_per_ip_burst` / `lookups_per_ip_rps` | u32 | `16` / `2` | Per-source-IP budget for lookups a request may **start** (cache hits and joining an in-flight lookup are free). Over it, that source gets 500. Stops one host with a valid NONCE from filling `queue_depth` with random usernames. Raise it for a large office behind one NAT. |
+| `lookups_per_prefix_burst` / `lookups_per_prefix_rps` | u32 | `64` / `8` | The same per /24 (IPv4) or /48 (IPv6). |
 
 ---
 
@@ -374,7 +376,7 @@ IP is required. Readiness follows initialization of every configured queue.
 | `rate_soft_percent` | u64 | `60` | Percent of the above at which `/capacity` reports `DEGRADED`. |
 | `rate_hard_percent` | u64 | `80` | Percent at which it reports `SATURATED`. |
 | `drain_timeout_secs` | u64 | `30` | How long shutdown waits for allocations to end. |
-| `max_total_bytes_per_sec` | u64 | `0` | Node-wide cap on relayed bytes/second, both directions and all allocations combined (coturn `bps-capacity`, different mechanism — see below). `0` = no cap. Values below 1500 are refused. |
+| `max_total_bytes_per_sec` | u64 | `0` | Node-wide cap on relayed bytes/second, both directions and all allocations combined (coturn `bps-capacity`, different mechanism — see below). RFC 6062 TCP-relay data is not counted. `0` = no cap. Values below 1500 are refused. |
 
 **Measure `max_packets_per_sec`; do not estimate it.**
 `scripts/verify/capacity-profile.sh` on the hardware in question. A figure from
@@ -391,9 +393,9 @@ At 80 % that leaves 30 400 pps of headroom before the cliff. At 90 % it would le
 19 200, which at these rates is seconds of traffic growth.
 
 **`max_total_bytes_per_sec` drops, it does not refuse sessions.** One token
-bucket (one second of burst) shared by every allocation and datapath. Once it is
-empty, relayed packets — ChannelData, Send indications and peer→client traffic
-alike — are dropped and counted in `turna_relay_capacity_dropped_packets_total` /
+bucket (one second of burst) shared by every allocation on every packet
+datapath (UDP, TURNS, DTLS, QUIC, SCTP). Once it is empty, relayed packets —
+ChannelData, Send indications and peer→client traffic alike — are dropped and counted in `turna_relay_capacity_dropped_packets_total` /
 `_bytes_total`; the configured figure is exported as
 `turna_relay_capacity_bytes_per_sec`. coturn's `bps-capacity` instead reserves
 bandwidth per session at allocation time and refuses new sessions when it runs
@@ -401,6 +403,13 @@ out. The practical difference: under turna's cap every call on the node degrades
 together, so size it as a ceiling you never expect to reach (a paid egress
 allowance, a shared uplink), not as admission control. Every relayed packet
 updates one shared atomic while the cap is on; it costs nothing when off.
+
+Two limits of the mechanism. **It is first come, first served**: there is no
+fairness between allocations, so a single heavy allocation can spend the budget
+the others needed — bound each one with `max_bytes_per_sec_per_allocation`, and
+use this cap only for the sum. **RFC 6062 TCP-relay data is not counted**: it is
+copied between TCP sockets outside the packet processor, so a node relaying TCP
+peers can exceed the figure by that traffic.
 
 **`drain_timeout_secs` is a bound, not a target.** The drain loop also exits early
 when three consecutive polls remove nothing: a node whose clients vanished without
@@ -633,6 +642,10 @@ only prefixes you route. It is empty by default, because a default that guessed
 at RFC 1918 would hand the higher ceiling to whatever private network happened to
 reach the node.
 
+**Refresh shares the `allocate` tier.** It was the one authenticated method
+without a per-method limit; over the budget it is answered `486` like Allocate. A
+client refreshes every few minutes, so the shared budget costs it nothing.
+
 **No value may be `0`.** Config validation refuses it. A zero refill is a bucket
 that empties once and never fills again, which is never what "0" is meant to
 express, and this limiter has no way to say "unlimited".
@@ -658,6 +671,7 @@ Bans expire on their own; there is no unban command to forget.
 | `enabled` | bool | `false` | Turn the feature on. |
 | `auth_failures` | u32 | `10` | Auth failures in the window that trigger a ban. `0` disables this trigger. |
 | `rate_limit_violations` | u32 | `0` | Rate-limiter refusals in the window that trigger a ban. `0` (default) disables this trigger — see below. |
+| `credential_lookups` | u32 | `20` | `[turn.auth.webhook]` lookups one source starts, or is refused by its lookup budget, in the window that trigger a ban. Joining a lookup already in flight does not count. `0` disables it. Inert without the webhook. |
 | `window_secs` | u64 | `60` | Counting window. Must be > 0 when enabled. |
 | `ban_secs` | u64 | `600` | Ban duration. Must be > 0 when enabled. |
 | `scope` | string | `"ip"` | `"ip"` counts and bans the address; `"prefix"` counts and bans the /24 (IPv4) or /48 (IPv6), for attackers rotating through a block. |
@@ -681,8 +695,16 @@ ChannelBind, CONNECT and ConnectionBind. The nonce is bound to the client addres
 and has to be fetched with a round trip, so this evidence cannot be forged with a
 spoofed source. A Binding with bad MESSAGE-INTEGRITY is deliberately **not**
 counted: it needs no nonce, and counting it would let anyone get a victim banned.
-A credential lookup that is merely pending or unavailable (the auth webhook) is
-not a failure either.
+**`Expired` does not count.** A stale TURN REST credential or OAuth token is a
+client clock or a cached credential, not guessing; it is still counted in
+`turna_auth_failures`. A credential lookup that is merely pending or unavailable
+(the auth webhook) is not a failure either; lookups a source *starts* count
+separately, toward `credential_lookups`.
+
+**Prefix scope and the allowlist.** With `scope = "prefix"` a ban covers the
+whole /24 or /48, but an allowlisted address inside it is still let through.
+Addresses from a dual-stack socket (`::ffff:a.b.c.d`) are treated as the IPv4
+client for keys, prefixes and the allowlist.
 
 **Why `rate_limit_violations` is off by default.** It counts refused packets, and
 a UDP packet can carry any source address. An attacker who can spoof can make the

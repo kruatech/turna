@@ -112,7 +112,8 @@ All read 0 while the webhook is off (the default). See [auth-webhook.md](auth-we
 | `turna_auth_webhook_cache_misses_total` | counter | Requests that had no usable entry and queued a lookup. Concurrent requests for one user queue one lookup. |
 | `turna_auth_webhook_rejected_total` | counter | Lookups that could not be queued (`queue_depth` full, or the cache full of in-flight lookups). Those requests failed closed with 500. Non-zero means the endpoint is too slow for the arrival rate: raise `max_concurrency`, or look at the endpoint. |
 | `turna_auth_webhook_cache_entries` | gauge | Users in the cache (including expired ones not yet swept, every 5 s). Bounded by `max_entries`. |
-| `turna_auth_webhook_deferred_total` | counter | Requests parked unanswered while their user was looked up (UDP clients retransmit; TURNS/SCTP requests are re-processed). Not failures. |
+| `turna_auth_webhook_deferred_total` | counter | Requests parked unanswered while their user was looked up (UDP clients retransmit; TURNS, SCTP and QUIC-stream requests are re-processed). Not failures. |
+| `turna_auth_webhook_throttled_total` | counter | Lookups a source wanted to start but its per-source budget (`lookups_per_*`) refused; that source got 500. Sustained from one address or prefix is someone naming random users — with `[turn.auto_ban]` on, it is also ban evidence. |
 | `turna_auth_webhook_unavailable_total` | counter | Requests refused with `500 Server Error` because the lookup failed or could not be queued. **The number of users the endpoint's trouble turned away.** Not counted in `turna_auth_failures`, and never auto-ban evidence. |
 | `turna_auth_webhook_duration_seconds` | histogram | Endpoint round trip, including timeouts (which land at `timeout_ms`). |
 

@@ -319,6 +319,15 @@ fn binding_stays_anonymous_by_default() {
 /// A minimal credential endpoint for `[turn.auth.webhook]`: `hookuser` is
 /// found (by password), every other name is 404. Counts the requests it served.
 fn webhook_stub(password: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    webhook_stub_delayed(password, Duration::ZERO)
+}
+
+/// As [`webhook_stub`], answering every name that starts with `hookuser` and
+/// holding each answer for `delay` (a slow endpoint).
+fn webhook_stub_delayed(
+    password: String,
+    delay: Duration,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
     use std::io::{Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let url = format!("http://{}/turn/credentials", l.local_addr().unwrap());
@@ -327,44 +336,49 @@ fn webhook_stub(password: String) -> (String, std::sync::Arc<std::sync::atomic::
     std::thread::spawn(move || {
         for s in l.incoming() {
             let Ok(mut s) = s else { continue };
-            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            // Read headers, then the declared body.
-            loop {
-                let n = s.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&buf).to_string();
-                if let Some(h) = text.find("\r\n\r\n") {
-                    let cl = text
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                        })
-                        .unwrap_or(0);
-                    if buf.len() >= h + 4 + cl {
+            let password = password.clone();
+            let hits = hits.clone();
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read headers, then the declared body.
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
                         break;
                     }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let cl = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + cl {
+                            break;
+                        }
+                    }
                 }
-            }
-            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let req = String::from_utf8_lossy(&buf);
-            let (status, body) = if req.contains("\"username\":\"hookuser\"") {
-                ("200 OK", format!("{{\"password\":\"{password}\"}}"))
-            } else {
-                ("404 Not Found", "{}".to_string())
-            };
-            let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let req = String::from_utf8_lossy(&buf);
+                std::thread::sleep(delay);
+                let (status, body) = if req.contains("\"username\":\"hookuser") {
+                    ("200 OK", format!("{{\"password\":\"{password}\"}}"))
+                } else {
+                    ("404 Not Found", "{}".to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = s.write_all(resp.as_bytes());
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
         }
     });
     (url, hits_out)
@@ -558,4 +572,166 @@ fn oauth_verification_kit_selftest_passes_against_the_node() {
         "other server",
     );
     assert!(s.ok, "{s}");
+}
+
+/// A TURNS client driven through `openssl s_client`: STUN messages in, STUN
+/// messages out. `None` when openssl is not installed.
+struct TlsClient {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl TlsClient {
+    fn connect(addr: SocketAddr) -> Option<Self> {
+        use std::io::Read;
+        let mut child = std::process::Command::new("openssl")
+            .args([
+                "s_client",
+                "-connect",
+                &addr.to_string(),
+                "-quiet",
+                "-nocommands",
+                "-verify_quiet",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            // STUN framing: 20-byte header whose bytes 2..4 are the body length.
+            let mut h = [0u8; 20];
+            if stdout.read_exact(&mut h).is_err() {
+                return;
+            }
+            let len = u16::from_be_bytes([h[2], h[3]]) as usize;
+            let mut body = vec![0u8; len];
+            if stdout.read_exact(&mut body).is_err() {
+                return;
+            }
+            let mut msg = h.to_vec();
+            msg.extend(body);
+            if tx.send(msg).is_err() {
+                return;
+            }
+        });
+        Some(Self { child, stdin, rx })
+    }
+
+    fn transact(&mut self, msg: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        use std::io::Write;
+        self.stdin.write_all(msg).ok()?;
+        self.stdin.flush().ok()?;
+        self.rx.recv_timeout(timeout).ok()
+    }
+
+    fn send(&mut self, msg: &[u8]) {
+        use std::io::Write;
+        let _ = self.stdin.write_all(msg);
+        let _ = self.stdin.flush();
+    }
+}
+
+impl Drop for TlsClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// TURNS with a slow credential endpoint: a parked Allocate is answered once
+/// the lookup completes (a TCP client never retransmits), and one whose
+/// connection closes while it is parked leaves no allocation behind.
+#[test]
+fn auth_webhook_over_turns_answers_parked_requests_and_forgets_closed_ones() {
+    let password = std::env::var("TURNA_TEST_PW_V1").expect("source .env.test");
+    let (url, hits) = webhook_stub_delayed(password.clone(), Duration::from_millis(1500));
+    let dir = std::env::temp_dir().join(format!("turna-aa-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    let ok = std::process::Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout",
+        ])
+        .arg(&key)
+        .arg("-out")
+        .arg(&cert)
+        .args(["-subj", "/CN=localhost"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("skipping: openssl not available");
+        return;
+    }
+    let tls_port = free_port(false);
+    let Some(node) = boot_with_users(
+        &format!("[turn.auth.webhook]\nenabled = true\nurl = \"{url}\"\ntimeout_ms = 5000\n"),
+        "",
+        &format!(
+            "[tls]\nenabled = true\nlisten = \"127.0.0.1:{tls_port}\"\ncert_path = \"{}\"\n\
+             key_path = \"{}\"\n",
+            cert.display(),
+            key.display()
+        ),
+        false,
+    ) else {
+        return;
+    };
+    let tls: SocketAddr = format!("127.0.0.1:{tls_port}").parse().unwrap();
+    let t = Duration::from_secs(3);
+
+    let authed = |c: &mut TlsClient, user: &str| -> Option<Vec<u8>> {
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let r = c.transact(&probe.encode(), t)?;
+        let (realm, nonce) = (extract_realm(&r)?, extract_nonce(&r)?);
+        let k = long_term_key(user, &realm, &password);
+        let mut m = TurnMsg::request(0x0003);
+        m.add_requested_transport();
+        m.add_lifetime(600);
+        m.add_username(user);
+        m.add_realm(&realm);
+        m.add_nonce(&nonce);
+        Some(m.encode_with_integrity(&k))
+    };
+
+    // B: parked, then its connection closes before the endpoint answers.
+    let Some(mut b) = TlsClient::connect(tls) else {
+        eprintln!("skipping: openssl s_client unavailable");
+        return;
+    };
+    let req_b = authed(&mut b, "hookuser-b").expect("challenge over TURNS");
+    b.send(&req_b);
+    std::thread::sleep(Duration::from_millis(300));
+    drop(b);
+
+    // A: parked, connection kept, answered when the lookup lands.
+    let mut a = TlsClient::connect(tls).expect("second TLS client");
+    let req_a = authed(&mut a, "hookuser-a").expect("challenge over TURNS");
+    let resp = a
+        .transact(&req_a, Duration::from_secs(5))
+        .expect("the parked Allocate is answered without a retransmission");
+    assert!(
+        is_success(&resp),
+        "allocation for the webhook user over TURNS"
+    );
+
+    // Past B's lookup completing: its re-injected request must have been dropped.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        metric_value(&node.health, "turna_active_allocations"),
+        1.0,
+        "only the open connection holds an allocation"
+    );
+    drop(a);
+    let _ = std::fs::remove_dir_all(&dir);
 }

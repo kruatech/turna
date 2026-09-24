@@ -262,7 +262,9 @@ impl RelayEgress {
                 debug_assert!(false, "ForwardZeroCopy reached the tokio dispatch path");
             }
             // DTLS and QUIC datagrams: the client retransmits, and the
-            // retransmission is served from the credential cache.
+            // retransmission is served from the credential cache. QUIC stream
+            // requests never get here: `QuicBridge` parks and re-processes
+            // them itself.
             Action::AwaitCredentials { .. } => {}
             Action::None => {}
         }

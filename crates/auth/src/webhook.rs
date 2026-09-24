@@ -19,7 +19,7 @@
 //!   the same name share it) and returns `Pending` with a [`Waiter`];
 //! - the processor drops a pending UDP request silently — the client's own STUN
 //!   retransmission (RFC 8489 §6.2.1, 500 ms first RTO) arrives after the fetch
-//!   completes and hits the cache — and hands the waiter to the TURNS/SCTP
+//!   completes and hits the cache — and hands the waiter to the TURNS, SCTP and QUIC-stream
 //!   bridges, whose clients do not retransmit, so they can re-process the same
 //!   request when the answer lands.
 //!
@@ -50,6 +50,9 @@ use crate::UserKeys;
 
 /// RFC 8489 §14.3: USERNAME is less than 513 bytes.
 const MAX_USERNAME_BYTES: usize = 513;
+
+/// Floor on every cache TTL. See [`CredentialCache::complete`].
+const MIN_TTL: Duration = Duration::from_secs(1);
 
 /// Cache tunables, from `[turn.auth.webhook]`.
 #[derive(Debug, Clone)]
@@ -97,19 +100,64 @@ pub enum Lookup {
     Unavailable,
     /// A fetch is in flight; wait on this, then process the request again.
     Pending(Waiter),
+    /// A fetch was needed but the caller's admission check (the per-source
+    /// lookup limit) refused to start one. Nothing was queued or cached.
+    Throttled,
+}
+
+/// Whether a lookup may start an HTTP fetch on a miss.
+#[derive(Clone, Copy)]
+pub enum FetchPolicy<'a> {
+    /// Read the cache only; a miss or an in-flight entry reads as not found.
+    /// For requests whose source address is not proven by a NONCE round trip.
+    Never,
+    /// Start a fetch on a miss.
+    Always,
+    /// Start a fetch on a miss only if this returns true. Called at most once,
+    /// and only when a fetch would actually start — cache hits and requests
+    /// that join an in-flight fetch never consume the caller's budget.
+    Admit(&'a dyn Fn() -> bool),
+}
+
+impl std::fmt::Debug for FetchPolicy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FetchPolicy::Never => "Never",
+            FetchPolicy::Always => "Always",
+            FetchPolicy::Admit(_) => "Admit",
+        })
+    }
 }
 
 /// Resolves when the in-flight fetch it was handed for completes (or its entry
 /// is dropped). Cheap to clone; many requests may wait on one fetch.
 #[derive(Debug, Clone)]
-pub struct Waiter(watch::Receiver<bool>);
+pub struct Waiter {
+    rx: watch::Receiver<bool>,
+    /// `realm \0 username`: identifies the lookup, so callers can coalesce
+    /// everything waiting on the same one.
+    key: Arc<str>,
+    /// True for the one request that started the fetch, false for requests
+    /// that joined it. Lets the caller charge a source once per lookup.
+    started: bool,
+}
 
 impl Waiter {
+    /// Identifies the lookup this waits on (`realm`, NUL, `username`).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Whether this request started the fetch (rather than joining one).
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
     /// Wait for the fetch to finish. Callers bound this with their own timeout.
     pub async fn wait(mut self) {
         // Err means the sender was dropped: the entry was evicted or replaced.
         // Either way there is nothing more to wait for.
-        let _ = self.0.wait_for(|done| *done).await;
+        let _ = self.rx.wait_for(|done| *done).await;
     }
 }
 
@@ -147,6 +195,9 @@ pub struct WebhookStats {
     pub rejected: AtomicU64,
     /// Entries evicted to make room.
     pub evictions: AtomicU64,
+    /// Fetches not started because the caller's admission check (the
+    /// per-source lookup limit) refused.
+    pub throttled: AtomicU64,
 }
 
 /// The shared cache. One per realm that has a webhook (today: the base realm).
@@ -205,11 +256,23 @@ impl CredentialCache {
         self.base.elapsed().as_millis() as u64
     }
 
-    fn answer(&self, slot: &Slot, now_ms: u64) -> Option<Lookup> {
+    fn waiter(&self, rx: watch::Receiver<bool>, username: &str, started: bool) -> Waiter {
+        Waiter {
+            rx,
+            key: format!("{}\0{username}", self.realm).into(),
+            started,
+        }
+    }
+
+    fn answer(&self, username: &str, slot: &Slot, now_ms: u64) -> Option<Lookup> {
         match &slot.state {
             State::InFlight { waiter, .. } => {
                 self.stats.coalesced.fetch_add(1, Ordering::Relaxed);
-                Some(Lookup::Pending(Waiter(waiter.clone())))
+                Some(Lookup::Pending(self.waiter(
+                    waiter.clone(),
+                    username,
+                    false,
+                )))
             }
             _ if slot.expires_ms <= now_ms => None,
             State::Found(keys) => {
@@ -236,7 +299,9 @@ impl CredentialCache {
         match self.entries.get(username) {
             Some(slot) => match &slot.state {
                 State::InFlight { .. } => Lookup::NotFound,
-                _ => self.answer(&slot, now).unwrap_or(Lookup::NotFound),
+                _ => self
+                    .answer(username, &slot, now)
+                    .unwrap_or(Lookup::NotFound),
             },
             None => Lookup::NotFound,
         }
@@ -244,13 +309,31 @@ impl CredentialCache {
 
     /// Consult the cache, starting a fetch on a miss. Never blocks.
     pub fn lookup(&self, username: &str) -> Lookup {
+        self.lookup_with(username, FetchPolicy::Always)
+    }
+
+    /// Consult the cache; whether a miss may start a fetch is `policy`'s call.
+    pub fn lookup_with(&self, username: &str, policy: FetchPolicy<'_>) -> Lookup {
+        let admit = match policy {
+            FetchPolicy::Never => return self.peek(username),
+            FetchPolicy::Always => None,
+            FetchPolicy::Admit(f) => Some(f),
+        };
         if username.is_empty() || username.len() >= MAX_USERNAME_BYTES {
             return Lookup::NotFound;
         }
         let now = self.now_ms();
         if let Some(slot) = self.entries.get(username) {
-            if let Some(answer) = self.answer(&slot, now) {
+            if let Some(answer) = self.answer(username, &slot, now) {
                 return answer;
+            }
+        }
+        // A fetch would start here. Ask the caller's budget first, so a source
+        // naming random users is stopped before it can fill the shared queue.
+        if let Some(admit) = admit {
+            if !admit() {
+                self.stats.throttled.fetch_add(1, Ordering::Relaxed);
+                return Lookup::Throttled;
             }
         }
         // Make room before inserting. The guard above is dropped: DashMap locks
@@ -265,7 +348,7 @@ impl CredentialCache {
         let waiter = match self.entries.entry(username.to_string()) {
             MapEntry::Occupied(mut o) => {
                 // Raced with another request for the same user.
-                if let Some(answer) = self.answer(o.get(), now) {
+                if let Some(answer) = self.answer(username, o.get(), now) {
                     return answer;
                 }
                 let (done, waiter) = watch::channel(false);
@@ -301,7 +384,7 @@ impl CredentialCache {
             self.stats.rejected.fetch_add(1, Ordering::Relaxed);
             return Lookup::Unavailable;
         }
-        Lookup::Pending(Waiter(waiter))
+        Lookup::Pending(self.waiter(waiter, username, true))
     }
 
     /// Record a fetch result and wake its waiters.
@@ -309,6 +392,7 @@ impl CredentialCache {
         let now = self.now_ms();
         let s = &self.settings;
         let (state, ttl) = match outcome {
+            // The endpoint's hint may shorten the cache, never lengthen it.
             FetchOutcome::Found { keys, ttl } => (
                 State::Found(keys),
                 ttl.map(|t| t.min(s.positive_ttl)).unwrap_or(s.positive_ttl),
@@ -316,6 +400,11 @@ impl CredentialCache {
             FetchOutcome::NotFound => (State::NotFound, s.negative_ttl),
             FetchOutcome::Failed => (State::Failed, s.error_ttl),
         };
+        // Never below a second. An answer that is already expired when it is
+        // stored (`"ttl_secs": 0`, or a zero TTL passed by a library user) turns
+        // every retransmission into another miss: the request is parked again,
+        // another HTTP request goes out, and the client is never answered.
+        let ttl = ttl.max(MIN_TTL);
         let expires_ms = now.saturating_add(ttl.as_millis() as u64);
         let previous = match self.entries.get_mut(username) {
             Some(mut slot) => {
@@ -477,16 +566,57 @@ mod tests {
     }
 
     #[test]
-    fn expired_entries_refetch() {
+    fn a_zero_ttl_is_clamped_so_the_answer_is_served() {
         let mut s = settings();
         s.negative_ttl = Duration::from_millis(0);
         let (c, mut rx) = CredentialCache::new("r", s);
         let _ = c.lookup("ghost");
         let _ = rx.try_recv();
         c.complete("ghost", FetchOutcome::NotFound);
-        // TTL 0: already expired, so this is a miss with a new fetch.
-        assert!(matches!(c.lookup("ghost"), Lookup::Pending(_)));
-        assert!(rx.try_recv().is_ok());
+        // Clamped to one second: served from the cache, no second fetch.
+        assert!(matches!(c.lookup("ghost"), Lookup::NotFound));
+        assert!(rx.try_recv().is_err());
+
+        // The endpoint's `"ttl_secs": 0` the same way.
+        let _ = c.lookup("zero");
+        let _ = rx.try_recv();
+        c.complete(
+            "zero",
+            FetchOutcome::Found {
+                keys: keys(),
+                ttl: Some(Duration::ZERO),
+            },
+        );
+        assert!(matches!(c.lookup("zero"), Lookup::Found(_)));
+        assert!(rx.try_recv().is_err(), "no fetch per retransmission");
+    }
+
+    #[test]
+    fn admission_is_asked_only_when_a_fetch_would_start() {
+        let (c, mut rx) = CredentialCache::new("r", settings());
+        let asked = std::cell::Cell::new(0);
+        let deny = || {
+            asked.set(asked.get() + 1);
+            false
+        };
+        assert!(matches!(
+            c.lookup_with("a", FetchPolicy::Admit(&deny)),
+            Lookup::Throttled
+        ));
+        assert!(rx.try_recv().is_err(), "nothing queued");
+        assert!(c.is_empty(), "nothing cached");
+        // Started by someone else: joining it costs no budget.
+        let Lookup::Pending(first) = c.lookup("b") else {
+            panic!()
+        };
+        assert!(first.started());
+        let Lookup::Pending(joined) = c.lookup_with("b", FetchPolicy::Admit(&deny)) else {
+            panic!()
+        };
+        assert!(!joined.started());
+        assert_eq!(joined.key(), first.key());
+        assert_eq!(asked.get(), 1);
+        assert_eq!(c.stats.throttled.load(Ordering::Relaxed), 1);
     }
 
     #[test]

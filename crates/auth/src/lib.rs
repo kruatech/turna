@@ -69,6 +69,11 @@ pub enum AuthError {
     /// is not counted as an auth failure and never feeds auto-ban.
     #[error("credential lookup unavailable")]
     Unavailable,
+    /// `[turn.auth.webhook]`: a lookup was needed and the caller's per-source
+    /// budget refused to start it. Refused like `Unavailable`, but it is the
+    /// source's doing, so the processor counts it as auto-ban evidence.
+    #[error("credential lookup throttled")]
+    Throttled,
 }
 
 // ── TURN auth mode ────────────────────────────────────────────────────────────
@@ -286,18 +291,19 @@ impl Drop for AuthMode {
 impl AuthMode {
     /// Validate a STUN message's credentials. Returns the key on success.
     pub fn validate(&self, msg: &StunMessage, raw: &[u8]) -> Result<Vec<u8>, AuthError> {
-        self.validate_opts(msg, raw, true)
+        self.validate_opts(msg, raw, webhook::FetchPolicy::Always)
     }
 
     /// [`validate`](Self::validate) with control over the credential webhook:
-    /// `allow_fetch = false` consults its cache but never starts an HTTP
-    /// lookup. For requests whose source has not proven itself with a NONCE
-    /// round trip, which must not be able to make the node call out.
+    /// `FetchPolicy::Never` consults its cache but never starts an HTTP lookup
+    /// (for requests whose source has not proven itself with a NONCE round
+    /// trip); `FetchPolicy::Admit` starts one only if the caller's per-source
+    /// budget allows.
     pub fn validate_opts(
         &self,
         msg: &StunMessage,
         raw: &[u8],
-        allow_fetch: bool,
+        fetch: webhook::FetchPolicy<'_>,
     ) -> Result<Vec<u8>, AuthError> {
         // RFC 7635 third-party auth uses an ACCESS-TOKEN, not USERNAME/REALM —
         // handle it before the long-term credential extraction below.
@@ -349,11 +355,7 @@ impl AuthMode {
                     (Some(k), _) => Some(k),
                     (None, None) => None,
                     (None, Some(cache)) => {
-                        let lookup = if allow_fetch {
-                            cache.lookup(username)
-                        } else {
-                            cache.peek(username)
-                        };
+                        let lookup = cache.lookup_with(username, fetch);
                         match lookup {
                             webhook::Lookup::Found(keys) => {
                                 let k = if has_sha256 {
@@ -369,6 +371,7 @@ impl AuthMode {
                             webhook::Lookup::NotFound => None,
                             webhook::Lookup::Unavailable => return Err(AuthError::Unavailable),
                             webhook::Lookup::Pending(w) => return Err(AuthError::Pending(w)),
+                            webhook::Lookup::Throttled => return Err(AuthError::Throttled),
                         }
                     }
                 };
@@ -531,7 +534,7 @@ impl AuthMode {
         msg: &StunMessage,
         raw: &[u8],
     ) -> Result<(Vec<u8>, Option<u32>), AuthError> {
-        self.validate_with_lifetime_opts(msg, raw, true)
+        self.validate_with_lifetime_opts(msg, raw, webhook::FetchPolicy::Always)
     }
 
     /// [`validate_with_lifetime`](Self::validate_with_lifetime) with the
@@ -540,13 +543,13 @@ impl AuthMode {
         &self,
         msg: &StunMessage,
         raw: &[u8],
-        allow_fetch: bool,
+        fetch: webhook::FetchPolicy<'_>,
     ) -> Result<(Vec<u8>, Option<u32>), AuthError> {
         match self {
             AuthMode::OAuth { .. } => self
                 .validate_oauth(msg, raw)
                 .map(|(k, life)| (k, Some(life))),
-            _ => self.validate_opts(msg, raw, allow_fetch).map(|k| (k, None)),
+            _ => self.validate_opts(msg, raw, fetch).map(|k| (k, None)),
         }
     }
 
@@ -1538,7 +1541,7 @@ mod webhook_validate_tests {
         let (m, _cache, mut rx) = mode(&password());
         let (msg, raw) = signed("stranger", &password(), false);
         assert!(matches!(
-            m.validate_opts(&msg, &raw, false),
+            m.validate_opts(&msg, &raw, webhook::FetchPolicy::Never),
             Err(AuthError::InvalidCredentials)
         ));
         assert!(rx.try_recv().is_err());

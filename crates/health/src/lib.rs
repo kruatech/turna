@@ -340,6 +340,8 @@ pub struct Metrics {
     pub auth_webhook_deferred: AtomicU64,
     /// Requests refused with 500 because the lookup failed (fail closed).
     pub auth_webhook_unavailable: AtomicU64,
+    /// Lookups refused by the per-source lookup budget (500 to that source).
+    pub auth_webhook_throttled: AtomicU64,
 
     // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
     // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
@@ -593,6 +595,7 @@ impl Metrics {
             auth_webhook_cache_entries: AtomicU64::new(0),
             auth_webhook_deferred: AtomicU64::new(0),
             auth_webhook_unavailable: AtomicU64::new(0),
+            auth_webhook_throttled: AtomicU64::new(0),
             quic_active: AtomicU64::new(0),
             quic_sessions_total: AtomicU64::new(0),
             quic_closed_total: AtomicU64::new(0),
@@ -882,7 +885,10 @@ impl Metrics {
              turna_auth_webhook_deferred_total {}\n\
              # HELP turna_auth_webhook_unavailable_total Requests refused with 500 because the credential lookup failed (fail closed)\n\
              # TYPE turna_auth_webhook_unavailable_total counter\n\
-             turna_auth_webhook_unavailable_total {}\n",
+             turna_auth_webhook_unavailable_total {}\n\
+             # HELP turna_auth_webhook_throttled_total Credential lookups refused by the per-source lookup budget\n\
+             # TYPE turna_auth_webhook_throttled_total counter\n\
+             turna_auth_webhook_throttled_total {}\n",
             l(&self.autoban_bans),
             l(&self.autoban_active),
             l(&self.autoban_dropped),
@@ -901,6 +907,7 @@ impl Metrics {
             l(&self.auth_webhook_cache_entries),
             l(&self.auth_webhook_deferred),
             l(&self.auth_webhook_unavailable),
+            l(&self.auth_webhook_throttled),
         )
     }
 

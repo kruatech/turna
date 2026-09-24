@@ -1387,7 +1387,7 @@ pub struct OAuthConfig {
 ///
 /// The lookup never runs on the packet path: the datapath consults the cache,
 /// and a miss queues one fetch and parks the request (UDP clients retransmit
-/// into the warm cache; TURNS/SCTP requests are re-processed when the answer
+/// into the warm cache; TURNS, SCTP and QUIC-stream requests are re-processed when the answer
 /// lands). Every failure — timeout, error status, malformed body, full queue —
 /// refuses the request (500) for `error_ttl_secs`: fail closed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1421,6 +1421,16 @@ pub struct WebhookConfig {
     pub error_ttl_secs: u64,
     /// Cap on cached users.
     pub max_entries: usize,
+    /// Per-source budget for lookups a client may start (a cache miss that
+    /// needs an HTTP request): token bucket per source IP ...
+    pub lookups_per_ip_burst: u32,
+    pub lookups_per_ip_rps: u32,
+    /// ... and per /24 (IPv4) or /48 (IPv6). Without it one host with a valid
+    /// NONCE could name random users and fill `queue_depth`, and every uncached
+    /// user on the node would get 500 until the queue drained. Joining a lookup
+    /// already in flight and cache hits cost nothing.
+    pub lookups_per_prefix_burst: u32,
+    pub lookups_per_prefix_rps: u32,
 }
 
 impl Default for WebhookConfig {
@@ -1438,6 +1448,10 @@ impl Default for WebhookConfig {
             negative_ttl_secs: 30,
             error_ttl_secs: 2,
             max_entries: 100_000,
+            lookups_per_ip_burst: 16,
+            lookups_per_ip_rps: 2,
+            lookups_per_prefix_burst: 64,
+            lookups_per_prefix_rps: 8,
         }
     }
 }
@@ -1493,6 +1507,18 @@ impl WebhookConfig {
             errors.push(
                 "turn.auth.webhook.max_concurrency, queue_depth and max_entries must be > 0".into(),
             );
+        }
+        for (name, v) in [
+            ("lookups_per_ip_burst", self.lookups_per_ip_burst),
+            ("lookups_per_ip_rps", self.lookups_per_ip_rps),
+            ("lookups_per_prefix_burst", self.lookups_per_prefix_burst),
+            ("lookups_per_prefix_rps", self.lookups_per_prefix_rps),
+        ] {
+            if v == 0 {
+                errors.push(format!(
+                    "turn.auth.webhook.{name} must be > 0 (a zero bucket would refuse every lookup)"
+                ));
+            }
         }
         // A zero TTL would re-fetch on every packet, and a zero error TTL would
         // let a stream client's re-processed request find no answer and be
@@ -1743,6 +1769,11 @@ pub struct AutoBanConfig {
     /// Rate-limit refusals within the window that trigger a ban. 0 (default)
     /// turns this trigger off.
     pub rate_limit_violations: u32,
+    /// `[turn.auth.webhook]` credential lookups one source starts (or is
+    /// refused by `lookups_per_*`) within the window that trigger a ban. Only
+    /// requests behind a valid NONCE can start one, so this cannot be forged.
+    /// Joining a lookup already in flight does not count. 0 turns it off.
+    pub credential_lookups: u32,
     /// Counting window, seconds.
     pub window_secs: u64,
     /// Ban duration, seconds.
@@ -1769,6 +1800,7 @@ impl Default for AutoBanConfig {
             enabled: false,
             auth_failures: 10,
             rate_limit_violations: 0,
+            credential_lookups: 20,
             window_secs: 60,
             ban_secs: 600,
             scope: "ip".into(),
@@ -1797,10 +1829,14 @@ impl AutoBanConfig {
         if !self.enabled {
             return errors;
         }
-        if self.auth_failures == 0 && self.rate_limit_violations == 0 {
+        if self.auth_failures == 0
+            && self.rate_limit_violations == 0
+            && self.credential_lookups == 0
+        {
             errors.push(
-                "turn.auto_ban.enabled = true but both triggers are 0 \
-                 (auth_failures, rate_limit_violations), so nothing could ever be banned"
+                "turn.auto_ban.enabled = true but every trigger is 0 \
+                 (auth_failures, rate_limit_violations, credential_lookups), so nothing \
+                 could ever be banned"
                     .into(),
             );
         }
@@ -1893,6 +1929,11 @@ pub struct RelayConfig {
     /// together rather than new calls being refused. Burst is one second's
     /// worth. Dropped traffic is counted in
     /// `turna_relay_capacity_dropped_{packets,bytes}_total`.
+    ///
+    /// RFC 6062 TCP-relay data is not counted (it never passes through the
+    /// packet processor), and the budget is first come, first served — no
+    /// fairness between allocations; bound each with
+    /// `quota.max_bytes_per_sec_per_allocation`.
     #[serde(default)]
     pub max_total_bytes_per_sec: u64,
 }
@@ -4968,11 +5009,12 @@ mod abuse_controls_tests {
         assert_eq!(ok.turn.auto_ban.auth_failures, 5);
 
         let err = parse_dev(
-            "[turn.auto_ban]\nenabled = true\nauth_failures = 0\nrate_limit_violations = 0\n",
+            "[turn.auto_ban]\nenabled = true\nauth_failures = 0\nrate_limit_violations = 0\n\
+             credential_lookups = 0\n",
         )
         .expect_err("no trigger must be refused")
         .to_string();
-        assert!(err.contains("both triggers are 0"), "{err}");
+        assert!(err.contains("every trigger is 0"), "{err}");
 
         let err = parse_dev("[turn.auto_ban]\nenabled = true\nban_secs = 0\n")
             .expect_err("zero ban must be refused")
@@ -5061,12 +5103,14 @@ mod abuse_controls_tests {
             timeout_ms: 0,
             error_ttl_secs: 0,
             max_entries: 0,
+            lookups_per_ip_rps: 0,
             ..WebhookConfig::default()
         };
         let e = w.validate(false, false);
         assert!(e.iter().any(|m| m.contains("timeout_ms")), "{e:?}");
         assert!(e.iter().any(|m| m.contains("error_ttl_secs")), "{e:?}");
         assert!(e.iter().any(|m| m.contains("max_entries")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("lookups_per_ip_rps")), "{e:?}");
     }
 
     #[test]

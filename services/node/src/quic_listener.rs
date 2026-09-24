@@ -157,7 +157,11 @@ pub fn spawn_quic(
     // `QuicBridge` takes ownership of the processor handle; keep a clone for the
     // session-close release path below.
     let released = processor.clone();
-    let mut bridge = QuicBridge::new(processor);
+    // Stream requests parked on a credential lookup ([turn.auth.webhook]) come
+    // back through `retry_rx`: QUIC streams are reliable, so the client will not
+    // retransmit them.
+    let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel(256);
+    let mut bridge = QuicBridge::new(processor).with_credential_retry(retry_tx);
     let stats_out = stats.clone();
     tokio::spawn(async move {
         // session_id -> client addr, so SessionClosed (which carries no addr)
@@ -165,7 +169,26 @@ pub fn spawn_quic(
         let mut session_addr: std::collections::HashMap<String, std::net::SocketAddr> =
             std::collections::HashMap::new();
 
-        while let Some(ev) = event_rx.recv().await {
+        enum Incoming {
+            Event(QuicEvent),
+            Retry(turna_relay::quic_bridge::QuicRetry),
+        }
+        loop {
+            let incoming = tokio::select! {
+                ev = event_rx.recv() => ev.map(Incoming::Event),
+                Some(r) = retry_rx.recv() => Some(Incoming::Retry(r)),
+            };
+            let Some(incoming) = incoming else {
+                break;
+            };
+            let ev = match incoming {
+                Incoming::Event(ev) => ev,
+                Incoming::Retry(r) => {
+                    let actions = bridge.reprocess(r);
+                    deliver(&bridge, &egress, &outbound, &stats_out, actions).await;
+                    continue;
+                }
+            };
             // Peek session lifecycle to maintain the cross-transport egress
             // registry (client_sinks), then hand the event to the bridge.
             match &ev {
@@ -311,49 +334,7 @@ pub fn spawn_quic(
                     reg.remove(&failed);
                 }
             }
-            for action in actions {
-                // Relay-plane actions go into the shared relay egress; a control
-                // Send comes back here for delivery over this QUIC session.
-                let Some((data, target)) = egress.dispatch(action).await else {
-                    continue;
-                };
-                let Some(session_id) = bridge.session_for_addr(target) else {
-                    continue; // client gone
-                };
-                let via_datagram = data
-                    .first()
-                    .map(|b| (0x40..=0x7f).contains(b))
-                    .unwrap_or(false);
-                // Control responses go back on the stream the request came in on.
-                let stream_id = if via_datagram {
-                    None
-                } else {
-                    bridge.control_stream_for(&session_id)
-                };
-                // Clone the per-session sender out of the registry without
-                // holding the lock across the send.
-                let sender = outbound
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.get(&session_id).cloned());
-                if let Some(tx) = sender {
-                    // B6: non-blocking enqueue; drop + count on a full queue.
-                    if tx
-                        .try_send(QuicOutbound {
-                            session_id,
-                            data: data.to_vec(),
-                            via_datagram,
-                            finish_stream: false,
-                            stream_id,
-                        })
-                        .is_err()
-                    {
-                        stats_out
-                            .send_errors
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            }
+            deliver(&bridge, &egress, &outbound, &stats_out, actions).await;
         }
         // The consumer's channel closing means the listener is gone, whatever the
         // reason — including a panic, which leaves no other trace. Report it as an
@@ -374,6 +355,62 @@ pub fn spawn_quic(
             consumer_metrics.set_quic_readiness(turna_health::Readiness::Degraded);
         }
     });
+}
+
+/// Deliver the processor's actions for this QUIC listener: relay-plane actions
+/// to the shared egress, control responses back over the originating session
+/// and stream.
+#[cfg(feature = "quic")]
+async fn deliver(
+    bridge: &QuicBridge,
+    egress: &turna_relay::RelayEgress,
+    outbound: &OutboundRegistry,
+    stats_out: &Arc<QuicStats>,
+    actions: Vec<turna_relay::processor::Action>,
+) {
+    for action in actions {
+        // Relay-plane actions go into the shared relay egress; a control
+        // Send comes back here for delivery over this QUIC session.
+        let Some((data, target)) = egress.dispatch(action).await else {
+            continue;
+        };
+        let Some(session_id) = bridge.session_for_addr(target) else {
+            continue; // client gone
+        };
+        let via_datagram = data
+            .first()
+            .map(|b| (0x40..=0x7f).contains(b))
+            .unwrap_or(false);
+        // Control responses go back on the stream the request came in on.
+        let stream_id = if via_datagram {
+            None
+        } else {
+            bridge.control_stream_for(&session_id)
+        };
+        // Clone the per-session sender out of the registry without
+        // holding the lock across the send.
+        let sender = outbound
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&session_id).cloned());
+        if let Some(tx) = sender {
+            // B6: non-blocking enqueue; drop + count on a full queue.
+            if tx
+                .try_send(QuicOutbound {
+                    session_id,
+                    data: data.to_vec(),
+                    via_datagram,
+                    finish_stream: false,
+                    stream_id,
+                })
+                .is_err()
+            {
+                stats_out
+                    .send_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// Drive the configured listener. With the `web-transport` feature the

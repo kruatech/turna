@@ -187,8 +187,9 @@ end-to-end media continuity tests across process/node death.
   its own lifetime; (2) a user not in the cache cannot allocate while the
   endpoint is down or slow — requests fail closed with `500` for
   `error_ttl_secs` at a time; (3) the first request of an uncached user over
-  UDP costs one client retransmission interval, and over QUIC/WebTransport
-  streams it is not answered at all (the client's transaction timeout applies).
+  UDP costs one client retransmission interval; (4) a source over its
+  per-source lookup budget (`lookups_per_*`) is refused (500) until the budget
+  refills, which a large office behind one NAT can hit on a cold cache.
 - **Why it stays:** caching is what keeps the endpoint off the per-request
   path; failing closed is the only safe default for an authentication decision;
   the retransmission cost follows from never blocking the synchronous datapath.
@@ -196,7 +197,7 @@ end-to-end media continuity tests across process/node death.
   endpoint can shorten them per user; `turna_auth_webhook_errors_total` and
   `turna_auth_webhook_unavailable_total` with alert rules make an outage
   visible; static users keep working throughout; TURNS and SCTP requests are
-  re-processed rather than left to time out.
-- **Review by:** when QUIC stream re-processing is added, or if a revocation
-  push channel is ever introduced.
+  re-processed rather than left to time out, and so are QUIC/WebTransport
+  stream messages; the per-source budget is configurable.
+- **Review by:** if a revocation push channel is ever introduced.
 

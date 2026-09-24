@@ -49,8 +49,12 @@ pub(crate) async fn run_sctp_bridge(
     let server = SctpTransportServer::new(cfg)?;
 
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
-    // For re-processing a request parked on a credential lookup.
-    let retry_tx = event_tx.clone();
+    // For re-processing a request parked on a credential lookup. Requests for a
+    // connection that closed meanwhile are dropped by the `owners` check below.
+    let parked: crate::stream_retry::ParkingLot<
+        turna_transport::tcp_tls::TcpConnectionId,
+        TcpTransportEvent,
+    > = crate::stream_retry::ParkingLot::new(event_tx.clone());
     let (sctp_send_tx, sctp_send_rx) = mpsc::channel::<TcpSendCommand>(8192);
 
     let stats = Arc::new(turna_transport::sctp::SctpStats::default());
@@ -237,7 +241,7 @@ pub(crate) async fn run_sctp_bridge(
                                 peer_addr,
                                 data: bytes::BytesMut::from(&retry_raw[..]),
                             };
-                            if !crate::stream_retry::park(wait, &retry_tx, again) {
+                            if !parked.park(wait, conn_id, again) {
                                 debug!(%peer_addr, "credential-wait slots full; request dropped");
                             }
                         }
@@ -251,6 +255,7 @@ pub(crate) async fn run_sctp_bridge(
                 peer_addr,
                 reason,
             } => {
+                parked.forget(conn_id);
                 if owners.remove(&conn_id) != Some(peer_addr) {
                     continue;
                 }

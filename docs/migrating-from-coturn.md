@@ -81,7 +81,7 @@ What is worth porting is any *business* deny/allow list specific to your network
 | `user-quota` | `[turn.relay.quota] max_per_user` |
 | `total-quota` | `[turn.relay] max_allocations` |
 | `max-bps` | `[turn.relay.quota] max_bytes_per_sec_per_allocation` (bytes/second) — `0` is unlimited and is **refused** under `production = true` unless you also set `allow_unlimited_bandwidth = true` |
-| `bps-capacity` | `[turn.relay] max_total_bytes_per_sec` (bytes/second, both directions combined) | **different mechanism**: coturn reserves bandwidth per session at allocation time and refuses new sessions when it is used up; turna drops relayed packets once the node-wide bucket (one second of burst) is empty, so existing calls degrade together instead of new ones being refused. `0` (default) is no cap |
+| `bps-capacity` | `[turn.relay] max_total_bytes_per_sec` (bytes/second, both directions combined) | **different mechanism**: coturn reserves bandwidth per session at allocation time and refuses new sessions when it is used up; turna drops relayed packets once the node-wide bucket (one second of burst) is empty, so existing calls degrade together instead of new ones being refused, first come first served; RFC 6062 TCP-relay data is not counted. `0` (default) is no cap |
 | `unauthorized-ratelimit` (4.14+) | tiered rate limiting is on by default; see the auth-failure metrics |
 | fail2ban on coturn's log | `[turn.auto_ban]` | built in, off by default: bans a source after N nonce-bound auth failures in a window, without a log parser in the loop |
 

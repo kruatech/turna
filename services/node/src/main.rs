@@ -871,6 +871,7 @@ fn rate_limit_settings(cfg: &turna_config::RateLimitConfig) -> turna_relay::Rate
         auto_ban: None,
         bandwidth_cap: None,
         require_binding_auth: false,
+        webhook_lookup_limiter: None,
     }
 }
 
@@ -897,6 +898,7 @@ fn auto_ban_table(config: &TurnConfig) -> Option<Arc<turna_relay::AutoBan>> {
         turna_relay::AutoBanSettings {
             auth_failures: a.auth_failures,
             rate_limit_violations: a.rate_limit_violations,
+            credential_lookups: a.credential_lookups,
             window: Duration::from_secs(a.window_secs),
             ban: Duration::from_secs(a.ban_secs),
             prefix_scope: a.scope == "prefix",
@@ -963,6 +965,21 @@ fn run_tokio(
         config.relay.max_total_bytes_per_sec,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // `[turn.auth.webhook]`: per-source budget for lookups a request may start.
+    if config.auth.webhook.enabled {
+        let w = &config.auth.webhook;
+        rate_limits.webhook_lookup_limiter = Some(Arc::new(turna_relay::TieredRateLimiter::new(
+            turna_relay::TieredLimits {
+                per_ip: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+                per_prefix: (w.lookups_per_prefix_burst, w.lookups_per_prefix_rps),
+                // Unused by the lookup budget; set to the same values so nothing
+                // reaching for them gets an accidental free pass.
+                allocate: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+                create_permission: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+                channel_bind: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+            },
+        )));
+    }
     // `[turn.auth] require_binding_auth` (coturn `secure-stun`).
     rate_limits.require_binding_auth = config.auth.require_binding_auth;
     if config.auth.require_binding_auth {
