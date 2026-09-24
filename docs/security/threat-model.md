@@ -197,6 +197,34 @@ OBSERVABILITY
 - **Controls:** strict schema, production validation, file-secret support,
   masked `--dump-config`.
 
+### 5.8a Credential webhook (`[turn.auth.webhook]`, opt-in)
+
+- **Vector:** the HTTPS call from turna to the operator's signalling service,
+  and the USERNAME an unauthenticated client chooses, which becomes the body of
+  that call.
+- **Risks:**
+  - *Credential disclosure in transit* — the answer carries a user's key or
+    password. Controls: `https://` required in production, system or pinned
+    (`ca_file`) roots, redirects not followed, environment proxies ignored.
+  - *Endpoint impersonation / unauthorised queries* — anyone able to POST to the
+    endpoint could harvest keys. Controls: bearer token and/or HMAC-SHA256
+    request signature with a timestamp (one of them required in production);
+    the endpoint must verify it.
+  - *Amplification / enumeration against the signalling service* — a client
+    naming random users makes turna call out. Controls: a lookup is only started
+    by requests that completed a NONCE round trip (Binding with
+    MESSAGE-INTEGRITY never starts one), per-user coalescing, negative cache,
+    `max_concurrency` + `queue_depth`, the per-IP/prefix/Allocate rate limits,
+    and `[turn.auto_ban]` on the resulting 401s.
+  - *Datapath stall* — none by construction: the packet path only reads the
+    cache; lookups run on separate tasks and the request is parked.
+  - *Endpoint outage* — fail closed (500), never fail open. Cached users keep
+    working until their TTL.
+  - *Log leakage* — the lookup path logs no USERNAME, password, key, token or
+    signature; `--dump-config` masks the token and secret.
+- **Accepted:** revocation lag up to `positive_ttl_secs`; availability of TURN
+  for uncached users depends on the endpoint (RISK-008).
+
 ## 6. Security invariants
 
 - No allocation or relay state is created before credentials validate.

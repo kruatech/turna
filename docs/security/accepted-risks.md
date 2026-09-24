@@ -176,3 +176,27 @@ end-to-end media continuity tests across process/node death.
 - **Review by:** if a cluster-wide ban table is ever added, since that would
   multiply the reach of a forged ban across nodes.
 
+## RISK-008 — auth webhook: cached credentials outlive revocation, and uncached users depend on the endpoint
+
+- **Status:** accepted; applies only with `[turn.auth.webhook] enabled = true`
+  (off by default).
+- **Description:** (1) a user's keys are cached for up to `positive_ttl_secs`
+  (default 300 s, capped per answer by the endpoint's `ttl_secs`), so a user
+  removed or re-keyed in the signalling service can still authenticate against
+  this node until the entry expires, and an allocation already granted runs to
+  its own lifetime; (2) a user not in the cache cannot allocate while the
+  endpoint is down or slow — requests fail closed with `500` for
+  `error_ttl_secs` at a time; (3) the first request of an uncached user over
+  UDP costs one client retransmission interval, and over QUIC/WebTransport
+  streams it is not answered at all (the client's transaction timeout applies).
+- **Why it stays:** caching is what keeps the endpoint off the per-request
+  path; failing closed is the only safe default for an authentication decision;
+  the retransmission cost follows from never blocking the synchronous datapath.
+- **Compensating controls:** TTLs are configurable down to one second and the
+  endpoint can shorten them per user; `turna_auth_webhook_errors_total` and
+  `turna_auth_webhook_unavailable_total` with alert rules make an outage
+  visible; static users keep working throughout; TURNS and SCTP requests are
+  re-processed rather than left to time out.
+- **Review by:** when QUIC stream re-processing is added, or if a revocation
+  push channel is ever introduced.
+

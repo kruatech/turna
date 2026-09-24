@@ -241,6 +241,19 @@ impl HistogramRegistry {
             ),
         );
 
+        // `[turn.auth.webhook]` round trips. Only observed when the webhook is
+        // enabled; an empty histogram otherwise.
+        histograms.insert(
+            "turna_auth_webhook_duration_seconds".into(),
+            Histogram::new(
+                "turna_auth_webhook_duration_seconds",
+                "Credential webhook request latency, including timeouts",
+                vec![
+                    0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
+                ],
+            ),
+        );
+
         histograms.insert(
             "turna_allocation_lifetime_seconds".into(),
             Histogram::new(

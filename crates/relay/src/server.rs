@@ -278,6 +278,9 @@ impl RelayEgress {
             Action::ForwardZeroCopy { .. } => {
                 debug_assert!(false, "ForwardZeroCopy reached the tokio dispatch path");
             }
+            // DTLS and QUIC datagrams: the client retransmits, and the
+            // retransmission is served from the credential cache.
+            Action::AwaitCredentials { .. } => {}
             Action::None => {}
         }
         None
@@ -1180,6 +1183,10 @@ fn spawn_recv_worker(
                         Action::ForwardZeroCopy { .. } => {
                             debug_assert!(false, "ForwardZeroCopy reached the tokio recvmmsg path");
                         }
+                        // UDP: dropped unanswered. The client's STUN
+                        // retransmission arrives after the credential
+                        // lookup and is served from the cache.
+                        Action::AwaitCredentials { .. } => {}
                         Action::None => {}
                     }
                 }

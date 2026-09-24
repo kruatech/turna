@@ -76,3 +76,16 @@ targets. What they say at INFO has not been examined.
 
 Both are follow-up work, and naming them is the point: an audit that implies it
 covered everything is worse than one that says where it stopped.
+
+## Addendum — the credential webhook (added after this audit)
+
+`services/node/src/auth_webhook.rs` (`[turn.auth.webhook]`) was written against
+the two negative results above and keeps them: a failed lookup logs its kind,
+latency and an occurrence count, throttled to powers of two; the USERNAME, a
+returned password or key, the bearer token and the request signature appear in
+no logging macro. The response body, which may hold a plaintext password, is
+zeroized after parsing. `--dump-config` masks `bearer_token` and
+`signing_secret` like the shared secret. The auto-ban events
+(`turna_relay::abuse`) carry the source address through the same
+`log_allocation_addresses` switch as every other client address.
+
