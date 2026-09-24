@@ -208,10 +208,8 @@ impl LogFile {
         let backing_off = st
             .retry_after
             .is_some_and(|t| std::time::Instant::now() < t);
-        if due && !backing_off {
-            if self.rotate(&mut st) {
-                st.period = now_period;
-            }
+        if due && !backing_off && self.rotate(&mut st) {
+            st.period = now_period;
         }
 
         if st.file.is_none() {
