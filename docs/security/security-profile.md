@@ -21,7 +21,7 @@ item with no cost is usually one nobody thought about.
 
 | setting | why |
 |---|---|
-| `[management.rbac] enabled = true` | Without it every management client is an administrator. Note it is default-deny: enabling on a running deployment locks out every client until bound. |
+| `[grpc.rbac] enabled = true` | Without it every management client is an administrator. Note it is default-deny: enabling on a running deployment locks out every client until bound. |
 | `[turn.relay.quota] max_per_user` | A single credential can otherwise consume the whole port range. |
 | Per-IP caps on every enabled transport | `max_connections_per_ip` on TURNS, DTLS, QUIC, SCTP. One source can otherwise hold every slot. |
 | Handshake rate limits | TURNS, QUIC and SCTP support them. DTLS only on the demux path — see below. |

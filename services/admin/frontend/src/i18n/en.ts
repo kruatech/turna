@@ -99,6 +99,8 @@ export const en: Record<string, string> = {
   'nav.collapse': 'Collapse',
   'topbar.paused': 'paused',
   'topbar.nodata': 'no data',
+  'topbar.authRequired': 'Admin token required — the backend rejects reads without it. Polling is paused.',
+  'topbar.enterToken': 'Enter token',
   'topbar.unreachable': 'Node unreachable — showing last known values. Retrying…',
   'ov.activeAlloc': 'Active allocations',
   'ov.bandwidth': 'Bandwidth (relay)',
