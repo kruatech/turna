@@ -101,10 +101,23 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   left-truncation restricted to {16,20,24,28,32} bytes per RFC 8489 §14.6 (rejects
   short/empty tags before comparing); FINGERPRINT = CRC32/ISO-HDLC ⊕ 0x5354554E.
   Unit tests cover tamper / wrong-key / truncated-tag for both. No defect.
-- **Not a defect — correct by omission**: **USERHASH (0x001E)** is not implemented;
-  since it is comprehension-required, the server correctly answers `420` per
-  RFC 8489 §7.3.1. The optional userhash anonymity mechanism (§9.2.4) is simply not
-  supported; a userhash-only client cannot authenticate. Document, don't "fix".
+- **USERHASH (0x001E) — implemented** (RFC 8489 §14.4). `Attribute::UserHash([u8; 32])`,
+  strict 32-byte decode, `StunMessage::get_userhash` / `has_user_identity`. A request
+  naming its user by `SHA-256(username ":" realm)` is authenticated by
+  `AuthMode::validate_identity`, which resolves the hash through an index kept beside
+  the LongTerm user map (`static_users`, runtime-added users, and users rehydrated from
+  the Tarantool `turna_users` space, which arrive via `add_user_keys`). The resolved
+  name is the quota subject. **TURN REST (shared-secret) cannot resolve a USERHASH** —
+  the username embeds an expiry the server never stores, and SHA-256 cannot be
+  inverted — so a hash on that realm is "not valid" per §9.2.4 and answered `401`,
+  as it is for an unknown hash on a LongTerm realm; OAuth likewise. Accepting USERHASH
+  is always on (it replaces a `420` with success). *Advertising* it — the §9.2 nonce
+  cookie `obMatJos2QAAA` with Security Feature bit 1 "Username anonymity" — is opt-in
+  (`[turn.auth] advertise_userhash`, default off) and refused by validation unless every
+  realm is a `static_users` realm. Bit 0 "Password algorithms" stays clear because
+  PASSWORD-ALGORITHMS is not sent (§9.2.5 would make clients give up). OpaqueString is
+  not applied, in parity with the long-term keys (see COMPLIANCE §3); RFC 8489 B.1's
+  userhash value is a unit test (`turna_crypto::userhash_tests`).
 - **Minor**: MESSAGE-INTEGRITY-SHA256 and PASSWORD-ALGORITHM are decoded as
   `Attribute::Unknown` ("Stage 1"), not first-class typed variants — read/verify
   works (and is exercised), there is just no typed *encode* for them.
@@ -118,7 +131,7 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **partial→stable — CLOSED for the codec.** Done: RFC 5769 known-answer vectors
   (`rfc5769_vectors.rs`), no-panic fuzz (`fuzz_decode.rs`), generative IPv6 XOR-address
   roundtrips (`ipv6_roundtrip.rs`), SHA-1/SHA-256 verify **and** sign, integrity
-  compute internals audited, USERHASH decision (correct-by-omission). Typed encode for
+  compute internals audited, USERHASH implemented (see above). Typed encode for
   MI-SHA256/PASSWORD-ALGORITHM is deliberately **not** added — the generic `encode()`
   skips integrity/fingerprint (added separately via `encode_with_integrity*`), so a
   typed variant in the generic loop would be inert; read+verify already work via the
