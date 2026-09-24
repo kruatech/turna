@@ -171,6 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allow_core_dumps = false` closing the dump and `/proc/<pid>/mem` paths, the
   three exposures the audit listed are now addressed.
 
+- Transport: the per-IP DTLS session counters (both listener paths), the
+  io_uring relay-route table, the UDP buffer pool and the hugepage free list use
+  `parking_lot::Mutex` instead of `std::sync::Mutex` + `.lock().unwrap()`. A
+  panic while one of these was held used to poison it, and every later
+  `.unwrap()` on the recv/send path then panicked too. The demux path already
+  ignored poisoning by hand (`into_inner()`); all of them now share the
+  workspace's stated hot-path lock policy.
+
 - **`file://` secrets were read without checking their permissions.** The whole
   point of the indirection is to keep the value out of the config file, and a
   secret mounted at the default 0644 looked exactly as safe as one at 0600 —
