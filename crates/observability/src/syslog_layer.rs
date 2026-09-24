@@ -75,6 +75,7 @@ use crate::syslog::{EventKind, SyslogExporter};
 const SECURITY_TARGETS: &[&str] = &[
     "turna_relay::processor",
     "turna_relay::peer_filter",
+    "turna_relay::abuse",
     "turna_control::grpc",
     "turna_transport::tcp_tls",
     "turna_transport::dtls",
@@ -86,6 +87,9 @@ const SECURITY_TARGETS: &[&str] = &[
 /// Prefixes rather than whole messages: the tail of these lines carries detail
 /// that changes, and matching the whole string would break on an added word.
 const RULES: &[(&str, EventKind)] = &[
+    // First: a ban line mentions rate limits and auth failures in its detail,
+    // and `classify` returns the first match.
+    ("auto-ban", EventKind::SourceBanned),
     ("auth failed", EventKind::AuthFailure),
     ("authentication failed", EventKind::AuthFailure),
     ("stale nonce", EventKind::AuthFailure),
@@ -328,6 +332,12 @@ mod tests {
                 EventKind::RateLimited,
             ),
             ("management audit", EventKind::AuditEntry),
+            // The exact lines turna_relay::abuse writes.
+            ("auto-ban: source banned", EventKind::SourceBanned),
+            (
+                "auto-ban: ban expired, source unbanned",
+                EventKind::SourceBanned,
+            ),
         ];
         for (msg, want) in cases {
             assert_eq!(

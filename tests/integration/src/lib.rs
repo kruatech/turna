@@ -54,6 +54,9 @@ use tokio::net::UdpSocket;
 // test runs, and killed when the test process exits (PR_SET_PDEATHSIG on Linux).
 use std::sync::OnceLock;
 
+#[cfg(test)]
+mod auth_abuse;
+
 struct TestServer {
     addr: SocketAddr,
     _child: Option<std::process::Child>,
@@ -88,6 +91,12 @@ fn free_port(udp: bool) -> u16 {
 }
 
 fn node_binary() -> std::path::PathBuf {
+    // An explicit binary wins. Useful when several checkouts share one
+    // CARGO_TARGET_DIR: workspace crates hash to the same artifact names, so the
+    // `turna-node` next to the test binary may be another checkout's build.
+    if let Some(p) = std::env::var_os("TURNA_NODE_BIN") {
+        return std::path::PathBuf::from(p);
+    }
     // current_exe = <target>/<profile>/deps/<bin>-<hash>;
     // turna-node lives at <target>/<profile>/turna-node.
     let exe = std::env::current_exe().expect("current_exe");
