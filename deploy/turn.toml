@@ -32,8 +32,10 @@ listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
 # More UDP addresses to serve, in addition to `listen` — coturn's repeated
 # `listening-ip`. Each is a full address, so a second interface may use another
 # port. Replies and relayed data for a client leave from the listener it used.
-# tokio datapath only (io_uring / AF_XDP refuse it at startup), and a wildcard
-# address cannot share a port with a specific one.
+# tokio datapath only (io_uring / AF_XDP refuse it at startup), a wildcard
+# address cannot share a port with a specific one, and it cannot be combined
+# with [turn.migration] (RFC 8016 mobility).
+#
 # listen_extra = ["198.51.100.20:3478", "10.0.0.5:3478"]
 # SO_RCVBUF / SO_SNDBUF for the listener and every relay socket, in bytes.
 # 0 = leave the kernel default, which is what every release before 0.5.0 did.

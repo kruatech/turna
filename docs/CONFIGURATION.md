@@ -57,15 +57,26 @@ Rules, all checked at startup:
 - No duplicates, and no wildcard address (`0.0.0.0` / `[::]`) on the same port
   as another listener. With `SO_REUSEPORT` the kernel would accept both binds and
   split one address's traffic between them.
-- A port may not equal `[health]`'s or `[management]`'s, the same rule `listen`
-  has. An address that cannot be bound aborts startup.
+- No overlap with the other **UDP** listeners that are enabled — `[turn.dtls]`
+  and `[turn.quic]` — on the same port and the same address (or a wildcard on
+  either side). TCP listeners (`[health]`, `[management]`, `[tls]`,
+  `[turn.tcp]`) and SCTP are other protocols and do not conflict. An address
+  that cannot be bound aborts startup.
+- **Not combinable with `[turn.migration] enabled = true`** (RFC 8016
+  mobility). The socket an allocation's relayed data leaves from is fixed when
+  the allocation is created; a mobility re-key moves the allocation to a new
+  client address but not to the listener that address uses, so a client that
+  moved to another listener would receive Data indications from an address it
+  never sent to. Refused at startup rather than half-working.
 - The addresses join `listen` in the peer filter's unconditional self-deny.
 
-Limitations: an allocation's return path is fixed to the listener it was created
-on, so an RFC 8016 mobility re-key that moves a client to a *different*
-listener keeps sending from the original one. Allocations are keyed by client
-address, as before, so one client source address using two listeners at once is
-one allocation, not two.
+**Limitation — one allocation per client source address.** Allocations are
+keyed by the client's address and port only, not by which listener they arrived
+on (as before this key existed). A client that allocates on the primary and on
+an extra address *from the same source socket* is talking about one
+allocation: the second Allocate gets `437 Allocation Mismatch`, and the
+allocation stays bound to the first listener. Use a separate socket (source
+port) per server address, which is what ICE agents do anyway.
 
 There is **one relay address per family**: `[turn.relay] bind_ip` / `bind_ip6`
 (coturn's `relay-ip`) do not take lists. The relayed address is built from a
@@ -253,7 +264,7 @@ Requires `--features tls`. Maturity: **beta**.
 | `alpn_required` | bool | `false` | RFC 7443 strict mode: refuse a client that negotiates no ALPN (`turna_tls_alpn_rejected_total`). Requires `enable_alpn = true` — the combination `alpn_required = true` with `enable_alpn = false` is a startup error. Default `false` = compatible. |
 | `client_ca` | path | `""` | PEM bundle of CAs allowed to sign a TURNS **client** certificate. Empty = no client-certificate verification, which is what a public TURN server wants. Enables mTLS on the TURNS listener only — the management plane keeps its own `[grpc] tls_ca`. |
 | `min_version` | string | `"1.2"` | Lowest TLS version offered: `"1.2"` (TLS 1.2 and 1.3 — the behaviour before this key existed) or `"1.3"`. Nothing older exists in rustls, so coturn's `no-tlsv1` / `no-tlsv1_1` have no counterpart to set. |
-| `cipher_suites` | array of string | `[]` | Allowlist, by rustls name, in preference order. Empty = the rustls defaults (unchanged behaviour). Valid names: `TLS13_AES_256_GCM_SHA384`, `TLS13_AES_128_GCM_SHA256`, `TLS13_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`. An unknown or duplicated name is a startup error, as is a list of only TLS 1.2 suites with `min_version = "1.3"`. TLS 1.2 suites also need a key of the matching type (ECDSA vs RSA). Applies to TURNS only: QUIC is TLS 1.3 by definition (RFC 9001) and builds its own rustls config, which these keys do not touch. |
+| `cipher_suites` | array of string | `[]` | Allowlist, by rustls name, in preference order. Empty = the rustls defaults (unchanged behaviour). Valid names: `TLS13_AES_256_GCM_SHA384`, `TLS13_AES_128_GCM_SHA256`, `TLS13_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`. An unknown or duplicated name is a startup error, as is a list of only TLS 1.2 suites with `min_version = "1.3"`. TLS 1.2 suites also need a key of the matching type (ECDSA vs RSA): the key is checked when the certificate is loaded (startup and every hot-reload), and an allowlist that leaves nothing usable with it — e.g. only `TLS_ECDHE_ECDSA_*` suites with an RSA certificate and no TLS 1.3 suite — makes the TURNS listener refuse to start (the node reports Degraded, as for any certificate that fails to load; a failed reload keeps the previous material). TLS 1.2 suites that all mismatch the key while TLS 1.3 suites remain only log a warning: TLS 1.3 clients are still served. Applies to TURNS only: QUIC is TLS 1.3 by definition (RFC 9001) and builds its own rustls config, which these keys do not touch. |
 | `proxy_protocol` | bool | `false` | Expect a HAProxy PROXY protocol header (v1 or v2) on every connection and use its source address as the client's. See [PROXY protocol](#proxy-protocol-tls-and-turntcp). |
 | `proxy_protocol_trusted_cidrs` | array of CIDR | `[]` | Load balancers allowed to send the header. Required, non-empty, when `proxy_protocol = true`. |
 | `proxy_protocol_timeout_secs` | u64 | `5` | Deadline for the header, before the TLS handshake starts. Must be positive when `proxy_protocol = true`. |
@@ -291,6 +302,28 @@ listener: `[tls]` and `[turn.tcp]` each have their own three keys.
 - Configure the balancer to send the header (HAProxy `send-proxy` /
   `send-proxy-v2`, AWS NLB target-group attribute `proxy_protocol_v2.enabled`).
   With TURNS the balancer must pass TLS through (TCP mode), not terminate it.
+- **Connections waiting for their header count against `max_connections`.** A
+  permit is taken when the connection is accepted, before the header is read,
+  and kept until the connection closes, so a trusted source that opens
+  connections and sends nothing holds at most `max_connections` of them for
+  `proxy_protocol_timeout_secs`; the excess is refused immediately
+  (`turna_{tls,tcp}_rejected_over_cap_total`).
+- **Trusted ranges are never relay peers.** While PROXY protocol is on for an
+  enabled listener, its `proxy_protocol_trusted_cidrs` are added to the peer
+  filter's *unconditional* deny — `allowed_peer_ranges` and
+  `allow_loopback_peers` do not reopen them. Reason: the relay's own traffic
+  may come from an address inside the trusted range (a node on the balancer's
+  subnet). If a client could make the relay open an RFC 6062 connection or send
+  datagrams to a PROXY-trusting listener — this node's, or another node's in
+  the same pool — that listener would see a trusted source, accept a header the
+  *client* wrote, and every per-IP control would key on an address the client
+  chose. A load-balancer subnet is never a legitimate media peer, so refusing it
+  costs nothing (CreatePermission / ChannelBind / CONNECT answer 403).
+- Keep the allowlist to the balancers' own addresses. If the relay bind address
+  (`bind_ip`, or the private half of `external_ip`) falls inside a trusted range
+  the node logs a warning at startup: relayed traffic then leaves from a source
+  the listeners trust, and the peer deny above only covers listeners inside the
+  range — not another node's listener reachable at an address outside it.
 
 ---
 
