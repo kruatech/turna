@@ -154,8 +154,11 @@ pub enum Error {
     Util(#[from] util::Error),
     #[error("utf8: {0}")]
     Utf8(#[from] FromUtf8Error),
-    #[error("{0}")]
-    Sec1(#[source] sec1::Error),
+    /// A peer's SEC1-encoded public key did not decode. Carried as text: the
+    /// error type belongs to the `sec1` major the curve crates (p256/p384) use,
+    /// so naming it here would pin a second, possibly different, `sec1`.
+    #[error("sec1: {0}")]
+    Sec1(String),
     #[error("{0}")]
     Aes(#[from] aes::cipher::InvalidLength),
     #[error("{0}")]
@@ -190,12 +193,6 @@ impl PartialEq for IoError {
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(IoError(e))
-    }
-}
-
-impl From<sec1::Error> for Error {
-    fn from(e: sec1::Error) -> Self {
-        Error::Sec1(e)
     }
 }
 
