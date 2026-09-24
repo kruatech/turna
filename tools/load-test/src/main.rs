@@ -510,11 +510,19 @@ struct Stats {
     /// P0 #14: elapsed-ns from `start` when the steady-state measurement
     /// window began (after warmup). 0 = measure from construction.
     measure_start_ns: AtomicU64,
+    /// Elapsed-ns from `start` when the measured window closed (`stop()`).
+    /// 0 = still open. Without it the window ran on through teardown — the
+    /// channel-data mode's peer drain and Refresh(0) of every allocation — so
+    /// rates read a few percent low and covered a different span from the
+    /// server CPU sample, which is taken at `stop()`.
+    measure_end_ns: AtomicU64,
     start: Instant,
     running: AtomicBool,
     /// Server process samples bracketing the measured window (`--server-pid`).
-    /// `srv_start` is re-taken when the warm-up is discarded; `srv_end` when the
-    /// run stops.
+    /// `srv_start` is re-taken by `begin_window()` — when the warm-up is
+    /// discarded, or right before the measured phase when there is none;
+    /// `srv_end` at `stop()`. Same instants as `measure_{start,end}_ns`, so CPU
+    /// and throughput describe one window.
     srv_start: std::sync::Mutex<Option<procfs::ProcSample>>,
     srv_end: std::sync::Mutex<Option<procfs::ProcSample>>,
 }
@@ -531,6 +539,7 @@ impl Stats {
             lat_sum: 0.into(),
             lat_min: AtomicU64::new(u64::MAX),
             measure_start_ns: AtomicU64::new(0),
+            measure_end_ns: AtomicU64::new(0),
             lat_max: 0.into(),
             start: Instant::now(),
             running: true.into(),
@@ -598,12 +607,33 @@ impl Stats {
         for b in &self.lat_buckets {
             b.store(0, Ordering::Relaxed);
         }
+        self.begin_window();
+    }
+
+    /// Open the measured window now, without touching the counters.
+    ///
+    /// Called by `reset_preserving_errors()` after a warm-up, and directly by
+    /// the load modes right before their measured phase when there is no
+    /// warm-up — otherwise the window (and the server CPU baseline) would start
+    /// at construction and include allocation setup.
+    fn begin_window(&self) {
         self.measure_start_ns
             .store(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
         *self
             .srv_start
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = procfs::sample();
+    }
+
+    /// Length of the measured window, seconds: from `begin_window()` (or
+    /// construction) to `stop()`, or to now while still running.
+    fn window_secs(&self) -> f64 {
+        let start = self.measure_start_ns.load(Ordering::Relaxed);
+        let end = match self.measure_end_ns.load(Ordering::Relaxed) {
+            0 => self.start.elapsed().as_nanos() as u64,
+            e => e,
+        };
+        end.saturating_sub(start) as f64 / 1e9
     }
 
     fn is_running(&self) -> bool {
@@ -613,6 +643,12 @@ impl Stats {
         // Close the server-side window at the first stop only; a second call
         // (none today) must not stretch it over teardown.
         if self.running.swap(false, Ordering::Relaxed) {
+            // `max(1)`: 0 means "open", and a stop in the first nanosecond
+            // must still close the window.
+            self.measure_end_ns.store(
+                (self.start.elapsed().as_nanos() as u64).max(1),
+                Ordering::Relaxed,
+            );
             *self
                 .srv_end
                 .lock()
@@ -684,10 +720,9 @@ impl Stats {
     }
 
     fn snapshot(&self, label: &str, mode: &str) -> Snapshot {
-        // P0 #14: measure only the steady-state window (total minus warmup).
-        let total = self.start.elapsed().as_secs_f64();
-        let win_start = self.measure_start_ns.load(Ordering::Relaxed) as f64 / 1e9;
-        let el = (total - win_start).max(0.0);
+        // P0 #14: measure only the steady-state window — after the warm-up (or
+        // setup) and ending at stop(), not at the end of teardown.
+        let el = self.window_secs();
         let sent = self.sent.load(Ordering::Relaxed);
         let recv = self.recv.load(Ordering::Relaxed);
         let errs = self.errs.load(Ordering::Relaxed);
@@ -1038,6 +1073,8 @@ async fn run_binding(
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
         stats.reset();
+    } else {
+        stats.begin_window();
     }
     tokio::time::sleep(duration).await;
     stats.stop();
@@ -1332,6 +1369,8 @@ async fn run_channeldata(
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
         stats.reset();
+    } else {
+        stats.begin_window();
     }
     tokio::time::sleep(duration).await;
     stats.stop();
@@ -2522,6 +2561,43 @@ mod tests {
         s.record_latency(Duration::from_micros(600));
         assert_eq!(s.percentile(0.50), 500);
         assert_eq!(s.percentile(0.99), 1000);
+    }
+
+    /// The window ends at `stop()`, not when the snapshot is taken after
+    /// teardown, and starts at `begin_window()`, not at construction.
+    #[test]
+    fn window_runs_from_begin_to_stop_not_to_snapshot() {
+        let s = Stats::new();
+        std::thread::sleep(Duration::from_millis(60)); // "setup" — excluded
+        s.begin_window();
+        std::thread::sleep(Duration::from_millis(100)); // measured
+        s.sent.store(1000, Ordering::Relaxed);
+        s.recv.store(1000, Ordering::Relaxed);
+        s.stop();
+        std::thread::sleep(Duration::from_millis(150)); // "teardown" — excluded
+        let snap = s.snapshot("x", "channeldata");
+        assert!(
+            (0.09..0.15).contains(&snap.duration_s),
+            "window {} s should be ~0.1 s",
+            snap.duration_s
+        );
+        // Rate over the window, not over window + teardown.
+        assert!(snap.rps > 6_000.0, "rps {}", snap.rps);
+        // A second stop must not move the end.
+        let before = s.window_secs();
+        std::thread::sleep(Duration::from_millis(20));
+        s.stop();
+        assert_eq!(s.window_secs(), before);
+    }
+
+    #[test]
+    fn open_window_reads_up_to_now() {
+        let s = Stats::new();
+        s.begin_window();
+        std::thread::sleep(Duration::from_millis(30));
+        let a = s.window_secs();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(s.window_secs() > a, "an open window keeps growing");
     }
 
     /// P0 #14: `reset()` starts the steady-state window — everything from the

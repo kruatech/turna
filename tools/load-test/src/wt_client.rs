@@ -568,6 +568,8 @@ pub async fn run_wt_load(
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
         stats.reset_preserving_errors();
+    } else {
+        stats.begin_window();
     }
     tokio::time::sleep(duration).await;
     stats.stop();
