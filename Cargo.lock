@@ -4619,6 +4619,7 @@ dependencies = [
  "parking_lot",
  "quinn",
  "rand 0.10.3",
+ "rcgen 0.13.2",
  "rtnetlink",
  "rustls",
  "sha1",
