@@ -189,9 +189,12 @@ stunclient 203.0.113.10 -p 3478
 The rules below assume `ufw`. Adapt to your tool.
 
 ```sh
-# TURN listener. UDP only: there is no plain TURN-over-TCP listener, so a rule
-# for 3478/tcp opens a port nothing binds. TCP clients are served over TURNS.
+# TURN listener. UDP only by default: plain TURN over TCP ([turn.tcp]) is
+# opt-in, so a rule for 3478/tcp opens a port nothing binds unless you enabled
+# it. TCP clients are served over TURNS.
 sudo ufw allow 3478/udp comment 'turna STUN/TURN'
+# Only with [turn.tcp] enabled = true:
+# sudo ufw allow 3478/tcp comment 'turna plain TURN over TCP'
 
 # TURNS, when [tls] is enabled — and it is the ONLY way in for a client whose
 # network blocks UDP. Use 443 instead if your users sit behind filters that

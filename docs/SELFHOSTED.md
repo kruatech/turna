@@ -53,8 +53,9 @@ The node logs the size it actually got and warns when it was clamped.
 
 ## 3. Certificates
 
-TURNS is not optional: turna has no plain TURN-over-TCP listener, so it is the
-only way in for a client on a network that blocks UDP. Corporate guests are
+TURNS is not optional: plain TURN over TCP (`[turn.tcp]`) is opt-in and off by
+default, and TURNS is the encrypted way in for a client on a network that blocks
+UDP. Corporate guests are
 exactly that population.
 
 Two workable paths:

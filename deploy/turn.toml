@@ -29,6 +29,12 @@ production = false
 # =============================================================================
 [turn]
 listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
+# More UDP addresses to serve, in addition to `listen` — coturn's repeated
+# `listening-ip`. Each is a full address, so a second interface may use another
+# port. Replies and relayed data for a client leave from the listener it used.
+# tokio datapath only (io_uring / AF_XDP refuse it at startup), and a wildcard
+# address cannot share a port with a specific one.
+# listen_extra = ["198.51.100.20:3478", "10.0.0.5:3478"]
 # SO_RCVBUF / SO_SNDBUF for the listener and every relay socket, in bytes.
 # 0 = leave the kernel default, which is what every release before 0.5.0 did.
 #
@@ -70,6 +76,12 @@ listen      = "${TURNA_LISTEN_ADDR:-0.0.0.0:3478}"
 # Externally reachable IP. Required in production.
 # Tip: don't leave this blank behind NAT — clients receive this IP in the
 # XOR-RELAYED-ADDRESS attribute.
+#
+# 1:1 NAT (AWS elastic IP and the like): coturn's `-X PUBLIC/PRIVATE` form is
+# accepted too, e.g. "203.0.113.10/10.0.0.5". PUBLIC is advertised, and the relay
+# sockets bind PRIVATE — the same as [turn.relay] bind_ip = PRIVATE. Both halves
+# IPv4 (put a v6 pair in external_ip6); a bind_ip naming another address is an
+# error.
 external_ip = "${TURNA_EXTERNAL_IP:-}"
 # RFC 6156 IPv6 relayed transport. Empty = IPv4-only relaying (the default): an
 # Allocate carrying REQUESTED-ADDRESS-FAMILY = IPv6 is answered
@@ -86,6 +98,7 @@ external_ip = "${TURNA_EXTERNAL_IP:-}"
 # They are also refused (440) when `external_ip` above is an IPv6 literal: the
 # relayed listener binds 0.0.0.0, so a v6 relayed address would be advertised and
 # never served. Use a v4 `external_ip` on any node with [turn.tcp_relay] enabled.
+# Accepts "PUBLIC6/PRIVATE6" like external_ip; the private half pins bind_ip6.
 external_ip6 = "${TURNA_EXTERNAL_IP6:-}"
 realm       = "${TURNA_REALM:-turna}"
 # Transport backend: tokio | io_uring | af_xdp | auto.
@@ -317,7 +330,7 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # =============================================================================
 # For clients on networks that block UDP. Requires a binary built with
 # `--features tls`. Also the control transport RFC 6062 TCP allocations need:
-# [turn.tcp_relay] does nothing unless this listener is enabled.
+# [turn.tcp_relay] needs this listener or the plain [turn.tcp] one.
 #
 # Maturity: beta — see docs/feature-support.md.
 #
@@ -373,17 +386,33 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # # NOTE: no CRL/OCSP in code, deliberately (docs/MTLS.md -> Revocation). Revoke by
 # # rotating the CA.
 # require_client_cert = false
+# # Lowest TLS version offered: "1.2" (default: TLS 1.2 and 1.3) or "1.3".
+# min_version = "1.2"
+# # Cipher-suite allowlist by rustls name; empty = rustls defaults. Unknown
+# # names are a startup error. Valid: TLS13_AES_256_GCM_SHA384,
+# # TLS13_AES_128_GCM_SHA256, TLS13_CHACHA20_POLY1305_SHA256,
+# # TLS_ECDHE_{ECDSA,RSA}_WITH_{AES_256_GCM_SHA384,AES_128_GCM_SHA256,
+# # CHACHA20_POLY1305_SHA256}. The TLS 1.2 ECDSA/RSA suites need a matching key.
+# cipher_suites = []
+# # HAProxy PROXY protocol (v1/v2) from a TCP load balancer: the client address
+# # is taken from the header, so auth, rate limits, per-IP caps and logs see the
+# # real client. Only honoured from proxy_protocol_trusted_cidrs; with this on, a
+# # connection from anywhere else (or without a header) is closed.
+# # Counter: turna_tls_proxy_rejected_total.
+# proxy_protocol = false
+# proxy_protocol_trusted_cidrs = ["10.0.0.0/24"]
+# proxy_protocol_timeout_secs = 5
 
 # =============================================================================
 # [turn.tcp_relay] — RFC 6062 TCP relay allocations
 # =============================================================================
 # The client relays TCP (not UDP) to peers via CONNECT / CONNECTION-BIND.
-# Requires [tls] enabled: RFC 6062 §4.1 mandates a TCP/TLS control connection,
-# and a TCP-transport Allocate arriving over UDP/DTLS/QUIC is refused with 400.
+# Requires [tls] or [turn.tcp] enabled: RFC 6062 §4.1 mandates a TCP/TLS control
+# connection, and a TCP-transport Allocate arriving over UDP/DTLS/QUIC is refused
+# with 400.
 #
-# REFUSED under production = true (config validation rejects enabled = true).
-# Implemented and testable with production = false; the gate lifts once interop
-# and pipelined-client hardening are done.
+# Allowed under production = true since 2026-08-25 (docs/feature-support.md).
+# Size for it first: a listener and a connection per relayed peer.
 #
 # [turn.tcp_relay]
 # enabled = false
@@ -395,6 +424,31 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # max_total = 50000
 # # Per-direction relay buffer, bytes.
 # buffer_size = 16384
+
+# =============================================================================
+# [turn.tcp] — plain TURN over TCP (turn:host:3478?transport=tcp), no TLS
+# =============================================================================
+# OFF by default. TURNS ([tls]) is the better TCP fallback — it gets through
+# firewalls that inspect or block other TCP ports, and it hides the TURN control
+# traffic. This exists for clients already configured with the plain-TCP URL.
+# Same connection handling as TURNS minus the handshake; RFC 6062 TCP relay
+# works over it. Needs the `tls` build feature (a default one) and the tokio
+# datapath. Publish 3478/tcp in your firewall/container if you enable it.
+#
+# [turn.tcp]
+# enabled = false
+# listen = "0.0.0.0:3478"
+# max_frame_size = 65536
+# read_timeout_secs = 300
+# max_connections = 10000
+# max_connections_per_ip = 64
+# # New connections per second per source IP; 0 = unlimited.
+# max_connections_per_sec_per_ip = 0
+# connection_burst_per_ip = 0
+# # PROXY protocol, same rules as [tls]. Counter: turna_tcp_proxy_rejected_total.
+# proxy_protocol = false
+# proxy_protocol_trusted_cidrs = []
+# proxy_protocol_timeout_secs = 5
 
 # =============================================================================
 # [turn.dtls] — TURN over DTLS (RFC 7350), port 5349/udp

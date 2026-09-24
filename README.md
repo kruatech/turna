@@ -146,7 +146,8 @@ RPC contract.
 - STUN binding and full TURN allocation lifecycle (Allocate / Refresh /
   CreatePermission / ChannelBind / Send & Data indications)
 - UDP relay on the default path (IPv4, plus IPv6 when `external_ip6` is set); TCP relay (RFC 6062)
-  requires `[tls]`, since RFC 6062 carries the control connection over TCP/TLS
+  requires `[tls]` or the opt-in plain `[turn.tcp]` listener, since RFC 6062 carries
+  the control connection over TCP/TLS
 - Long-term credentials, TURN REST (coturn-compatible) time-limited credentials,
   rate limiting, and shared-secret rotation via `SIGHUP`; multi-tenant realms with
   per-tenant relay port pools and limits
@@ -228,25 +229,30 @@ config validation rejects placeholder secrets and a missing `external_ip`.
 
 ### Client ICE configuration
 
-Two URLs are served, and a third one that browser examples commonly carry is not:
+Two URLs are served by default, and a third one that browser examples commonly
+carry is not unless you opt in:
 
 ```js
 iceServers: [
   { urls: "turn:turn.example.net:3478?transport=udp", username, credential },
   { urls: "turns:turn.example.net:5349?transport=tcp", username, credential },
-  // NOT served: turn:turn.example.net:3478?transport=tcp
+  // Served only with [turn.tcp] enabled: turn:turn.example.net:3478?transport=tcp
 ]
 ```
 
-`transport=tcp` without TLS has no listener — by design, not by omission. TCP
-clients are served over TURNS, which is also what gets through a firewall that
-inspects traffic on 443 (point `[tls] listen` there if 5349 is filtered). A
-client config that keeps the plain-TCP URL spends its ICE-gathering budget on a
-connection refused before falling through to the URL that works.
+`transport=tcp` without TLS is **off by default**. TCP clients are served over
+TURNS, which is also what gets through a firewall that inspects traffic on 443
+(point `[tls] listen` there if 5349 is filtered). A client config that keeps the
+plain-TCP URL against a node without the listener spends its ICE-gathering
+budget on a connection refused before falling through to the URL that works.
 
-TURNS therefore is not optional infrastructure here: it is the only TCP entry
-point, which is why `tls` is a default Cargo feature and why a binary built with
-`--no-default-features` refuses to start when `[tls]` is enabled.
+For deployments whose clients already carry the plain-TCP URL, `[turn.tcp]`
+enables it as an opt-in listener (same connection handling as TURNS minus the
+handshake, RFC 6062 TCP relay included) — see
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#turntcp--plain-turn-over-tcp-opt-in).
+It shares the TURNS code, which is why `tls` is a default Cargo feature and why
+a binary built with `--no-default-features` refuses to start when `[tls]` or
+`[turn.tcp]` is enabled.
 
 ## Architecture
 
@@ -283,7 +289,7 @@ per-feature production maturity always check
 | Message integrity, SHA-256 (`MESSAGE-INTEGRITY-SHA256`) | RFC 8489 | Supported |
 | TURN allocation lifecycle, UDP relay | RFC 5766 / RFC 8656 | Supported (default tokio datapath) |
 | Relayed transport family | RFC 6156 / 8656 | IPv4 by default; IPv6 opt-in via `[turn] external_ip6` (unset → `440`). One family per allocation, cross-family peers get `443`. `ADDITIONAL-ADDRESS-FAMILY` not implemented |
-| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; allowed in production since 2026-08-25. Requires the `tls` listener. IPv4 only — an IPv6 TCP allocation answers 440 |
+| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; allowed in production since 2026-08-25. Requires the `tls` listener or the opt-in plain `[turn.tcp]` one. IPv4 only — an IPv6 TCP allocation answers 440 |
 | Session migration | RFC 8016 | Partial — tickets are issued and re-issued on the tokio datapath; cross-node migration is **unwired** (no allocation is transferred between nodes), treat as same-node |
 | TLS-over-TCP transport (`tls`) | — | **Supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, and 24 h under load ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)) |
 | DTLS transport (`dtls`) | RFC 7350 | Supported — 24 h under load with zero packet loss, a 300 000-packet spoofed-source flood that allocates no state, 20/20 handshakes at 3 % path loss, and interop with OpenSSL and coturn's client ([docs/interop/dtls-stack-2026-09-16.md](docs/interop/dtls-stack-2026-09-16.md)). Not reachable from a browser: WebRTC has no DTLS transport for TURN |
