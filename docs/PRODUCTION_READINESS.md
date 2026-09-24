@@ -226,7 +226,9 @@ Known residual gaps, per transport:
 
 `config::validate()` rejects `production = true` with `turn.auth.oauth.enabled`.
 OAuth still needs verification against a real authorization server. Do not
-bypass normal production checks just to enable it.
+bypass normal production checks just to enable it. The kit and procedure for that
+verification, and the record that justifies lifting this refusal, are in
+[runbooks/oauth-verification.md](runbooks/oauth-verification.md).
 
 The RFC 6062 gate was lifted on 2026-08-25. The SCTP gate is now lifted for
 Linux/tokio after native functional, lifecycle/limits and WAN verification;
