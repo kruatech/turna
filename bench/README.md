@@ -43,21 +43,37 @@ CPU is percent of one core, so a multi-threaded server can exceed 100.
 | `summary.md` | the summary as Markdown tables — what goes into `RESULTS.md` |
 | `meta.json` | kernel, CPU model, governor, relevant sysctls, `ulimit -n`, turna commit (and whether the tree was dirty), exact coturn build, every parameter |
 | `<server>__<scenario>__r<N>.json` | raw `turna-load-test --json` output per run; a failed run is kept as `….json.failed` and excluded from medians |
-| `server-<name>.log` | the server's own output |
+| `server-<name>.log` | the server's own output (for docker coturn, `docker logs` of the container) |
+| `failures.tsv` | every run that produced no result, and why |
 
 The `runs` column says how many repeats a median is over, so a row built from
-fewer surviving repeats than requested is visible.
+fewer surviving repeats than requested is visible. A server that did not start,
+was not available, or produced no run for a scenario gets a `FAILED` / `SKIPPED`
+row (`status` column in the CSV, a table in `summary.md`, `failures.tsv`) — the
+matrix skips it and carries on rather than aborting. Ctrl-C or SIGTERM stops the
+running server and ends the matrix.
 
 ## Reproducibility
 
-- **coturn is pinned.** `COTURN_SOURCE=docker` (default) runs
+- **coturn is pinned, and runs natively for headline numbers.**
+  `COTURN_SOURCE=native` (the default) runs `turnserver` from the distro package
+  and refuses to run unless it is exactly `COTURN_NATIVE_VERSION` (default
+  `4.6.1-1build4`, Ubuntu 24.04 — the reference host's OS). On another
+  distribution, build coturn 4.6.1 from its tag, set `COTURN_ALLOW_UNPINNED=1`
+  and say so in `RESULTS.md`; `meta.json` records what actually ran either way.
+- **Why not docker for the comparison.** `COTURN_SOURCE=docker` runs
   `coturn/coturn:4.7.0-r4-debian` by digest
   (`sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93`,
   the multi-arch index as published on Docker Hub) with host networking and the
-  same CPU set. `COTURN_SOURCE=native` uses the distro package and refuses to run
-  unless it is exactly `COTURN_NATIVE_VERSION` (default `4.6.1-1build4`, Ubuntu
-  24.04) — `COTURN_ALLOW_UNPINNED=1` overrides, and `meta.json` records what
-  actually ran either way.
+  same CPU set. It is convenient but not like-for-like: docker's default seccomp
+  profile is a BPF filter evaluated on every system call, and a relay makes
+  several per packet (`recvmmsg`, `sendmsg`, …), while turna runs native with no
+  such filter. The cost is per syscall, so it shows up in exactly the numbers
+  compared here — relay pps per CPU and Binding RPS — and understates coturn.
+  The size of that effect was not measured here. Use the docker path for
+  checking the harness or for coturn-versus-coturn comparisons; for turna versus
+  coturn, publish native numbers (or run turna in the same container runtime,
+  which this harness does not do).
 - **Same configuration surface.** `turna.toml`, `coturn.conf`, `eturnal.yml` and
   `pion-turn/main.go` all serve plain UDP with the REST secret `bench-secret` and
   realm `bench`. turna and coturn additionally run with quotas off and loopback
@@ -88,8 +104,9 @@ harness spreads client sockets over `127.0.0.1`–`127.0.255.254` (`SOURCE_IPS`,
   defaults); errors in the binding row mean a source reached it and the spread
   must widen.
 - **coturn's hold on a deleted allocation's 5-tuple.** After Refresh(0),
-  coturn 4.6.1 answers a new Allocate from the same 5-tuple with 437 for more
-  than 120 s (observed with a one-socket probe). A fresh client per cycle from one
+  coturn answers a new Allocate from the same 5-tuple with 437 for more than
+  120 s. Observed on the 4.6.1 package only, with a one-socket probe; not checked
+  against the 4.7.0 image. A fresh client per cycle from one
   address soon lands on a recently used ephemeral port and collects those 437s.
   This is also why `allocate` without `--fresh` — one socket per worker, Allocate
   and Refresh(0) repeated on it — is not usable against coturn.
@@ -104,7 +121,7 @@ Allocate rate limit and no per-user quota by default. The file says why for each
 - `jq`, `python3`.
 - turna built in release mode: `cargo build --release` (binaries are looked up in
   `$TARGET_DIR`, default `$CARGO_TARGET_DIR/release` or `target/release`).
-- coturn: docker with a running daemon, or the pinned distro package.
+- coturn: the pinned distro package (default), or docker with a running daemon.
 - Optional: eturnal (`ETURNAL_BIN`), a Go toolchain for pion.
 
 ## Running
@@ -114,7 +131,7 @@ bash bench/matrix.sh                                         # everything, defau
 DURATION=60 REPEATS=5 bash bench/matrix.sh                   # publication settings
 SERVERS="turna-bpf-off coturn" SCENARIOS="relay" bash bench/matrix.sh
 CHANNELS=1000 PPS=50 PAYLOADS=1200 SCENARIOS=relay bash bench/matrix.sh
-SMOKE=1 SERVERS="turna-bpf-off coturn" COTURN_SOURCE=native bash bench/matrix.sh
+SMOKE=1 SERVERS="turna-bpf-off coturn" bash bench/matrix.sh
 ```
 
 Every knob is an environment variable documented at the top of `matrix.sh`.

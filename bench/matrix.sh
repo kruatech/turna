@@ -41,11 +41,18 @@
 #   - turna-node + turna-load-test built (cargo build --release; TARGET_DIR
 #     overrides where they are looked up)
 #   - coturn, pinned, one of:
-#       COTURN_SOURCE=docker (default)  docker; pulls $COTURN_IMAGE by digest
-#       COTURN_SOURCE=native            `turnserver` from the distro package; the
+#       COTURN_SOURCE=native (default)  `turnserver` from the distro package; the
 #                                       installed version must equal
 #                                       $COTURN_NATIVE_VERSION unless
-#                                       COTURN_ALLOW_UNPINNED=1
+#                                       COTURN_ALLOW_UNPINNED=1. Use this for
+#                                       headline numbers: it runs the way turna
+#                                       does, a native process.
+#       COTURN_SOURCE=docker            docker; pulls $COTURN_IMAGE by digest.
+#                                       Convenient, but the container's seccomp
+#                                       filter runs on every syscall coturn makes
+#                                       and turna (native) pays no such cost —
+#                                       not a like-for-like comparison. See
+#                                       bench/README.md, "Reproducibility".
 #   - eturnal: https://eturnal.net (optional; ETURNAL_BIN, default `eturnalctl`)
 #   - pion:    go toolchain (optional) — built automatically into bench/bin/
 #   - jq, python3
@@ -87,7 +94,8 @@ SECRET="${SECRET:-bench-secret}"
 #     response and every 401 challenge is one, so from a handful of sources the
 #     binding and allocate scenarios would measure that anti-reflection budget.
 #   - coturn refuses a new Allocate from a 5-tuple whose allocation was just
-#     deleted with Refresh(0) — observed with 4.6.1 as 437 for more than 120 s.
+#     deleted with Refresh(0) — observed with the 4.6.1 package as 437 for more
+#     than 120 s; not checked against the 4.7.0 image.
 #     A fresh client per cycle from one address soon lands on a recently used
 #     ephemeral port; spreading sources makes that collision negligible.
 SOURCE_IPS="${SOURCE_IPS:-65534}"
@@ -102,7 +110,7 @@ ETURNAL_BIN="${ETURNAL_BIN:-eturnalctl}"
 # coturn/coturn:4.7.0-r4-debian as published on Docker Hub (2025-12-18); the
 # native pin is Ubuntu 24.04's package. Change them together with a note in
 # RESULTS.md — a result without the exact coturn build is not reproducible.
-COTURN_SOURCE="${COTURN_SOURCE:-docker}"
+COTURN_SOURCE="${COTURN_SOURCE:-native}"
 COTURN_IMAGE="${COTURN_IMAGE:-coturn/coturn:4.7.0-r4-debian@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93}"
 COTURN_NATIVE_VERSION="${COTURN_NATIVE_VERSION:-4.6.1-1build4}"
 COTURN_ALLOW_UNPINNED="${COTURN_ALLOW_UNPINNED:-0}"
@@ -190,9 +198,10 @@ server_available() {
 
 SRV_PID=""       # what we started, for stop_server
 SRV_TARGET=""    # the process whose /proc the load generator samples
+LOGS_PID=""      # `docker logs -f` follower, docker coturn only
 start_server() {
     local name="$1" log_file="$RESULTS_DIR/server-$1.log"
-    SRV_PID=""; SRV_TARGET=""
+    SRV_PID=""; SRV_TARGET=""; LOGS_PID=""
     case "$name" in
         turna-bpf-on)
             TURNA_BPF_FILTER=1 "${PIN_S[@]}" "$TURNA_NODE" "$BENCH_DIR/turna.toml" >"$log_file" 2>&1 &
@@ -208,10 +217,15 @@ start_server() {
                 docker run -d --rm --name "$COTURN_CONTAINER" --network host \
                     --cpuset-cpus "$SERVER_CPUS" \
                     -v "$BENCH_DIR/coturn.conf:/etc/coturn/turnserver.conf:ro" \
-                    "$COTURN_IMAGE" -c /etc/coturn/turnserver.conf >"$log_file" 2>&1
+                    "$COTURN_IMAGE" -c /etc/coturn/turnserver.conf >/dev/null || return 1
+                # The server's own output, not the container ID `run -d` prints.
+                # Followed rather than read at the end: --rm deletes the
+                # container, and its logs with it, on stop.
+                docker logs -f "$COTURN_CONTAINER" >"$log_file" 2>&1 &
+                LOGS_PID=$!
                 # The image's entrypoint execs turnserver, so the container's
                 # init PID (as the host sees it) is the server itself.
-                SRV_TARGET="$(docker inspect -f '{{.State.Pid}}' "$COTURN_CONTAINER")"
+                SRV_TARGET="$(docker inspect -f '{{.State.Pid}}' "$COTURN_CONTAINER")" || return 1
             else
                 "${PIN_S[@]}" turnserver -c "$BENCH_DIR/coturn.conf" >"$log_file" 2>&1 &
                 SRV_PID=$!
@@ -226,6 +240,7 @@ start_server() {
     esac
     # taskset execs the server, so $! is the server's own PID.
     [ -n "$SRV_TARGET" ] || SRV_TARGET="$SRV_PID"
+    return 0
 }
 
 resolve_target() {
@@ -247,12 +262,22 @@ stop_server() {
     if command -v docker >/dev/null 2>&1; then
         docker stop "$COTURN_CONTAINER" >/dev/null 2>&1 || true
     fi
+    if [ -n "${LOGS_PID:-}" ]; then
+        kill "$LOGS_PID" 2>/dev/null || true
+        wait "$LOGS_PID" 2>/dev/null || true
+        LOGS_PID=""
+    fi
     # eturnalctl forks an Erlang VM; make sure nothing lingers.
     pkill -f "beam.smp.*eturnal" 2>/dev/null || true
     SRV_TARGET=""
     sleep 1
 }
-trap stop_server EXIT INT TERM
+# EXIT cleans up however the script ends. INT and TERM must also *end* it: a
+# trap that only stopped the server would let the loop carry on and boot the
+# next one.
+trap stop_server EXIT
+trap 'log "interrupted (SIGINT) — stopping"; exit 130' INT
+trap 'log "terminated (SIGTERM) — stopping"; exit 143' TERM
 
 # Is anything bound to UDP $1? /proc/net/udp{,6} rather than ss(8), which
 # minimal hosts and containers often lack.
@@ -301,8 +326,9 @@ run_case() {
                 channel-data -n "$CHANNELS" --pps "$PPS" --payload "$payload" > "$out" || rc=$? ;;
     esac
     if [ "$rc" -ne 0 ] || ! jq -e . "$out" >/dev/null 2>&1; then
-        log "    $label: FAILED (exit $rc) — kept as $(basename "$out").failed, excluded from the summary"
+        log "    $label: FAILED (exit $rc) — kept as $(basename "$out").failed, excluded from the medians"
         mv "$out" "$out.failed" 2>/dev/null || true
+        record_failure "$srv" "$scen" "$r" "load generator exited $rc"
         return 0
     fi
     if [ "$scen" = memory ]; then
@@ -403,19 +429,36 @@ if [ "$(ulimit -n)" != unlimited ] && [ "$(ulimit -n)" -lt "$need_fds" ]; then
     log "WARN: ulimit -n is $(ulimit -n), the client needs about $need_fds (bench/PLAN.md sets 1048576)"
 fi
 
+# One line per run that produced no result, for summarize.py: it shows them as
+# FAILED rows rather than letting a server silently drop out of the tables.
+record_failure() {
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$RESULTS_DIR/failures.tsv"
+}
+
+# Explicit returns rather than `set -e`: this is called from an `if`, where
+# errexit is off, and a server that does not come up must skip that server,
+# not abort the whole matrix.
 boot_server() {
     local srv="$1" port
     port="$(server_port "$srv")"
-    start_server "$srv"
-    wait_port "$port"
+    if ! start_server "$srv"; then
+        log "   $srv: failed to start (see $RESULTS_DIR/server-$srv.log)"
+        return 1
+    fi
+    if ! wait_port "$port"; then
+        log "   $srv: nothing bound UDP $port (see $RESULTS_DIR/server-$srv.log)"
+        return 1
+    fi
     sleep 1   # let the runtime settle
     resolve_target "$srv"
     if [ -n "$SRV_TARGET" ]; then log "   $srv up on $port, sampling /proc/$SRV_TARGET"; fi
+    return 0
 }
 
 for srv in $SERVERS; do
     if ! server_available "$srv"; then
         log "SKIP $srv: not available"
+        record_failure "$srv" "*" "-" "skipped: not available"
         continue
     fi
     log "── $srv ──"
@@ -425,8 +468,11 @@ for srv in $SERVERS; do
             # A fresh server per repeat: the before/held delta is only
             # comparable when no earlier run has grown the allocator's pools.
             for r in $(seq 1 "$REPEATS"); do
-                boot_server "$srv"
-                run_case "$srv" memory "$r"
+                if boot_server "$srv"; then
+                    run_case "$srv" memory "$r"
+                else
+                    record_failure "$srv" memory "$r" "server did not start"
+                fi
                 stop_server
             done
         else
@@ -434,7 +480,14 @@ for srv in $SERVERS; do
         fi
     done
     [ "${#others[@]}" -gt 0 ] || continue
-    boot_server "$srv"
+    if ! boot_server "$srv"; then
+        log "SKIP $srv: server did not start — its remaining scenarios are recorded as FAILED"
+        for scen in "${others[@]}"; do
+            record_failure "$srv" "$scen" "*" "server did not start"
+        done
+        stop_server
+        continue
+    fi
     for scen in "${others[@]}"; do
         for r in $(seq 1 "$REPEATS"); do
             run_case "$srv" "$scen" "$r"

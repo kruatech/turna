@@ -5,11 +5,17 @@
 # Two deliberate departures from turna's defaults, both so the harness measures
 # the server rather than an admission policy that coturn does not have:
 #
-#   - [turn.rate_limit.default]: every load-test client comes from 127.0.0.1,
-#     and the default per-IP Allocate limit (burst 32, 16/s) would turn the
-#     allocate scenario into a measurement of that limiter. coturn applies no
-#     Allocate rate limit by default. 16_000_000 stays under the token bucket's
-#     24-bit ceiling (crates/qos, TOKEN_MASK); there is no "unlimited" value.
+#   - [turn.rate_limit.default]: coturn applies no per-source Allocate,
+#     CreatePermission or ChannelBind limit by default; turna does (Allocate:
+#     burst 32, 16/s per source address), plus per-address and per-/24 packet
+#     tiers. matrix.sh spreads clients over up to 65 534 loopback addresses,
+#     which keeps most sources under those defaults — but not with a small
+#     SOURCE_IPS, not bench/run.sh's direct invocations, and not the per-/24
+#     tier, which every 256 spread addresses share. Raised so that no setting of
+#     the harness measures a limiter instead of the server. 16_000_000 stays
+#     under the token bucket's 24-bit ceiling (crates/qos, TOKEN_MASK); there is
+#     no "unlimited" value. The fixed unauthenticated-reply budget (8/s per
+#     source) is not configurable and is what the spread is for.
 #   - [turn.relay.quota] max_per_user = 0: REST usernames are
 #     "<expiry>:bench", so every allocation in the same second shares one
 #     username and the default of 100 per user would cap the relay and memory

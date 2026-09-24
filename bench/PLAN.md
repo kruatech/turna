@@ -18,12 +18,15 @@ All four speak the same TURN REST credential convention, configured
 with one shared secret (`bench-secret`) — see `turna.toml`,
 `coturn.conf`, `eturnal.yml`, `pion-turn/main.go`.
 
-**Pinned builds.** coturn: `coturn/coturn:4.7.0-r4-debian@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93`
-(`COTURN_SOURCE=docker`, the default) or the Ubuntu 24.04 package
-`4.6.1-1build4` (`COTURN_SOURCE=native`; any other installed version is refused
-unless `COTURN_ALLOW_UNPINNED=1`). turna: the commit recorded in `meta.json`,
-built with `cargo build --release`. Publish results against one pin only, and
-say which.
+**Pinned builds.** coturn for published numbers: the Ubuntu 24.04 package
+`4.6.1-1build4`, run natively like turna (`COTURN_SOURCE=native`, the default;
+any other installed version is refused unless `COTURN_ALLOW_UNPINNED=1`).
+Alternative, not for turna-versus-coturn headlines:
+`coturn/coturn:4.7.0-r4-debian@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93`
+(`COTURN_SOURCE=docker`) — the container's seccomp filter taxes every syscall
+and turna runs without one (README.md, "Reproducibility"). turna: the commit
+recorded in `meta.json`, built with `cargo build --release`. Publish results
+against one pin only, and say which.
 
 ## Scenarios
 
@@ -112,8 +115,8 @@ Close browsers/IDEs; check `htop` is quiet before starting.
 
 ```bash
 cargo build --release
-docker pull coturn/coturn:4.7.0-r4-debian@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93
-sudo apt install jq                   # + eturnal, go per their docs
+sudo apt install coturn=4.6.1-1build4 jq   # Ubuntu 24.04; + eturnal, go per their docs
+sudo systemctl disable --now coturn   # the package's own service must not hold ports
 SMOKE=1 bash bench/matrix.sh          # harness check, seconds
 bash bench/matrix.sh                  # defaults
 DURATION=60 REPEATS=5 bash bench/matrix.sh   # publication run
