@@ -1,8 +1,12 @@
 # `ADDITIONAL-ADDRESS-FAMILY` (RFC 8656 §7.2) — design
 
-**Status:** not started. Blocked on one decision (§3). The §7 prerequisite is
-**largely satisfied** and no longer the reason to defer — see §7, which was written
-before the IPv6 path had been exercised and has since been overtaken.
+**Status:** not started. Blocked on one decision (§3) — and, since the RFC re-read of
+2026-09-24 (§8), on a correction to that decision: RFC 8656 gives each family of a
+dual allocation its **own** lifetime and permissions, and answers a half-successful
+Allocate with **success plus ADDRESS-ERROR-CODE**, not a failure. Both change the
+storage shape. The §7 prerequisite is **largely satisfied** and no longer the reason
+to defer — see §7, which was written before the IPv6 path had been exercised and has
+since been overtaken.
 
 One Allocate asks for a relayed address in **both** families and gets two, in a
 single allocation. This is what a dual-stack WebRTC client wants, and it is the
@@ -20,11 +24,14 @@ small. The state work is not, and that is what this document is about.
   `400`. (We already enforce the analogous exclusion with `RESERVATION-TOKEN`.)
 - On success the response carries **two** `XOR-RELAYED-ADDRESS` attributes, one per
   family.
-- On partial failure — one family available, the other not — the RFC's position is
-  that the allocation fails; the server does not silently return one family when
-  two were requested. Getting this wrong is worse than not implementing the
-  feature, because a client that asked for dual-stack and received one family will
-  believe it has both.
+- On partial failure — one family available, the other not — **the allocation
+  succeeds with the family that could be allocated, and the success response carries
+  ADDRESS-ERROR-CODE (0x8001)** naming the missing family with 440 or 508 (RFC 8656
+  §7.2 step 9, client side §7.3). Only when neither can be allocated is the answer a
+  508. *This bullet used to say the allocation fails; that was wrong — see §8.* What
+  it was guarding against is still right: the server must never return one family
+  **silently**, because a client that asked for dual-stack and received one family
+  without ADDRESS-ERROR-CODE will believe it has both.
 
 Codec side, today: `Attribute::RequestedAddressFamily` exists,
 `ADDITIONAL-ADDRESS-FAMILY` does not (`attribute.rs` has no `0x8000` entry). Because
@@ -159,12 +166,18 @@ over-permissive shortcut would hide.
 - Both attributes present → `400`; IPv4 in the additional attribute → `400`.
 - Success returns two `XOR-RELAYED-ADDRESS` attributes, families distinct, ports
   distinct.
-- Second bind fails → the whole Allocate fails **and the first port is released**
-  (assert the pool is back to its prior state, not just that a `508` was returned).
+- Second bind fails → success with the first family **and ADDRESS-ERROR-CODE (508)**
+  for the second, whose port is released (assert the pool: one port held, not two).
+  Both binds fail → `508` and the pool is back to its prior state. *(Corrected
+  2026-09-24; this line used to require the whole Allocate to fail.)*
+- EVEN-PORT with R=1 plus ADDITIONAL-ADDRESS-FAMILY → `400`; RESERVATION-TOKEN plus
+  ADDITIONAL-ADDRESS-FAMILY → `400` (§7.2 steps 8 and 5).
 - A v4 peer permission does not authorise traffic on the v6 socket, and vice versa.
 - Restart with a dual-stack allocation live: rehydrate restores both ports and both
   are marked used in the pool.
-- Refresh and remove affect both ports atomically.
+- Refresh **without** REQUESTED-ADDRESS-FAMILY affects both halves atomically; a
+  Refresh **with** it touches only that family, and LIFETIME = 0 there deletes one half
+  and leaves the other half's permissions and channels intact (§8.1).
 
 ## 7. Prerequisite: verify plain IPv6 first — LARGELY SATISFIED
 
@@ -202,3 +215,66 @@ What has changed is that the base is now largely verified.
 
 So the order is no longer "verify, then this". It is: **decide §3**, which is the
 one thing genuinely outstanding, and treat the two items above as parallel work.
+
+## 8. RFC re-read, 2026-09-24 — what the design above gets wrong
+
+Done while implementing the rest of the protocol-parity PR (USERHASH, RFC 5780, IPv6
+for RFC 6062). AAF was **not** implemented in that PR; these findings are why.
+
+1. **Partial success is a success.** RFC 8656 §7.2 step 9: if the server can allocate
+   only one family, it returns an Allocate *success* with ADDRESS-ERROR-CODE (0x8001,
+   §18.12: family, class/number 440 or 508, reason phrase) for the other; §7.3 tells
+   the client not to retry a 440 family and to wait a minute after a 508. §1 and §6
+   above said the reverse and are corrected in place.
+
+2. **Each family has its own lifetime.** §8.1: a Refresh of a dual allocation may carry
+   REQUESTED-ADDRESS-FAMILY to refresh — or, with LIFETIME = 0, delete — one family
+   only, and "Deleting a single allocation destroys any permissions or channels
+   associated with that particular allocation; it MUST NOT affect any permissions or
+   channels associated with allocations for the other address family." So a dual
+   allocation is two halves with independent expiry and independent permission and
+   channel sets, sharing one 5-tuple and one quota unit. None of the three options in
+   §3 models that:
+   - option 1 has one `expires_at_ms` (and the only `by_expiry` index) for both;
+   - option 3 as costed ("one tuple per allocation, both ports indexed") needs a
+     second expiry field **and** a second expiry index, or the sweep cannot find an
+     expired v6 half whose v4 half is alive;
+   - a half-deleted allocation (v6 gone, v4 alive, or the reverse) must be a legal
+     stored state, so the "primary" port can disappear while the allocation lives —
+     which is awkward when `relay_port` is the primary key and the write-behind
+     coalescing key (`WriteOp::relay_port`).
+   The shape this points at is a synthetic primary key (`allocation_id`, already in
+   `StoredAllocation`) with `relay_port4` / `relay_port6` as **nullable unique**
+   secondary indexes and per-family expiry fields, each indexed. Tarantool cannot
+   enforce uniqueness *across* the two port indexes (a port is family-agnostic in the
+   pool), so the store function must check both before insert — write that check and
+   its test first.
+
+3. **"Composite primary key `(relay_port, family)`" is option 2 in disguise.** A key of
+   (port, family) means one tuple per port, which is exactly the double-counted
+   `by_user` quota §3 rejects. Option 3 only works in its "synthetic key" reading.
+
+4. **CreatePermission and ChannelBind.** §10.1: for a dual allocation the client MAY mix
+   families in one CreatePermission. The 443 rule becomes "the peer's family must match
+   a *live* half", evaluated per peer, and the permission belongs to that half (point 2).
+
+5. **Surfaces that assume one port per allocation** (all need the second port, and all
+   emit or consume `CloseRelay { port }`): `relay::server` (tokio egress registry and
+   expiry sweep), `relay::handler` + `transport::worker` (io_uring), the AF_XDP
+   listener, the TLS / QUIC / SCTP bridges and the DTLS listener, `session`'s
+   `by_relay` index and `release`/`refresh`, the port selection in
+   `channel_data_decision`, `handle_send_indication` and `process_relay_recv` (the
+   relay port must follow the peer's family), `node::writer` coalescing, failover
+   `turna_claim_allocation`, `bulk_load`, and the control-plane allocation listing
+   (whose proto would need an additive field). The io_uring and AF_XDP datapaths need
+   their feature builds to test.
+
+6. **Test environment, as found.** Tarantool *is* runnable in the development container
+   (Ubuntu's `tarantool` 2.6 runs all three `deploy/tarantool/tests/*_test.lua` suites
+   green when `box.cfg` is called before `init.lua`; CI uses the `tarantool/tarantool:2`
+   image). IPv6 is **not**: binds fail with EAFNOSUPPORT, so every success path of a
+   dual allocation — which binds a v6 socket by definition — would only ever run as a
+   skipped test there. The migration could be tested; the feature could not.
+
+**Next step:** decide §3 again with points 2–3 in hand (a per-family expiry index is
+the new cost), then implement on a host with IPv6.

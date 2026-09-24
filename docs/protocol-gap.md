@@ -285,6 +285,11 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   and `init.lua` carries an explicit "change one place, change both" coupling with
   the Rust script. Full analysis, per-option edit lists, the test list and the
   ordering argument: [docs/design/additional-address-family.md](design/additional-address-family.md).
+  **Reopened 2026-09-24** (design doc §8): RFC 8656 §8.1 gives each family of a dual
+  allocation its own lifetime and permissions, and §7.2 step 9 answers a half-successful
+  Allocate with success + ADDRESS-ERROR-CODE, so none of the three options is complete
+  as costed. Until implemented, an ADDITIONAL-ADDRESS-FAMILY attribute is ignored
+  (comprehension-optional) and the client gets a single-family allocation.
 - **IPv6 for RFC 6062 TCP relay — implemented, opt-in (2026-09-24).** With
   `[turn.tcp_relay] allow_ipv6 = true` *and* `[turn] external_ip6` set, a TCP Allocate
   with `REQUESTED-ADDRESS-FAMILY = IPv6` binds its relayed listener v6 (`IPV6_V6ONLY`,

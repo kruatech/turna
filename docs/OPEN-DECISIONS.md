@@ -132,6 +132,13 @@ option 1 with the halved guarantee written down at the call site rather than dis
 later. Not option 2 (two tuples per allocation) — it double-counts `by_user` quotas and
 makes refresh and remove non-atomic.
 
+**Reopened 2026-09-24:** a re-read of RFC 8656 found that the options above model one
+lifetime per allocation, while §8.1 gives each family of a dual allocation its own
+lifetime, permissions and channels (a Refresh with REQUESTED-ADDRESS-FAMILY can delete
+one half), and §7.2 step 9 answers a half-successful Allocate with success plus
+ADDRESS-ERROR-CODE rather than failure. A per-family expiry index is a cost none of the
+options priced. Details: `design/additional-address-family.md` §8.
+
 **Prerequisite either way:** plain IPv6 relaying is verified
 (`docs/interop/relayed-media-2026-08-19.md`), so this no longer stacks on an unverified
 base.
