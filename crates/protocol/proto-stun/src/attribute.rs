@@ -32,6 +32,10 @@ pub const ATTR_ALTERNATE_SERVER: u16 = 0x8023;
 /// NOT implemented (see docs/protocol-gap.md → RFC 5780).
 pub const ATTR_CHANGE_REQUEST_RESERVED: u16 = 0x0003;
 pub const ATTR_USERNAME: u16 = 0x0006;
+/// RFC 8489 §14.4 USERHASH (comprehension-required): 32 bytes,
+/// `SHA-256(username ":" realm)`, sent in place of USERNAME when the server's
+/// nonce cookie advertises "Username anonymity".
+pub const ATTR_USERHASH: u16 = 0x001E;
 pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
 /// RFC 8489 §14.6 MESSAGE-INTEGRITY-SHA256 (HMAC-SHA-256; 16..=32 bytes).
 pub const ATTR_MESSAGE_INTEGRITY_SHA256: u16 = 0x001C;
@@ -123,6 +127,8 @@ pub enum Attribute {
     AlternateServer(SocketAddr),
     XorMappedAddress(SocketAddr),
     Username(String),
+    /// RFC 8489 §14.4 USERHASH — SHA-256 over `username ":" realm`.
+    UserHash([u8; 32]),
     MessageIntegrity([u8; 20]),
     Fingerprint(u32),
     ErrorCode {
@@ -173,6 +179,7 @@ impl Attribute {
             Self::AlternateServer(_) => ATTR_ALTERNATE_SERVER,
             Self::XorMappedAddress(_) => ATTR_XOR_MAPPED_ADDRESS,
             Self::Username(_) => ATTR_USERNAME,
+            Self::UserHash(_) => ATTR_USERHASH,
             Self::MessageIntegrity(_) => ATTR_MESSAGE_INTEGRITY,
             Self::Fingerprint(_) => ATTR_FINGERPRINT,
             Self::ErrorCode { .. } => ATTR_ERROR_CODE,
@@ -211,6 +218,11 @@ impl Attribute {
             // (plain, NOT XOR). Encoding it as XOR breaks spec-compliant
             // clients (pion, libnice) parsing the 300 Try Alternate redirect.
             Self::MappedAddress(addr) | Self::AlternateServer(addr) => encode_address(buf, addr),
+            Self::UserHash(h) => {
+                ensure(buf.len(), 32)?;
+                buf[..32].copy_from_slice(h);
+                Ok(32)
+            }
             Self::Username(s) | Self::Realm(s) | Self::Nonce(s) | Self::Software(s) => {
                 let b = s.as_bytes();
                 ensure(buf.len(), b.len())?;
@@ -503,6 +515,18 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                 let name = std::str::from_utf8(value)
                     .map_err(|_| StunError::AttributeParse("USERNAME is not valid UTF-8".into()))?;
                 Attribute::Username(name.to_string())
+            }
+            ATTR_USERHASH => {
+                // RFC 8489 §14.4: fixed length of 32 bytes.
+                if value.len() != 32 {
+                    return Err(StunError::AttributeParse(format!(
+                        "USERHASH must be 32 bytes, got {}",
+                        value.len()
+                    )));
+                }
+                let mut h = [0u8; 32];
+                h.copy_from_slice(value);
+                Attribute::UserHash(h)
             }
             ATTR_MESSAGE_INTEGRITY => {
                 if value.len() != 20 {
@@ -1004,6 +1028,62 @@ mod tests {
             !matches!(attrs.as_slice(), [Attribute::Unknown { .. }]),
             "0x0017 must not decode as Unknown (would trigger 420)"
         );
+    }
+}
+
+#[cfg(test)]
+mod userhash_codec {
+    use super::*;
+
+    const TID: [u8; 12] = [7u8; 12];
+
+    fn frame(attr: &Attribute) -> Vec<u8> {
+        let mut value = [0u8; 64];
+        let len = attr.encode_value(&mut value, &TID).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&attr.attr_type().to_be_bytes());
+        buf.extend_from_slice(&(len as u16).to_be_bytes());
+        buf.extend_from_slice(&value[..len]);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn userhash_roundtrips_and_is_not_unknown() {
+        // A typed variant matters beyond tidiness: `Attribute::Unknown` with a
+        // type below 0x8000 is what the relay answers with 420.
+        let h: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let buf = frame(&Attribute::UserHash(h));
+        assert_eq!(
+            &buf[..4],
+            &[0x00, 0x1E, 0x00, 0x20],
+            "type 0x001E, length 32"
+        );
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(attrs.as_slice(), [Attribute::UserHash(v)] if *v == h));
+    }
+
+    #[test]
+    fn userhash_wrong_length_rejected() {
+        // RFC 8489 §14.4: fixed length of 32 bytes.
+        for len in [0usize, 20, 31, 33, 64] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&ATTR_USERHASH.to_be_bytes());
+            buf.extend_from_slice(&(len as u16).to_be_bytes());
+            buf.extend(std::iter::repeat_n(0xAB, len));
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+            assert!(
+                matches!(
+                    parse_attributes(&buf, &TID),
+                    Err(StunError::AttributeParse(_))
+                ),
+                "USERHASH of {len} bytes must be rejected"
+            );
+        }
     }
 }
 

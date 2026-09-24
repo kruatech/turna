@@ -857,6 +857,30 @@ impl TurnaConfig {
             }
         }
 
+        // RFC 8489 §9.2.5: a client that sees "Username anonymity" in the nonce
+        // cookie MUST send USERHASH. Only a long-term (static_users) realm can
+        // resolve one, so advertising it anywhere else locks clients out.
+        if self.turn.auth.advertise_userhash {
+            if self.turn.auth.oauth.enabled || self.turn.auth.static_users.is_empty() {
+                errors.push(
+                    "turn.auth.advertise_userhash = true requires the base realm to use \
+                     static_users: a TURN REST or OAuth realm cannot resolve a USERHASH, \
+                     and a client told to send one would never authenticate"
+                        .into(),
+                );
+            }
+            for t in &self.tenants {
+                if t.static_users.is_empty() {
+                    errors.push(format!(
+                        "turn.auth.advertise_userhash = true but tenant '{}' uses a shared \
+                         secret; the nonce is issued before the realm is known, so every \
+                         realm must be able to resolve a USERHASH",
+                        t.id
+                    ));
+                }
+            }
+        }
+
         // Rate-limit tiers: a zero anywhere is a limiter that refuses forever.
         errors.extend(self.turn.rate_limit.default.validate("default"));
         errors.extend(self.turn.rate_limit.trusted.validate("trusted"));
@@ -1278,6 +1302,23 @@ pub struct AuthConfig {
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
     pub oauth: OAuthConfig,
+    /// Advertise RFC 8489 username anonymity (USERHASH, §14.4).
+    ///
+    /// A request that names its user by USERHASH instead of USERNAME is
+    /// accepted whatever this says — long-term users, including those loaded
+    /// from the state backend, are resolved by `SHA-256(username ":" realm)`.
+    /// What this key controls is whether clients are *told* to do so: when
+    /// true, every nonce starts with the RFC 8489 "nonce cookie" with the
+    /// "Username anonymity" feature bit set, and a conforming client then MUST
+    /// send USERHASH (§9.2.5).
+    ///
+    /// Off by default because it changes every nonce on the wire. Refused
+    /// unless every realm on the node — the base realm and every tenant — uses
+    /// `static_users`: a TURN REST username embeds an expiry the server never
+    /// stores, so its hash cannot be resolved, and a REST client told to hash
+    /// would never authenticate. OAuth is refused for the same reason.
+    #[serde(default)]
+    pub advertise_userhash: bool,
 }
 
 impl Default for AuthConfig {
@@ -1291,6 +1332,7 @@ impl Default for AuthConfig {
             credential_clock_skew_secs: default_credential_clock_skew(),
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
+            advertise_userhash: false,
         }
     }
 }
@@ -3995,6 +4037,50 @@ mod tests {
             msg.contains("cluster_secret"),
             "validation error should call out cluster_secret, got: {msg}"
         );
+    }
+
+    #[test]
+    fn advertise_userhash_is_off_by_default_and_needs_long_term_realms() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
+        assert!(!AuthConfig::default().advertise_userhash, "opt-in only");
+
+        // Base realm on TURN REST (no static_users): refused.
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.auth.advertise_userhash = true;
+        let rest = cfg.validate();
+
+        // Base realm on static users: accepted.
+        cfg.turn.auth.static_users = vec![StaticUser {
+            username: "alice".into(),
+            password: "a-long-enough-password".into(),
+        }];
+        let long_term = cfg.validate();
+
+        // ...until a shared-secret tenant is added.
+        cfg.tenants = vec![TenantConfig {
+            id: "t1".into(),
+            realm: "t1realm".into(),
+            relay_port_range: [50000, 50100],
+            shared_secret: "a-real-non-placeholder-secret".into(),
+            previous_shared_secret: String::new(),
+            static_users: Vec::new(),
+            max_allocations: 0,
+            quota: QuotaConfig::default(),
+            listen: None,
+        }];
+        let with_rest_tenant = cfg.validate();
+
+        restore_turna_production(saved);
+        let msg = rest.expect_err("REST base realm must refuse").to_string();
+        assert!(msg.contains("advertise_userhash"), "{msg}");
+        long_term.expect("static users can resolve a USERHASH");
+        let msg = with_rest_tenant
+            .expect_err("a REST tenant must refuse")
+            .to_string();
+        assert!(msg.contains("tenant 't1'"), "{msg}");
     }
 
     #[test]

@@ -172,6 +172,18 @@ pub enum AuthMode {
     LongTerm {
         realm: String,
         users: Arc<DashMap<String, UserKeys>>,
+        /// RFC 8489 §14.4 USERHASH → username, for requests that name the user
+        /// by `SHA-256(username ":" realm)` instead of USERNAME.
+        ///
+        /// A second map rather than a scan: the hash is not invertible, so
+        /// without an index every USERHASH request would hash every user. Kept
+        /// in step with `users` by the only four functions that write either
+        /// ([`AuthMode::long_term`], `add_user`, `add_user_keys`,
+        /// `remove_user`). Users rehydrated from the state backend (Tarantool
+        /// `turna_users`) arrive through `add_user_keys`, so they are indexed
+        /// too — the username is stored alongside the derived keys, and the
+        /// hash needs only the name and the realm, never the password.
+        userhashes: Arc<DashMap<[u8; 32], String>>,
     },
     /// Time-limited credentials with shared secret.
     SharedSecret {
@@ -268,17 +280,92 @@ impl Drop for AuthMode {
     }
 }
 
+/// What a successful validation established: the key, the OAuth lifetime cap
+/// and the username the request was authenticated as.
+///
+/// `username` is the part that is new. Under RFC 8489 username anonymity the
+/// request carries USERHASH instead of USERNAME, so "who is this" can no longer
+/// be read off the message afterwards — it is only known once the hash has been
+/// resolved against the user table, which happens here.
+#[derive(Debug, Clone)]
+pub struct Validated {
+    pub key: Vec<u8>,
+    /// OAuth only: the token's remaining lifetime (RFC 7635 §6.1).
+    pub max_lifetime_secs: Option<u32>,
+    /// The USERNAME, or the username a USERHASH resolved to. For OAuth this is
+    /// the USERNAME (the kid) if one was sent, else empty — unchanged from
+    /// before USERHASH existed.
+    pub username: String,
+}
+
 impl AuthMode {
     /// Validate a STUN message's credentials. Returns the key on success.
     pub fn validate(&self, msg: &StunMessage, raw: &[u8]) -> Result<Vec<u8>, AuthError> {
+        self.validate_identity(msg, raw).map(|v| v.key)
+    }
+
+    /// Resolve the username a request names: USERNAME if present, otherwise
+    /// the user whose `SHA-256(username ":" realm)` equals USERHASH (RFC 8489
+    /// §14.4).
+    ///
+    /// USERNAME wins when both are sent, and USERHASH is then ignored.
+    /// §9.2.3.2 asks for "either", and the key is derived from the USERNAME, so
+    /// a USERHASH naming somebody else grants nothing — the request is checked
+    /// against the USERNAME's key exactly as if the hash were absent.
+    ///
+    /// Only a LongTerm backend can resolve a hash, because only it has a list
+    /// of names to hash. A TURN REST (`SharedSecret`) credential is minted by
+    /// the signalling service and never stored here: the username is
+    /// `<expiry>:<userid>`, the server learns it only from the request, and
+    /// SHA-256 cannot be run backwards to recover it. A USERHASH on that
+    /// backend is therefore "not valid" in the sense of RFC 8489 §9.2.4 and is
+    /// answered 401, which is what the RFC prescribes for an invalid USERHASH.
+    /// The 401 is not a dead end for a conforming client: it only uses
+    /// USERHASH when the nonce cookie sets "Username anonymity" (§9.2.5), and
+    /// config validation refuses to advertise that bit on a realm that cannot
+    /// honour it.
+    fn resolve_username(&self, msg: &StunMessage, raw: &[u8]) -> Result<String, AuthError> {
+        if let Some(u) = msg.get_username() {
+            return Ok(u.to_string());
+        }
+        let hash = msg.get_userhash().ok_or(AuthError::MissingCredentials)?;
+        match self {
+            AuthMode::LongTerm { userhashes, .. } => match userhashes.get(hash) {
+                Some(name) => Ok(name.value().clone()),
+                None => {
+                    // Same timing equalisation as an unknown USERNAME (M3): one
+                    // integrity check against a throwaway key, then reject.
+                    const DUMMY_KEY: [u8; 32] = [0x2b; 32];
+                    if msg.get_message_integrity_sha256().is_some() {
+                        let _ = msg.verify_integrity_sha256(raw, &DUMMY_KEY);
+                    } else {
+                        let _ = msg.verify_integrity(raw, &DUMMY_KEY);
+                    }
+                    Err(AuthError::InvalidCredentials)
+                }
+            },
+            AuthMode::SharedSecret { .. } => Err(AuthError::InvalidCredentials),
+            AuthMode::OAuth { .. } => unreachable!("OAuth never resolves a username"),
+        }
+    }
+
+    /// [`validate`](Self::validate), also returning the OAuth lifetime cap and
+    /// the authenticated username (see [`Validated`]).
+    pub fn validate_identity(&self, msg: &StunMessage, raw: &[u8]) -> Result<Validated, AuthError> {
         // RFC 7635 third-party auth uses an ACCESS-TOKEN, not USERNAME/REALM —
         // handle it before the long-term credential extraction below.
         if let AuthMode::OAuth { .. } = self {
             return self
                 .validate_oauth(msg, raw)
-                .map(|(mac_key, _lifetime)| mac_key);
+                .map(|(mac_key, lifetime)| Validated {
+                    key: mac_key,
+                    max_lifetime_secs: Some(lifetime),
+                    username: msg.get_username().unwrap_or("").to_string(),
+                });
         }
-        let username = msg.get_username().ok_or(AuthError::MissingCredentials)?;
+        if !msg.has_user_identity() {
+            return Err(AuthError::MissingCredentials);
+        }
         let realm = msg.get_realm().ok_or(AuthError::MissingCredentials)?;
         // Strict: the REALM in the request must match the server's realm.
         // (The key is already derived from the server realm, so a mismatch
@@ -286,6 +373,8 @@ impl AuthMode {
         if realm != self.realm() {
             return Err(AuthError::InvalidCredentials);
         }
+        let username_owned = self.resolve_username(msg, raw)?;
+        let username = username_owned.as_str();
 
         let server_realm = self.realm();
         let has_sha256 = msg.get_message_integrity_sha256().is_some();
@@ -462,7 +551,11 @@ impl AuthMode {
         } else if !msg.verify_integrity(raw, &key) {
             return Err(AuthError::IntegrityFailed);
         }
-        Ok(key)
+        Ok(Validated {
+            key,
+            max_lifetime_secs: None,
+            username: username_owned,
+        })
     }
 
     /// Like [`validate`] but also returns the OAuth token's remaining lifetime in
@@ -473,12 +566,16 @@ impl AuthMode {
         msg: &StunMessage,
         raw: &[u8],
     ) -> Result<(Vec<u8>, Option<u32>), AuthError> {
-        match self {
-            AuthMode::OAuth { .. } => self
-                .validate_oauth(msg, raw)
-                .map(|(k, life)| (k, Some(life))),
-            _ => self.validate(msg, raw).map(|k| (k, None)),
-        }
+        self.validate_identity(msg, raw)
+            .map(|v| (v.key, v.max_lifetime_secs))
+    }
+
+    /// Whether this backend can resolve an RFC 8489 USERHASH. Only a LongTerm
+    /// backend holds the usernames a hash can be matched against; see
+    /// [`AuthMode::resolve_username`](Self::resolve_username) for why TURN REST
+    /// and OAuth cannot.
+    pub fn supports_userhash(&self) -> bool {
+        matches!(self, AuthMode::LongTerm { .. })
     }
 
     pub fn realm(&self) -> &str {
@@ -499,13 +596,16 @@ impl AuthMode {
     {
         let realm = realm.into();
         let map: DashMap<String, UserKeys> = DashMap::new();
+        let hashes: DashMap<[u8; 32], String> = DashMap::new();
         for (u, p) in users {
             let (u, p) = (u.as_ref(), p.as_ref());
             map.insert(u.to_string(), UserKeys::derive(u, &realm, p));
+            hashes.insert(turna_crypto::userhash(u, &realm), u.to_string());
         }
         AuthMode::LongTerm {
             realm,
             users: Arc::new(map),
+            userhashes: Arc::new(hashes),
         }
     }
 
@@ -513,10 +613,18 @@ impl AuthMode {
     /// Returns `true` if applied (i.e. this is a LongTerm backend).
     pub fn add_user(&self, username: &str, password: &str) -> bool {
         match self {
-            AuthMode::LongTerm { realm, users } => {
+            AuthMode::LongTerm {
+                realm,
+                users,
+                userhashes,
+            } => {
                 users.insert(
                     username.to_string(),
                     UserKeys::derive(username, realm, password),
+                );
+                userhashes.insert(
+                    turna_crypto::userhash(username, realm),
+                    username.to_string(),
                 );
                 true
             }
@@ -528,7 +636,20 @@ impl AuthMode {
     /// if a user was present and removed.
     pub fn remove_user(&self, username: &str) -> bool {
         match self {
-            AuthMode::LongTerm { users, .. } => users.remove(username).is_some(),
+            AuthMode::LongTerm {
+                realm,
+                users,
+                userhashes,
+            } => {
+                // Index first: a USERHASH request racing this removal then finds
+                // no name rather than a name whose keys are already gone — both
+                // end in InvalidCredentials, but this order never has the index
+                // pointing at a user that no longer exists after we return.
+                userhashes.remove_if(&turna_crypto::userhash(username, realm), |_, u| {
+                    u == username
+                });
+                users.remove(username).is_some()
+            }
             AuthMode::SharedSecret { .. } | AuthMode::OAuth { .. } => false,
         }
     }
@@ -546,8 +667,16 @@ impl AuthMode {
     /// SharedSecret. Returns `true` if applied.
     pub fn add_user_keys(&self, username: &str, keys: UserKeys) -> bool {
         match self {
-            AuthMode::LongTerm { users, .. } => {
+            AuthMode::LongTerm {
+                realm,
+                users,
+                userhashes,
+            } => {
                 users.insert(username.to_string(), keys);
+                userhashes.insert(
+                    turna_crypto::userhash(username, realm),
+                    username.to_string(),
+                );
                 true
             }
             AuthMode::SharedSecret { .. } | AuthMode::OAuth { .. } => false,
@@ -1284,5 +1413,165 @@ mod subject_tests {
     fn long_term_usernames_are_left_alone() {
         let m = AuthMode::long_term("r".to_string(), [("100:alice", "pw")]);
         assert_eq!(m.subject_of("100:alice"), "100:alice");
+    }
+}
+
+#[cfg(test)]
+mod userhash_tests {
+    use super::*;
+    use turna_proto_stun::attribute::Attribute;
+    use turna_proto_stun::header::MessageClass;
+    use turna_proto_stun::message::StunMessage;
+    use turna_proto_stun::method::Method;
+
+    /// An Allocate that names the user by USERHASH only (RFC 8489 §9.2.3.2),
+    /// signed with MESSAGE-INTEGRITY-SHA256 or the RFC 5389 variant.
+    fn by_hash(realm: &str, user: &str, pass: &str, sha256: bool) -> (StunMessage, Vec<u8>) {
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::UserHash(turna_crypto::userhash(user, realm)));
+        m.add(Attribute::Realm(realm.into()));
+        let mut buf = [0u8; 512];
+        let len = if sha256 {
+            let key = turna_crypto::long_term_key_sha256(user, realm, pass);
+            m.encode_with_integrity_sha256(&mut buf, &key).unwrap()
+        } else {
+            let key = turna_crypto::long_term_key(user, realm, pass);
+            m.encode_with_integrity(&mut buf, &key).unwrap()
+        };
+        let raw = buf[..len].to_vec();
+        (StunMessage::decode(&raw).unwrap(), raw)
+    }
+
+    #[test]
+    fn long_term_resolves_userhash_to_the_user() {
+        let mode = AuthMode::long_term("r", [("alice", "pw-a"), ("bob", "pw-b")]);
+        for sha256 in [true, false] {
+            let (msg, raw) = by_hash("r", "bob", "pw-b", sha256);
+            assert!(msg.get_username().is_none());
+            let v = mode
+                .validate_identity(&msg, &raw)
+                .expect("userhash accepted");
+            assert_eq!(v.username, "bob", "the hash resolves to the right name");
+            assert_eq!(v.key.len(), if sha256 { 32 } else { 16 });
+        }
+    }
+
+    #[test]
+    fn userhash_with_wrong_password_fails_integrity() {
+        let mode = AuthMode::long_term("r", [("alice", "pw-a")]);
+        let (msg, raw) = by_hash("r", "alice", "WRONG", true);
+        assert!(matches!(
+            mode.validate_identity(&msg, &raw),
+            Err(AuthError::IntegrityFailed)
+        ));
+    }
+
+    #[test]
+    fn unknown_userhash_is_invalid_credentials() {
+        let mode = AuthMode::long_term("r", [("alice", "pw-a")]);
+        let (msg, raw) = by_hash("r", "mallory", "x", true);
+        assert!(matches!(
+            mode.validate_identity(&msg, &raw),
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    /// A hash computed over another realm names nobody here: the index is
+    /// keyed by this backend's realm, and REALM itself is checked first.
+    #[test]
+    fn userhash_for_another_realm_does_not_resolve() {
+        let mode = AuthMode::long_term("r", [("alice", "pw-a")]);
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::UserHash(turna_crypto::userhash(
+            "alice", "other",
+        )));
+        m.add(Attribute::Realm("r".into()));
+        let key = turna_crypto::long_term_key_sha256("alice", "r", "pw-a");
+        let mut buf = [0u8; 512];
+        let len = m.encode_with_integrity_sha256(&mut buf, &key).unwrap();
+        let msg = StunMessage::decode(&buf[..len]).unwrap();
+        assert!(matches!(
+            mode.validate_identity(&msg, &buf[..len]),
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    /// Runtime user management keeps the index in step: an added user is
+    /// resolvable, a removed one is not, and rehydrated keys (no password)
+    /// are indexed too — that is the path Tarantool-backed users take.
+    #[test]
+    fn index_follows_add_remove_and_rehydrate() {
+        let mode = AuthMode::long_term("r", Vec::<(&str, &str)>::new());
+        let (msg, raw) = by_hash("r", "carol", "pw-c", true);
+        assert!(mode.validate_identity(&msg, &raw).is_err());
+
+        assert!(mode.add_user("carol", "pw-c"));
+        assert_eq!(
+            mode.validate_identity(&msg, &raw).unwrap().username,
+            "carol"
+        );
+
+        assert!(mode.remove_user("carol"));
+        assert!(matches!(
+            mode.validate_identity(&msg, &raw),
+            Err(AuthError::InvalidCredentials)
+        ));
+
+        assert!(mode.add_user_keys("carol", UserKeys::derive("carol", "r", "pw-c")));
+        assert_eq!(
+            mode.validate_identity(&msg, &raw).unwrap().username,
+            "carol"
+        );
+    }
+
+    /// TURN REST cannot resolve a hash: the username embeds an expiry the
+    /// server has never seen, and SHA-256 does not run backwards. RFC 8489
+    /// §9.2.4 answers an invalid USERHASH with 401, which InvalidCredentials is.
+    #[test]
+    fn shared_secret_rejects_userhash() {
+        let mode = AuthMode::SharedSecret {
+            realm: "r".into(),
+            secret: b"s".to_vec(),
+            previous: None,
+        };
+        assert!(!mode.supports_userhash());
+        let (msg, raw) = by_hash("r", "1700000000:alice", "whatever", true);
+        assert!(matches!(
+            mode.validate_identity(&msg, &raw),
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    /// With both attributes, USERNAME decides; a USERHASH naming somebody else
+    /// is ignored rather than consulted.
+    #[test]
+    fn username_takes_precedence_over_userhash() {
+        let mode = AuthMode::long_term("r", [("alice", "pw-a"), ("bob", "pw-b")]);
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::Username("alice".into()));
+        m.add(Attribute::UserHash(turna_crypto::userhash("bob", "r")));
+        m.add(Attribute::Realm("r".into()));
+        let key = turna_crypto::long_term_key_sha256("alice", "r", "pw-a");
+        let mut buf = [0u8; 512];
+        let len = m.encode_with_integrity_sha256(&mut buf, &key).unwrap();
+        let msg = StunMessage::decode(&buf[..len]).unwrap();
+        let v = mode.validate_identity(&msg, &buf[..len]).unwrap();
+        assert_eq!(v.username, "alice");
+    }
+
+    #[test]
+    fn registry_subject_is_the_resolved_name() {
+        let reg = AuthRegistry::new(AuthMode::long_term("r", [("dave", "pw-d")]));
+        assert!(reg.all_realms_support_userhash());
+        let (msg, raw) = by_hash("r", "dave", "pw-d", true);
+        let res = reg.validate(&msg, &raw).unwrap();
+        assert_eq!(res.subject, "dave");
+
+        let rest = AuthRegistry::new(AuthMode::SharedSecret {
+            realm: "r".into(),
+            secret: b"s".to_vec(),
+            previous: None,
+        });
+        assert!(!rest.all_realms_support_userhash());
     }
 }

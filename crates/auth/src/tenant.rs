@@ -134,6 +134,19 @@ impl AuthRegistry {
         self.tenants.keys().cloned().collect()
     }
 
+    /// Whether every realm this registry serves can resolve an RFC 8489
+    /// USERHASH. Advertising "Username anonymity" in the nonce cookie obliges
+    /// a conforming client to send USERHASH instead of USERNAME (§9.2.5), and
+    /// the 401 challenge is issued before the realm is known, so the bit is only
+    /// safe when no realm would then be unable to authenticate that client.
+    pub fn all_realms_support_userhash(&self) -> bool {
+        self.base.load().supports_userhash()
+            && self
+                .tenants
+                .values()
+                .all(|(_, auth)| auth.load().supports_userhash())
+    }
+
     /// Number of explicit tenants (0 = single-tenant).
     pub fn tenant_count(&self) -> usize {
         self.tenants.len()
@@ -169,24 +182,27 @@ impl AuthRegistry {
             // the current backend for this request; a concurrent rotation
             // publishes a new one for the next request without disturbing this.
             let mode = auth.load();
-            let (key, max_lifetime_secs) = mode.validate_with_lifetime(msg, raw)?;
+            let v = mode.validate_identity(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: Some(tenant_id.clone()),
                 realm: realm_ref.to_string(),
-                key,
-                subject: mode.subject_of(msg.get_username().unwrap_or("")),
-                max_lifetime_secs,
+                key: v.key,
+                // The resolved name, not `msg.get_username()`: a USERHASH
+                // request carries no USERNAME, and keying its quota on "" would
+                // pool every anonymous user into one subject.
+                subject: mode.subject_of(&v.username),
+                max_lifetime_secs: v.max_lifetime_secs,
             })
         } else if realm_ref == self.base_realm {
             // Base realm: default/single-tenant.
             let base = self.base.load();
-            let (key, max_lifetime_secs) = base.validate_with_lifetime(msg, raw)?;
+            let v = base.validate_identity(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: None,
                 realm: realm_ref.to_string(),
-                key,
-                subject: base.subject_of(msg.get_username().unwrap_or("")),
-                max_lifetime_secs,
+                key: v.key,
+                subject: base.subject_of(&v.username),
+                max_lifetime_secs: v.max_lifetime_secs,
             })
         } else {
             // Unknown realm — no backend to authenticate against. Reject; never

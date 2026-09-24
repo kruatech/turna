@@ -445,6 +445,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // default: most deployed TURN clients predate RFC 8489 and send only
     // MESSAGE-INTEGRITY, so turning it on where they exist locks them out.
     turna_auth::set_require_sha256(config.auth.require_sha256);
+    // RFC 8489 username anonymity: advertise it in the nonce cookie only when
+    // asked. Accepting USERHASH needs no switch. Set before any processor is
+    // built, because each processor's nonce issuer reads it at construction.
+    turna_relay::processor::set_advertise_userhash(config.auth.advertise_userhash);
+    if config.auth.advertise_userhash {
+        info!("RFC 8489 username anonymity advertised: clients will send USERHASH");
+    }
 
     metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
     // The packet-rate ceiling and its thresholds. Separate call because the two

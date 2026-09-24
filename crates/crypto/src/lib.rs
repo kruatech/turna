@@ -77,6 +77,19 @@ pub fn long_term_key_sha256(username: &str, realm: &str, password: &str) -> Vec<
     Sha256::digest(input.as_bytes()).to_vec()
 }
 
+/// RFC 8489 §14.4 USERHASH: `SHA-256(username ":" realm)` (32 bytes).
+///
+/// The RFC applies the OpaqueString profile (RFC 8265) to both inputs before
+/// hashing. Like [`long_term_key`] and [`long_term_key_sha256`], this does not:
+/// the long-term key and the userhash must be derived from the same bytes, or a
+/// user whose name changes under OpaqueString would authenticate by USERNAME
+/// and fail by USERHASH (or the reverse). Names that OpaqueString leaves
+/// unchanged — which includes every ASCII name — hash identically either way,
+/// as the RFC 8489 Appendix B.1 vector (a non-ASCII name) confirms.
+pub fn userhash(username: &str, realm: &str) -> [u8; 32] {
+    sha256(format!("{username}:{realm}").as_bytes())
+}
+
 /// Raw SHA-256 of `data` (32 bytes). Used by the control-plane audit log to
 /// hash-chain privileged operations.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -135,6 +148,28 @@ pub fn generate_turn_credentials(
         result.into_bytes(),
     );
     (username, password)
+}
+
+#[cfg(test)]
+mod userhash_tests {
+    /// RFC 8489 Appendix B.1: username "マトリックス" (unchanged by
+    /// OpaqueString), realm "example.org", USERHASH value as printed in the
+    /// vector.
+    #[test]
+    fn rfc8489_b1_userhash_vector() {
+        let expected: [u8; 32] = [
+            0x4a, 0x3c, 0xf3, 0x8f, 0xef, 0x69, 0x92, 0xbd, 0xa9, 0x52, 0xc6, 0x78, 0x04, 0x17,
+            0xda, 0x0f, 0x24, 0x81, 0x94, 0x15, 0x56, 0x9e, 0x60, 0xb2, 0x05, 0xc4, 0x6e, 0x41,
+            0x40, 0x7f, 0x17, 0x04,
+        ];
+        assert_eq!(
+            super::userhash(
+                "\u{30DE}\u{30C8}\u{30EA}\u{30C3}\u{30AF}\u{30B9}",
+                "example.org"
+            ),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]

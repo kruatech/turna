@@ -281,6 +281,7 @@ per-feature production maturity always check
 | --- | --- | --- |
 | STUN Binding | RFC 5389 | Supported (default tokio datapath) |
 | Message integrity, SHA-256 (`MESSAGE-INTEGRITY-SHA256`) | RFC 8489 | Supported |
+| Username anonymity (`USERHASH`) | RFC 8489 §14.4 | Supported for long-term (`static_users` / stored) users; TURN REST answers `401` (a hash of an ephemeral username cannot be resolved). Advertising it in the nonce is opt-in (`[turn.auth] advertise_userhash`) |
 | TURN allocation lifecycle, UDP relay | RFC 5766 / RFC 8656 | Supported (default tokio datapath) |
 | Relayed transport family | RFC 6156 / 8656 | IPv4 by default; IPv6 opt-in via `[turn] external_ip6` (unset → `440`). One family per allocation, cross-family peers get `443`. `ADDITIONAL-ADDRESS-FAMILY` not implemented |
 | TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; allowed in production since 2026-08-25. Requires the `tls` listener. IPv4 only — an IPv6 TCP allocation answers 440 |

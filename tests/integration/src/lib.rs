@@ -2745,3 +2745,81 @@ fn metric_value(health: &SocketAddr, name: &str) -> f64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0)
 }
+
+#[cfg(test)]
+mod userhash_e2e {
+    //! RFC 8489 §14.4 USERHASH against a real node: an Allocate that names its
+    //! user by `SHA-256(username ":" realm)` and carries no USERNAME at all.
+    //! Until this landed the node answered 420, because 0x001E is
+    //! comprehension-required and was not understood.
+    use super::*;
+
+    const ATTR_USERHASH: u16 = 0x001E;
+
+    fn userhash(user: &str, realm: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("{user}:{realm}").as_bytes()).into()
+    }
+
+    #[tokio::test]
+    async fn allocate_by_userhash_succeeds_on_a_long_term_realm() {
+        let target = target_addr();
+        let sock = bind_socket().await;
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let r401 = skip_if_no_server!(
+            send_recv(&sock, target, &probe.encode(), 2000).await,
+            target
+        );
+        let (r401, _) = r401;
+        if test_secret().is_some() {
+            // A TURN REST realm cannot resolve a hash (the username embeds an
+            // expiry the server never stores); the processor tests pin the 401.
+            eprintln!("SKIP: target uses a shared secret; USERHASH needs a long-term realm");
+            return;
+        }
+        let realm = extract_realm(&r401).expect("401 carries REALM");
+        let nonce = extract_nonce(&r401).expect("401 carries NONCE");
+        let (username, password) = effective_credentials();
+
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_attr(ATTR_USERHASH, &userhash(&username, &realm));
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let key = long_term_key(&username, &realm, &password);
+        let (resp, _) = send_recv(&sock, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to USERHASH Allocate");
+        assert!(
+            is_success(&resp),
+            "USERHASH Allocate must succeed; err={:?}",
+            extract_error_code(&resp)
+        );
+
+        // A hash of a name the node does not know is a 401, not a 420.
+        let sock2 = bind_socket().await;
+        let (r401, _) = send_recv(&sock2, target, &probe.encode(), 2000)
+            .await
+            .expect("challenge");
+        let nonce = extract_nonce(&r401).expect("NONCE");
+        let mut bad = TurnMsg::request(0x0003);
+        bad.add_requested_transport();
+        bad.add_attr(ATTR_USERHASH, &userhash("nobody-by-this-name", &realm));
+        bad.add_realm(&realm);
+        bad.add_nonce(&nonce);
+        let (resp, _) = send_recv(&sock2, target, &bad.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to unknown USERHASH");
+        assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(401));
+
+        // Release the first allocation so the shared node stays clean.
+        let mut rel = TurnMsg::request(0x0004);
+        rel.add_lifetime(0);
+        rel.add_attr(ATTR_USERHASH, &userhash(&username, &realm));
+        rel.add_realm(&realm);
+        rel.add_nonce(&extract_nonce(&r401).unwrap_or_default());
+        let _ = send_recv(&sock, target, &rel.encode_with_integrity(&key), 1000).await;
+    }
+}

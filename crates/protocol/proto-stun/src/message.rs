@@ -54,6 +54,25 @@ impl StunMessage {
         })
     }
 
+    /// RFC 8489 §14.4 USERHASH, if present. The attribute is fixed-length, so
+    /// a present value is always the full 32 bytes.
+    pub fn get_userhash(&self) -> Option<&[u8; 32]> {
+        self.attributes.iter().find_map(|a| match a {
+            Attribute::UserHash(h) => Some(h),
+            _ => None,
+        })
+    }
+
+    /// Whether the request names a user at all: USERNAME or, under RFC 8489
+    /// username anonymity, USERHASH. §9.2.3.2 requires "either the USERNAME or
+    /// USERHASH" on an authenticated request, so every "is this request
+    /// carrying credentials" check must accept both.
+    pub fn has_user_identity(&self) -> bool {
+        self.attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::Username(_) | Attribute::UserHash(_)))
+    }
+
     pub fn get_realm(&self) -> Option<&str> {
         self.attributes.iter().find_map(|a| match a {
             Attribute::Realm(r) => Some(r.as_str()),
