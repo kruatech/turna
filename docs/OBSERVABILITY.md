@@ -77,6 +77,7 @@ scrape_configs:
 | `turna_malformed_packets_total` | counter | Packets classified as unknown/malformed. |
 | `turna_quota_exceeded_total` | counter | Packets dropped due to quota. |
 | `turna_peer_rejected_total` | counter | Permission/ChannelBind/Send requests rejected by peer filter. |
+| `turna_tcp_relay_peer_refused_total` | counter | RFC 6062 §5.3: peer-initiated TCP connections to a relayed address that were accepted and closed immediately because the allocation has no permission for the peer's IP (or the peer filter denies it); no ConnectionAttempt is sent. Reads 0 unless `[turn.tcp_relay]` is enabled. A steady rate is scanning of relayed ports. |
 
 ### RTP/QoS metrics
 
