@@ -229,7 +229,7 @@ it explicitly — the number is now a decision either way.
 enforced on the stock listener, where the handshake runs below `accept()`.
 Validation refuses the combination rather than accepting a limit that would do
 nothing. Add `max_handshakes_per_sec_per_ip = 0` to keep the stock listener, or
-drop `demux = false` — it has been the default since 0.4.1, and the stock path
+drop `demux = false` — it has been the default since 0.5.0, and the stock path
 has neither handshake rate limiting nor certificate hot-reload.
 
 The default is not made to depend on `demux`, deliberately: a setting whose

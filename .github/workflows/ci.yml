@@ -646,7 +646,7 @@ jobs:
         # Three Lua suites pin the CAS semantics the failover claim depends on:
         # migration idempotency, the exact-u64 parser, and the runtime /
         # user-limits CAS round-trip including rollback on an injected write
-        # failure. GA_FINAL_REPORT.md documented how to run them by hand, and
+        # failure. docs/verification/v0.3.0-ga-final-report.md documented how to run them by hand, and
         # nothing ever did — so the contract they pin was unenforced, in the one
         # place where getting CAS wrong loses allocations silently.
         #
