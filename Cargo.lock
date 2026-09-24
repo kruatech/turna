@@ -4299,7 +4299,7 @@ dependencies = [
  "cbc",
  "ccm",
  "chrono",
- "der-parser 8.2.0",
+ "der-parser 10.0.0",
  "env_logger",
  "hkdf",
  "hmac",
