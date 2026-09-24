@@ -529,6 +529,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     self_addrs.extend(relay_bind_v4.map(std::net::IpAddr::V4));
     self_addrs.extend(relay_bind_v6.map(std::net::IpAddr::V6));
+    // Load-balancer ranges trusted to send a PROXY header are never relay
+    // peers: a client that got the relay to connect into one could forge the
+    // header on a PROXY-trusting listener. Unconditional, like self_addrs.
+    let proxy_trusted = turna_config::proxy_trusted_cidrs_in_use(&config, &tls_cfg);
+    if !proxy_trusted.is_empty() {
+        info!(ranges = ?proxy_trusted, "PROXY-protocol trusted ranges denied as relay peers");
+    }
     turna_relay::peer_filter::init_peer_policy(
         turna_relay::peer_filter::PeerPolicy::from_config(
             &config.peer_filter.profile,
@@ -536,7 +543,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &config.peer_filter.denied_peer_ranges,
             &config.peer_filter.allowed_peer_ranges,
         )
-        .with_self_addresses(self_addrs),
+        .with_self_addresses(self_addrs)
+        .with_forbidden_ranges(&proxy_trusted),
     );
 
     run_tokio(
