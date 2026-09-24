@@ -2827,6 +2827,22 @@ async fn allocate_with_permission(
     target: SocketAddr,
     peer: SocketAddr,
 ) -> SocketAddr {
+    let (relay, presp) = allocate_and_request_permission(client, target, peer).await;
+    assert!(
+        is_success(&presp),
+        "CreatePermission failed: {:?}",
+        extract_error_code(&presp)
+    );
+    relay
+}
+
+/// As [`allocate_with_permission`], returning the CreatePermission response
+/// instead of asserting on it.
+async fn allocate_and_request_permission(
+    client: &UdpSocket,
+    target: SocketAddr,
+    peer: SocketAddr,
+) -> (SocketAddr, Vec<u8>) {
     let mut probe = TurnMsg::request(0x0003);
     probe.add_requested_transport();
     let (r401, _) = send_recv(client, target, &probe.encode(), 2000)
@@ -2858,12 +2874,7 @@ async fn allocate_with_permission(
     let (presp, _) = send_recv(client, target, &perm.encode_with_integrity(&key), 2000)
         .await
         .expect("CreatePermission response");
-    assert!(
-        is_success(&presp),
-        "CreatePermission failed: {:?}",
-        extract_error_code(&presp)
-    );
-    relay
+    (relay, presp)
 }
 
 /// `external_ip = "PUBLIC/PRIVATE"`: the public half is advertised in
@@ -3263,4 +3274,49 @@ fn rfc6062_tcp_relay_over_plain_tcp_listener() {
     peer_side.write_all(b"peer->client").unwrap();
     data.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"peer->client");
+}
+
+/// A PROXY-trusted range is never a relay peer. Otherwise a client could have
+/// the relay connect (RFC 6062) or send into the balancer range and reach a
+/// PROXY-trusting listener from a trusted source, forging its own header. Here
+/// the trusted range is loopback and `allow_loopback_peers` is on — the
+/// forbidden range must still win.
+#[tokio::test]
+async fn proxy_trusted_range_is_refused_as_a_relay_peer() {
+    let udp = free_port(true);
+    let tcp = free_port(false);
+    let body = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{udp}\"\n\
+         external_ip = \"127.0.0.1\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 50601\n\
+         max_port = 50700\n\
+         max_allocations = 32\n\
+         [turn.peer_filter]\n\
+         allow_loopback_peers = true\n\
+         [turn.tcp]\n\
+         enabled = true\n\
+         listen = \"127.0.0.1:{tcp}\"\n\
+         proxy_protocol = true\n\
+         proxy_protocol_trusted_cidrs = [\"127.0.0.0/8\"]\n"
+    );
+    let Some(_node) = start_private_node("proxy-peer-deny", &body) else {
+        return;
+    };
+    let target: SocketAddr = format!("127.0.0.1:{udp}").parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listener: SocketAddr = format!("127.0.0.1:{tcp}").parse().unwrap();
+    let (_, presp) = allocate_and_request_permission(&client, target, listener).await;
+    assert!(
+        is_error(&presp),
+        "CreatePermission towards a PROXY-trusted address must be refused"
+    );
+    assert_eq!(extract_error_code(&presp).map(|(c, _)| c), Some(403));
 }
