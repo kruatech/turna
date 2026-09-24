@@ -1,5 +1,9 @@
 # AF_XDP 1.1 — embedded XDP filter: first-build checklist
 
+> Current status: **supported within the verified Linux IPv4 UDP copy-mode scope**.
+> See [scope, evidence and unresolved limitations](verification/af-xdp-supported-2026-09-22.md).
+> This historical record describes its original run or plan; it is not the current support matrix.
+
 This change makes `transport = "af_xdp"` self-contained: instead of relying on
 libxdp's default "redirect-everything" program (auto-loaded by xsk-rs today), the
 datapath attaches an in-tree **selective** XDP program that redirects only UDP

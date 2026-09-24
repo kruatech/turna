@@ -119,10 +119,12 @@ actually relay TCP — note that `[turn.tcp_relay]` is **refused under
 `production = true`** pending interop verification. That is a real blocker for a
 production migration, not a formality.
 
-**io_uring / AF_XDP.** Do not enable these as part of a migration. They are
-experimental, and they do not start the TURNS, TCP-relay, SCTP or mobility
-listeners at all — the config validator will refuse the combination. Migrate on
-`transport = "tokio"` and evaluate datapaths separately.
+**io_uring / AF_XDP.** Migrate on `transport = "tokio"` first and evaluate
+backend changes separately. io_uring is now [supported on Linux](verification/io-uring-supported-2026-09-19.md)
+for the stated UDP scope; AF_XDP is [supported within its verified Linux IPv4 UDP
+copy-mode scope](verification/af-xdp-supported-2026-09-22.md). This does not extend
+support to every listener/backend combination. In particular SCTP requires tokio.
+Validate the full configuration and required listeners before cutover.
 
 ## A minimal equivalent config
 
@@ -204,7 +206,7 @@ they are the default and cannot be configured away.
    It loads and validates the file, prints the effective configuration with
    secrets masked, and exits. Validation is fail-fast, so anything the validator
    rejects — a placeholder secret, a missing `external_ip` under `production`, an
-   `io_uring` datapath next to a TURNS listener — aborts here rather than at 3am.
+   `io_uring` datapath next to an enabled SCTP listener — aborts here rather than at 3am.
 2. Point one client at the new server with `iceTransportPolicy: "relay"` and
    confirm a relay candidate. The browser interop procedure that was used for
    TURNS is in [interop/v0.3.0-rc.1.md](interop/v0.3.0-rc.1.md).

@@ -200,6 +200,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the additional `web-transport` feature; `web_transport = true` is the
     // config default, so a `--features quic`-only build must say so explicitly
     // rather than fall back to raw QUIC the operator did not ask for.
+    if config.sctp.enabled && (!cfg!(feature = "sctp") || !cfg!(target_os = "linux")) {
+        return Err("[turn.sctp] requires a Linux node built with --features sctp".into());
+    }
+
     if config.quic.enabled && !turna_transport::quic::QUIC_AVAILABLE {
         return Err(
             "[turn.quic] is enabled in the configuration, but this binary \
@@ -584,7 +588,7 @@ fn build_tcp_relay_config(
 }
 
 /// Map the config-layer [`turna_config::SctpSection`] to the transport-layer
-/// `SctpTransportConfig`. Experimental TURN-over-SCTP control transport.
+/// `SctpTransportConfig`. Supported native Linux TURN-over-SCTP transport.
 #[cfg(feature = "sctp")]
 fn build_sctp_transport_config(
     c: &turna_config::SctpSection,
@@ -2092,12 +2096,12 @@ fn run_tokio(
         // 2.4: startup validation passed. The supported Tokio datapath marks
         // Ready only AFTER its listener is actually bound (see the Tokio arm
         // below), closing the P2 window where `/ready` returned 200 before
-        // TokioTransport::bind. The opt-in AfXdp/io_uring datapaths bind inside
-        // the datapath loop with no observable post-bind hook here, so they are
-        // marked Ready at this point (behaviour unchanged for them).
-        if !matches!(
+        // TokioTransport::bind. AF_XDP marks Ready after all configured queues
+        // and the selective filter have been bound. io_uring retains its existing
+        // startup readiness behaviour here.
+        if matches!(
             transport_decision.backend,
-            turna_transport::TransportBackend::Tokio
+            turna_transport::TransportBackend::IoUring
         ) {
             metrics.set_readiness(turna_health::Readiness::Ready);
         }
@@ -2402,7 +2406,7 @@ fn run_tokio(
                 };
                 #[cfg(feature = "sctp")]
                 let server = if config.sctp.enabled {
-                    info!(listen = %config.sctp.listen, "TURN-over-SCTP (experimental) enabled");
+                    info!(listen = %config.sctp.listen, "TURN-over-SCTP enabled (Linux, plaintext)");
                     server.with_sctp(build_sctp_transport_config(&config.sctp))
                 } else {
                     server

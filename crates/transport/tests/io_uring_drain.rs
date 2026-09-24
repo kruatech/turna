@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 use turna_transport::worker::{spawn_worker_pool, ForwardAction, PacketHandler, WorkerPoolConfig};
 
 /// Handler that does nothing — we only care about the worker lifecycle here.
-struct NoopHandler;
+struct NoopHandler(Arc<AtomicBool>);
 
 impl PacketHandler for NoopHandler {
     fn handle_packet(&mut self, _data: &[u8], _source: SocketAddr) -> ForwardAction {
+        self.0.store(true, Ordering::SeqCst);
         ForwardAction::None
     }
     fn handle_relay_packet(
@@ -45,18 +46,28 @@ fn worker_pool_drains_and_exits_on_shutdown() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let drain_grace = Duration::from_millis(200);
 
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let listen_addr = reservation.local_addr().unwrap();
+    drop(reservation);
+    let received = Arc::new(AtomicBool::new(false));
     let config = WorkerPoolConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(), // ephemeral port
+        listen_addr,
         num_workers: 1,
         shutdown: shutdown.clone(),
         drain_grace,
         ..Default::default()
     };
 
-    let handles = spawn_worker_pool(config, |_id| NoopHandler);
+    let observed = received.clone();
+    let handles = spawn_worker_pool(config, move |_id| NoopHandler(observed.clone()));
 
-    // Let the worker come up and arm its ring before we ask it to drain.
-    std::thread::sleep(Duration::from_millis(150));
+    // A thread that exited during ring setup is NOT a successful drain test.
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !received.load(Ordering::SeqCst) && Instant::now() < ready_deadline {
+        probe.send_to(b"uring-drain-probe", listen_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // Trigger graceful drain.
     shutdown.store(true, Ordering::SeqCst);
@@ -64,6 +75,7 @@ fn worker_pool_drains_and_exits_on_shutdown() {
     // Each worker must exit within drain_grace + generous slack. We poll
     // `is_finished` against a deadline instead of a bare `join()` so a drain
     // *hang* fails the test instead of hanging it forever.
+    let actually_received = received.load(Ordering::SeqCst);
     let deadline = Instant::now() + drain_grace + Duration::from_secs(5);
     for handle in handles {
         while !handle.is_finished() {
@@ -78,4 +90,8 @@ fn worker_pool_drains_and_exits_on_shutdown() {
             .join()
             .expect("worker thread panicked during graceful drain");
     }
+    assert!(
+        actually_received,
+        "worker never received a packet; check io_uring startup/kernel availability"
+    );
 }

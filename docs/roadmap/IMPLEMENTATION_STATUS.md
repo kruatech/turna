@@ -87,6 +87,13 @@ compile/test/clippy matrix is the source of truth.
 - **shipped** runbook for the encrypted transports (`docs/runbooks/encrypted-transports.md`, covering the rules in `docs/alerts/transport-backends.yml`); **pending** dashboards.
 
 ## Stage 4b - AF_XDP Phase 2 (datapath completeness)
+
+> Historical implementation record. Current selective-filter behavior, copy-mode
+> support and remaining limits are documented in the
+> [2026-09-22 support record](../verification/af-xdp-supported-2026-09-22.md).
+> Current ARP/NDP traffic remains on the kernel path. Historical claims below
+> are not evidence of present zero-copy, IPv6 WAN or physical-NIC qualification.
+
 All four planned items shipped, compile clean, frame logic unit-tested, and the
 datapath validated live (IPv4+IPv6):
 

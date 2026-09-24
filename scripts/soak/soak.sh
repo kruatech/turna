@@ -305,7 +305,7 @@ checked because the log grows with duration and load.
 EOF
   exit 1
 fi
-say "disk: ${FREE_MB} MB free, budget ${MIN_FREE_MB} MB for ${DURATION_SECS}s"
+log "disk: ${FREE_MB} MB free, budget ${MIN_FREE_MB} MB for ${DURATION_SECS}s"
 
 # And a cap, so even a correct estimate cannot be defeated by an unexpected log
 # rate. Truncation loses the middle of the log, which is better than losing the
@@ -417,10 +417,10 @@ DTLS
 fi)
 
 [turn.peer_filter]
-# The `channel-data` mode binds its peer socket on 127.0.0.1, and loopback is a
+# The channel-data mode binds its peer socket on 127.0.0.1, and loopback is a
 # forbidden peer by default — correct behaviour (it is SSRF protection), but it makes
 # a loopback relay test impossible. Without this, every channel fails
-# CreatePermission with 403 during warmup, `--warmup` then RESETS the counters, and
+# CreatePermission with 403 during warmup, --warmup then RESETS the counters, and
 # the phase reports sent=0 recv=0 errs=0 for its whole duration: a failed phase that
 # looks like an idle one. That cost a 20-minute run to diagnose.
 #
@@ -429,7 +429,7 @@ profile = "lan"
 allow_loopback_peers = true
 
 [turn.relay.quota]
-# The load tool sends ONE `--uid` for every client, so all concurrency lands on a
+# The load tool sends ONE --uid for every client, so all concurrency lands on a
 # single username. The default per-user cap is 100, which refuses everything above
 # that with 486 Allocation Quota Reached — and the client retries in a tight loop, so
 # a soak configured this way records millions of errors, a handful of successes, and a
@@ -527,7 +527,7 @@ SERIES="turna_active_allocations turna_total_allocations turna_uptime_seconds \
 turna_packets_received turna_packets_sent turna_bytes_received turna_bytes_sent \
 turna_send_queue_dropped_total turna_malformed_packets_total \
 turna_parser_rejections_total turna_peer_rejected_total turna_auth_failures \
-turna_quota_exceeded_total turna_rate_limited turna_processor_panics_total \
+turna_quota_exceeded_total turna_rate_limited turna_unauth_replies_suppressed_total turna_processor_panics_total \
 turna_transport_readiness turna_backend_readiness turna_draining \
 turna_tls_active_connections turna_tls_handshake_failures_total \
 turna_tls_rejected_over_cap_total turna_tls_rejected_per_ip_total \
@@ -549,8 +549,9 @@ sample() {
   rss=$(awk '/^VmRSS:/{print $2}' "/proc/$NODE_PID/status" 2>/dev/null)
   vm=$(awk '/^VmSize:/{print $2}' "/proc/$NODE_PID/status" 2>/dev/null)
   thr=$(awk '/^Threads:/{print $2}' "/proc/$NODE_PID/status" 2>/dev/null)
-  fds=$(ls "/proc/$NODE_PID/fd" 2>/dev/null | wc -l)
-  metrics=$(curl -fsS --max-time 5 "http://$HEALTH_ADDR/metrics" 2>/dev/null)
+  metrics=$(curl -fsS --max-time 5 "http://$HEALTH_ADDR/metrics" 2>/dev/null) || die "metrics unavailable during sampling"
+  fds=$(printf '%s\n' "$metrics" | awk '$1 == "turna_process_open_fds" {print $2; exit}')
+  [[ "$fds" =~ ^[0-9]+$ ]] && [ "$fds" -gt 0 ] || die "missing or invalid turna_process_open_fds"
 
   line="$now,$elapsed,$phase,${rss:-},${vm:-},${thr:-},${fds:-}"
   for s in $SERIES; do

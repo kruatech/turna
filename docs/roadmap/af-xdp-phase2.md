@@ -1,5 +1,9 @@
 # AF_XDP Phase 2 — implementation plan (COMPLETED)
 
+> Current status: **supported within the verified Linux IPv4 UDP copy-mode scope**.
+> See [scope, evidence and unresolved limitations](../verification/af-xdp-supported-2026-09-22.md).
+> This historical record describes its original run or plan; it is not the current support matrix.
+
 > **STATUS: all four items shipped and validated on hardware (IPv4 + IPv6).** See
 > `docs/roadmap/IMPLEMENTATION_STATUS.md` → "Stage 4b" for what landed. This file is
 > kept as the record of *how* it was planned, not as a task list.

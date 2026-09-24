@@ -28,31 +28,24 @@ These are the areas we want to harden, in rough priority order:
      connection close). The remaining work is *evidence*: run
      [docs/verification/encrypted-transports.md](docs/verification/encrypted-transports.md)
      and record it, then they can be called supported.
-   - `quic` / `web-transport` are **experimental** with known functional gaps —
-     most `[turn.quic]` limits are not applied on the WebTransport path, there is
-     no per-stream reply routing there, and QUIC connection migration is not
-     detected. See
-     [docs/design/quic-webtransport.md](docs/design/quic-webtransport.md) §7.
-   - `io-uring` and `af-xdp` remain **experimental** and hardware/kernel
-     dependent; see [docs/roadmap/af-xdp-phase2.md](docs/roadmap/af-xdp-phase2.md).
-     `io-uring` is now **beta**: endurance and ChannelData relaying are both on record
-     (`docs/soak/endurance-2026-08-19.md`) on Ubuntu 24.04 / kernel 6.14. Getting there
-     found and fixed a relay-slot leak that made the datapath forward nothing at all
-     while its control plane ran at 10 800 Allocate/s. What remains before `supported`
-     is a run on the kernel you actually deploy — io_uring behaviour is
-     version-sensitive, and one kernel is not evidence for another.
-   - `sctp` is **experimental and refused under `production = true`**, and unlike
-     the others it has had none of the hardening pass: no per-IP cap, no metrics,
-     no readiness gauge, no cooperative drain, and a plaintext control channel.
-     [docs/protocol-gap.md](docs/protocol-gap.md) rates it lowest priority. The
-     current position is **keep it refused and do not invest**: the production gate
-     already makes it unshippable, so hardening it would be work for a feature with
-     no RFC and no users. The open decision is whether to delete it outright; until
-     then it stays test-only and the feature-powerset CI keeps it compiling.
-     (One real bug was fixed in passing: `sctp_bridge` never released an
-     allocation when the association closed, so every closed connection leaked its
-     relay port until the TTL expired — `tls_bridge` had that release, SCTP did
-     not.)
+   - `quic` / `web-transport` are **supported** on Linux/macOS with tokio.
+     Limits, per-stream replies and migration handling are implemented.
+     Scope and evidence: [support record](docs/verification/quic-webtransport-supported-2026-09-18.md).
+   - `io-uring` is **supported on Linux**, opt-in; tokio remains the default.
+     Recovery, buffer/cancellation handling, functional checks and clean shutdown
+     are verified. Load evidence includes 30-minute media and four-hour authenticated
+     churn on 6.8.0-87, plus functional checks and short churn on 6.14.0-33.
+     [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md).
+   - `af-xdp` is **supported within the verified Linux IPv4 UDP copy-mode scope**.
+     SKB/native copy-mode evidence is recorded on 6.8.0-87 / `virtio_net`;
+     zero-copy, additional hardware and cold-neighbor/route-change validation remain.
+     Earlier WAN control timeouts remain unexplained despite later passing runs.
+     [Scope and evidence](docs/verification/af-xdp-supported-2026-09-22.md).
+   - `sctp` is **supported on Linux/tokio**, opt-in and allowed in production.
+     Native functional, lifecycle/limits and 30-minute WAN checks passed.
+     [Evidence and scope](docs/verification/sctp-supported-2026-09-18.md):
+     plaintext, UDP peer-side relay, kernel SCTP/IP protocol 132 required.
+     Independent-client interoperability and multi-day endurance are not claimed.
 
    Cross-cutting gaps that block *all* of the encrypted transports from
    "supported": on the **default** DTLS path there is still no certificate
@@ -63,13 +56,9 @@ These are the areas we want to harden, in rough priority order:
    bidirectional media on any encrypted transport — only a STUN Binding test on
    DTLS today.
 
-3. **Decide the production gate for the three refused features.**
-   `config::validate()` hard-rejects `turn.tcp_relay.enabled`,
-   `turn.sctp.enabled` and `turn.auth.oauth.enabled` when `production = true`.
-   Each needs an explicit exit condition rather than staying refused
-   indefinitely: RFC 6062 needs interop plus pipelined-client hardening, OAuth
-   needs an interop pass against a real authorization server, and SCTP needs the
-   keep-or-drop decision above.
+3. **Finish OAuth verification before lifting its production gate.**
+   RFC 7635 needs a real authorization-server interoperability run. RFC 6062
+   and Linux/tokio SCTP are no longer refused merely by `production = true`.
 
 4. **Finish the relayed transport family.** IPv6 relaying is now opt-in via
    `[turn] external_ip6`, with RFC 6156 §4.2 family separation (443 on a

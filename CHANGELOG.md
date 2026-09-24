@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Document AF_XDP as **supported within the verified Linux IPv4 UDP copy-mode scope**
+  (SKB/native, Linux 6.8.0-87, `virtio_net`, two RX queues). Record four-hour
+  native WAN media and 15-minute churn, resource cleanup and XDP detach. Keep
+  zero-copy unverified and earlier control timeouts unresolved; no root-cause
+  fix is claimed. Reconcile loader, queue, geometry and metric documentation.
+  See `docs/verification/af-xdp-supported-2026-09-22.md`.
+
+- Promote the io_uring UDP datapath to **supported on Linux**, opt-in, with
+  tested kernels 6.8.0-87 and 6.14.0-33. Record receive/cancel recovery tests,
+  functional acceptance and shutdown, 30-minute media, four-hour authenticated
+  churn on cloud and short second-kernel churn. Document worker-dependent memory,
+  configuration limits and the earlier failed fresh-socket churn separately.
+  See `docs/verification/io-uring-supported-2026-09-19.md`.
+
+- Promote QUIC and WebTransport to supported within the Linux/macOS tokio
+  scope. Reconcile configuration, operations and support documentation with the
+  implemented limits, routing, cleanup and recorded verification. Keep WAN loss,
+  project-specific mappings and unverified multi-day endurance explicit; see
+  `docs/verification/quic-webtransport-supported-2026-09-18.md`.
+
+- Promote native TURN-over-SCTP to **supported on Linux/tokio**, opt-in. Lift the
+  production refusal while retaining platform/feature/framing validation; reject
+  backend selections that do not start the SCTP listener. The channel remains
+  plaintext and the peer-side relay UDP. Record native functional, lifecycle/limits
+  and 30-minute WAN evidence in `docs/verification/sctp-supported-2026-09-18.md`.
+  No QUIC/WebTransport status change or multi-day endurance claim.
+
 ### Security
 
 - **`services/admin`: the read-only API routes required no token.**

@@ -41,12 +41,9 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **SSRF/peer policy is already first-class**: `crates/relay/src/peer_filter.rs`
   (`is_forbidden_peer`, `normalize_ip`) + a validated peer-filter config profile.
   New relayed transports must route through it, not around it.
-- **Production gate (config `validate()`).** With `production=true`: experimental
-  transports are refused (`turn.tcp_relay.enabled` / `turn.sctp.enabled` → hard
-  error), an unlimited per-allocation bandwidth cap (`max_bytes_per_sec_per_allocation = 0`) is
-  refused unless `allow_unlimited_bandwidth = true` is set to accept the risk, and
-  the shipped production Helm example now pins a finite `maxBytesPerSecPerAllocation`. So the
-  "not production" notes below are **enforced**, not merely advisory.
+- **Production gate (config `validate()`).** OAuth remains refused under
+  `production=true`. The RFC 6062 gate was lifted earlier; SCTP is now supported
+  on Linux/tokio. Normal production secret/address/quota checks still apply.
 
 ## Summary
 
@@ -67,8 +64,8 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 | NAT discovery (RFC 5780) | **absent** | no codec in the tree — see the section below; the earlier "codec done" claim was wrong |
 | OAuth (RFC 7635) | **done** (stages 1–3) | codec + AuthMode::OAuth (AEAD decrypt + MI-by-mac_key; token-time = §6.2 fixed-point + clock skew) + config wiring + 401 THIRD-PARTY-AUTHORIZATION challenge + §6.1 lifetime cap incl. zero-remaining 401 + **`kid`-from-USERNAME key selection (RFC 7635 §6.1): kid-tagged keys select one AS-RS key directly; `strict_kid` opt-in rejects unknown/absent kid, default keeps trial-decrypt fallback for rotation**. Remaining: RFC 6062 TCP-allocate binding |
 | ORIGIN | **present (codec)** | `Attribute::Origin` (0x802F) parse/encode/getter |
-| QUIC / WebTransport | **both beta** — raw QUIC has correctness, relayed media and 20 min under load, but **no independent implementation can exist**: no RFC defines TURN over raw QUIC. WebTransport has browser interop (Chrome 151, real certificate, `docs/interop/webtransport-browser-2026-08-20.md`) plus 20 min under load | `quic.rs` raw-QUIC + wtransport H3 paths; per-stream control replies, session + per-IP caps, per-IP handshake rate limit, cert hot-reload and the full `[turn.quic]` transport limits on **both** paths (the wtransport `quinn` dependency feature is enabled, so `quic_config_mut()` is reachable). Remaining: `alpn` inert on H3 (wtransport forces `h3`), no interop test |
-| SCTP client transport | **wired** | codec + bridge + transport server + server.with_sctp + [turn.sctp] config + Cargo feature; needs compile pass + host kernel; **refused under `production=true`** (config gate) |
+| QUIC / WebTransport | **supported**, Linux/macOS with tokio | Project-specific TURN mappings; shared transport limits and per-stream routing implemented on both paths. WebTransport uses H3 ALPN. Raw QUIC independent TURN-client interoperability is not established. [Support scope and evidence](verification/quic-webtransport-supported-2026-09-18.md). |
+| SCTP client transport | **supported on Linux/tokio** | Native SCTP, control and ChannelData, UDP relay; production allowed. [Evidence](verification/sctp-supported-2026-09-18.md). |
 
 ---
 
@@ -521,53 +518,24 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   auth challenge, and an origin allow/deny policy in config. Both are policy
   features on top of the now-available attribute, not codec work.
 
-### SCTP client transport — partial (control-transport only)
-- **No RFC**: no TURN RFC defines SCTP as a *relayed* transport. Only sane form is
-  **TURN-over-SCTP as a client control transport** (STUN/TURN length-framed over an
-  SCTP association, like TURN-over-TCP); the relay socket to the peer stays UDP.
-  `TRANSPORT_SCTP = 132` is the IANA protocol number (RFC 4960), not a standardized
-  TURN relayed-transport value — used here only to name the control transport.
-- **Done**: `TRANSPORT_SCTP` constant; `crates/relay/src/sctp_bridge.rs` — the
-  relay-side glue (a faithful adaptation of `tls_bridge.rs`, reusing the shared
-  `TcpTransportEvent`/`TcpSendCommand` stream events; relayed traffic goes out UDP
-  via the same `OutMsg`/`ClientSinks` machinery). Registered under `feature = "sctp"`.
-- **Transport server — written** (`crates/transport/src/sctp.rs`): faithful mirror
-  of `tcp_tls`, minus TLS. One-to-one SCTP (`SOCK_STREAM`+`IPPROTO_SCTP`) via
-  `socket2` + `tokio::io::unix::AsyncFd`; reuses the shared `TcpFrameCodec` and the
-  `TcpConnectionId/TcpTransportEvent/TcpSendCommand` types; registered under
-  `feature = "sctp"` in `transport/lib.rs`. Plaintext control channel (TLS-over-SCTP
-  out of scope). Highest-uncertainty blind module — has `// VERIFY (on-repo)` marks
-  at the socket2/SCTP-specific spots; expect a compile pass.
-- **Wiring — done** (`with_sctp` path, mirroring TURNS):
-  - Cargo: `turna-transport` gains `sctp = ["tls"]`; `turna-relay` gains
-    `sctp = ["turna-transport/sctp"]`. `socket2`/`libc` were already non-optional
-    `cfg(unix)` deps — nothing new to add.
-  - `RelayServer::with_sctp(SctpTransportConfig)` + an `sctp_config` field; the
-    bridge is spawned in `run()` under `#[cfg(feature = "sctp")]`, sharing the relay
-    send channel + `client_sinks` exactly like the TURNS bridge.
-  - `config`: `[turn.sctp]` section (`SctpSection`: enabled/listen/max_frame_size/
-    read_timeout_secs/max_connections/backlog; disabled by default).
-  - node `main.rs`: `build_sctp_transport_config` + `if config.sctp.enabled { …
-    with_sctp … }` in the tokio backend, after the TURNS block.
-  - Fixed `TcpConnectionId::next` visibility to `pub(crate)` so the sctp module can
-    mint connection ids.
-- **Remaining**: (1) **Host**: Linux `sctp` kernel module loaded. (2) io_uring
-  backend: SCTP is only wired in the tokio backend path (mirrors where TURNS is
-  wired); add to the io_uring arm if needed. (3) The control channel is
-  **plaintext** — TLS-over-SCTP is out of scope, so anything an operator would
-  protect with TURNS is unprotected here. (4) It is missing the hardening every
-  other listener received: no per-IP connection cap, no handshake rate limit, no
-  `turna_sctp_*` metrics, no readiness gauge, and no cooperative drain.
-- **Fixed 2026-08-18**: `sctp_bridge` did not release the allocation on
-  `ConnectionClosed`, so a closed association held its relay port until the TTL and
-  a reconnecting client hit 437. `tls_bridge` had that release; SCTP was missing
-  it. Now mirrored.
-- **Recommendation stands, sharpened**: low real-world use, high attack surface,
-  awkward in containers (needs the host SCTP kernel module). Position: **keep it
-  refused under `production = true` and do not invest further** — the gate already
-  makes it unshippable, so hardening it buys nothing. The only open decision is
-  deletion. Keep experimental, off by default.
-- **Priority**: lowest.
+### SCTP client transport — supported on Linux/tokio
+
+Native one-to-one SCTP (`SOCK_STREAM` + `IPPROTO_SCTP`) carries framed STUN/TURN
+control and ChannelData over one ordered stream; relay sockets toward peers stay
+UDP. This project-specific mapping is not a standardized SCTP relay allocation,
+WebRTC DataChannel or SCTP-over-DTLS. No TLS encryption is supplied.
+
+Implemented: codec/bridge/listener wiring, global and per-IP caps, association rate
+limit, independent read idle timeout, bounded writes/queues, strict framing,
+`SCTP_NODELAY`, readiness/metrics, allocation release and cooperative drain.
+Native Linux functional, load, lifecycle/limits and 30-minute WAN checks passed;
+see [support scope and evidence](verification/sctp-supported-2026-09-18.md).
+
+Production is allowed. Linux kernel SCTP support, the `sctp` build feature,
+the tokio backend and IP protocol 132 reachability are required. Other backends
+are rejected when SCTP is enabled. Non-Linux, SCTP multistream/multihoming,
+independent-client interoperability and multi-day endurance remain outside the
+verified scope.
 
 ---
 

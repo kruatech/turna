@@ -79,13 +79,13 @@ Production checklist:
 | UDP TURN/STUN over tokio | Mainline | Recommended baseline. Endurance re-recorded against this release (`docs/soak/endurance-2026-08-19.md`): 3 h, 13.7 M allocations, 441 M packets, RSS +0.2 %, no fd or thread growth, no dropped packets, no panics, clean drain. |
 | TURNS / TLS-over-TCP | **Supported** | Metrics (`turna_tls_*`), `max_connections_per_ip`, per-IP handshake rate limit, mTLS (verified incl. the refusal case) and ALPN strict mode, certificate hot-reload, cooperative drain. Three lines of evidence: browser interop across three engines (`docs/interop/turns-browsers-2026-08-18.md`), a Let's Encrypt chain validated by a verifying client against a public deployment, and **24 h under load** — 9.6 h of relayed media at zero loss plus 4.8 h of allocation churn at 441/s, no leak on any signal (`docs/soak/endurance-24h-2026-08-22.md`). |
 | RFC 6062 TCP relay allocations | Beta, allowed in production | The `production = true` refusal was lifted on 2026-08-25: interop is recorded against our own client and against coturn's (`docs/interop/coturn-2026-08-23.md`), including the pipelined `ConnectionBind` case that no independent client had exercised before. What the gate used to stand in for — a sizing decision, since each relayed peer costs a listener and a connection — is now yours to make. Still IPv4-only. |
-| TURN-over-SCTP | **Refused in production** | Same gate on `[turn.sctp].enabled`. No RFC defines SCTP for TURN; control channel only. Needs the host `sctp` kernel module. |
+| TURN-over-SCTP | **Supported on Linux/tokio** | Opt-in native SCTP, allowed in production; requires kernel support and IP protocol 132 reachability. Plaintext, UDP peer-side relay. [Evidence](verification/sctp-supported-2026-09-18.md). |
 | Third-party auth (RFC 7635 OAuth) | **Refused in production** | Same gate on `[turn.auth.oauth].enabled`. |
 | IPv6 relayed transport | Opt-in, verified | Set `[turn] external_ip6` to a routable IPv6 address. Unset (default) keeps the old behaviour: IPv6 Allocate → `440`. Relayed media verified between two **routable** global v6 addresses with the peer filter in its `lan` profile and no loopback concession (`docs/interop/relayed-media-2026-08-19.md`), plus interop against coturn's client (`docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. |
 | DTLS | Beta, optional feature | Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics, bounded accept (`accept_timeout_secs`). On the **default** path pre-handshake rate limiting is still missing — do not expose to an untrusted internet without upstream rate limiting. `[turn.dtls] demux = true` adds it, plus concurrent handshakes and certificate hot-reload, but is itself unverified. |
-| QUIC / WebTransport | Optional feature | Both **beta**. Raw QUIC: allocation, relayed media both directions and 20 min under load at zero loss — but **no independent implementation exists**, because no RFC defines TURN over raw QUIC, so interop cannot be obtained from anyone. WebTransport: browser interop on record (Chrome 151 against a real certificate, `docs/interop/webtransport-browser-2026-08-20.md`) plus 20 min under load. The full `[turn.quic]` config applies on both paths. WebTransport residual — no client has exercised it. Neither has relayed-media evidence. |
-| io_uring | Optional backend | Usable in production when explicitly enabled, on a kernel you have tested. Endurance and relaying are both on record (`docs/soak/endurance-2026-08-19.md`, Ubuntu 24.04 / 6.14): no leak over 3 h, ~4× tokio's Allocate throughput, ChannelData relayed at ~17 000 rps with zero errors. Costs ~1 GiB resident (pre-registered buffers). Not the default recommendation: io_uring behaviour is kernel-version-sensitive, so verify on yours before relying on it. |
-| AF_XDP | Explicit opt-in backend | Never auto-selected. Correctness verified on a veth lab (`docs/interop/af-xdp-2026-08-19.md`): relayed media at three rates with zero loss after fixing an RX frame leak. Still needs a run on the target NIC — the lab attaches in SKB mode, which copies every frame and reproduces none of the kernel-bypass behaviour that AF_XDP is for. |
+| QUIC / WebTransport | Optional features; supported on Linux/macOS with tokio | Project-specific TURN mappings. Functional, lifecycle/limits, 20-minute load and WAN checks recorded; WebTransport also has Chrome browser evidence. DATAGRAM delivery is unreliable. No multi-day endurance or independent raw-QUIC TURN interoperability claim. See [support record](verification/quic-webtransport-supported-2026-09-18.md). |
+| io_uring | Supported on Linux, opt-in | Explicit `transport = "io_uring"`, built with `io-uring`. Tested kernels 6.8.0-87 and 6.14.0-33; 134 MiB and 1073 MiB RSS respectively in different worker/host configurations, not a kernel-only comparison. [Evidence and deployment scope](verification/io-uring-supported-2026-09-19.md). |
+| AF_XDP | Supported within verified Linux IPv4 UDP copy-mode scope | Opt-in; SKB/native copy on Linux 6.8.0-87 / `virtio_net`, two queues. Zero-copy unverified; prior WAN churn timeouts unexplained. [Evidence](verification/af-xdp-supported-2026-09-22.md). |
 | Cluster redirect/gossip | Implemented path | Useful for new-client distribution; secure gossip with `cluster_secret`. |
 | Tarantool allocation persistence/failover | Implemented path | Monitor writer drops/errors; validate failover in your environment. |
 | Runtime user CRUD over gRPC | Implemented (requires Tarantool backend) | `AddUser`/`RemoveUser` via the control-plane gRPC; users persist in the shared backend and nodes pick them up at startup and via periodic refresh. Needs `[cluster.backend] type = "tarantool"`. |
@@ -102,40 +102,41 @@ explicit so a kernel/build capability does not silently change the datapath.
 - **Mitigation:** set `transport = "tokio"` in production configs and Helm
   values unless you are intentionally validating another backend.
 
-### R2 — io_uring is experimental
+### R2 — io_uring kernel and memory requirements
 
-The io_uring datapath contains sharded ownership and drain logic, but it needs
-runtime verification on the same kernel/NIC/load profile you plan to operate.
-It is not the recommended default for a first production rollout.
+The supported UDP datapath requires kernel io_uring access and sufficient memory
+for each worker's buffers and rings. Worker count defaults to available parallelism;
+`TURNA_IOURING_WORKERS` overrides it. Support does not imply a fixed memory cost
+or verified behaviour on every kernel and security policy.
 
 - **Severity:** Medium
-- **Mitigation:** use `tokio`; validate io_uring separately with
-  `cargo test --features io-uring` and a drain-under-load run.
+- **Mitigation:** select the backend explicitly, size workers and relay capacity,
+  and run recovery/drain, functional and load checks after deployment changes.
+  See the [support record](verification/io-uring-supported-2026-09-19.md) and
+  [operator runbook](runbooks/io-uring.md). Tokio remains the default.
 
-### R3 — AF_XDP is opt-in and environment-sensitive
+### R3 — AF_XDP support is scoped to a verified deployment
 
-`transport = "af_xdp"` is wired as an explicit backend when built on Linux with
-`--features af-xdp`. The active path uses the XSK datapath from
-`turna_transport::af_xdp::xsk`. The older `AfXdpTransport` wrapper in
-`crates/transport/src/af_xdp.rs` remains a loud non-functional stub and is not
-the runtime path.
+AF_XDP is supported for the documented Linux IPv4 UDP copy-mode deployment:
+6.8.0-87, `virtio_net`, two queues, SKB/copy and native/copy. The active path is
+`turna_transport::af_xdp::xsk::XskDatapath`; the node owns its embedded selective
+XDP program. It is never auto-selected. [Evidence](verification/af-xdp-supported-2026-09-22.md).
 
-AF_XDP requires privileges, NIC/queue setup and correct source/destination MAC
-configuration. IPv4-only is no longer true — the v6 frame path and ICMPv6 ND are
-implemented — and the XDP program is embedded and attached by the node itself, so no
-external redirect plumbing is needed.
+The native four-hour media run met the agreed 99.99% delivery threshold, with
+37 missing echoes recorded rather than hidden. The final 15-minute native churn
+completed 49,647/49,647 operations with zero errors and full cleanup. Previous
+WAN churn timeouts still have no established cause; a passing run is not a fix.
 
-The veth lab step is done (`docs/interop/af-xdp-2026-08-19.md`), and it is worth
-knowing what it cost: three separate lab faults masked the datapath entirely before
-anything could be measured. Both ends of the veth in one namespace short-circuits
-through `lo`; `frame_count` above twice the ring size kills RX silently; and the
-`fill_ring_size`/`rx_ring_size`/`comp_ring_size`/`tx_ring_size` keys in
-`[turn.af_xdp]` are accepted and ignored.
+Fixed geometry is validated at startup: frames 4096 bytes, rings 2048 entries,
+frame_count at most 4096. Inert geometry overrides are refused. All RX queues
+must be configured. Native attach is independent of copy/zero-copy selection.
 
-- **Severity:** High if enabled without a hardware-specific validation run.
-- **Mitigation:** keep it disabled for normal production. The lab run is on record;
-  repeat it on the target NIC, where the attach is native rather than SKB, before
-  exposing traffic.
+- Revalidate after kernel, NIC, driver or topology changes. Zero-copy, IPv6 WAN,
+  cold-neighbor and route-change behavior are outside this evidence.
+- XDP redirect bypasses ordinary UDP INPUT filtering. The selective destination
+  IP/port filter is not a source-IP ACL; retain application auth, limits and peer policy.
+- Capability-only setup needs privileges for XSK/BPF/XDP, not just CAP_NET_RAW.
+  A support label does not certify an unsafe-code audit or every listener combination.
 
 ### R4 — Optional encrypted transports are less exercised than UDP
 
@@ -211,35 +212,25 @@ Known residual gaps, per transport:
   - **DTLS — beta with interop.** Allocation and media on both listener paths,
     20 min under load, and agreement with coturn's client
     (`docs/interop/coturn-2026-08-23.md`) — an implementation nobody here wrote.
-  - **WebTransport — beta with interop.** A browser drives it, with its own H3
-    stack and hand-written STUN.
-  - **QUIC — beta, and it stops there.** Correctness and endurance are recorded,
-    but no RFC defines TURN over raw QUIC, so no second implementation exists and
-    none can be written. This is not a testing gap.
+  - **WebTransport — supported.** Browser and transport verification within the
+    scope in [the support record](verification/quic-webtransport-supported-2026-09-18.md).
+  - **QUIC — supported.** Maintained project-specific TURN mapping. Independent
+    raw-QUIC TURN interoperability is not established; this is an explicit scope
+    limitation, not a claim that another implementation cannot be written.
 
   The gate is `docs/verification/encrypted-transports.md`; operator response for
   the alerts is `docs/runbooks/encrypted-transports.md`.
 
-### R9 — two experimental features are refused in production, and that is deliberate
+### R9 — RFC 7635 OAuth remains refused in production
 
-`config::validate()` hard-fails when `production = true` and either
-`turn.sctp.enabled` or `turn.auth.oauth.enabled` is set. The node does not start,
-with a diagnostic naming the key.
+`config::validate()` rejects `production = true` with `turn.auth.oauth.enabled`.
+OAuth still needs verification against a real authorization server. Do not
+bypass normal production checks just to enable it.
 
-`turn.tcp_relay.enabled` was on that list until 2026-08-25. It came off because
-the evidence the gate was waiting for arrived — interop against an independent
-implementation — not because the risk changed. The remaining two are refused for
-different reasons: SCTP has none of the hardening the other listeners received
-and no users, and OAuth has never been exercised against a real authorization
-server.
-
-- **Severity:** none if understood; an outage if discovered during a production
-  cutover.
-- **Mitigation:** decide before the cutover whether you need any of them. If you
-  do, the honest options are to run that deployment with `production = false`
-  (which also disables the placeholder-secret and missing-`external_ip` checks —
-  usually the wrong trade) or to keep the feature out of the production profile
-  and finish its verification first.
+The RFC 6062 gate was lifted on 2026-08-25. The SCTP gate is now lifted for
+Linux/tokio after native functional, lifecycle/limits and WAN verification;
+see [SCTP support evidence](verification/sctp-supported-2026-09-18.md).
+Platform, backend, feature availability and framing validation remain enforced.
 
 ### R10 — IPv6 relayed transport is opt-in
 
@@ -492,15 +483,16 @@ authoritative per-feature register is `docs/protocol-gap.md`.
 
 | Area | State |
 |---|---|
-| `io_uring` datapath | Beta — endurance and relaying recorded on kernels **6.8 and 6.14**; version-sensitive, verify on yours (R2) |
-| `AF_XDP` datapath | Beta (lab-verified) (R3) — correctness on a veth lab: relayed media at three rates with zero loss, ARP/NDP answered by the datapath itself. The XDP program is embedded and attached by the node (no external program), and the v6 frame path is implemented. **Not a capacity result**: veth attaches in SKB mode, which copies every frame. Validate on your NIC. |
-| QUIC (raw) | Beta — interop recorded including relayed media both directions (R4) |
-| WebTransport (H3) | Beta — browser interop (Chrome 151, real certificate) **and** 20 min under load at zero loss (R4) |
+| `io_uring` datapath | **Supported on Linux**, opt-in; tested on 6.8.0-87 and 6.14.0-33. Kernel and resource configuration still require deployment validation (R2). |
+| `AF_XDP` datapath | Supported within verified Linux IPv4 UDP copy-mode scope (R3). Embedded filter, queue coverage, four-hour native media and 15-minute churn. [Limits and evidence](verification/af-xdp-supported-2026-09-22.md). |
+| QUIC (`quic`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
+| WebTransport (`web-transport`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
 | TURNS | **Supported** — three-engine interop, public certificate chain, coturn interop, 24 h under load (R4) |
 | DTLS | Beta — allocation and media on both listener paths, 20 min under load, **and interop against coturn's client** (R4) |
 | DTLS demux (`demux = true`) | Opt-in, no evidence yet — concurrent handshakes, pre-handshake admission, rate limit, cert reload |
 | mTLS for TURNS clients | Opt-in (`[tls] client_ca`), verified incl. the refusal case; no CRL/OCSP by design |
-| SCTP, OAuth | Refused in production (R9) |
+| SCTP | Supported on Linux/tokio; plaintext, native SCTP (R9) |
+| OAuth | Refused in production (R9) |
 | RFC 6062 TCP relay | Beta, no longer refused — gate lifted 2026-08-25 (R9) |
 | IPv6 relayed transport | Opt-in; conformance **and relayed media** recorded, loopback only (R10) |
 | Mobility (RFC 8016) | Partial — same-node only; cross-node migration is not implemented (the placeholder module was removed) |

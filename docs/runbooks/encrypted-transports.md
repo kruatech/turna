@@ -4,8 +4,9 @@ Operator response for the alerts in `docs/alerts/transport-backends.yml`. Config
 reference: `docs/CONFIGURATION.md`. Metric definitions:
 `docs/OBSERVABILITY.md` → "Encrypted-transport metrics".
 
-Maturity before you start: TURNS and DTLS are **beta**, QUIC/WebTransport is
-**experimental** (`docs/feature-support.md`). The UDP/tokio path is always the
+Maturity before you start: QUIC/WebTransport are **supported** on Linux/macOS
+with tokio, within their [documented scope](../verification/quic-webtransport-supported-2026-09-18.md).
+For TURNS and DTLS consult `docs/feature-support.md`. The UDP/tokio path is always the
 fallback — if an encrypted listener is unhealthy and clients can reach UDP, the
 fastest mitigation is usually to stop advertising the encrypted URI, not to debug
 under pressure.

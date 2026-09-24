@@ -8,6 +8,7 @@ pub mod peer_filter;
 pub mod processor;
 pub mod server;
 pub mod tcp_relay;
+mod udp_transactions;
 
 pub use server::{new_client_sinks, start_relay_egress, ClientSinks, RelayEgress};
 #[cfg(feature = "tls")]

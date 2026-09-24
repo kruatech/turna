@@ -51,6 +51,7 @@ scrape_configs:
 
 | Metric | Type | Meaning |
 |---|---|---|
+| `turna_process_open_fds` | gauge | Linux node file descriptors from `/proc/self/fd`, excluding the sampling directory descriptor. Omitted on non-Linux or read failure; absence is not zero. Used by transport cleanup monitoring. |
 | `turna_active_allocations` | gauge | Current allocation count. |
 | `turna_total_allocations` | counter | Total successful allocations since start. |
 | `turna_relay_ports_in_use` | gauge | Relay ports held by an allocation **or** by an unclaimed EVEN-PORT reservation — a reserved port is unavailable to anyone else, so counting it free would understate how full the pool is. Summed across the global pool and any tenant pools. |
@@ -280,6 +281,9 @@ it during an incident. Design and rationale: `docs/design/capacity-api.md`.
 
 #### TURN-over-SCTP (`[turn.sctp]`)
 
+Supported on Linux/tokio; opt-in native SCTP without TLS. See
+[support scope and evidence](verification/sctp-supported-2026-09-18.md).
+
 Refused under `production = true`. These exist so a deployment that opts in on an
 internal network can see what the listener is doing — it shipped with no counters
 at all, which meant a listener that had stopped accepting looked identical to an
@@ -395,12 +399,12 @@ route table (see below).
 |--------|------|---------|
 | `turna_afxdp_readiness` | gauge | Datapath readiness, same encoding as the listener gauges (`0`=starting, `1`=ready, `2`=degraded, `3`=draining). Reads `starting` when AF_XDP is not the selected backend, so `0` here does **not** mean a stuck datapath unless you have actually selected AF_XDP. |
 | `turna_afxdp_rx_frames_total` / `turna_afxdp_rx_bytes_total` | counter | Frames taken off the RX queue, and TURN payload bytes within them. |
-| `turna_afxdp_tx_frames_total` / `turna_afxdp_tx_bytes_total` | counter | Frames and bytes sent. |
+| `turna_afxdp_tx_frames_total` / `turna_afxdp_tx_bytes_total` | counter | Successful TX submissions and TURN payload bytes; neither submission nor completion proves peer delivery. |
 | `turna_afxdp_tx_drops_total` | counter | Send failures. A sustained rate is packet loss the client will see. |
 | `turna_afxdp_tx_inflight` | gauge | Frames pushed to the TX ring but not yet completed. A value that climbs and does not fall means completions are not being reaped. |
-| `turna_afxdp_umem_free_frames` | gauge | Free UMEM frames left for RX/TX. Approaching `0` is the exhaustion signal — RX will start dropping before anything else reports an error. |
-| `turna_afxdp_parse_drops_total` | counter | Received frames matching no TURN or relay port. Steady background noise is normal on a shared NIC; a spike correlated with client complaints means relay-port registration is lagging. |
-| `turna_afxdp_relay_ports_registered` | gauge | Relay ports currently demuxed by the datapath. Compare against `turna_allocations_active` — a persistent gap is the previous line's cause. |
+| `turna_afxdp_umem_free_frames` | gauge | Free TX frames aggregated across queues. RX buffers are managed separately; this is not RX fill-ring capacity. |
+| `turna_afxdp_parse_drops_total` | counter | Rejected/undemuxable frames after redirect, including malformed IP/UDP framing or checksums. Inspect logs and packet evidence before assigning a cause. |
+| `turna_afxdp_relay_ports_registered` | gauge | Relay ports registered for AF_XDP. Compare with `turna_active_allocations`; check both return to zero after cleanup. |
 | `turna_afxdp_neighbor_unresolved` | gauge | `1` = the next-hop TX MAC is still the zero placeholder and **TX will not deliver**; `0` = resolved. This is a hard outage indicator, not a warning. |
 | `turna_afxdp_neighbor_cache_entries` | gauge | Resolved next-hop MAC entries cached. |
 | `turna_afxdp_arp_replies_total` | counter | ARP replies the datapath sent for its own IP. |
@@ -417,7 +421,7 @@ Unless noted, these are summed across workers, so they scale with
 |--------|------|---------|
 | `turna_uring_workers` | gauge | Worker threads in the pool. The denominator for every other series here. |
 | `turna_uring_sq_len` / `turna_uring_sq_capacity` | gauge | Last-sampled submission-queue occupancy against total capacity. Sustained `sq_len` near `sq_capacity` is the saturation signal. |
-| `turna_uring_sq_push_failed_total` | counter | Submission pushes rejected because the SQ was full. Non-zero means work was refused, not merely delayed. |
+| `turna_uring_sq_push_failed_total` | counter | Submission pushes rejected because the SQ was full. Counts failed submission attempts, not packet loss: receive and cancellation work is retained for retry. Correlate with buffer availability, send errors and verified media; sustained growth indicates SQ pressure. |
 | `turna_uring_cq_len` | gauge | Last-sampled completion-queue occupancy. |
 | `turna_uring_cqe_drained_total` | counter | Completion entries drained. |
 | `turna_uring_cqe_batches_total` | counter | Drain iterations that pulled at least one CQE. `cqe_drained_total / cqe_batches_total` is the mean batch size — a value near `1` means the ring is being polled harder than the traffic justifies. |

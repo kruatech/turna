@@ -81,9 +81,8 @@
   <div class="grid">
     <div>
       <label for="url">WebTransport URL</label>
-      <input id="url" value="https://turna.quinter.ru:3479/" spellcheck="false">
-      <p class="hint">HTTPS with a certificate the browser trusts. Self-signed will not
-      do — WebTransport has no exception dialogue.</p>
+      <input id="url" value="https://localhost:3482/" spellcheck="false">
+      <p class="hint">Use a trusted HTTPS certificate, or the SHA-256 pin supplied by the local probe.</p>
     </div>
     <div>
       <label for="mode">Credentials</label>
@@ -101,6 +100,11 @@
       <input id="pass" type="password" spellcheck="false">
       <p class="hint">Never written to the log.</p>
     </div>
+  </div>
+  <div class="grid">
+    <div><label for="pin">Local certificate SHA-256 (optional)</label><input id="pin" spellcheck="false"></div>
+    <div><label for="peer">UDP echo peer IPv4</label><input id="peer" value="127.0.0.1"></div>
+    <div><label for="peerport">UDP echo peer port</label><input id="peerport" value="39000" type="number"></div>
   </div>
   <div class="bar">
     <button id="run" class="primary">Run</button>
@@ -133,7 +137,7 @@
 
 const CHECKS = [
   { id:"session", tag:"Session",  title:"WebTransport session established",
-    why:"HTTP/3 CONNECT to the server. A certificate the browser does not trust fails here, with no way to override." },
+    why:"HTTP/3 CONNECT to the server. The certificate must be trusted or match the supplied SHA-256 pin." },
   { id:"stream",  tag:"Stream",   title:"Bidirectional control stream opens",
     why:"TURN control messages travel on a bidi stream; the server accepts it and replies on the same one." },
   { id:"auth",    tag:"Auth",     title:"401 challenge, then an authenticated Allocate",
@@ -444,15 +448,19 @@ async function run(){
   // ── session ──
   set("session","run");
   try {
-    wt = new WebTransport(url);
-    await wt.ready;
+    const pin = el("pin").value.replace(/:/g, "").trim();
+    if (pin && !/^[0-9a-f]{64}$/i.test(pin)) throw new Error("Expected 64 hex digits for SHA-256");
+    const options = pin ? {serverCertificateHashes: [{algorithm: "sha-256",
+      value: Uint8Array.from(pin.match(/../g), h => parseInt(h,16))}]} : {};
+    wt = new WebTransport(url, options);
+    wt.closed.catch(() => {});
+    await Promise.race([wt.ready, new Promise((_, reject) => setTimeout(() => reject(new Error("session timeout")), 10000))]);
     set("session","pass", `connected to ${url}`);
   } catch (e) {
     set("session","fail",
-      `${e}\n\nA certificate the browser does not trust fails exactly here, and ` +
-      `WebTransport offers no exception dialogue — unlike an https:// page, you cannot ` +
-      `click through. Check that [turn.quic] has web_transport = true and that the ` +
-      `certificate matches the host in the URL.`);
+      `${e}\n\nCheck web_transport = true, the endpoint URL and certificate trust. ` +
+      `For the local probe, use its generated SHA-256 pin and short-lived EC certificate.`);
+    if (wt) wt.close();
     return;
   }
 
@@ -466,6 +474,7 @@ async function run(){
     set("stream","pass","bidirectional stream open");
   } catch (e) {
     set("stream","fail", String(e));
+    wt.close();
     return;
   }
 
@@ -529,12 +538,8 @@ async function run(){
   set("perm","run");
   const channel = 0x4000;
   try {
-    const relayed = state.detail.relayed;
-    // The peer is the relayed address itself: this page has no second socket, and a
-    // permission for the relay's own address is enough to make the server accept
-    // ChannelData for it. What it proves is the encoding of XOR-PEER-ADDRESS and the
-    // channel binding, which is what an independent implementation is for.
-    const peerHost = relayed.host, peerPort = relayed.port;
+    const peerHost = el("peer").value.trim(), peerPort = Number(el("peerport").value);
+    if (!Number.isInteger(peerPort) || peerPort < 1 || peerPort > 65535) throw new Error("Invalid UDP echo port");
 
     const p = new Msg(M_CREATE_PERM).addXorPeer(peerHost, peerPort)
       .addString(A_USERNAME, cred.username).addString(A_REALM, realm).add(A_NONCE, nonce);
@@ -559,27 +564,35 @@ async function run(){
   set("media","run");
   try {
     const payload = enc.encode("turn-over-webtransport from a browser");
-    for (let i = 0; i < 10; i++) await writer.write(channelDataFrame(channel, payload));
-    log("10 ChannelData frames written to the stream", "dim");
-
-    // The relayed reply comes back as a datagram, not on the stream: media is
-    // unreliable by nature and a reliable stream would add retransmission and
-    // head-of-line blocking that UDP does not have. Both are accepted so a server
-    // that chooses reliable delivery is not reported as broken.
-    const got = await Promise.race([
-      dgReader.read().then(r => ({ via:"datagram", data:r.value })),
-      readMsg(6000).then(m => ({ via:"stream", data:m })),
-      new Promise((_, rej) => setTimeout(() => rej(new Error(
-        "nothing came back within 6 s, on either a datagram or the stream. The " +
-        "allocation and the channel binding both succeeded, so the control plane " +
-        "works and the relay egress does not.")), 6000)),
-    ]);
-    const first = got.data && got.data.length ? got.data[0] : 0;
-    if (!(first >= 0x40 && first <= 0x7f)){
-      throw new Error(`expected ChannelData back, got ${got.data.length} bytes starting with 0x${first.toString(16)}`);
-    }
+    const dgWriter = wt.datagrams.writable.getWriter();
+    try {
+      for (let i = 0; i < 10; i++) {
+        const frame = channelDataFrame(channel, payload);
+        if (i < 5) await writer.write(frame);
+        else await dgWriter.write(frame.slice(0, 4 + payload.length));
+        const got = await Promise.race([
+          dgReader.read(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("UDP echo timeout")), 6000))
+        ]);
+        const data = got.value;
+        if (!data || (data.length !== 4 + payload.length && data.length !== ((4 + payload.length + 3) & ~3)) || data[0] !== 0x40 || data[1] !== 0 ||
+            ((data[2] << 8) | data[3]) !== payload.length ||
+            !payload.every((v, j) => data[j + 4] === v)) {
+          const hex = a => Array.from(a || [], b => b.toString(16).padStart(2, "0")).join(" ");
+          throw new Error("UDP echo mismatch: " + JSON.stringify({
+            packet: i + 1,
+            ingress: i < 5 ? "stream" : "datagram",
+            done: got.done,
+            actualType: Object.prototype.toString.call(data),
+            actualBytes: data ? data.byteLength : null,
+            actualHex: hex(data ? data.slice(0, 128) : []),
+            expectedHex: hex(frame.slice(0, 4 + payload.length))
+          }));
+        }
+      }
+    } finally { dgWriter.releaseLock(); }
     set("media","pass",
-      `relayed data returned as a WebTransport ${got.via} (${got.data.length} bytes)\n` +
+      `10/10 UDP echo payloads verified (5 stream, 5 datagram ingress)\n` +
       `This is the half a control-plane check cannot reach: an allocation that answers ` +
       `every request correctly can still forward nothing.`);
   } catch (e) {

@@ -696,7 +696,7 @@ jobs:
   # load tool's `quic-check` and `wt-check` probes, each of which ends at
   # relayed media arriving on the far side — not at a success response.
   #
-  # PHASES limits the run to those two transports. Dropping the variable runs
+  # PHASES includes native Linux SCTP. Dropping the variable runs
   # the full matrix (udp, turns, dtls too), which is what you want locally and
   # too slow to put on every PR.
   #
@@ -705,9 +705,9 @@ jobs:
   # evidence lives in docs/interop/webtransport-browser-2026-08-20.md and has to
   # be refreshed by hand.
   transport-e2e:
-    name: e2e (QUIC + WebTransport)
+    name: e2e (QUIC + WebTransport + SCTP)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -718,11 +718,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends protobuf-compiler
-      - name: QUIC + WebTransport end-to-end
+      - name: Require native SCTP kernel support
+        run: |
+          sudo modprobe sctp
+          python3 scripts/verify/transport-observe.py sctp
+      - name: QUIC + WebTransport + SCTP end-to-end
         env:
-          PHASES: quic wt
+          PHASES: quic wt sctp
           OUT: transport-e2e
         run: bash scripts/verify/transports.sh
+      - name: Transport lifecycle, admission and backpressure
+        env:
+          PHASES: quic wt sctp
+          CYCLES: "2"
+          CRASH_ROUNDS: "1"
+          HEALTH_PORT: "19096"
+          OUT: transport-lifecycle-e2e
+        run: python3 scripts/verify/transport-lifecycle.py
       - name: Upload logs
         # Always: a passing run's node logs are the baseline you compare the next
         # failure against, and this harness writes everything to files rather
@@ -731,7 +743,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: transport-e2e-logs
-          path: transport-e2e/
+          path: |
+            transport-e2e/
+            transport-lifecycle-e2e/
           retention-days: 14
 
   # ── P0 §7.3 / §24: deployment consistency gate ──────────────────────────────

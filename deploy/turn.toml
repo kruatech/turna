@@ -90,9 +90,11 @@ external_ip6 = "${TURNA_EXTERNAL_IP6:-}"
 realm       = "${TURNA_REALM:-turna}"
 # Transport backend: tokio | io_uring | af_xdp | auto.
 # - tokio (set below): epoll + recvmmsg/sendmmsg. The supported production path.
-# - io_uring: Linux + `--features io-uring`. Experimental.
-# - af_xdp: Linux + `--features af-xdp` + CAP_NET_RAW. Experimental; `listen`
-#   must be a concrete IP, not 0.0.0.0.
+# - io_uring: supported on Linux, opt-in; build with `--features io-uring`.
+#   Tested scope and sizing: docs/verification/io-uring-supported-2026-09-19.md.
+# - af_xdp: supported within verified Linux IPv4 UDP copy-mode scope; opt-in.
+#   Requires `--features af-xdp`, XSK/BPF/XDP privileges and a concrete listen IP.
+#   Scope: docs/verification/af-xdp-supported-2026-09-22.md.
 # - auto: pick io_uring when usable at runtime, else tokio. Convenient for dev,
 #   but docs/PRODUCTION_READINESS.md R1 advises against it in production —
 #   a kernel/build capability change would silently move your datapath.
@@ -481,39 +483,38 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # needs a node restart.
 
 # =============================================================================
-# [turn.sctp] — TURN-over-SCTP (experimental, no RFC)
+# [turn.sctp] — TURN-over-SCTP (supported on Linux/tokio)
 # =============================================================================
-# Client CONTROL transport over an SCTP association; the relay socket to the peer
-# stays UDP. Requires `--features sctp` and the host `sctp` kernel module.
-#
-# REFUSED under production = true (config validation rejects enabled = true).
-#
-# No TURN RFC defines SCTP. The control channel is PLAINTEXT — whatever you would
-# protect with TURNS is unprotected here. Low real-world use, awkward in
-# containers; see docs/protocol-gap.md, which rates it lowest priority.
+# Opt-in native SCTP for TURN control and ChannelData; peer-side relay stays UDP.
+# Requires --features sctp, Linux kernel SCTP support and turn.transport = "tokio".
+# Allowed with production = true; normal production validation still applies.
+# IP protocol 132 must pass through the network (not TCP/UDP). No TLS encryption.
+# Project-specific TURN mapping, not browser WebRTC DataChannel.
+# Evidence: docs/verification/sctp-supported-2026-09-18.md
 #
 # [turn.sctp]
 # enabled = false
-# listen  = "0.0.0.0:3478"
+# listen = "0.0.0.0:3478"
 # max_frame_size = 65536
 # read_timeout_secs = 300
 # max_connections = 10000
+# max_connections_per_ip = 0
+# max_associations_per_sec_per_ip = 0
+# association_burst_per_ip = 0
 # backlog = 1024
 
 # =============================================================================
 # [turn.quic] — QUIC / WebTransport listener
 # =============================================================================
 # Requires `--features quic` (raw QUIC) or `--features web-transport` (browser
-# HTTP/3 CONNECT, implies quic). Maturity: EXPERIMENTAL.
+# HTTP/3 CONNECT, implies quic). Supported on Linux/macOS with tokio.
 #
 # Enabling this without the matching feature is a startup error. With
 # web_transport = true you need `--features web-transport` specifically.
 #
-# IMPORTANT: on the WebTransport (H3) path only listen/cert/key/keep_alive are
-# applied — max_bi_streams, max_uni_streams, enable_datagrams,
-# max_datagram_size, idle_timeout_secs and alpn have NO effect there (the
-# listener warns about this at startup). Use web_transport = false if you need
-# those limits enforced. See docs/design/quic-webtransport.md §7.
+# Both paths apply transport limits, admission and per-stream replies.
+# Only alpn is raw-QUIC-only: WebTransport negotiates h3.
+# Scope: docs/verification/quic-webtransport-supported-2026-09-18.md.
 #
 # [turn.quic]
 # enabled = false
@@ -554,8 +555,8 @@ tls_ca   = "${TURNA_GRPC_TLS_CA:-}"
 # max_handshakes_per_sec_per_ip = 0
 # # Burst allowance; 0 = twice the rate.
 # handshake_burst_per_ip = 0
-# # Certificate hot-reload poll, seconds. WebTransport path only (raw QUIC has
-# # no reload hook and needs a restart). 0 disables.
+# # Certificate hot-reload poll, seconds. Both paths; new sessions use the
+# # new certificate and existing sessions remain connected. 0 disables.
 # cert_reload_secs = 30
 #
 # NOTE: the default listen port 5350/udp collides numerically with

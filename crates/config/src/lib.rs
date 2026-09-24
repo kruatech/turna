@@ -177,6 +177,28 @@ impl TurnaConfig {
             const MAX_FRAME_COUNT: u32 = LIB_RING_SIZE * 2;
 
             let a = &self.turn.af_xdp;
+            if !matches!(a.attach_mode.as_str(), "auto" | "skb" | "native") {
+                errors.push("turn.af_xdp.attach_mode must be auto, skb or native".into());
+            }
+            if a.zero_copy && a.attach_mode == "skb" {
+                errors.push("turn.af_xdp.zero_copy requires native attach mode".into());
+            }
+            let mut queues = HashSet::new();
+            for q in a
+                .queue_ids
+                .iter()
+                .copied()
+                .chain(std::iter::once(a.queue_id))
+            {
+                if q >= 64 {
+                    errors.push("turn.af_xdp queue IDs must be below 64".into());
+                }
+            }
+            for q in &a.queue_ids {
+                if !queues.insert(*q) {
+                    errors.push("turn.af_xdp.queue_ids contains duplicates".into());
+                }
+            }
             if a.frame_size != LIB_FRAME_SIZE {
                 errors.push(format!(
                     "turn.af_xdp.frame_size = {} is not applied: the UMEM is built with the library default of {LIB_FRAME_SIZE}. Set it to {LIB_FRAME_SIZE} or remove the key.",
@@ -377,6 +399,38 @@ impl TurnaConfig {
                 );
             }
         }
+        if self.turn.quic.enabled {
+            if self.turn.quic.idle_timeout_secs == 0 {
+                errors.push("turn.quic.idle_timeout_secs must be positive".into());
+            }
+            if !self.turn.quic.web_transport
+                && (self.turn.quic.alpn.is_empty()
+                    || self
+                        .turn
+                        .quic
+                        .alpn
+                        .iter()
+                        .any(|s| s.is_empty() || s.len() > 255))
+            {
+                errors.push("raw QUIC needs nonempty ALPN identifiers of at most 255 bytes".into());
+            }
+            if !self.turn.quic.enable_datagrams {
+                errors.push(
+                    "turn.quic.enable_datagrams must be true: relay media uses datagrams".into(),
+                );
+            }
+            if self.turn.quic.max_bi_streams == 0
+                || self.turn.quic.max_bi_streams > u32::MAX as u64
+                || self.turn.quic.max_uni_streams > u32::MAX as u64
+            {
+                errors.push(
+                    "turn.quic stream counts must fit u32, with at least one bidi stream".into(),
+                );
+            }
+            if !(4..=65535).contains(&self.turn.quic.max_datagram_size) {
+                errors.push("turn.quic.max_datagram_size must be in 4..=65535".into());
+            }
+        }
         // RFC 6156: external_ip6 must be a real IPv6 literal if set — a v4 literal
         // here would advertise a v4 address for a v6-family allocation, which is
         // exactly the mismatch the 443 check exists to prevent.
@@ -414,25 +468,21 @@ impl TurnaConfig {
                     .into(),
             );
         }
-        // Experimental transports are not production-ready: RFC 6062 TCP relay is
-        // partial/experimental, and TURN-over-SCTP is experimental. Refuse to
-        // enable either under `production` so an unfinished datapath is never
-        // shipped as if it were supported.
-        // RFC 6062 TCP relay is no longer refused under `production`. Interop is
-        // recorded (docs/interop/transports-2026-08-19.md and
-        // docs/interop/coturn-2026-08-23.md), including the pipelined
-        // ConnectionBind case that the prebuffer in transport::tcp_tls exists to
-        // handle and that no independent client had exercised before.
-        //
-        // It still carries a different operational profile from UDP — a listener
-        // and a connection per relayed peer — but that is a sizing decision for
-        // the operator, documented in docs/feature-support.md, not something a
-        // config refusal can make for them.
-        if prod && self.turn.sctp.enabled {
-            errors.push(
-                "turn.sctp.enabled = true in production, but TURN-over-SCTP is experimental and not supported in production"
-                    .into(),
-            );
+        // SCTP is supported on Linux/tokio; production uses the same safety
+        // validation as other supported listeners. See verification evidence.
+        if self.turn.sctp.enabled {
+            if !matches!(self.turn.transport, TransportSelection::Tokio) {
+                errors.push("turn.sctp requires turn.transport = \"tokio\"; other backends do not start this listener".into());
+            }
+            if !cfg!(target_os = "linux") {
+                errors.push("turn.sctp requires Linux native SCTP support".into());
+            }
+            if self.turn.sctp.backlog <= 0
+                || self.turn.sctp.read_timeout_secs == 0
+                || !(20..=65555).contains(&self.turn.sctp.max_frame_size)
+            {
+                errors.push("turn.sctp requires positive backlog/read timeout and max_frame_size in 20..=65555".into());
+            }
         }
         // RFC 7635 OAuth is experimental: refuse in production, and when enabled
         // require a server_name plus at least one valid AES keyring entry.
@@ -1001,7 +1051,7 @@ pub struct TurnConfig {
     /// Requires the node binary built with `--features dtls`.
     #[serde(default)]
     pub dtls: DtlsSection,
-    /// TURN-over-SCTP control transport (experimental). Disabled by default.
+    /// TURN-over-SCTP client transport (supported on Linux/tokio). Disabled by default.
     /// Requires the node binary built with `--features sctp`.
     #[serde(default)]
     pub sctp: SctpSection,
@@ -2222,6 +2272,8 @@ pub struct QuicConfigSection {
     /// Negotiate WebTransport-over-HTTP/3 (browser handshake). When `false`,
     /// only the raw-QUIC datapath runs. Requires the `web-transport` feature.
     pub web_transport: bool,
+    /// Allow validated QUIC path migration.
+    pub allow_migration: bool,
     /// Listen address (default `0.0.0.0:5350`).
     pub listen: SocketAddr,
     /// PEM certificate chain.
@@ -2269,6 +2321,7 @@ impl Default for QuicConfigSection {
         Self {
             enabled: false,
             web_transport: true,
+            allow_migration: true,
             listen: "0.0.0.0:5350".parse().unwrap(),
             cert_path: PathBuf::from("/etc/turna/tls/cert.pem"),
             key_path: PathBuf::from("/etc/turna/tls/key.pem"),
@@ -2319,6 +2372,10 @@ pub struct AfXdpSection {
     pub interface: String,
     /// NIC queue id to bind the AF_XDP socket to.
     pub queue_id: u32,
+    /// Explicit RX queues. Empty preserves queue_id; all active RX queues must be covered.
+    pub queue_ids: Vec<u32>,
+    /// XDP attach mode: auto (legacy zero_copy choice), skb, or native.
+    pub attach_mode: String,
     /// UMEM frame count.
     pub frame_count: u32,
     /// UMEM frame size, bytes.
@@ -2348,6 +2405,8 @@ impl Default for AfXdpSection {
         Self {
             interface: "eth0".into(),
             queue_id: 0,
+            queue_ids: Vec::new(),
+            attach_mode: "auto".into(),
             frame_count: 4096,
             // 4096, not 2048: this is the size the UMEM is actually created
             // with. The old default described a geometry that never existed.
@@ -2492,7 +2551,7 @@ impl Default for DtlsSection {
     }
 }
 
-/// TURN-over-SCTP listener (experimental client CONTROL transport; the relayed
+/// TURN-over-SCTP listener (supported Linux/tokio client transport; the relayed
 /// side stays UDP). No TURN RFC defines SCTP relaying — see docs/protocol-gap.md.
 /// Disabled by default. Requires the node binary built with `--features sctp`
 /// and a host with the SCTP kernel module.
@@ -3550,6 +3609,48 @@ mod tests {
     }
 
     #[test]
+    fn quic_rejects_unusable_transport_limits() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.quic.enabled = true;
+        cfg.turn.quic.enable_datagrams = false;
+        cfg.turn.quic.max_bi_streams = 0;
+        cfg.turn.quic.max_datagram_size = 3;
+        let result = cfg.validate();
+        restore_turna_production(saved);
+        let msg = result
+            .expect_err("unusable QUIC limits must be rejected")
+            .to_string();
+        assert!(msg.contains("enable_datagrams"), "{msg}");
+        assert!(msg.contains("stream counts"), "{msg}");
+        assert!(msg.contains("max_datagram_size"), "{msg}");
+    }
+
+    #[test]
+    fn enabled_transports_reject_invalid_timeouts_and_framing() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.quic.enabled = true;
+        cfg.turn.quic.web_transport = false;
+        cfg.turn.quic.idle_timeout_secs = 0;
+        cfg.turn.quic.alpn = vec![String::new()];
+        cfg.turn.sctp.enabled = true;
+        cfg.turn.sctp.max_frame_size = 19;
+        cfg.turn.sctp.backlog = 0;
+        cfg.turn.sctp.read_timeout_secs = 0;
+        let result = cfg.validate();
+        restore_turna_production(saved);
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("idle_timeout_secs"), "{message}");
+        assert!(message.contains("ALPN"), "{message}");
+        assert!(message.contains("max_frame_size"), "{message}");
+    }
+
+    #[test]
     fn quic_section_defaults_and_parse() {
         // Off by default; when present, fields parse and unknown keys are
         // rejected (deny_unknown_fields). Lives under [turn.quic].
@@ -3558,6 +3659,7 @@ mod tests {
         assert!(q.web_transport, "WebTransport on when QUIC is enabled");
         assert_eq!(q.listen.port(), 5350);
         assert!(q.enable_datagrams);
+        assert!(q.allow_migration);
 
         let toml = r#"
             [turn]
@@ -3754,6 +3856,17 @@ mod tests {
         "#;
         let cfg: TurnaConfig = toml::from_str(toml).expect("io_uring section parses");
         assert_eq!(cfg.turn.io_uring.relay_socket_capacity_per_worker, 512);
+    }
+
+    #[test]
+    fn af_xdp_native_copy_and_multiple_queues_parse() {
+        let section: AfXdpSection = toml::from_str(
+            "interface = 'ens3'\nqueue_ids = [0, 1]\nattach_mode = 'native'\nzero_copy = false",
+        )
+        .unwrap();
+        assert_eq!(section.queue_ids, vec![0, 1]);
+        assert_eq!(section.attach_mode, "native");
+        assert!(!section.zero_copy);
     }
 
     #[test]
@@ -4014,6 +4127,8 @@ shared_secret = "test-secret"
 
     #[test]
     fn port_conflict_detected() {
+        // Other config tests temporarily set the process-wide production flag.
+        let _guard = production_env_lock();
         // Until 0.5.0 this fixture collided `[turn]` with `[signaling]`, which
         // no longer exists. The check itself is unchanged and still covers the
         // three remaining listeners; health-on-the-TURN-port is the realistic
@@ -4254,6 +4369,28 @@ shared_secret = "deadbeef-this-is-a-real-secret-honest"
 allow_unlimited_bandwidth = true
 
 "#
+    }
+
+    #[test]
+    fn sctp_support_policy_matches_platform_and_backend() {
+        let _guard = production_env_lock();
+        let mut cfg: TurnaConfig = toml::from_str(prod_config_clean()).unwrap();
+        cfg.turn.sctp.enabled = true;
+        let result = cfg.validate();
+        if cfg!(target_os = "linux") {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(result.unwrap_err().to_string().contains("SCTP support"));
+        }
+        for backend in [
+            TransportSelection::Auto,
+            TransportSelection::IoUring,
+            TransportSelection::AfXdp,
+        ] {
+            cfg.turn.transport = backend;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("turn.sctp requires turn.transport"), "{err}");
+        }
     }
 
     #[test]

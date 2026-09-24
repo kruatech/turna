@@ -16,7 +16,7 @@ web-transport = ["quic", "dep:wtransport"]
 af-xdp = ["dep:xsk-rs", "dep:rtnetlink", "dep:netlink-packet-route", "dep:futures-util", "dep:libxdp-sys", "dep:libbpf-sys"]
 # TURN over DTLS (RFC 7350), pure-Rust DTLS 1.2 via webrtc-dtls.
 dtls = ["dep:turna-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
-# TURN-over-SCTP client control transport (experimental). Reuses the tcp_tls
+# TURN-over-SCTP client transport (supported on Linux/tokio). Reuses the tcp_tls
 # frame codec + shared stream-event types, so it depends on the `tls` feature.
 # socket2 (cfg(unix)) and libc are already non-optional deps; SCTP needs the
 # host `sctp` kernel module at runtime.

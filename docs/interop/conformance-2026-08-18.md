@@ -1,5 +1,9 @@
 # Conformance and QUIC interop — 2026-08-18
 
+> Historical checkpoint: the SCTP production refusal described below has since
+> been lifted for Linux/tokio. Current scope and evidence:
+> [SCTP supported](../verification/sctp-supported-2026-09-18.md).
+
 Two runs, on a developer machine (macOS, Apple silicon), against a loopback node.
 Recorded because both cover things that previously had **no** evidence of any kind.
 

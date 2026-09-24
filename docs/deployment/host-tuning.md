@@ -169,12 +169,13 @@ in the support bundle's `host.txt` for exactly this reason.
 
 ## io_uring and AF_XDP
 
-**io_uring** is verified on kernels 6.8 and 6.14 — 9.6 hours at 0.006 % loss. It
-is kernel-version-sensitive by nature, so that is evidence about those two
-kernels and not a general claim. A slot leak here made a worker go deaf after
-exactly 64 packets while its control plane ran at 10 800 allocations/second; if
-throughput drops to nothing on one worker while others are fine, that is the
-shape to look for.
+**io_uring** is supported on Linux as an opt-in UDP datapath. Latest validation
+covers 6.8.0-87 and 6.14.0-33; see [evidence](../verification/io-uring-supported-2026-09-19.md).
+Kernel security policy must allow ring creation. Set `TURNA_IOURING_WORKERS`
+when the available CPU count would create more workers than the memory budget
+allows; the default follows available parallelism. Size buffers and relay capacity
+alongside workers, and inspect RSS, FD floors and io_uring metrics under load.
+See the [runbook](../runbooks/io-uring.md). This does not require AF_XDP setup.
 
 **AF_XDP** works on a veth lab in SKB mode. That copies every frame and therefore
 demonstrates correctness, **not performance** — do not read the AF_XDP results as

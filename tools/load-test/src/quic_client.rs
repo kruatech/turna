@@ -177,18 +177,48 @@ impl QuicSession {
         ))
     }
 
-    async fn authed(&mut self, method: u16, build: impl FnOnce(&mut Msg)) -> Result<(), String> {
-        let mut m = Msg::request(method);
-        build(&mut m);
-        m.add_username(&self.user);
-        m.add_realm(&self.realm);
-        m.add_nonce(&self.nonce);
-        let pkt = m.encode_with_integrity(&self.key);
-        let resp = self.ctl.request(&pkt, self.rtt_ms).await?;
-        if is_success(&resp) {
-            return Ok(());
+    async fn authed(&mut self, method: u16, build: impl Fn(&mut Msg)) -> Result<(), String> {
+        // Rebuild with a new transaction ID and integrity after a stale nonce.
+        // One retry only: a rejecting server must not cause an infinite loop.
+        for attempt in 0..2 {
+            let mut m = Msg::request(method);
+            build(&mut m);
+            m.add_username(&self.user);
+            m.add_realm(&self.realm);
+            m.add_nonce(&self.nonce);
+            let pkt = m.encode_with_integrity(&self.key);
+            let resp = self.ctl.request(&pkt, self.rtt_ms).await?;
+            if is_success(&resp) {
+                return Ok(());
+            }
+            if attempt == 0 && error_code(&resp) == Some(438) {
+                self.nonce = get_nonce(&resp)
+                    .filter(|nonce| !nonce.is_empty())
+                    .ok_or("438 Stale Nonce without replacement NONCE")?;
+                continue;
+            }
+            return Err(format!("{method:#06x} rejected: {:?}", error_code(&resp)));
         }
-        Err(format!("{method:#06x} rejected: {:?}", error_code(&resp)))
+        unreachable!("bounded authenticated request loop")
+    }
+
+    /// Exercise the server's stale-nonce challenge without waiting 630 seconds.
+    async fn check_stale_nonce(&mut self, ch: u16, peer: SocketAddr) -> Result<(), String> {
+        for method in [M_REFRESH, M_CREATE_PERM, M_CHANNEL_BIND] {
+            // The server classifies an invalid nonce as stale, just like expiry.
+            self.nonce = b"turna-stale-nonce-regression".to_vec();
+            self.authed(method, |m| match method {
+                M_REFRESH => m.add_lifetime(600),
+                M_CREATE_PERM => m.add_xor_peer(peer),
+                M_CHANNEL_BIND => {
+                    m.add_channel_number(ch);
+                    m.add_xor_peer(peer);
+                }
+                _ => unreachable!(),
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn create_permission(&mut self, peer: SocketAddr) -> Result<(), String> {
@@ -212,17 +242,18 @@ impl QuicSession {
     }
 
     pub async fn send_channel_data(&mut self, ch: u16, payload: &[u8]) -> Result<usize, String> {
-        let frame = channel_data_frame(ch, payload);
-        self.ctl
-            .send
-            .write_all(&frame)
-            .await
-            .map_err(|e| format!("ChannelData write: {e}"))?;
-        Ok(frame.len())
+        let mut frame = channel_data_frame(ch, payload);
+        frame.truncate(4 + payload.len()); // datagrams have no stream padding
+        let len = frame.len();
+        self.conn
+            .send_datagram(frame.into())
+            .map_err(|e| format!("ChannelData datagram: {e}"))?;
+        Ok(len)
     }
 
-    pub fn close(&self) {
+    pub async fn close(&self) {
         self.conn.close(0u32.into(), b"done");
+        self._ep.wait_idle().await;
     }
 }
 
@@ -297,6 +328,8 @@ pub async fn run_quic_load(
                 return;
             }
 
+            let recv_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let recv_done_task = recv_done.clone();
             let recv_stats = stats.clone();
             let recv_task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 2048];
@@ -313,7 +346,7 @@ pub async fn run_quic_load(
                         }
                         Ok(Err(_)) => break,
                         Err(_) => {
-                            if !recv_stats.is_running() {
+                            if recv_done_task.load(Ordering::Relaxed) {
                                 break;
                             }
                         }
@@ -327,8 +360,12 @@ pub async fn run_quic_load(
             let mut next_refresh = Instant::now() + Duration::from_secs(240);
             while stats.is_running() {
                 tick.tick().await;
+                if !stats.is_running() {
+                    break;
+                }
                 if Instant::now() >= next_refresh {
-                    if sess.refresh(ch, peer_addr).await.is_err() {
+                    if let Err(e) = sess.refresh(ch, peer_addr).await {
+                        eprintln!("transport refresh failed: {e}");
                         stats.errs.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -345,8 +382,10 @@ pub async fn run_quic_load(
                     }
                 }
             }
-            sess.close();
+            recv_done.store(true, Ordering::Relaxed);
+            // Let the peer drain queued media while the connection still exists.
             let _ = recv_task.await;
+            sess.close().await;
         }));
     }
 
@@ -354,7 +393,7 @@ pub async fn run_quic_load(
     crate::progress_reporter(&stats, json);
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
-        stats.reset();
+        stats.reset_preserving_errors();
     }
     tokio::time::sleep(duration).await;
     stats.stop();
@@ -412,6 +451,21 @@ pub async fn quic_allocate_check(
             )
         })?;
     log.push(format!("QUIC handshake ok (alpn {alpn})"));
+    for _ in 0..64 {
+        let a = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+            .await
+            .map_err(|_| "open_bi timed out (stream credit leak)")?
+            .map_err(|e| e.to_string())?;
+        let b = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+            .await
+            .map_err(|_| "open_bi timed out (stream credit leak)")?
+            .map_err(|e| e.to_string())?;
+        crate::stream_common::check_parallel_streams(a, b).await?;
+        // Binding has a per-IP unauthenticated-reply budget (8/s).
+        // Pace the probe so it exercises stream lifecycle, not that budget.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    log.push("128 streams: interleaving, reply routing, half-close and credit recovery ok".into());
 
     let (send, recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
     let mut ctl = ControlStream {
@@ -540,6 +594,25 @@ pub async fn quic_allocate_check(
         "ChannelBind ok for {peer_addr} on channel {channel:#06x}"
     ));
 
+    // Rebind the same connection, retaining the allocation and relay port.
+    let old_local = ep.local_addr().map_err(|e| e.to_string())?;
+    let socket = std::net::UdpSocket::bind(if old_local.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .map_err(|e| e.to_string())?;
+    let new_port = socket.local_addr().map_err(|e| e.to_string())?.port();
+    ep.rebind(socket).map_err(|e| format!("QUIC rebind: {e}"))?;
+    // Send on the new path, then allow the server's 2s migration poll to run.
+    let binding = Msg::request(0x0001).encode();
+    ctl.request(&binding, rtt_ms).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    log.push(format!(
+        "QUIC endpoint rebound {} -> {new_port}; testing existing relay",
+        old_local.port()
+    ));
+
     // client → relay → peer
     const N: usize = 20;
     let payload = b"turn-over-quic media probe";
@@ -648,5 +721,105 @@ pub async fn quic_allocate_check(
     conn.close(0u32.into(), b"done");
     ep.wait_idle().await;
     log.push("session closed cleanly".into());
+    let (mut retry_session, _) =
+        QuicSession::connect(server, server_name, alpn, creds, rtt_ms).await?;
+    retry_session.check_stale_nonce(channel, peer_addr).await?;
+    retry_session.close().await;
+    log.push("438 Stale Nonce recovery: Refresh, CreatePermission, ChannelBind ok".into());
+    // A malformed stream must close its session, release the allocation, and
+    // leave the listener able to authenticate a fresh connection.
+    let (mut bad, _) = QuicSession::connect(server, server_name, alpn, creds, rtt_ms).await?;
+    bad.ctl
+        .send
+        .write_all(&[0xff, 0, 0, 0])
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(Duration::from_secs(5), bad.conn.closed())
+        .await
+        .map_err(|_| "malformed stream did not close its session")?;
+    bad.close().await;
+    let (fresh, _) = QuicSession::connect(server, server_name, alpn, creds, rtt_ms).await?;
+    fresh.close().await;
+    log.push("malformed stream rejected; reconnect and allocation ok".into());
+
     Ok(log)
+}
+
+impl crate::transport_probe::Session for QuicSession {
+    fn unreliable_media(&self) -> bool {
+        true
+    }
+    fn network_stats(&self) -> String {
+        let stats = self.conn.stats();
+        format!(
+            concat!(
+                "{{\"udp_tx\":{},\"udp_rx\":{},\"datagram_frames_tx\":{},",
+                "\"datagram_frames_rx\":{},\"path_lost_packets\":{},\"path_sent_packets\":{},",
+                "\"congestion_events\":{},\"rtt_ms\":{}}}"
+            ),
+            stats.udp_tx.datagrams,
+            stats.udp_rx.datagrams,
+            stats.frame_tx.datagram,
+            stats.frame_rx.datagram,
+            stats.path.lost_packets,
+            stats.path.sent_packets,
+            stats.path.congestion_events,
+            stats.path.rtt.as_secs_f64() * 1000.
+        )
+    }
+
+    async fn bind_peer(&mut self, peer: SocketAddr) -> Result<(), String> {
+        self.refresh(0x4000, peer).await
+    }
+    async fn send_media(&mut self, payload: &[u8]) -> Result<(), String> {
+        self.send_channel_data(0x4000, payload).await.map(|_| ())
+    }
+    async fn receive_media(&mut self) -> Result<Vec<u8>, String> {
+        self.conn
+            .read_datagram()
+            .await
+            .map(|d| d.to_vec())
+            .map_err(|e| e.to_string())
+    }
+    fn pressure_packet(&self) -> Vec<u8> {
+        let mut m = Msg::request(M_REFRESH);
+        m.add_lifetime(600);
+        m.add_username(&self.user);
+        m.add_realm(&self.realm);
+        m.add_nonce(&self.nonce);
+        m.encode_with_integrity(&self.key)
+    }
+    async fn write_control(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.ctl
+            .send
+            .write_all(bytes)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    async fn close_probe(&mut self) -> Result<(), String> {
+        self.close().await;
+        Ok(())
+    }
+}
+pub async fn run_probe(
+    server: SocketAddr,
+    creds: &Creds,
+    action: &str,
+    hold: u64,
+) -> Result<(), String> {
+    let (session, relay) =
+        QuicSession::connect(server, "localhost", "stun.turn", creds, 3000).await?;
+    crate::transport_probe::exercise(session, relay, action, hold).await
+}
+
+/// Cross-host media probe; echo peer runs on the TURN server host.
+pub async fn run_network(
+    server: SocketAddr,
+    creds: &Creds,
+    peer: SocketAddr,
+    seconds: u64,
+    pps: u64,
+) -> Result<(), String> {
+    let (session, _) = QuicSession::connect(server, "localhost", "stun.turn", creds, 5000).await?;
+    crate::transport_probe::network_session(session, peer, seconds, pps).await
 }
