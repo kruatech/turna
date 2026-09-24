@@ -29,7 +29,6 @@ publish = false
 util = { version = "0.9.0", package = "webrtc-util", default-features = false, features = ["conn"] }
 
 byteorder = "1"
-rand_core = "0.10"
 hkdf = "0.12"
 p256 = { version = "0.13", features = ["default", "ecdh", "ecdsa"] }
 p384 = "0.13"
