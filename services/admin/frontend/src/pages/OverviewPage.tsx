@@ -4,7 +4,7 @@ import { MiniChart } from '../ui/MiniChart'
 import { ProgressBar } from '../ui/ProgressBar'
 import { useI18n } from '../i18n'
 import { formatBytes, formatBytesRate, formatCount } from '../format/format'
-import { rateSeries, statusSeries, lastRate, metricOr } from '../lib/series'
+import { rateSeries, statusSeries, lastRate, metricOr, type Point } from '../lib/series'
 import type { PanelProps } from '../panels/types'
 import type { ReactNode } from 'react'
 
@@ -105,7 +105,7 @@ export function OverviewPage({ status, metrics, history, frozen }: PanelProps) {
 }
 
 function KpiCard({ color, icon, value, label, chart, cc }:
-  { color: string; icon: ReactNode; value: string; label: string; chart: any[]; cc: string }) {
+  { color: string; icon: ReactNode; value: string; label: string; chart: Point[]; cc: string }) {
   return (
     <div className="card overflow-hidden">
       <div className="flex items-start justify-between px-5 pt-5 pb-3">

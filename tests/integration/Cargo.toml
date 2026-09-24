@@ -3,6 +3,7 @@ publish = false
 name    = "turna-integration-tests"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 # Doc-comment examples here are shell usage notes, not Rust — don't
