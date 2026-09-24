@@ -3,6 +3,7 @@ publish = false
 name = "turna-auth"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 aes-gcm = "0.11"

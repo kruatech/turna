@@ -63,6 +63,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Documented claims (metric names, feature states, the Helm chart's scope,
+      # the management proto's field numbers) are asserted against the code.
+      # The script existed and passed, but no workflow ran it.
+      - name: doc-claims gate
+        run: bash scripts/check-doc-claims.sh
 
   msrv:
     name: msrv (pinned 1.95.0)
@@ -443,11 +448,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # SHA-pinned to match the repo's pinned-actions policy. Resolve/update with:
       #   git ls-remote https://github.com/actions/setup-node refs/tags/v4
-      # Node major aligned with deploy/Dockerfile.admin (node:22) so the frontend
-      # CI job and the real container build share one toolchain.
+      # Node major aligned with deploy/Dockerfile.admin (node:24, LTS) so the
+      # frontend CI job and the real container build share one toolchain.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '24'
       # This is the contour that catches admin TypeScript <-> backend contract
       # drift before release. Requires services/admin/frontend/package-lock.json
       # to be committed (npm ci refuses to run without it).
@@ -455,10 +460,11 @@ jobs:
         working-directory: services/admin/frontend
         run: |
           npm ci
+          npm run lint
           npm run build
 
   deny:
-    name: cargo-deny (лицензии, advisories)
+    name: cargo-deny (licenses, advisories)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -490,7 +496,7 @@ jobs:
           fi
       - run: cargo install cargo-fuzz
       - run: cd fuzz && cargo +nightly fuzz build
-      # короткий smoke-прогон каждой цели, 30 секунд
+      # short smoke run of every target, 30 seconds each
       - run: |
           cd fuzz
           # Derived from the manifest, not hardcoded. The list used to be five
@@ -646,7 +652,7 @@ jobs:
         # Three Lua suites pin the CAS semantics the failover claim depends on:
         # migration idempotency, the exact-u64 parser, and the runtime /
         # user-limits CAS round-trip including rollback on an injected write
-        # failure. GA_FINAL_REPORT.md documented how to run them by hand, and
+        # failure. docs/verification/v0.3.0-ga-final-report.md documented how to run them by hand, and
         # nothing ever did — so the contract they pin was unenforced, in the one
         # place where getting CAS wrong loses allocations silently.
         #

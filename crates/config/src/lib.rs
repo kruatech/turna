@@ -242,7 +242,7 @@ impl TurnaConfig {
             let r = &self.grpc.rbac;
             if r.enabled && r.bindings.is_empty() {
                 errors.push(
-                    "[management.rbac] enabled = true with no bindings: every \
+                    "[grpc.rbac] enabled = true with no bindings: every \
                      management request would be denied, including the ones needed to \
                      fix this. Add a binding or disable RBAC."
                         .into(),
@@ -2725,17 +2725,17 @@ impl Default for ManagementConfig {
 /// than a default somebody discovers during an incident.
 ///
 /// ```toml
-/// [management.rbac]
+/// [grpc.rbac]
 /// enabled = true
 ///
 /// # Optional. Extends and can override the built-in viewer/operator/admin.
-/// [management.rbac.roles]
+/// [grpc.rbac.roles]
 /// oncall = ["node:drain", "stats:read", "allocations:read"]
 ///
 /// # Certificate SHA-256 fingerprints, lower-case hex, no colons.
 /// #   openssl x509 -in client.pem -noout -fingerprint -sha256 \
 /// #     | cut -d= -f2 | tr -d : | tr 'A-Z' 'a-z'
-/// [management.rbac.bindings]
+/// [grpc.rbac.bindings]
 /// "3fa1...c9" = ["admin"]
 /// "7bd2...04" = ["oncall"]
 /// ```
