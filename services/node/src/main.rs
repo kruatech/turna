@@ -808,6 +808,23 @@ fn apply_command(
 /// only mean the key was left empty — but it is reported rather than swallowed,
 /// because silently relaying IPv4-only after an operator set the key would be the
 /// worst outcome.
+/// The `[turn.nat_discovery]` topology. Config validation has already
+/// refused every shape this can reject; the error path is for an embedder that
+/// skipped it.
+fn nat_discovery_topology(
+    cfg: &turna_config::NatDiscoverySection,
+) -> Result<turna_relay::nat_discovery::NatDiscoveryTopology, Box<dyn std::error::Error>> {
+    let a1: std::net::IpAddr = cfg.primary_ip.parse()?;
+    let a2: std::net::IpAddr = cfg.alternate_ip.parse()?;
+    turna_relay::nat_discovery::NatDiscoveryTopology::new(
+        a1,
+        a2,
+        cfg.primary_port,
+        cfg.alternate_port,
+    )
+    .map_err(|e| format!("[turn.nat_discovery]: {e}").into())
+}
+
 fn resolve_external_ip6(cfg: &TurnConfig) -> Option<std::net::Ipv6Addr> {
     if cfg.external_ip6.is_empty() {
         return None;
@@ -2338,6 +2355,34 @@ fn run_tokio(
             }
             let _ = shutdown_tx.send(true);
         });
+
+        // RFC 5780 NAT behaviour discovery, opt-in. Four sockets of its own
+        // (A1:P1, A1:P2, A2:P1, A2:P2) beside whichever TURN datapath is chosen
+        // below, because no datapath can answer from a socket other than the
+        // one a request arrived on. Bound here so a missing address fails
+        // startup rather than serving a topology that reports the wrong NAT
+        // type. A dedicated processor: its ingress tiers and unauthenticated-
+        // reply budget are the configured ones, in buckets of its own.
+        if config.nat_discovery.enabled {
+            let topology = nat_discovery_topology(&config.nat_discovery)?;
+            let sockets = turna_relay::nat_discovery::bind(&topology).await?;
+            let nd_processor = Arc::new(
+                turna_relay::PacketProcessor::new_with_cluster(
+                    store.clone(),
+                    auth.clone(),
+                    external_ip,
+                    metrics.clone(),
+                    None,
+                )
+                .with_rate_limits(&rate_limits),
+            );
+            tokio::spawn(turna_relay::nat_discovery::run(
+                nd_processor,
+                topology,
+                sockets,
+                shutdown_rx.clone(),
+            ));
+        }
 
         let datapath_result: Result<(), Box<dyn std::error::Error>> =
             match transport_decision.backend {

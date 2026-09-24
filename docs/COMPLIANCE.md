@@ -19,6 +19,7 @@ Suggested home in-repo: `docs/COMPLIANCE.md`.
 | 8489 | MESSAGE-INTEGRITY-SHA256 hardening | **Verified** | Tag length constrained to 16–32 and a multiple of 4 before truncated verify (F1, `proto-stun/integrity.rs`); any non-FINGERPRINT attribute after MESSAGE-INTEGRITY invalidates it (I1, `proto-stun/message.rs`). |
 | 5389 | FINGERPRINT | **Verified** | Handled; only FINGERPRINT may follow MESSAGE-INTEGRITY (I1). |
 | 8489 §14.4 / §9.2 | USERHASH (username anonymity) | **Verified (unit/processor tests)** | Accepted on LongTerm realms (static users, runtime and Tarantool-rehydrated users) by `SHA-256(username ":" realm)` lookup (`auth::AuthMode::validate_identity`); resolved name is the quota subject. TURN REST / OAuth realms answer `401` (a REST username cannot be recovered from its hash). Nonce-cookie advertisement (`obMatJos2QAAA`, bit 1 only) is opt-in via `[turn.auth] advertise_userhash` and refused unless every realm uses `static_users`. No third-party client interop recorded. |
+| 5780 | NAT behaviour discovery (CHANGE-REQUEST, RESPONSE-ORIGIN, OTHER-ADDRESS) | **Verified, optional, UDP only** | Off by default (`[turn.nat_discovery]`); four sockets A1/A2 × P1/P2, reply source per §6.1 Table 1 (`relay::nat_discovery`, `processor::handle_nat_discovery`). PADDING / RESPONSE-PORT → 420. TURN listener still answers CHANGE-REQUEST with 420 (§6). Interop: coturn `turnutils_natdiscovery`, loopback (`docs/interop/rfc5780-natdiscovery-2026-09-24.md`). |
 | 5389 §7.3.1 | Unknown comprehension-required attrs | **Verified** | Unknown type `< 0x8000` in a request → 420 + UNKNOWN-ATTRIBUTES; `0x8000+` ignored; 0x001C/0x001D allowlisted (I3, `processor::reject_unknown_comprehension_required`). |
 | 5766 / 8656 | Allocate / Refresh / CreatePermission / ChannelBind | **Verified** | All four methods handled with long-term auth challenge, nonce, MESSAGE-INTEGRITY (`processor` handlers). |
 | 5766 / 8656 | Send / Data indications | **Verified** | Send indication relays to a permitted peer; peer→client falls back to a Data indication when no channel is bound (`processor::handle_send_indication`, `process_relay_recv`). |
@@ -189,7 +190,8 @@ before it can be stated as fact — deliberately **not** asserted above:
 `docs/alerts/` are backed by a grep over the code:
 
 - `ATTR_ALTERNATE_SERVER` is 0x8023, not the CHANGE-REQUEST value 0x0003.
-- No document makes a live claim of an RFC 5780 codec while none exists.
+- No document makes a live claim of an RFC 5780 codec while none exists; once the
+  codec exists, the `[turn.nat_discovery]` switch must exist and default to off.
 - If `node_migration.rs` has no callers, some document says "unwired".
 - Every metric in an alert `expr:` is actually exported by `turna-health`.
 - Each `production = true` refusal named in the docs still exists in

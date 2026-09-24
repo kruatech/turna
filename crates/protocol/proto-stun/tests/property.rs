@@ -214,7 +214,16 @@ proptest! {
     }
 }
 
-// ── Property: USERHASH roundtrip ─────────────────────────────────────────────
+// ── Property: USERHASH / RFC 5780 attribute roundtrip ────────────────────────
+
+fn arb_any_addr() -> impl Strategy<Value = std::net::SocketAddr> {
+    prop_oneof![
+        arb_ipv4_addr(),
+        (any::<[u8; 16]>(), any::<u16>()).prop_map(|(ip, port)| {
+            std::net::SocketAddr::new(std::net::Ipv6Addr::from(ip).into(), port)
+        }),
+    ]
+}
 
 proptest! {
     /// RFC 8489 §14.4 USERHASH: every 32-byte value survives encode → decode,
@@ -235,6 +244,36 @@ proptest! {
         prop_assert_eq!(decoded.get_realm(), Some(realm.as_str()));
     }
 
+    /// RFC 5780 §7.2 CHANGE-REQUEST flags survive encode → decode.
+    #[test]
+    fn prop_change_request_roundtrip(change_ip in any::<bool>(), change_port in any::<bool>()) {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        msg.add(Attribute::ChangeRequest { change_ip, change_port });
+
+        let mut buf = [0u8; 256];
+        let len = msg.encode(&mut buf).unwrap();
+        let decoded = StunMessage::decode(&buf[..len]).unwrap();
+
+        prop_assert_eq!(decoded.get_change_request(), Some((change_ip, change_port)));
+    }
+
+    /// RFC 5780 §7.3 / §7.4: RESPONSE-ORIGIN and OTHER-ADDRESS, both families.
+    #[test]
+    fn prop_response_origin_other_address_roundtrip(
+        origin in arb_any_addr(),
+        other in arb_any_addr(),
+    ) {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::SuccessResponse);
+        msg.add(Attribute::ResponseOrigin(origin));
+        msg.add(Attribute::OtherAddress(other));
+
+        let mut buf = [0u8; 256];
+        let len = msg.encode(&mut buf).unwrap();
+        let decoded = StunMessage::decode(&buf[..len]).unwrap();
+
+        prop_assert_eq!(decoded.get_response_origin(), Some(origin));
+        prop_assert_eq!(decoded.get_other_address(), Some(other));
+    }
 }
 
 // ── Property: encode length == HEADER + attr_bytes (4-aligned) ───────────────

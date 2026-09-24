@@ -292,7 +292,7 @@ per-feature production maturity always check
 | WebTransport (`web-transport`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
 | TURN-over-SCTP transport (`sctp`) | Project-specific TURN mapping | **Supported on Linux/tokio**, opt-in, allowed in production. Native SCTP without TLS; control and ChannelData, UDP relay. [Evidence](docs/verification/sctp-supported-2026-09-18.md) |
 | Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
-| NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
+| NAT behaviour discovery | RFC 5780 | Opt-in (`[turn.nat_discovery]`, off by default), UDP only; needs two addresses of one family on the host and refuses to start without them. Rate-limited like Binding; PADDING / RESPONSE-PORT refused. coturn client interop on loopback |
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
 | Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |
 | `io_uring` datapath | — | **Supported on Linux**, opt-in UDP datapath. Verified on **6.8.0-87 / 6.14.0-33**: recovery/drain, live TURN checks, 30-minute media and four-hour authenticated allocation churn on 6.8; functional checks and short churn on 6.14. [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md). |

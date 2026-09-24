@@ -234,6 +234,48 @@ what prevents one authenticated client hijacking another's pending connection.
 
 ---
 
+## `[turn.nat_discovery]` — RFC 5780 NAT behaviour discovery
+
+Answers STUN Binding on four UDP sockets — A1:P1, A1:P2, A2:P1, A2:P2 — so a client
+can ask for a reply from the other address and/or port (`CHANGE-REQUEST`) and learn
+how its NAT maps and filters. Off by default. The TURN listener is not one of the
+four and keeps answering `CHANGE-REQUEST` with `420`, as RFC 5780 §6 requires of a
+socket with no alternate address.
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Serve RFC 5780 on the four sockets. |
+| `primary_ip` | string | `""` | A1, the address clients are pointed at (e.g. through `_stun-behavior._udp`). |
+| `alternate_ip` | string | `""` | A2, a second address of the **same family**, assigned to this host. |
+| `primary_port` | u16 | `3478` | P1. Collides with a TURN listener on the same address or on the wildcard — move one of them. |
+| `alternate_port` | u16 | `3479` | P2, distinct from P1. |
+
+Validation refuses `enabled = true` unless both addresses parse, differ, share a
+family and are not a wildcard; unless the ports differ; and when a port collides
+with `turn.listen`, an enabled DTLS or QUIC listener, or any relay port range. A
+bind failure at startup stops the node: a discovery service answering from three of
+its four addresses would report the wrong NAT type.
+
+Replies are unauthenticated and `CHANGE-REQUEST` can send them from three different
+sources, so every request passes the `[turn.rate_limit]` tiers and the
+unauthenticated-reply budget (in a processor of its own — same tiers, separate
+buckets) before anything is sent. `PADDING` and `RESPONSE-PORT` are not implemented
+and are answered `420`. Only Binding is served. UDP only.
+
+The addresses must be the ones clients reach: `RESPONSE-ORIGIN` and `OTHER-ADDRESS`
+name them, so behind a 1:1 NAT they would name private addresses.
+
+```toml
+[turn.nat_discovery]
+enabled = true
+primary_ip = "203.0.113.10"
+alternate_ip = "203.0.113.11"
+primary_port = 3478      # TURN listener on another address, or move these ports
+alternate_port = 3479
+```
+
+---
+
 ## `[turn.quic]` — QUIC / WebTransport
 
 Requires `--features quic` (raw QUIC datapath) or `--features web-transport`

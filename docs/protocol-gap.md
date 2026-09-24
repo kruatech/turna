@@ -61,7 +61,7 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 | Multi-realm / tenant | present, isolation tests needed | per-tenant range + disjointness validation + realm match |
 | Peer filtering (SSRF) | present | `peer_filter` module |
 | TCP relay (RFC 6062) | **near-complete (experimental)** | Allocate(TCP)+CONNECT+ConnectionBind raw-detach over TLS + **peer-initiated relayed TCP listener + accept loop + CONNECTION-ATTEMPT indication + ConnectionBind on peer-initiated conns**; ConnectionBind ownership-bound (O#1), leak-safe detach (O#2); off by default; remaining: pipelined-client hardening + interop verification; **still refused under `production=true`** pending interop verification |
-| NAT discovery (RFC 5780) | **absent** | no codec in the tree — see the section below; the earlier "codec done" claim was wrong |
+| NAT discovery (RFC 5780) | **present, opt-in, UDP only** | codec (`Attribute::ChangeRequest` / `ResponseOrigin` / `OtherAddress`) + four-socket responder `relay::nat_discovery` behind `[turn.nat_discovery]` (default off, refused without two same-family addresses); coturn `turnutils_natdiscovery` interop on loopback — see the section below |
 | OAuth (RFC 7635) | **done** (stages 1–3) | codec + AuthMode::OAuth (AEAD decrypt + MI-by-mac_key; token-time = §6.2 fixed-point + clock skew) + config wiring + 401 THIRD-PARTY-AUTHORIZATION challenge + §6.1 lifetime cap incl. zero-remaining 401 + **`kid`-from-USERNAME key selection (RFC 7635 §6.1): kid-tagged keys select one AS-RS key directly; `strict_kid` opt-in rejects unknown/absent kid, default keeps trial-decrypt fallback for rotation**. Remaining: RFC 6062 TCP-allocate binding |
 | ORIGIN | **present (codec)** | `Attribute::Origin` (0x802F) parse/encode/getter |
 | QUIC / WebTransport | **supported**, Linux/macOS with tokio | Project-specific TURN mappings; shared transport limits and per-stream routing implemented on both paths. WebTransport uses H3 ALPN. Raw QUIC independent TURN-client interoperability is not established. [Support scope and evidence](verification/quic-webtransport-supported-2026-09-18.md). |
@@ -456,27 +456,39 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 - **Priority**: medium-high (enterprise/firewalled clients). Now a wiring job, not a
   from-scratch build.
 
-### NAT behavior discovery — RFC 5780 — ABSENT (this entry was wrong)
-- **Correction (2026-08-18).** This section previously claimed the codec was done,
-  listing `ATTR_CHANGE_REQUEST`, `Attribute::ChangeRequest`, `ATTR_RESPONSE_ORIGIN`,
-  `ATTR_OTHER_ADDRESS`, the matching getters and a test `tests/nat_discovery.rs`.
-  **None of that exists.** A repo-wide grep for `ChangeRequest`, `OtherAddress` and
-  `ResponseOrigin` over `crates/` returns nothing, and `proto-stun/tests/` has no
-  `nat_discovery.rs`. Treat RFC 5780 as not started.
-- **Bug the stale entry was hiding.** It also claimed `ATTR_ALTERNATE_SERVER` had
-  been corrected from 0x0003 to 0x8023. It had not — the constant was still
-  **0x0003**, which is CHANGE-REQUEST. Since ALTERNATE-SERVER is the payload of a
-  300 Try Alternate, every cluster redirect and every lame-duck drain redirect was
-  sending an attribute a conforming client cannot recognise as the alternate
-  address. Fixed now (`ATTR_ALTERNATE_SERVER = 0x8023`); 0x0003 is kept as
-  `ATTR_CHANGE_REQUEST_RESERVED` purely so the collision cannot come back.
-  **This is a wire-behaviour change — the redirect path needs a re-test.**
-- **Remaining (all of it)**: the codec, and then the *service*, which needs a
-  **2×IP / 2×port** topology so the server can answer from an alternate
-  address/port per CHANGE-REQUEST. That conflicts with the current
-  single-relay-IP hostNetwork model, so the networking model (#9) comes first.
-- **Priority**: low. Without the dual-address topology the codec alone buys
-  nothing, so the honest status is "not started", not "partial".
+### NAT behavior discovery — RFC 5780 — present, opt-in, UDP only (2026-09-24)
+- **Codec**: `ATTR_CHANGE_REQUEST` (0x0003) → `Attribute::ChangeRequest { change_ip,
+  change_port }` (strict 4-byte decode, A = 0x04 / B = 0x02 of the last byte, §7.2);
+  `ATTR_RESPONSE_ORIGIN` (0x802B) and `ATTR_OTHER_ADDRESS` (0x802C), both in the plain
+  MAPPED-ADDRESS format (§7.1); getters `get_change_request`, `get_response_origin`,
+  `get_other_address`. Unit tests assert the encoded bytes, property tests round-trip
+  both families. PADDING (0x0026) and RESPONSE-PORT (0x0027) are deliberately **not**
+  implemented: both are optional for a server (§7.5, §7.6) and both are the
+  amplification tools §10 discusses, so they stay comprehension-required unknowns and
+  are answered 420.
+- **Service**: `relay::nat_discovery` binds A1:P1, A1:P2, A2:P1, A2:P2 (§6) and
+  answers Binding only, choosing the reply socket from Table 1 (§6.1) —
+  `PacketProcessor::handle_nat_discovery`. Responses carry XOR-MAPPED-ADDRESS **and**
+  MAPPED-ADDRESS, RESPONSE-ORIGIN (the socket actually used) and OTHER-ADDRESS (Ca:Cp
+  whatever the flags). Every request passes the configured `[turn.rate_limit]` ingress
+  tiers and the unauthenticated-reply budget before anything is sent, including a 420.
+  The TURN listener is not one of the four sockets: it keeps answering CHANGE-REQUEST
+  with 420, which §6 requires of a socket with no alternate, and never adds
+  OTHER-ADDRESS.
+- **Config**: `[turn.nat_discovery]` (`enabled = false` by default). Validation refuses
+  it without two concrete addresses of one family, with equal ports, or when a port
+  collides with a UDP listener or falls in a relay port range; a bind failure at
+  startup is fatal.
+- **Evidence**: processor and socket tests (loopback 127.0.0.1 + 127.0.0.2), an
+  integration test against a real node, and interop with coturn's
+  `turnutils_natdiscovery` (`docs/interop/rfc5780-natdiscovery-2026-09-24.md`).
+- **Not done**: TCP and TLS (§6 SHOULD); a run through a real NAT against two public
+  addresses; advertised-address overrides for a node behind 1:1 NAT (RESPONSE-ORIGIN
+  names the bound address).
+- **History, kept on purpose.** Until 2026-08-18 this section claimed a codec that did
+  not exist, and the same stale entry hid `ATTR_ALTERNATE_SERVER = 0x0003` (the
+  CHANGE-REQUEST value), which made every 300 Try Alternate unreadable. The constant
+  was fixed then; `change_request_is_not_alternate_server` now pins the two apart.
 - **Priority**: low (experimental; niche).
 
 ### OAuth third-party authorization — RFC 7635 — done (stages 1–3)

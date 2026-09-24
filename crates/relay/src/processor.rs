@@ -1407,7 +1407,9 @@ impl PacketProcessor {
         if matches!(msg.class, MessageClass::Request) {
             // I3: reject unknown comprehension-required attributes with 420 before
             // routing/auth — a request we can't parse must not be redirected.
-            if let Some(actions) = self.reject_unknown_comprehension_required(msg, src) {
+            // `false`: this is the TURN listener, which has no alternate
+            // address, so CHANGE-REQUEST is refused here too (RFC 5780 §6).
+            if let Some(actions) = self.reject_unknown_comprehension_required(msg, src, false) {
                 return actions;
             }
             if let Some(actions) = self.maybe_redirect_new_client(msg, src) {
@@ -1448,10 +1450,18 @@ impl PacketProcessor {
     /// required (type < 0x8000) attributes we didn't understand. 0x001C
     /// (MESSAGE-INTEGRITY-SHA256) and 0x001D (PASSWORD-ALGORITHM) are understood
     /// despite being parsed generically, so they never trigger 420.
+    ///
+    /// CHANGE-REQUEST decodes to a typed attribute, but RFC 5780 §6 requires a
+    /// server that cannot answer from an alternate address to refuse it with
+    /// 420 — which is every socket except the NAT-discovery ones. Only the
+    /// discovery responder passes `change_request_ok = true`. PADDING and
+    /// RESPONSE-PORT stay untyped and are refused everywhere (see
+    /// `handle_nat_discovery`).
     fn reject_unknown_comprehension_required(
         &self,
         msg: &StunMessage,
         src: SocketAddr,
+        change_request_ok: bool,
     ) -> Option<Vec<Action>> {
         let unknown: Vec<u16> = msg
             .attributes
@@ -1464,6 +1474,9 @@ impl PacketProcessor {
                         && *attr_type != turna_proto_stun::attribute::ATTR_PASSWORD_ALGORITHM =>
                 {
                     Some(*attr_type)
+                }
+                Attribute::ChangeRequest { .. } if !change_request_ok => {
+                    Some(turna_proto_stun::attribute::ATTR_CHANGE_REQUEST)
                 }
                 _ => None,
             })
@@ -1626,6 +1639,130 @@ impl PacketProcessor {
             data: Bytes::copy_from_slice(&buf[..len]),
             target: src,
         }]
+    }
+
+    /// RFC 5780 NAT behaviour discovery: answer a Binding request that arrived
+    /// on one of the four discovery sockets (`local` is that socket's address).
+    ///
+    /// Returns the response and the address it must be **sent from**, which is
+    /// the point of the exercise — the caller owns the four sockets and picks
+    /// the one bound to that address. `None` means drop silently.
+    ///
+    /// Everything that guards the TURN listener's Binding path guards this one:
+    /// the configured ingress tiers, then the unauthenticated-reply budget,
+    /// because a discovery response is an unauthenticated reply like any other
+    /// and a slightly larger one (MAPPED-ADDRESS, RESPONSE-ORIGIN and
+    /// OTHER-ADDRESS on top of XOR-MAPPED-ADDRESS). Two reflection vectors the
+    /// RFC itself names are closed by not implementing their attributes:
+    /// PADDING (§7.6, "divide the message into IP fragments") and RESPONSE-PORT
+    /// (§7.5, send somewhere other than the source) are comprehension-required
+    /// and answered 420, so a response always goes to the request's source
+    /// address and is never padded. Both are optional for a server.
+    ///
+    /// Only Binding is served. A TURN method here is dropped, not answered:
+    /// these sockets are not a TURN listener, and replying would advertise
+    /// one.
+    pub fn handle_nat_discovery(
+        &self,
+        raw: &[u8],
+        src: SocketAddr,
+        local: SocketAddr,
+        topology: &crate::nat_discovery::NatDiscoveryTopology,
+    ) -> Option<(Bytes, SocketAddr)> {
+        self.metrics
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_received
+            .fetch_add(raw.len() as u64, Ordering::Relaxed);
+        if !message::is_stun_message(raw) {
+            self.metrics
+                .malformed_packets
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if !self.limiter_for(src.ip()).check_ingress(src.ip()) {
+            self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let msg = match StunMessage::decode(raw) {
+            Ok(m) => m,
+            Err(_) => {
+                // Silent, as on the TURN listener: an error answer to garbage
+                // is a reflection vector.
+                self.metrics
+                    .parser_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        if !matches!(
+            (&msg.class, &msg.method),
+            (MessageClass::Request, Method::Binding)
+        ) {
+            return None;
+        }
+        // Every reply from here on — 420, 401 or success — is unauthenticated
+        // (or not yet authenticated), so the budget is charged first.
+        if !self.allow_unauth_reply(src) {
+            return None;
+        }
+        if let Some(actions) = self.reject_unknown_comprehension_required(&msg, src, true) {
+            // 420 goes out from the socket the request arrived on (Da:Dp).
+            return actions.into_iter().find_map(|a| match a {
+                Action::Send { data, .. } => Some((data, local)),
+                _ => None,
+            });
+        }
+        // Same rule as `handle_binding`: MESSAGE-INTEGRITY, when present, must
+        // verify. A failure is a 401 from Da:Dp.
+        let has_integrity =
+            msg.get_message_integrity().is_some() || msg.get_message_integrity_sha256().is_some();
+        if has_integrity && self.auth_validate(&msg, raw).is_err() {
+            self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+            // The challenge re-checks the budget; one reply was already allowed
+            // for this request, so charge it once and build the 401 directly.
+            let realm = self.auth.default_realm();
+            let nonce = self.nonce_mgr.issue(src);
+            let resp = turn::build_auth_challenge(msg.method, msg.transaction_id, realm, &nonce);
+            let mut buf = [0u8; 512];
+            let len = resp.encode(&mut buf).ok()?;
+            self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .bytes_sent
+                .fetch_add(len as u64, Ordering::Relaxed);
+            return Some((Bytes::copy_from_slice(&buf[..len]), local));
+        }
+
+        // RFC 5780 §6.1, Table 1: the source of the response follows the
+        // CHANGE-REQUEST flags; OTHER-ADDRESS is Ca:Cp whatever they say.
+        let (change_ip, change_port) = msg.get_change_request().unwrap_or((false, false));
+        let from = topology.response_source(local, change_ip, change_port)?;
+        let other = topology.other_address(local)?;
+
+        let mut resp = StunMessage::with_transaction_id(
+            Method::Binding,
+            MessageClass::SuccessResponse,
+            msg.transaction_id,
+        );
+        // §6.1: "The server MUST include both MAPPED-ADDRESS and
+        // XOR-MAPPED-ADDRESS in its Response."
+        resp.add(Attribute::XorMappedAddress(src));
+        resp.add(Attribute::MappedAddress(src));
+        // §6.1: RESPONSE-ORIGIN is the address actually sent from; OTHER-ADDRESS
+        // is included because this server has an alternate address and port.
+        resp.add(Attribute::ResponseOrigin(from));
+        resp.add(Attribute::OtherAddress(other));
+        if let Some(sw) = software_attribute() {
+            resp.add(Attribute::Software(sw.into()));
+        }
+        let mut buf = [0u8; 256];
+        let len = resp.encode(&mut buf).ok()?;
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+        Some((Bytes::copy_from_slice(&buf[..len]), from))
     }
 
     fn handle_allocate(
@@ -3447,5 +3584,192 @@ mod userhash_tests {
                 },
             );
         assert_eq!(PacketProcessor::nonce_cookie_for(&mixed, true), None);
+    }
+}
+
+#[cfg(test)]
+mod nat_discovery_tests {
+    //! RFC 5780 through the processor. The socket plumbing is tested in
+    //! `nat_discovery`; here, what each request is answered with and from where.
+    use super::*;
+    use crate::nat_discovery::NatDiscoveryTopology;
+    use turna_proto_stun::attribute::ATTR_CHANGE_REQUEST;
+
+    fn topo() -> NatDiscoveryTopology {
+        NatDiscoveryTopology::new(
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.2".parse().unwrap(),
+            3478,
+            3479,
+        )
+        .unwrap()
+    }
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(27000, 27999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "nat",
+                [("u", "p")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    fn binding(extra: Vec<Attribute>) -> Vec<u8> {
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        for a in extra {
+            m.add(a);
+        }
+        let mut buf = [0u8; 256];
+        let n = m.encode(&mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn plain_binding_carries_all_four_addresses() {
+        let p = processor();
+        let src = sa("198.51.100.7:40000");
+        let local = sa("127.0.0.1:3478");
+        let (bytes, from) = p
+            .handle_nat_discovery(&binding(vec![]), src, local, &topo())
+            .expect("a reply");
+        assert_eq!(from, local, "no CHANGE-REQUEST: answer from Da:Dp");
+        let r = StunMessage::decode(&bytes).unwrap();
+        assert!(matches!(r.class, MessageClass::SuccessResponse));
+        assert!(r
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::XorMappedAddress(x) if *x == src)));
+        assert!(r
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::MappedAddress(x) if *x == src)));
+        assert_eq!(r.get_response_origin(), Some(local));
+        assert_eq!(r.get_other_address(), Some(sa("127.0.0.2:3479")));
+    }
+
+    #[test]
+    fn change_request_moves_the_source_and_response_origin_follows() {
+        let p = processor();
+        let src = sa("198.51.100.7:40001");
+        let local = sa("127.0.0.1:3478");
+        for (ip, port, want) in [
+            (true, false, "127.0.0.2:3478"),
+            (false, true, "127.0.0.1:3479"),
+            (true, true, "127.0.0.2:3479"),
+        ] {
+            let req = binding(vec![Attribute::ChangeRequest {
+                change_ip: ip,
+                change_port: port,
+            }]);
+            let (bytes, from) = p.handle_nat_discovery(&req, src, local, &topo()).unwrap();
+            assert_eq!(from, sa(want));
+            let r = StunMessage::decode(&bytes).unwrap();
+            assert_eq!(r.get_response_origin(), Some(sa(want)));
+            assert_eq!(r.get_other_address(), Some(sa("127.0.0.2:3479")));
+        }
+    }
+
+    /// PADDING (0x0026) and RESPONSE-PORT (0x0027) are the two attributes the
+    /// RFC's security section worries about; both are optional for a server
+    /// and refused here, from the socket the request arrived on.
+    #[test]
+    fn padding_and_response_port_are_refused_with_420() {
+        let p = processor();
+        let src = sa("198.51.100.7:40002");
+        let local = sa("127.0.0.2:3479");
+        for (typ, value) in [(0x0026u16, vec![0u8; 64]), (0x0027, vec![0x13, 0x88, 0, 0])] {
+            let req = binding(vec![Attribute::Unknown {
+                attr_type: typ,
+                value,
+            }]);
+            let (bytes, from) = p.handle_nat_discovery(&req, src, local, &topo()).unwrap();
+            assert_eq!(from, local);
+            let r = StunMessage::decode(&bytes).unwrap();
+            assert!(r
+                .attributes
+                .iter()
+                .any(|a| matches!(a, Attribute::UnknownAttributes(v) if v == &vec![typ])));
+        }
+    }
+
+    #[test]
+    fn turn_methods_are_not_served_on_discovery_sockets() {
+        let p = processor();
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::RequestedTransport(17));
+        let mut buf = [0u8; 128];
+        let n = m.encode(&mut buf).unwrap();
+        assert!(p
+            .handle_nat_discovery(
+                &buf[..n],
+                sa("198.51.100.7:40003"),
+                sa("127.0.0.1:3478"),
+                &topo()
+            )
+            .is_none());
+    }
+
+    /// Replies share the unauthenticated-reply budget: a flood from one
+    /// (possibly spoofed) source stops being answered.
+    #[test]
+    fn replies_are_bounded_by_the_unauthenticated_budget() {
+        let p = processor();
+        let src = sa("198.51.100.8:40004");
+        let req = binding(vec![Attribute::ChangeRequest {
+            change_ip: true,
+            change_port: true,
+        }]);
+        let answered = (0..500)
+            .filter(|_| {
+                p.handle_nat_discovery(&req, src, sa("127.0.0.1:3478"), &topo())
+                    .is_some()
+            })
+            .count();
+        assert!(answered < 500, "all 500 were answered");
+        assert!(answered >= 1);
+        assert!(p.metrics.unauth_replies_suppressed.load(Ordering::Relaxed) > 0);
+    }
+
+    /// The TURN listener has no alternate address, so RFC 5780 §6 requires it
+    /// to refuse CHANGE-REQUEST with 420 — the same answer it gave when the
+    /// attribute was not understood at all.
+    #[test]
+    fn turn_listener_still_refuses_change_request() {
+        let p = processor();
+        let src = sa("198.51.100.7:40005");
+        let req = binding(vec![Attribute::ChangeRequest {
+            change_ip: true,
+            change_port: false,
+        }]);
+        let actions = p.process(Bytes::from(req), src);
+        let r = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("a reply");
+        assert!(r.attributes.iter().any(
+            |a| matches!(a, Attribute::UnknownAttributes(v) if v == &vec![ATTR_CHANGE_REQUEST])
+        ));
+        // And a plain Binding there still has no OTHER-ADDRESS (§6: a server
+        // without an alternate address MUST NOT include it).
+        let actions = p.process(Bytes::from(binding(vec![])), src);
+        let r = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(r.get_other_address().is_none());
+        assert!(r.get_response_origin().is_none());
     }
 }
