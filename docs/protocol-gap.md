@@ -531,6 +531,21 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   The TURN listener is not one of the four sockets: it keeps answering CHANGE-REQUEST
   with 420, which §6 requires of a socket with no alternate, and never adds
   OTHER-ADDRESS.
+- **Authenticated discovery Bindings** (fixed in review, 2026-09-24): a request with
+  MESSAGE-INTEGRITY is nonce-checked (missing → 400, not issued to this source or
+  stale → 438) and its success is signed with the resolved key, per RFC 5780 §6.1 and
+  RFC 8489 §9.2.4. Before, the integrity was checked but the reply was unsigned and
+  the nonce ignored, so a captured request replayed.
+- **One reply budget per source**: with discovery enabled every processor shares one
+  unauthenticated-reply budget (`UnauthReplyBudget`), so the discovery sockets do not
+  double what a spoofed victim receives. Replies are 80 B (v4) / 128 B (v6) against a
+  20–28 B request; see CONFIGURATION.md.
+- **Open — authenticated Binding on the TURN listener (pre-existing, not changed
+  here).** `handle_binding` verifies MESSAGE-INTEGRITY when present but never checks
+  the NONCE and answers unsigned, so an authenticated Binding there is replayable and
+  its response cannot be verified by the client. RFC 8489 §9.2.4 wants the nonce
+  checked and the response signed. The discovery responder does both now; the TURN
+  listener still does not.
 - **Config**: `[turn.nat_discovery]` (`enabled = false` by default). Validation refuses
   it without two concrete addresses of one family, with equal ports, or when a port
   collides with a UDP listener or falls in a relay port range; a bind failure at

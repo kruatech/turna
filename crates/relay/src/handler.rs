@@ -46,6 +46,15 @@ impl RelayHandler {
         }
     }
 
+    /// Share an unauthenticated-reply budget (see [`crate::UnauthReplyBudget`]).
+    /// Called right after construction, while the processor is not yet shared.
+    pub fn with_unauth_reply_budget(mut self, budget: Option<&crate::UnauthReplyBudget>) -> Self {
+        if let (Some(b), Some(p)) = (budget, Arc::get_mut(&mut self.processor)) {
+            p.set_unauth_reply_budget(b);
+        }
+        self
+    }
+
     /// Map a single `Action` to a `ForwardAction` for the io_uring send path.
     fn convert_action(&self, action: Action) -> ForwardAction {
         match action {

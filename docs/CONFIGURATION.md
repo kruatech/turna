@@ -260,9 +260,27 @@ its four addresses would report the wrong NAT type.
 
 Replies are unauthenticated and `CHANGE-REQUEST` can send them from three different
 sources, so every request passes the `[turn.rate_limit]` tiers and the
-unauthenticated-reply budget (in a processor of its own — same tiers, separate
-buckets) before anything is sent. `PADDING` and `RESPONSE-PORT` are not implemented
-and are answered `420`. Only Binding is served. UDP only.
+unauthenticated-reply budget before anything is sent. With discovery enabled that
+budget is **shared by every processor on the node** — the TURN listener, the
+discovery sockets, DTLS/QUIC and each io_uring worker — so a spoofed victim gets one
+budget (burst 64, 8/s per source IP) in total, not one per listener. With discovery
+off each processor keeps its own, as before. `PADDING` and `RESPONSE-PORT` are not
+implemented and are answered `420`. Only Binding is served. UDP only.
+
+**Amplification.** A discovery reply carries four addresses (XOR-MAPPED, MAPPED,
+RESPONSE-ORIGIN, OTHER-ADDRESS): **80 bytes** for IPv4 and **128 bytes** for IPv6
+with the default `software_attribute = "product"` (4 bytes more with `"full"`, 12
+fewer with `"none"`), against a 20-byte request (28 with CHANGE-REQUEST) — up to
+**4×** for IPv4 and **6.4×** for IPv6. The TURN listener's own Binding reply is 44
+bytes (2.2×). The shared budget above is what bounds it; the sizes are pinned by
+`discovery_reply_sizes_match_the_documentation`.
+
+**Authenticated Bindings.** A discovery Binding that carries MESSAGE-INTEGRITY is
+handled by the RFC 8489 long-term mechanism: NONCE, REALM and USERNAME/USERHASH are
+required (`400`), the nonce must be one this responder issued to that source and
+still fresh (`438` with a new one), the integrity must verify (`401`), and the success
+response is signed with the same MESSAGE-INTEGRITY variant (RFC 5780 §6.1).
+Discovery clients normally send no credentials and get an unsigned reply.
 
 The addresses must be the ones clients reach: `RESPONSE-ORIGIN` and `OTHER-ADDRESS`
 name them, so behind a 1:1 NAT they would name private addresses.

@@ -621,7 +621,7 @@ pub struct PacketProcessor {
     /// The distinction matters under spoofing, where the source address is the
     /// victim: a 48-byte response to a 20-byte request, up to the per-IP ingress
     /// refill of 50 000/second, is 2.4 MB/s aimed at whoever the attacker named.
-    unauth_reply_limiter: TieredRateLimiter,
+    unauth_reply_limiter: Arc<TieredRateLimiter>,
     external_ip: std::net::IpAddr,
     /// RFC 6156 IPv6 relayed transport. `None` (the default) keeps the historical
     /// IPv4-only behaviour: an explicit `REQUESTED-ADDRESS-FAMILY = IPv6` is
@@ -642,6 +642,42 @@ pub struct PacketProcessor {
     /// RFC 6062 TCP relay engine. `None` = TCP allocations disabled (Allocate
     /// with REQUESTED-TRANSPORT=TCP → 442).
     tcp_relay: Option<Arc<TcpRelayManager>>,
+}
+
+/// The budget for replies to addresses that have not authenticated (Binding
+/// responses, 401 challenges, RFC 5780 discovery replies), as a value that
+/// several processors can share.
+///
+/// Each processor has its own by default, which is the historical behaviour.
+/// The node shares one across every processor only when RFC 5780 discovery is
+/// enabled: the discovery responder is a separate processor, and with separate
+/// buckets a spoofed victim would receive a full budget of Binding replies from
+/// the TURN listener *and* another from the discovery sockets. One budget per
+/// source across both is the point.
+#[derive(Clone)]
+pub struct UnauthReplyBudget(Arc<TieredRateLimiter>);
+
+impl UnauthReplyBudget {
+    pub fn new() -> Self {
+        // (64, 8): a legitimate client needs single digits of these, ever.
+        // Only `per_ip` is consulted; the other tiers are set to the same
+        // values rather than left at their generous defaults so that a
+        // future caller reaching for one does not get an accidental
+        // free pass.
+        Self(Arc::new(TieredRateLimiter::new(TieredLimits {
+            per_ip: (64, 8),
+            per_prefix: (512, 64),
+            allocate: (64, 8),
+            create_permission: (64, 8),
+            channel_bind: (64, 8),
+        })))
+    }
+}
+
+impl Default for UnauthReplyBudget {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Rate-limit tiers handed to a [`PacketProcessor`].
@@ -808,18 +844,7 @@ impl PacketProcessor {
             )),
             trusted_limiter: None,
             trusted_prefixes: Vec::new(),
-            // (64, 8): a legitimate client needs single digits of these, ever.
-            // Only `per_ip` is consulted; the other tiers are set to the same
-            // values rather than left at their generous defaults so that a
-            // future caller reaching for one does not get an accidental
-            // free pass.
-            unauth_reply_limiter: TieredRateLimiter::new(TieredLimits {
-                per_ip: (64, 8),
-                per_prefix: (512, 64),
-                allocate: (64, 8),
-                create_permission: (64, 8),
-                channel_bind: (64, 8),
-            }),
+            unauth_reply_limiter: UnauthReplyBudget::new().0,
             external_ip,
             external_ip6: None,
             nonce_mgr,
@@ -834,6 +859,27 @@ impl PacketProcessor {
 
     pub fn store(&self) -> &Arc<AllocationStore> {
         &self.store
+    }
+
+    /// Draw unauthenticated replies from `budget` instead of this processor's
+    /// own (see [`UnauthReplyBudget`]).
+    pub fn with_unauth_reply_budget(mut self, budget: &UnauthReplyBudget) -> Self {
+        self.set_unauth_reply_budget(budget);
+        self
+    }
+
+    /// [`with_unauth_reply_budget`](Self::with_unauth_reply_budget) when a
+    /// budget is given; unchanged otherwise.
+    pub fn maybe_unauth_reply_budget(self, budget: Option<&UnauthReplyBudget>) -> Self {
+        match budget {
+            Some(b) => self.with_unauth_reply_budget(b),
+            None => self,
+        }
+    }
+
+    /// In-place form of [`with_unauth_reply_budget`](Self::with_unauth_reply_budget).
+    pub fn set_unauth_reply_budget(&mut self, budget: &UnauthReplyBudget) {
+        self.unauth_reply_limiter = budget.0.clone();
     }
 
     /// The nonce cookie this processor issues, per [`set_advertise_userhash`].
@@ -1714,24 +1760,68 @@ impl PacketProcessor {
                 _ => None,
             });
         }
-        // Same rule as `handle_binding`: MESSAGE-INTEGRITY, when present, must
-        // verify. A failure is a 401 from Da:Dp.
+        // A Binding that carries MESSAGE-INTEGRITY is handled as the RFC 8489
+        // §9.2.4 long-term mechanism prescribes, and its success response is
+        // signed (RFC 5780 §6.1: "If authentication is being required, the
+        // server MUST include a MESSAGE-INTEGRITY and associated attributes").
+        // The checks, in the RFC's order: USERNAME/USERHASH, REALM and NONCE
+        // present (else 400), the nonce issued by this responder to this
+        // source and still fresh (else 438 — a replayed request is refused
+        // here), the integrity valid (else 401). Every error goes out from
+        // Da:Dp; the budget was charged above, once, for whichever reply this
+        // turns out to be. An unauthenticated Binding (no MESSAGE-INTEGRITY) is
+        // answered unsigned, which is what discovery clients send.
         let has_integrity =
             msg.get_message_integrity().is_some() || msg.get_message_integrity_sha256().is_some();
-        if has_integrity && self.auth_validate(&msg, raw).is_err() {
-            self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-            // The challenge re-checks the budget; one reply was already allowed
-            // for this request, so charge it once and build the 401 directly.
-            let realm = self.auth.default_realm();
-            let nonce = self.nonce_mgr.issue(src);
-            let resp = turn::build_auth_challenge(msg.method, msg.transaction_id, realm, &nonce);
-            let mut buf = [0u8; 512];
-            let len = resp.encode(&mut buf).ok()?;
-            self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .bytes_sent
-                .fetch_add(len as u64, Ordering::Relaxed);
-            return Some((Bytes::copy_from_slice(&buf[..len]), local));
+        let mut signing_key: Option<Vec<u8>> = None;
+        if has_integrity {
+            let error = |code: u16, reason: &str, with_nonce: bool| {
+                let mut resp =
+                    turn::build_error_response(msg.method, msg.transaction_id, code, reason);
+                if with_nonce {
+                    resp.add(Attribute::Realm(self.auth.default_realm().to_string()));
+                    resp.add(Attribute::Nonce(self.nonce_mgr.issue(src)));
+                }
+                let mut buf = [0u8; 512];
+                let len = resp.encode(&mut buf).ok()?;
+                self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .bytes_sent
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                Some((Bytes::copy_from_slice(&buf[..len]), local))
+            };
+            let Some(nonce) = msg.get_nonce() else {
+                return error(400, "Bad Request", false);
+            };
+            if !msg.has_user_identity() || msg.get_realm().is_none() {
+                return error(400, "Bad Request", false);
+            }
+            if matches!(self.nonce_mgr.validate(src, nonce), NonceStatus::Stale) {
+                return error(438, "Stale Nonce", true);
+            }
+            match self.auth_validate(&msg, raw) {
+                Ok(r) => signing_key = Some(r.key),
+                Err(turna_auth::AuthError::BadRequest) => {
+                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    return error(400, "Bad Request", false);
+                }
+                Err(_) => {
+                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    let resp = turn::build_auth_challenge(
+                        msg.method,
+                        msg.transaction_id,
+                        self.auth.default_realm(),
+                        &self.nonce_mgr.issue(src),
+                    );
+                    let mut buf = [0u8; 512];
+                    let len = resp.encode(&mut buf).ok()?;
+                    self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .bytes_sent
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                    return Some((Bytes::copy_from_slice(&buf[..len]), local));
+                }
+            }
         }
 
         // RFC 5780 §6.1, Table 1: the source of the response follows the
@@ -1756,8 +1846,12 @@ impl PacketProcessor {
         if let Some(sw) = software_attribute() {
             resp.add(Attribute::Software(sw.into()));
         }
-        let mut buf = [0u8; 256];
-        let len = resp.encode(&mut buf).ok()?;
+        let mut buf = [0u8; 512];
+        let len = match &signing_key {
+            // Same MESSAGE-INTEGRITY variant as the request (RFC 8489 §9.2.4).
+            Some(key) => encode_with_integrity_auto(&resp, &mut buf, key, &msg).ok()?,
+            None => resp.encode(&mut buf).ok()?,
+        };
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -4434,5 +4528,175 @@ mod malformed_typed_attribute_tests {
                 "{typ:#06x}: expected 420 listing it"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nat_discovery_auth_and_budget_tests {
+    use super::*;
+    use crate::nat_discovery::NatDiscoveryTopology;
+
+    fn topo() -> NatDiscoveryTopology {
+        NatDiscoveryTopology::new(
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.2".parse().unwrap(),
+            3478,
+            3479,
+        )
+        .unwrap()
+    }
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(32000, 32099, 8)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "nd",
+                [("u", "pw")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    fn signed_binding(nonce: Option<&str>, pass: &str) -> Vec<u8> {
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        m.add(Attribute::ChangeRequest {
+            change_ip: true,
+            change_port: true,
+        });
+        m.add(Attribute::Username("u".into()));
+        m.add(Attribute::Realm("nd".into()));
+        if let Some(n) = nonce {
+            m.add(Attribute::Nonce(n.into()));
+        }
+        let key = turna_crypto::long_term_key("u", "nd", pass);
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn code(b: &[u8]) -> Option<u16> {
+        StunMessage::decode(b)
+            .unwrap()
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                Attribute::ErrorCode { code, .. } => Some(*code),
+                _ => None,
+            })
+    }
+
+    /// RFC 5780 §6.1 + RFC 8489 §9.2.4: an authenticated discovery Binding is
+    /// nonce-checked and its success response is signed.
+    #[test]
+    fn authenticated_binding_is_nonce_checked_and_signed() {
+        let p = processor();
+        let src: SocketAddr = "198.51.100.30:40000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+        // No NONCE with MESSAGE-INTEGRITY: 400, from Da:Dp.
+        let (r, from) = p
+            .handle_nat_discovery(&signed_binding(None, "pw"), src, local, &topo())
+            .unwrap();
+        assert_eq!((code(&r), from), (Some(400), local));
+
+        // A nonce this responder never issued to this source: 438 with a
+        // fresh one, so a captured request cannot be replayed elsewhere.
+        let foreign = processor().nonce_mgr.issue(src);
+        let (r, _) = p
+            .handle_nat_discovery(&signed_binding(Some(&foreign), "pw"), src, local, &topo())
+            .unwrap();
+        assert_eq!(code(&r), Some(438));
+        let fresh = StunMessage::decode(&r)
+            .unwrap()
+            .get_nonce()
+            .unwrap()
+            .to_string();
+
+        // Wrong password with a valid nonce: 401.
+        let (r, _) = p
+            .handle_nat_discovery(&signed_binding(Some(&fresh), "WRONG"), src, local, &topo())
+            .unwrap();
+        assert_eq!(code(&r), Some(401));
+
+        // Valid: success from Ca:Cp, signed with the long-term key.
+        let raw_req = signed_binding(Some(&fresh), "pw");
+        let (r, from) = p
+            .handle_nat_discovery(&raw_req, src, local, &topo())
+            .unwrap();
+        assert_eq!(from, "127.0.0.2:3479".parse::<SocketAddr>().unwrap());
+        let resp = StunMessage::decode(&r).unwrap();
+        assert!(matches!(resp.class, MessageClass::SuccessResponse));
+        let key = turna_crypto::long_term_key("u", "nd", "pw");
+        assert!(resp.verify_integrity(&r, &key), "response must be signed");
+    }
+
+    /// One budget per source across processors that share it: replies from
+    /// one exhaust the other.
+    #[test]
+    fn shared_budget_is_one_budget_per_source() {
+        let budget = UnauthReplyBudget::new();
+        let turn = processor().with_unauth_reply_budget(&budget);
+        let disc = processor().with_unauth_reply_budget(&budget);
+        let src: SocketAddr = "198.51.100.31:40000".parse().unwrap();
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        m.add(Attribute::Software("x".into()));
+        let mut buf = [0u8; 64];
+        let n = m.encode(&mut buf).unwrap();
+        // Drain the budget through the TURN listener's processor.
+        for _ in 0..200 {
+            turn.process(Bytes::copy_from_slice(&buf[..n]), src);
+        }
+        assert!(
+            disc.handle_nat_discovery(&buf[..n], src, "127.0.0.1:3478".parse().unwrap(), &topo())
+                .is_none(),
+            "the discovery responder must see the budget the TURN listener spent"
+        );
+        // Unshared processors keep independent budgets (the default).
+        let alone = processor();
+        assert!(alone
+            .handle_nat_discovery(&buf[..n], src, "127.0.0.1:3478".parse().unwrap(), &topo())
+            .is_some());
+    }
+
+    /// The sizes docs/CONFIGURATION.md quotes for the amplification factor.
+    #[test]
+    fn discovery_reply_sizes_match_the_documentation() {
+        let p = processor();
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        m.add(Attribute::ChangeRequest {
+            change_ip: false,
+            change_port: false,
+        });
+        let mut buf = [0u8; 64];
+        let n = m.encode(&mut buf).unwrap();
+        assert_eq!(n, 28, "request: header + CHANGE-REQUEST");
+        let (v4, _) = p
+            .handle_nat_discovery(
+                &buf[..n],
+                "198.51.100.32:40000".parse().unwrap(),
+                "127.0.0.1:3478".parse().unwrap(),
+                &topo(),
+            )
+            .unwrap();
+        // header 20 + 4 x 12 (four v4 addresses) + SOFTWARE "turna" 12.
+        assert_eq!(v4.len(), 80);
+        let t6 = NatDiscoveryTopology::new(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+            3478,
+            3479,
+        )
+        .unwrap();
+        let (v6, _) = p
+            .handle_nat_discovery(
+                &buf[..n],
+                "[2001:db8::99]:40000".parse().unwrap(),
+                "[2001:db8::1]:3478".parse().unwrap(),
+                &t6,
+            )
+            .unwrap();
+        // header 20 + 4 x 24 (four v6 addresses) + SOFTWARE 12.
+        assert_eq!(v6.len(), 128);
     }
 }

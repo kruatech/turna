@@ -2368,7 +2368,15 @@ fn run_tokio(
         // startup rather than serving a topology that reports the wrong NAT
         // type. A dedicated processor: its ingress tiers and unauthenticated-
         // reply budget are the configured ones, in buckets of its own.
-        if config.nat_discovery.enabled {
+        // With discovery on, every processor on the node draws unauthenticated
+        // replies from ONE budget per source, so the discovery sockets cannot
+        // double what a spoofed victim receives. Off: each keeps its own, as
+        // before.
+        let reply_budget = config
+            .nat_discovery
+            .enabled
+            .then(turna_relay::UnauthReplyBudget::new);
+        if let Some(budget) = &reply_budget {
             let topology = nat_discovery_topology(&config.nat_discovery)?;
             let sockets = turna_relay::nat_discovery::bind(&topology).await?;
             let nd_processor = Arc::new(
@@ -2379,7 +2387,8 @@ fn run_tokio(
                     metrics.clone(),
                     None,
                 )
-                .with_rate_limits(&rate_limits),
+                .with_rate_limits(&rate_limits)
+                .with_unauth_reply_budget(budget),
             );
             tokio::spawn(turna_relay::nat_discovery::run(
                 nd_processor,
@@ -2403,7 +2412,8 @@ fn run_tokio(
                         cluster_routing.clone(),
                     )
                     .with_external_ip6(external_ip6)
-                    .with_rate_limits(&rate_limits),
+                    .with_rate_limits(&rate_limits)
+                    .maybe_unauth_reply_budget(reply_budget.as_ref()),
                 );
                 let af_cfg = config.af_xdp.clone();
                 let listen = config.listen;
@@ -2453,6 +2463,7 @@ fn run_tokio(
                     Some(&rate_limits),
                 )
                 .with_external_ip6(external_ip6)
+                .with_unauth_reply_budget(reply_budget.as_ref())
                 .with_drain_timeout_secs(config.relay.drain_timeout_secs);
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
@@ -2564,7 +2575,8 @@ fn run_tokio(
                                 cluster_routing.clone(),
                             )
                             .with_external_ip6(external_ip6)
-                            .with_rate_limits(&rate_limits),
+                            .with_rate_limits(&rate_limits)
+                            .maybe_unauth_reply_budget(reply_budget.as_ref()),
                         );
                         let qd_sinks = turna_relay::new_client_sinks();
                         // Ephemeral fallback socket (bound off :3478 so it never
@@ -2633,6 +2645,7 @@ fn run_tokio(
                     let auth_f = auth.clone();
                     let metrics_f = metrics.clone();
                     let cluster_f = cluster_routing.clone();
+                    let budget_f = reply_budget.clone();
                     let handles = spawn_worker_pool(pool_cfg, move |_worker_id| {
                         RelayHandler::new_with_cluster(
                             store_f.clone(),
@@ -2641,6 +2654,7 @@ fn run_tokio(
                             metrics_f.clone(),
                             cluster_f.clone(),
                         )
+                        .with_unauth_reply_budget(budget_f.as_ref())
                     });
 
                     // io_uring mode does not run RelayServer::run, so nothing
