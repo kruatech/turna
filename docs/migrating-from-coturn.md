@@ -25,14 +25,16 @@ reload or a database row. So a migration has three parts:
 | coturn | turna | notes |
 |---|---|---|
 | `listening-port=3478` | `[turn] listen = "0.0.0.0:3478"` | address and port are one value |
-| `listening-ip=1.2.3.4` | same `[turn] listen` | multiple `listening-ip` lines have no single-key equivalent — run one process per public IP, which is the canonical topology here |
+| `listening-ip=1.2.3.4` | same `[turn] listen` | further `listening-ip` lines go in `[turn] listen_extra = ["5.6.7.8:3478", …]` (tokio datapath only; each address may carry its own port). Relayed data returns from the address the client used |
 | `tls-listening-port=5349` | `[tls] listen = "0.0.0.0:5349"` | plus `[tls] enabled = true`, and the binary must be built `--features tls` |
 | `external-ip=1.2.3.4` | `[turn] external_ip = "1.2.3.4"` | required under `production = true`; empty is refused |
-| `external-ip=PUBLIC/PRIVATE` | `[turn] external_ip` = the public one | the NAT-mapping form has no direct equivalent; set `listen` to the private address and `external_ip` to the public one |
-| `relay-ip=…` | — | relay sockets bind on the same interface as `listen` |
+| `external-ip=PUBLIC/PRIVATE` | `[turn] external_ip = "PUBLIC/PRIVATE"` | same form: PUBLIC is advertised, the relay sockets bind PRIVATE. Both halves IPv4 here; an IPv6 pair goes in `external_ip6`. Only one mapping per family — coturn's repeated `-X` has no equivalent |
+| `relay-ip=…` | `[turn.relay] bind_ip` / `bind_ip6` | one address per family; repeated `relay-ip` lines (several relay addresses on one node) are not supported — run one node per relay address |
 | `min-port` / `max-port` | `[turn.relay] min_port` / `max_port` | same meaning. Keep the range and the firewall in agreement — `scripts/check-deploy-consistency.sh` checks the three places it is declared |
 | `realm=turn.example.com` | `[turn] realm` | same |
-| `no-udp` / `no-tcp` / `no-tls` / `no-dtls` | omit the corresponding section, or `enabled = false` | there is no "start everything then switch bits off" model |
+| `no-udp` / `no-tcp` / `no-tls` / `no-dtls` | omit the corresponding section, or `enabled = false` | there is no "start everything then switch bits off" model. Note the inverse default for plain TCP: coturn listens on 3478/tcp unless `no-tcp`; turna does not unless `[turn.tcp] enabled = true` |
+| (plain TCP on `listening-port`) | `[turn.tcp] enabled = true`, `listen = "0.0.0.0:3478"` | opt-in; RFC 6062 TCP relay works over it too |
+| HAProxy in front (coturn has no PROXY protocol support) | `[tls]` / `[turn.tcp]` `proxy_protocol = true` + `proxy_protocol_trusted_cidrs` | v1 and v2; the header is only honoured from the listed balancer addresses |
 
 ## Authentication
 
@@ -87,7 +89,9 @@ What is worth porting is any *business* deny/allow list specific to your network
 |---|---|
 | `cert=` / `pkey=` | `[tls] cert_path` / `key_path` |
 | `no-tlsv1`, `no-tlsv1_1` | not needed — the listener does not offer them |
-| `dh2066`, `cipher-list` | not exposed |
+| `no-tlsv1_2` | `[tls] min_version = "1.3"` |
+| `cipher-list` | `[tls] cipher_suites = [...]`, by rustls name (not OpenSSL names); unknown names refuse to start |
+| `dh2066` | not needed — rustls offers no finite-field DH suites |
 | certificate reload | automatic on mtime change, no restart and no signal |
 
 DTLS is a separate section, `[turn.dtls]`, and needs `--features dtls`. Note
@@ -115,9 +119,10 @@ and shared allocation metadata, but read the honest boundary first: it does
 setup. Do not treat cluster mode as a prerequisite for migrating.
 
 **TCP relay (RFC 6062).** If you relied on `no-tcp-relay` being *off* — i.e. you
-actually relay TCP — note that `[turn.tcp_relay]` is **refused under
-`production = true`** pending interop verification. That is a real blocker for a
-production migration, not a formality.
+actually relay TCP — `[turn.tcp_relay]` needs a TCP control listener: `[tls]`, or
+the opt-in plain `[turn.tcp]`. It has been allowed under `production = true`
+since 2026-08-25 (see [feature-support.md](feature-support.md)); size for a
+listener and a connection per relayed peer before enabling it.
 
 **io_uring / AF_XDP.** Migrate on `transport = "tokio"` first and evaluate
 backend changes separately. io_uring is now [supported on Linux](verification/io-uring-supported-2026-09-19.md)

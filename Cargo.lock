@@ -4590,6 +4590,7 @@ dependencies = [
  "netlink-packet-route",
  "quinn",
  "rand 0.10.2",
+ "rcgen 0.13.2",
  "rtnetlink",
  "rustls",
  "sha1",

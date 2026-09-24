@@ -370,6 +370,25 @@ pub struct Metrics {
     pub tls_cert_reload_failures: AtomicU64,
     pub tls_rejected_rate_limit: AtomicU64,
     pub tls_alpn_rejected: AtomicU64,
+    /// TURNS connections refused by the PROXY protocol (untrusted source, or
+    /// a missing, malformed or late header). Zero unless `[tls] proxy_protocol`.
+    pub tls_proxy_rejected: AtomicU64,
+    // Plain TURN over TCP (`[turn.tcp]`). Mirrored from the same
+    // `TlsStats` type by the bridge running that listener; all zero when it is
+    // disabled. Handshake and certificate counters have no plain-TCP meaning
+    // and are not exported for it.
+    pub tcp_active: AtomicU64,
+    pub tcp_conns_total: AtomicU64,
+    pub tcp_closed_total: AtomicU64,
+    pub tcp_rejected_over_cap: AtomicU64,
+    pub tcp_rejected_per_ip: AtomicU64,
+    pub tcp_rejected_rate_limit: AtomicU64,
+    pub tcp_idle_timeouts: AtomicU64,
+    pub tcp_framing_errors: AtomicU64,
+    pub tcp_accept_errors: AtomicU64,
+    pub tcp_bytes_rx: AtomicU64,
+    pub tcp_bytes_tx: AtomicU64,
+    pub tcp_proxy_rejected: AtomicU64,
 
     // TURN-over-SCTP. Mirrored from `turna_transport::sctp::SctpStats` by the
     // SCTP bridge; all zero when the listener is disabled or not built.
@@ -592,6 +611,19 @@ impl Metrics {
             tls_cert_reload_failures: AtomicU64::new(0),
             tls_rejected_rate_limit: AtomicU64::new(0),
             tls_alpn_rejected: AtomicU64::new(0),
+            tls_proxy_rejected: AtomicU64::new(0),
+            tcp_active: AtomicU64::new(0),
+            tcp_conns_total: AtomicU64::new(0),
+            tcp_closed_total: AtomicU64::new(0),
+            tcp_rejected_over_cap: AtomicU64::new(0),
+            tcp_rejected_per_ip: AtomicU64::new(0),
+            tcp_rejected_rate_limit: AtomicU64::new(0),
+            tcp_idle_timeouts: AtomicU64::new(0),
+            tcp_framing_errors: AtomicU64::new(0),
+            tcp_accept_errors: AtomicU64::new(0),
+            tcp_bytes_rx: AtomicU64::new(0),
+            tcp_bytes_tx: AtomicU64::new(0),
+            tcp_proxy_rejected: AtomicU64::new(0),
             sctp_active: AtomicU64::new(0),
             sctp_conns_total: AtomicU64::new(0),
             sctp_closed_total: AtomicU64::new(0),
@@ -871,7 +903,7 @@ impl Metrics {
     /// zero unless the corresponding transport is enabled and built in.
     fn render_transport_metrics(&self) -> String {
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        format!(
+        let mut out = format!(
             "# HELP turna_quic_active_sessions Active QUIC/WebTransport sessions\n\
              # TYPE turna_quic_active_sessions gauge\n\
              turna_quic_active_sessions {}\n\
@@ -1305,6 +1337,69 @@ impl Metrics {
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        );
+        out.push_str(&self.render_tcp_listener_metrics());
+        out
+    }
+
+    /// Plain TURN over TCP and the PROXY-protocol refusal counters. A separate
+    /// block from the one above so adding a listener does not mean threading
+    /// arguments through a hundred-placeholder `format!`.
+    fn render_tcp_listener_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_tls_proxy_rejected_total TURNS connections refused by the PROXY protocol (untrusted source; missing, malformed or late header)\n\
+             # TYPE turna_tls_proxy_rejected_total counter\n\
+             turna_tls_proxy_rejected_total {}\n\
+             # HELP turna_tcp_active_connections Active plain TURN-over-TCP connections\n\
+             # TYPE turna_tcp_active_connections gauge\n\
+             turna_tcp_active_connections {}\n\
+             # HELP turna_tcp_connections_total Plain TURN-over-TCP connections accepted since start\n\
+             # TYPE turna_tcp_connections_total counter\n\
+             turna_tcp_connections_total {}\n\
+             # HELP turna_tcp_closed_total Plain TURN-over-TCP connections closed since start\n\
+             # TYPE turna_tcp_closed_total counter\n\
+             turna_tcp_closed_total {}\n\
+             # HELP turna_tcp_rejected_over_cap_total Plain TCP connections refused at the max_connections cap\n\
+             # TYPE turna_tcp_rejected_over_cap_total counter\n\
+             turna_tcp_rejected_over_cap_total {}\n\
+             # HELP turna_tcp_rejected_per_ip_total Plain TCP connections refused at max_connections_per_ip\n\
+             # TYPE turna_tcp_rejected_per_ip_total counter\n\
+             turna_tcp_rejected_per_ip_total {}\n\
+             # HELP turna_tcp_rejected_rate_limit_total Plain TCP connections refused by the per-IP connection rate limiter\n\
+             # TYPE turna_tcp_rejected_rate_limit_total counter\n\
+             turna_tcp_rejected_rate_limit_total {}\n\
+             # HELP turna_tcp_idle_timeouts_total Plain TCP connections closed by the idle read timeout\n\
+             # TYPE turna_tcp_idle_timeouts_total counter\n\
+             turna_tcp_idle_timeouts_total {}\n\
+             # HELP turna_tcp_framing_errors_total Plain TCP connections closed on invalid or over-sized TURN-over-TCP framing\n\
+             # TYPE turna_tcp_framing_errors_total counter\n\
+             turna_tcp_framing_errors_total {}\n\
+             # HELP turna_tcp_accept_errors_total Plain TCP accept() errors survived without stopping the listener\n\
+             # TYPE turna_tcp_accept_errors_total counter\n\
+             turna_tcp_accept_errors_total {}\n\
+             # HELP turna_tcp_bytes_rx_total Bytes read from plain TURN-over-TCP clients\n\
+             # TYPE turna_tcp_bytes_rx_total counter\n\
+             turna_tcp_bytes_rx_total {}\n\
+             # HELP turna_tcp_bytes_tx_total Bytes written to plain TURN-over-TCP clients\n\
+             # TYPE turna_tcp_bytes_tx_total counter\n\
+             turna_tcp_bytes_tx_total {}\n\
+             # HELP turna_tcp_proxy_rejected_total Plain TCP connections refused by the PROXY protocol (untrusted source; missing, malformed or late header)\n\
+             # TYPE turna_tcp_proxy_rejected_total counter\n\
+             turna_tcp_proxy_rejected_total {}\n",
+            l(&self.tls_proxy_rejected),
+            l(&self.tcp_active),
+            l(&self.tcp_conns_total),
+            l(&self.tcp_closed_total),
+            l(&self.tcp_rejected_over_cap),
+            l(&self.tcp_rejected_per_ip),
+            l(&self.tcp_rejected_rate_limit),
+            l(&self.tcp_idle_timeouts),
+            l(&self.tcp_framing_errors),
+            l(&self.tcp_accept_errors),
+            l(&self.tcp_bytes_rx),
+            l(&self.tcp_bytes_tx),
+            l(&self.tcp_proxy_rejected),
         )
     }
 }

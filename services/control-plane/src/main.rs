@@ -501,7 +501,12 @@ fn effective_external_ip(cfg: &TurnaConfig) -> String {
         warn!("external_ip is not configured (neither TURNA_EXTERNAL_IP nor [turn].external_ip)");
         "0.0.0.0".into()
     } else {
-        cfg.turn.external_ip.clone()
+        // The public half of a `PUBLIC/PRIVATE` mapping is the externally
+        // visible address; the private half is a bind detail of the node.
+        cfg.turn
+            .advertised_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| cfg.turn.external_ip.clone())
     }
 }
 

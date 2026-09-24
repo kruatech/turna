@@ -303,6 +303,9 @@ impl TurnaConfig {
             }
         }
 
+        // Additional UDP listeners.
+        errors.extend(self.validate_listen_extra());
+
         // TURN validation
         if self.turn.auth.shared_secret.is_empty() {
             errors.push("turn.auth.shared_secret is empty".into());
@@ -435,18 +438,35 @@ impl TurnaConfig {
         // here would advertise a v4 address for a v6-family allocation, which is
         // exactly the mismatch the 443 check exists to prevent.
         if !self.turn.external_ip6.is_empty() {
-            match self.turn.external_ip6.parse::<std::net::IpAddr>() {
-                Ok(std::net::IpAddr::V6(_)) => {}
-                Ok(std::net::IpAddr::V4(_)) => errors.push(
+            match parse_external_address(&self.turn.external_ip6) {
+                Ok(Some(ExternalAddress {
+                    public: IpAddr::V6(_),
+                    private,
+                })) => {
+                    // Same agreement rule as the v4 mapping: two keys naming
+                    // two different bind addresses is refused, not resolved.
+                    if let Some(private) = private {
+                        if !self.turn.relay.bind_ip6.is_empty()
+                            && self.turn.relay.bind_ip6.parse::<IpAddr>().ok() != Some(private)
+                        {
+                            errors.push(format!(
+                                "turn.external_ip6 = {:?} maps onto {private}, but \
+                                 turn.relay.bind_ip6 = {:?} names a different address; \
+                                 set one of them, or make them agree",
+                                self.turn.external_ip6, self.turn.relay.bind_ip6
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => errors.push(
                     "turn.external_ip6 must be an IPv6 address (it is the address \
                      advertised for IPv6-family allocations)"
                         .into(),
                 ),
-                Err(_) => errors.push(
-                    "turn.external_ip6 is not a valid IP address; leave it empty to \
-                     keep IPv4-only relaying"
-                        .into(),
-                ),
+                Err(why) => errors.push(format!(
+                    "turn.external_ip6 is not a valid IP address ({why}); leave it empty \
+                     to keep IPv4-only relaying"
+                )),
             }
         }
         // require_client_cert with no CA would demand a certificate nothing can
@@ -550,11 +570,39 @@ impl TurnaConfig {
             } else {
                 warn!("turn.external_ip is empty — NAT traversal may not work");
             }
-        } else if self.turn.external_ip.parse::<IpAddr>().is_err() {
-            errors.push(format!(
-                "turn.external_ip must be a valid IPv4 or IPv6 address, got {:?}",
-                self.turn.external_ip
-            ));
+        } else {
+            match parse_external_address(&self.turn.external_ip) {
+                Err(why) => errors.push(format!(
+                    "turn.external_ip must be a valid IPv4 or IPv6 address, or \
+                     PUBLIC/PRIVATE: {why}"
+                )),
+                Ok(Some(ExternalAddress {
+                    private: Some(private),
+                    ..
+                })) => {
+                    // The private half binds the IPv4 relay sockets (a v6
+                    // allocation is advertised from external_ip6), so a v6 pair
+                    // here would have nothing to bind.
+                    if !private.is_ipv4() {
+                        errors.push(format!(
+                            "turn.external_ip = {:?}: the PUBLIC/PRIVATE form must be IPv4 \
+                             on both sides here (the private half binds the IPv4 relay \
+                             sockets); put an IPv6 mapping in turn.external_ip6",
+                            self.turn.external_ip
+                        ));
+                    } else if !self.turn.relay.bind_ip.is_empty()
+                        && self.turn.relay.bind_ip.parse::<IpAddr>().ok() != Some(private)
+                    {
+                        errors.push(format!(
+                            "turn.external_ip = {:?} maps onto {private}, but \
+                             turn.relay.bind_ip = {:?} names a different address. The two \
+                             say the same thing; set one of them, or make them agree",
+                            self.turn.external_ip, self.turn.relay.bind_ip
+                        ));
+                    }
+                }
+                Ok(_) => {}
+            }
         }
 
         // Connection Migration (RFC 8016). A random per-process ticket secret
@@ -599,41 +647,134 @@ impl TurnaConfig {
             }
         }
 
-        // RFC 6062 §4.1 puts the TCP-allocation control connection on TCP/TLS, and
-        // this node has no plain-TCP listener — so [turn.tcp_relay] without [tls]
-        // is a datapath with no way for a client to reach it. The field docs have
-        // said "requires [tls] enabled" all along; nothing checked it.
+        // RFC 6062 §4.1 puts the TCP-allocation control connection on TCP/TLS, so
+        // [turn.tcp_relay] with neither [tls] nor the opt-in plain [turn.tcp]
+        // listener is a datapath with no way for a client to reach it.
         //
         // Hard error under production, warning otherwise: a dev box that flips the
         // flag while reading the code should be told, not blocked.
-        if self.turn.tcp_relay.enabled && !self.tls.enabled {
+        if self.turn.tcp_relay.enabled && !self.tls.enabled && !self.turn.tcp.enabled {
             if prod {
                 errors.push(
-                    "[turn.tcp_relay] needs [tls] enabled: RFC 6062 carries the TCP \
-                     allocation over the TLS control connection, and this node has no \
-                     plain-TCP listener, so no client could open one"
+                    "[turn.tcp_relay] needs [tls] or [turn.tcp] enabled: RFC 6062 carries \
+                     the TCP allocation over a TCP/TLS control connection, and with both \
+                     listeners off no client could open one"
                         .into(),
                 );
             } else {
                 warn!(
-                    "[turn.tcp_relay] is enabled but [tls] is not — no client can open a \
-                     TCP allocation, because the RFC 6062 control connection needs the \
-                     TURNS listener"
+                    "[turn.tcp_relay] is enabled but neither [tls] nor [turn.tcp] is — no \
+                     client can open a TCP allocation, because the RFC 6062 control \
+                     connection needs a TCP listener"
                 );
             }
         }
         // Not an error: a UDP-only deployment is legitimate (a closed network, or
-        // a fleet that fronts TURNS elsewhere). But turna ships no plain
-        // TURN-over-TCP listener, so with [tls] off there is no TCP entry point at
-        // all, and the browser ICE URL `turns:host:5349?transport=tcp` fails. That
-        // is a decision the operator should read in the log on day one, not infer
-        // from the users who cannot connect.
+        // a fleet that fronts TURNS elsewhere). But with [tls] off there is no
+        // encrypted TCP entry point, and the browser ICE URL
+        // `turns:host:5349?transport=tcp` fails. That is a decision the operator
+        // should read in the log on day one, not infer from the users who cannot
+        // connect.
         if prod && !self.tls.enabled {
-            warn!(
-                "[tls] is disabled: this node serves UDP only. There is no plain \
-                 TURN-over-TCP listener, so clients behind a UDP-blocking firewall \
-                 have no fallback. Enable [tls] for TURNS on 5349 (or 443)."
-            );
+            if self.turn.tcp.enabled {
+                warn!(
+                    "[tls] is disabled: TCP clients are served over plain [turn.tcp] only. \
+                     TURNS on 5349 (or 443) gets through firewalls that inspect or block \
+                     other TCP ports; enable [tls] as well."
+                );
+            } else {
+                warn!(
+                    "[tls] is disabled: this node serves UDP only. Plain TURN over TCP \
+                     ([turn.tcp]) is off too, so clients behind a UDP-blocking firewall \
+                     have no fallback. Enable [tls] for TURNS on 5349 (or 443)."
+                );
+            }
+        }
+
+        // TURNS TLS policy and PROXY protocol. Checked whether or not [tls] is
+        // enabled: a typo in a disabled section is still a typo, and it would
+        // surface the day the section is switched on.
+        errors.extend(validate_tls_policy(
+            "tls",
+            &self.tls.min_version,
+            &self.tls.cipher_suites,
+        ));
+        errors.extend(validate_proxy_protocol(
+            "tls",
+            self.tls.proxy_protocol,
+            &self.tls.proxy_protocol_trusted_cidrs,
+            self.tls.proxy_protocol_timeout_secs,
+        ));
+
+        // A relay socket bound inside a PROXY-trusted range sends relayed
+        // traffic from a trusted source. The node denies trusted ranges as
+        // peers, which covers every listener inside them; a listener of
+        // another node reachable at an address *outside* them would still
+        // accept a header from this relay. Warned, not refused: listing the
+        // node's own subnet is a common shortcut, and the remedy (list only
+        // the balancers) is the operator's call.
+        {
+            let trusted = self.proxy_trusted_cidrs_in_use();
+            let binds = [
+                self.turn.effective_relay_bind_ip().map(IpAddr::V4),
+                self.turn.effective_relay_bind_ip6().map(IpAddr::V6),
+            ];
+            for bind in binds.into_iter().flatten() {
+                if let Some(c) = trusted.iter().find(|c| cidr_contains(c, bind)) {
+                    warn!(
+                        relay_bind = %bind,
+                        trusted = %c,
+                        "the relay bind address is inside proxy_protocol_trusted_cidrs: relayed \
+                         traffic leaves from an address PROXY-protocol listeners trust. List only \
+                         the load balancers' addresses there, not a subnet the TURN nodes share"
+                    );
+                }
+            }
+        }
+
+        // Plain TURN over TCP.
+        errors.extend(validate_proxy_protocol(
+            "turn.tcp",
+            self.turn.tcp.proxy_protocol,
+            &self.turn.tcp.proxy_protocol_trusted_cidrs,
+            self.turn.tcp.proxy_protocol_timeout_secs,
+        ));
+        if self.turn.tcp.enabled {
+            let t = &self.turn.tcp;
+            // The listener is started by the tokio datapath only, like SCTP;
+            // on another backend it would be configured and absent.
+            if !matches!(self.turn.transport, TransportSelection::Tokio) {
+                errors.push(
+                    "turn.tcp requires turn.transport = \"tokio\"; other backends do not \
+                     start this listener"
+                        .into(),
+                );
+            }
+            if t.read_timeout_secs == 0 || t.max_connections == 0 {
+                errors.push("turn.tcp needs positive read_timeout_secs and max_connections".into());
+            }
+            // 20 bytes is a bare STUN header; 65555 the largest STUN message.
+            if !(20..=65555).contains(&t.max_frame_size) {
+                errors.push("turn.tcp.max_frame_size must be in 20..=65555".into());
+            }
+            if self.tls.enabled && self.tls.listen.port() == t.listen.port() {
+                errors.push(format!(
+                    "turn.tcp.listen port {} is also [tls] listen's port; both are TCP \
+                     listeners and cannot share it",
+                    t.listen.port()
+                ));
+            }
+            for (name, addr) in [
+                ("health", self.health.listen),
+                ("management", self.management.listen),
+            ] {
+                if addr.port() == t.listen.port() {
+                    errors.push(format!(
+                        "turn.tcp.listen port {} conflicts with the {name} listener",
+                        t.listen.port()
+                    ));
+                }
+            }
         }
 
         // Cluster / persistence validation (PR1).
@@ -886,6 +1027,98 @@ impl TurnaConfig {
         Ok(())
     }
 
+    /// `[turn] listen_extra`: tokio only, and no two UDP listeners that would
+    /// bind the same socket.
+    fn validate_listen_extra(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let extra = &self.turn.listen_extra;
+        if extra.is_empty() {
+            return errors;
+        }
+        if !matches!(self.turn.transport, TransportSelection::Tokio) {
+            errors.push(format!(
+                "turn.listen_extra is set, but turn.transport = {:?}: only the tokio \
+                 datapath can serve more than one UDP listener (io_uring and AF_XDP own a \
+                 single socket). Use transport = \"tokio\" or drop listen_extra — the \
+                 extra addresses would otherwise be silently unserved",
+                self.turn.transport
+            ));
+        }
+        let all: Vec<SocketAddr> = std::iter::once(self.turn.listen)
+            .chain(extra.iter().copied())
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                if a == b {
+                    errors.push(format!(
+                        "turn.listen_extra: {b} is listed twice (or repeats turn.listen)"
+                    ));
+                } else if a.port() == b.port()
+                    && (a.ip().is_unspecified() || b.ip().is_unspecified())
+                {
+                    // Every worker socket sets SO_REUSEPORT, so the kernel
+                    // accepts both binds and then splits one address's traffic
+                    // between two listeners: a failure that looks like packet
+                    // loss rather than a configuration error. The unspecified
+                    // address of either family counts as overlapping, because a
+                    // `[::]` bind may be dual-stack.
+                    errors.push(format!(
+                        "turn.listen_extra: {a} and {b} overlap (a wildcard address and \
+                         another address on the same port); list specific addresses, or \
+                         only the wildcard"
+                    ));
+                }
+            }
+        }
+        // The other UDP listeners. Health and management are TCP and cannot
+        // collide with a UDP bind; SCTP is its own IP protocol (132) and does
+        // not either. DTLS and QUIC are UDP, and a bind on the same address
+        // and port — or a wildcard on the same port — would either fail at
+        // startup or, with SO_REUSEPORT on our side, share the traffic.
+        let udp_listeners = [
+            ("turn.dtls", self.turn.dtls.enabled, self.turn.dtls.listen),
+            ("turn.quic", self.turn.quic.enabled, self.turn.quic.listen),
+        ];
+        for addr in extra {
+            for (name, enabled, other) in udp_listeners {
+                let overlaps = addr.port() == other.port()
+                    && (addr.ip() == other.ip()
+                        || addr.ip().is_unspecified()
+                        || other.ip().is_unspecified());
+                if enabled && overlaps {
+                    errors.push(format!(
+                        "turn.listen_extra: {addr} overlaps the UDP listener {name}.listen = \
+                         {other}; give it another port or a distinct specific address"
+                    ));
+                }
+            }
+        }
+        // RFC 8016 mobility re-keys an allocation onto a new client address,
+        // but the socket its relayed data leaves from is fixed when the
+        // allocation is created. With one listener that is always right; with
+        // several, a client that moves to another listener would get Data
+        // indications from an address it no longer talks to. Refused rather
+        // than half-working (docs/CONFIGURATION.md, listen_extra).
+        if self.turn.migration.enabled {
+            errors.push(
+                "turn.listen_extra cannot be combined with turn.migration.enabled: a \
+                 mobility re-key moves an allocation to a new client address but not to \
+                 the listener that address uses, so relayed data could leave from an \
+                 address the client never sent to. Use one of the two"
+                    .into(),
+            );
+        }
+        errors
+    }
+
+    /// `proxy_protocol_trusted_cidrs` of every *enabled* listener that has the
+    /// PROXY protocol on. The node denies these as relay peers
+    /// unconditionally: a relayed connection into a trusted range could reach
+    /// a PROXY-trusting listener from a trusted source and forge the header.
+    pub fn proxy_trusted_cidrs_in_use(&self) -> Vec<String> {
+        proxy_trusted_cidrs_in_use(&self.turn, &self.tls)
+    }
+
     /// Returns true if production mode is active.
     ///
     /// Sources, in order of precedence:
@@ -955,6 +1188,22 @@ pub enum TransportSelection {
 #[serde(default, deny_unknown_fields)]
 pub struct TurnConfig {
     pub listen: SocketAddr,
+    /// Further UDP addresses to serve TURN/STUN on, in addition to `listen`.
+    /// Empty (the default) serves `listen` alone, which is every release before
+    /// this key existed.
+    ///
+    /// coturn's repeated `listening-ip`. Each entry is a full socket address, so
+    /// a second interface can use a different port. Every listener feeds the same
+    /// processor, allocation store, rate limiters and peer filter; what is per
+    /// listener is the socket a client's replies and relayed data leave from,
+    /// which is the address the client sent to — without that, a client behind a
+    /// NAT would drop every Data indication as coming from an unknown source.
+    ///
+    /// tokio datapath only: the io_uring and AF_XDP backends own a single socket
+    /// and cannot serve these, so validation refuses the combination instead of
+    /// leaving the extra addresses silently unserved.
+    #[serde(default)]
+    pub listen_extra: Vec<SocketAddr>,
     /// `SO_RCVBUF` for the main listener and every relay socket, in bytes.
     /// 0 (the default) leaves the kernel default alone — no release before
     /// 0.5.0 touched it.
@@ -1008,6 +1257,18 @@ pub struct TurnConfig {
     /// because it is a property of this process, like the socket buffers above.
     #[serde(default)]
     pub allow_core_dumps: bool,
+    /// The address advertised to clients in XOR-RELAYED-ADDRESS (and used as
+    /// this node's public address elsewhere). A single IP literal, or coturn's
+    /// `-X PUBLIC/PRIVATE` form, e.g. `"203.0.113.10/10.0.0.5"`.
+    ///
+    /// The mapping form is for a 1:1 NAT (an AWS elastic IP, a GCP external
+    /// address): the host only has the private address, so the relay sockets
+    /// must bind it while clients must be told the public one. It is shorthand
+    /// for `external_ip = PUBLIC` plus `[turn.relay] bind_ip = PRIVATE`, and the
+    /// two are checked against each other — both sides IPv4 (the v4 relay
+    /// sockets are what the private half binds), neither unspecified, and a
+    /// `bind_ip` that names a different address is an error rather than a
+    /// silent choice between them.
     pub external_ip: String,
     /// RFC 6156 IPv6 relayed transport: the IPv6 address advertised in
     /// XOR-RELAYED-ADDRESS for allocations that asked for
@@ -1024,6 +1285,10 @@ pub struct TurnConfig {
     /// makes RFC 6062 TCP allocations answer 440. The TCP relay's listener binds
     /// `0.0.0.0`, so advertising a v6 relayed address would hand the client an
     /// address nothing serves. See `handle_allocate_tcp` in turna-relay.
+    ///
+    /// Accepts the same `PUBLIC/PRIVATE` form as `external_ip`, with both
+    /// halves IPv6; the private half then pins the v6 relay sockets the way
+    /// `[turn.relay] bind_ip6` does.
     pub external_ip6: String,
     pub realm: String,
     /// Transport backend preference. Default `tokio` (safest); `io_uring`,
@@ -1055,9 +1320,15 @@ pub struct TurnConfig {
     /// Requires the node binary built with `--features sctp`.
     #[serde(default)]
     pub sctp: SctpSection,
-    /// RFC 6062 TCP relay. Disabled by default; requires `[tls]` enabled.
+    /// RFC 6062 TCP relay. Disabled by default; requires a TCP control
+    /// listener, i.e. `[tls]` or `[turn.tcp]` enabled.
     #[serde(default)]
     pub tcp_relay: TcpRelaySection,
+    /// Plain TURN over TCP (`turn:host:3478?transport=tcp`), no TLS. Disabled
+    /// by default. Shares the TURNS listener's framing and connection handling,
+    /// so it needs the node built with the `tls` feature (a default one).
+    #[serde(default)]
+    pub tcp: TcpListenerSection,
     /// Tiered rate limiting (`[turn.rate_limit]`). Until 0.5.0 these were
     /// readable only from `TURNA_RATE_LIMIT_*` and friends, so the values in
     /// force appeared in no config file and no config dump.
@@ -1074,6 +1345,7 @@ impl Default for TurnConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:3478".parse().unwrap(),
+            listen_extra: Vec::new(),
             socket_recv_buffer_bytes: 0,
             socket_send_buffer_bytes: 0,
             software_attribute: default_software_attribute(),
@@ -1092,6 +1364,7 @@ impl Default for TurnConfig {
             dtls: DtlsSection::default(),
             sctp: SctpSection::default(),
             tcp_relay: TcpRelaySection::default(),
+            tcp: TcpListenerSection::default(),
             rate_limit: RateLimitConfig::default(),
             peer_filter: PeerFilterConfig::default(),
         }
@@ -1103,6 +1376,116 @@ impl TurnConfig {
         let config = TurnaConfig::load(path)?;
         Ok(config.turn)
     }
+
+    /// The public half of `external_ip`: what is advertised for IPv4-family
+    /// allocations. `None` when the key is empty or does not parse (validation
+    /// has already refused the latter by the time a node reads this).
+    pub fn advertised_ip(&self) -> Option<IpAddr> {
+        parse_external_address(&self.external_ip)
+            .ok()
+            .flatten()
+            .map(|a| a.public)
+    }
+
+    /// The public half of `external_ip6`, when it is an IPv6 address.
+    pub fn advertised_ip6(&self) -> Option<std::net::Ipv6Addr> {
+        match parse_external_address(&self.external_ip6).ok().flatten() {
+            Some(ExternalAddress {
+                public: IpAddr::V6(v6),
+                ..
+            }) => Some(v6),
+            _ => None,
+        }
+    }
+
+    /// Address the IPv4 relay sockets bind: `[turn.relay] bind_ip` when set,
+    /// otherwise the private half of an `external_ip = "PUBLIC/PRIVATE"`
+    /// mapping, otherwise `None` (the wildcard).
+    pub fn effective_relay_bind_ip(&self) -> Option<std::net::Ipv4Addr> {
+        if !self.relay.bind_ip.is_empty() {
+            return self.relay.bind_ip.parse().ok();
+        }
+        match parse_external_address(&self.external_ip).ok().flatten() {
+            Some(ExternalAddress {
+                private: Some(IpAddr::V4(v4)),
+                ..
+            }) => Some(v4),
+            _ => None,
+        }
+    }
+
+    /// IPv6 counterpart of [`effective_relay_bind_ip`](Self::effective_relay_bind_ip):
+    /// `bind_ip6`, else the private half of `external_ip6`.
+    pub fn effective_relay_bind_ip6(&self) -> Option<std::net::Ipv6Addr> {
+        if !self.relay.bind_ip6.is_empty() {
+            return self.relay.bind_ip6.parse().ok();
+        }
+        match parse_external_address(&self.external_ip6).ok().flatten() {
+            Some(ExternalAddress {
+                private: Some(IpAddr::V6(v6)),
+                ..
+            }) => Some(v6),
+            _ => None,
+        }
+    }
+}
+
+/// `external_ip` / `external_ip6` after parsing: the address advertised to
+/// clients, and — in coturn's `PUBLIC/PRIVATE` form — the local address it is
+/// NAT-mapped onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalAddress {
+    pub public: IpAddr,
+    pub private: Option<IpAddr>,
+}
+
+/// Parse an `external_ip`-style value. Empty is `Ok(None)`.
+///
+/// Only the shape is checked here (both halves are IP literals of the same
+/// family, neither is unspecified). Which family each key must carry is the
+/// caller's rule, because it differs between `external_ip` and `external_ip6`.
+pub fn parse_external_address(s: &str) -> std::result::Result<Option<ExternalAddress>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let Some((public, private)) = s.split_once('/') else {
+        return s
+            .parse::<IpAddr>()
+            .map(|public| {
+                Some(ExternalAddress {
+                    public,
+                    private: None,
+                })
+            })
+            .map_err(|_| format!("{s:?} is not a valid IP address"));
+    };
+    let public: IpAddr = public.trim().parse().map_err(|_| {
+        format!("{s:?}: the public half {public:?} of PUBLIC/PRIVATE is not an IP address")
+    })?;
+    // `10.0.0.0/8` is a plausible typo here and would otherwise read as "the
+    // private half 8 is not an IP address", which does not say what went wrong.
+    let private: IpAddr = private.trim().parse().map_err(|_| {
+        format!(
+            "{s:?}: the private half {private:?} of PUBLIC/PRIVATE is not an IP address \
+             (this is coturn's PUBLIC/PRIVATE mapping, not a CIDR)"
+        )
+    })?;
+    if public.is_ipv4() != private.is_ipv4() {
+        return Err(format!(
+            "{s:?}: PUBLIC and PRIVATE must be the same address family — a 1:1 NAT \
+             maps an address onto one of its own family"
+        ));
+    }
+    if public.is_unspecified() || private.is_unspecified() {
+        return Err(format!(
+            "{s:?}: neither half of PUBLIC/PRIVATE may be the unspecified address"
+        ));
+    }
+    Ok(Some(ExternalAddress {
+        public,
+        private: Some(private),
+    }))
 }
 
 /// Peer-address filter policy (M1). Lives under `[turn.peer_filter]`.
@@ -1199,6 +1582,41 @@ fn default_software_attribute() -> String {
 /// serde cannot express a non-zero integer default inline.
 fn default_credential_clock_skew() -> u64 {
     300
+}
+
+/// Free-function form of [`TurnaConfig::proxy_trusted_cidrs_in_use`], for
+/// callers (the node) that hold `[turn]` and `[tls]` separately.
+pub fn proxy_trusted_cidrs_in_use(turn: &TurnConfig, tls: &TlsConfig) -> Vec<String> {
+    let mut v = Vec::new();
+    if tls.enabled && tls.proxy_protocol {
+        v.extend(tls.proxy_protocol_trusted_cidrs.iter().cloned());
+    }
+    if turn.tcp.enabled && turn.tcp.proxy_protocol {
+        v.extend(turn.tcp.proxy_protocol_trusted_cidrs.iter().cloned());
+    }
+    v
+}
+
+/// Whether `ip` is inside `cidr` (`a.b.c.d/n` or `v6/n`). False for anything
+/// unparseable — validation reports those separately.
+fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
+    let Some((net, pfx)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    let (Ok(net), Ok(pfx)) = (net.trim().parse::<IpAddr>(), pfx.trim().parse::<u32>()) else {
+        return false;
+    };
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(a)) if pfx <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - pfx).unwrap_or(0);
+            u32::from(n) & mask == u32::from(a) & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(a)) if pfx <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - pfx).unwrap_or(0);
+            u128::from(n) & mask == u128::from(a) & mask
+        }
+        _ => false,
+    }
 }
 
 /// Lightweight CIDR syntax check (the relay does the authoritative parse).
@@ -2231,6 +2649,133 @@ pub struct TlsConfig {
     /// Requires `enable_alpn = true`. Default false = compatible mode (a client
     /// that offers no ALPN is served).
     pub alpn_required: bool,
+    /// Lowest TLS version the TURNS listener negotiates: `"1.2"` (the default,
+    /// which with rustls means TLS 1.2 and 1.3 — what every release so far has
+    /// offered) or `"1.3"`. There is no `"1.0"`/`"1.1"`: rustls does not
+    /// implement them, so coturn's `no-tlsv1`/`no-tlsv1_1` have nothing to do.
+    pub min_version: String,
+    /// Allowlist of cipher suites, by the names rustls uses (e.g.
+    /// `"TLS13_AES_256_GCM_SHA384"`, `"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"`).
+    /// Empty (the default) keeps the rustls defaults. A name rustls does not
+    /// implement is a configuration error, not something to skip — see
+    /// [`RUSTLS_CIPHER_SUITES`].
+    pub cipher_suites: Vec<String>,
+    /// Expect a HAProxy PROXY protocol header (v1 or v2) at the start of every
+    /// connection, and take the client address from it. For a TURNS listener
+    /// behind a TCP load balancer, which otherwise makes every client look like
+    /// the balancer to auth, rate limits, per-IP caps and logs.
+    ///
+    /// Opt-in and never auto-detected: a header is only honoured from a source
+    /// in `proxy_protocol_trusted_cidrs`, and with this on, a connection from
+    /// anywhere else is closed. Accepting the header from any source would let
+    /// every client choose its own address.
+    pub proxy_protocol: bool,
+    /// Sources allowed to send a PROXY header, as CIDRs (the load balancers).
+    /// Required, non-empty, when `proxy_protocol = true`.
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
+    /// Deadline for the PROXY header to arrive, seconds. Runs before (and in
+    /// addition to) `handshake_timeout_secs`.
+    pub proxy_protocol_timeout_secs: u64,
+}
+
+/// The TLS cipher suites the node's TLS stack (rustls with the `ring` provider,
+/// TLS 1.2 enabled) implements, by rustls name. Duplicated here rather than
+/// imported because this crate does not depend on rustls; the node has a test
+/// that fails when this list and rustls disagree.
+pub const RUSTLS_CIPHER_SUITES: &[&str] = &[
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
+fn default_tls_min_version() -> String {
+    "1.2".to_string()
+}
+
+fn default_proxy_protocol_timeout_secs() -> u64 {
+    5
+}
+
+/// Validate a `min_version` + `cipher_suites` pair. Shared shape, one caller
+/// today (`[tls]`); kept separate so the rule reads in one place.
+fn validate_tls_policy(section: &str, min_version: &str, suites: &[String]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let tls13_only = match min_version.trim() {
+        "1.2" => false,
+        "1.3" => true,
+        other => {
+            errors.push(format!(
+                "{section}.min_version = {other:?} is not supported; use \"1.2\" or \"1.3\" \
+                 (rustls implements nothing older than TLS 1.2)"
+            ));
+            false
+        }
+    };
+    let mut seen = HashSet::new();
+    for name in suites {
+        if !RUSTLS_CIPHER_SUITES.contains(&name.as_str()) {
+            errors.push(format!(
+                "{section}.cipher_suites: {name:?} is not a cipher suite this build \
+                 implements; valid names are {}",
+                RUSTLS_CIPHER_SUITES.join(", ")
+            ));
+        } else if !seen.insert(name.as_str()) {
+            errors.push(format!("{section}.cipher_suites lists {name:?} twice"));
+        }
+    }
+    // An allowlist with nothing usable at the chosen version refuses every
+    // client. rustls would also refuse to build the config, but only when the
+    // listener starts; saying it here makes `--check-config` catch it.
+    if !suites.is_empty() && errors.is_empty() {
+        let usable = suites
+            .iter()
+            .any(|n| !tls13_only || n.starts_with("TLS13_"));
+        if !usable {
+            errors.push(format!(
+                "{section}.cipher_suites names only TLS 1.2 suites while min_version = \
+                 \"1.3\": no suite is left to negotiate and every client would be refused"
+            ));
+        }
+    }
+    errors
+}
+
+/// Validate a PROXY protocol block (shared by `[tls]` and `[turn.tcp]`).
+fn validate_proxy_protocol(
+    section: &str,
+    enabled: bool,
+    trusted: &[String],
+    timeout_secs: u64,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for c in trusted {
+        if let Err(why) = validate_cidr(c) {
+            errors.push(format!("{section}.proxy_protocol_trusted_cidrs: {why}"));
+        }
+    }
+    if enabled {
+        if trusted.is_empty() {
+            errors.push(format!(
+                "{section}.proxy_protocol = true needs proxy_protocol_trusted_cidrs: \
+                 without an allowlist nothing may send the header, so every connection \
+                 would be refused (and accepting it from anywhere would let each client \
+                 choose its own address)"
+            ));
+        }
+        if timeout_secs == 0 {
+            errors.push(format!(
+                "{section}.proxy_protocol_timeout_secs must be positive: a connection that \
+                 never sends its header would otherwise hold a slot forever"
+            ));
+        }
+    }
+    errors
 }
 
 impl Default for TlsConfig {
@@ -2258,6 +2803,11 @@ impl Default for TlsConfig {
             alpn_required: false,
             client_ca: String::new(),
             require_client_cert: false,
+            min_version: default_tls_min_version(),
+            cipher_suites: Vec::new(),
+            proxy_protocol: false,
+            proxy_protocol_trusted_cidrs: Vec::new(),
+            proxy_protocol_timeout_secs: default_proxy_protocol_timeout_secs(),
         }
     }
 }
@@ -2631,6 +3181,67 @@ impl Default for TcpRelaySection {
             max_per_allocation: 10,
             max_total: 50_000,
             buffer_size: 16384,
+        }
+    }
+}
+
+/// Plain TURN over TCP (RFC 8656 §3.1, `transport=tcp` without TLS). Lives
+/// under `[turn.tcp]`. Disabled by default.
+///
+/// It was left out on purpose for a long time: TURNS on 5349/443 gets through
+/// more firewalls, and a plain-TCP URL that nothing serves only slows ICE down.
+/// It exists now for parity with coturn deployments whose clients are
+/// configured with `turn:host:3478?transport=tcp` and cannot all be changed at
+/// once. Credentials are never sent in the clear either way — TURN
+/// authenticates with an HMAC — but the media and the TURN control traffic are
+/// visible on the wire, which TURNS avoids.
+///
+/// Same connection handling as TURNS (framing, caps, idle timeout, cooperative
+/// drain, RFC 6062 CONNECT/ConnectionBind), minus the TLS handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpListenerSection {
+    /// Enable the listener.
+    pub enabled: bool,
+    /// TCP listen address. Default `0.0.0.0:3478` — the same number as the UDP
+    /// listener, which is what clients expect and does not conflict (different
+    /// protocol).
+    pub listen: SocketAddr,
+    /// Max framed STUN/ChannelData message size, bytes.
+    pub max_frame_size: usize,
+    /// Per-connection idle read timeout, seconds.
+    pub read_timeout_secs: u64,
+    /// Max concurrent connections.
+    pub max_connections: usize,
+    /// Max concurrent connections from one source IP. 0 = unlimited. Same
+    /// default and reasoning as `[tls] max_connections_per_ip`.
+    pub max_connections_per_ip: usize,
+    /// Per-source-IP new-connection rate, connections/second. 0 = unlimited.
+    pub max_connections_per_sec_per_ip: u32,
+    /// Burst allowance for the rate limit. 0 = twice the rate.
+    pub connection_burst_per_ip: u32,
+    /// Expect a HAProxy PROXY protocol header; see `[tls] proxy_protocol`.
+    pub proxy_protocol: bool,
+    /// Sources allowed to send the header. Required when `proxy_protocol`.
+    pub proxy_protocol_trusted_cidrs: Vec<String>,
+    /// Deadline for the header to arrive, seconds.
+    pub proxy_protocol_timeout_secs: u64,
+}
+
+impl Default for TcpListenerSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "0.0.0.0:3478".parse().unwrap(),
+            max_frame_size: 64 * 1024,
+            read_timeout_secs: 300,
+            max_connections: 10_000,
+            max_connections_per_ip: 64,
+            max_connections_per_sec_per_ip: 0,
+            connection_burst_per_ip: 0,
+            proxy_protocol: false,
+            proxy_protocol_trusted_cidrs: Vec::new(),
+            proxy_protocol_timeout_secs: default_proxy_protocol_timeout_secs(),
         }
     }
 }
@@ -3323,6 +3934,7 @@ pub fn classify_config_key(key: &str) -> FieldClass {
         | "turn.relay.quota.max_per_user" => FieldClass::Dynamic,
         // Rebinding / identity / credentials / safety — restart only.
         "turn.listen"
+        | "turn.listen_extra"
         | "turn.external_ip"
         | "turn.realm"
         | "turn.transport"
@@ -4628,5 +5240,359 @@ shared_secret = \"a-real-secret-not-the-placeholder\"
             !err.contains("removed in 0.5.0"),
             "a typo must not be reported as a removed section: {err}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network & deployment keys: listen_extra, PUBLIC/PRIVATE mapping, [turn.tcp],
+// PROXY protocol, TLS policy.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod network_deployment_tests {
+    use super::*;
+
+    /// Validate outside production, whatever the environment says. The flag is
+    /// read from `TURNA_PRODUCTION` too, and the other test modules flip it, so
+    /// the file-level `production` is the only thing set here and these tests
+    /// only assert on rules that hold in both modes.
+    fn check(cfg: &TurnaConfig) -> std::result::Result<(), String> {
+        cfg.validate().map_err(|e| e.to_string())
+    }
+
+    fn base() -> TurnaConfig {
+        let mut c = TurnaConfig::default();
+        c.turn.external_ip = "203.0.113.10".into();
+        c
+    }
+
+    fn err_contains(cfg: &TurnaConfig, needle: &str) {
+        let e = check(cfg).expect_err("config should be refused");
+        assert!(e.contains(needle), "error {e:?} should mention {needle:?}");
+    }
+
+    // ── listen_extra ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn listen_extra_defaults_empty_and_parses() {
+        assert!(TurnConfig::default().listen_extra.is_empty());
+        let c = TurnaConfig::from_str(
+            "[turn]\nlisten = \"10.0.0.5:3478\"\nlisten_extra = [\"192.0.2.7:3478\", \"10.0.0.5:3479\"]\n",
+        )
+        .expect("two specific addresses are valid");
+        assert_eq!(c.turn.listen_extra.len(), 2);
+    }
+
+    #[test]
+    fn listen_extra_refused_off_tokio() {
+        for t in [
+            TransportSelection::IoUring,
+            TransportSelection::AfXdp,
+            TransportSelection::Auto,
+        ] {
+            let mut c = base();
+            c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+            c.turn.listen_extra = vec!["192.0.2.7:3478".parse().unwrap()];
+            c.turn.transport = t;
+            // AF_XDP has refusals of its own for default ring sizes; only the
+            // listen_extra message matters here.
+            err_contains(&c, "turn.listen_extra is set");
+        }
+    }
+
+    #[test]
+    fn listen_extra_duplicate_and_wildcard_overlap_refused() {
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["10.0.0.5:3478".parse().unwrap()];
+        err_contains(&c, "listed twice");
+
+        // The default listen is 0.0.0.0:3478; a specific address on the same
+        // port would share traffic with it through SO_REUSEPORT.
+        let mut c = base();
+        c.turn.listen_extra = vec!["192.0.2.7:3478".parse().unwrap()];
+        err_contains(&c, "overlap");
+
+        // A different port next to the wildcard is fine.
+        let mut c = base();
+        c.turn.listen_extra = vec!["192.0.2.7:3479".parse().unwrap()];
+        check(&c).unwrap();
+    }
+
+    #[test]
+    fn listen_extra_is_checked_against_udp_listeners_only() {
+        // TCP health/management on the same port number do not conflict.
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec![format!("192.0.2.7:{}", c.health.listen.port())
+            .parse()
+            .unwrap()];
+        check(&c).unwrap();
+
+        // DTLS (UDP) on the same wildcard port does, once enabled.
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["192.0.2.7:5349".parse().unwrap()];
+        check(&c).unwrap();
+        c.turn.dtls.enabled = true; // default listen 0.0.0.0:5349
+        c.turn.dtls.max_handshakes_per_sec_per_ip = 0;
+        err_contains(&c, "overlaps the UDP listener turn.dtls.listen");
+        // A distinct specific address on the same port is fine.
+        c.turn.dtls.listen = "192.0.2.8:5349".parse().unwrap();
+        check(&c).unwrap();
+
+        // QUIC likewise.
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["192.0.2.7:5350".parse().unwrap()];
+        c.turn.quic.enabled = true;
+        c.turn.quic.listen = "192.0.2.7:5350".parse().unwrap();
+        err_contains(&c, "overlaps the UDP listener turn.quic.listen");
+    }
+
+    #[test]
+    fn listen_extra_refuses_mobility() {
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["192.0.2.7:3478".parse().unwrap()];
+        c.turn.migration.enabled = true;
+        c.turn.migration.ticket_secret = "a".repeat(64);
+        err_contains(&c, "cannot be combined with turn.migration.enabled");
+        c.turn.listen_extra.clear();
+        check(&c).unwrap();
+    }
+
+    #[test]
+    fn proxy_trusted_ranges_in_use_follow_enabled_listeners() {
+        let mut c = base();
+        c.tls.proxy_protocol = true;
+        c.tls.proxy_protocol_trusted_cidrs = vec!["10.1.0.0/24".into()];
+        c.turn.tcp.proxy_protocol = true;
+        c.turn.tcp.proxy_protocol_trusted_cidrs = vec!["10.2.0.0/24".into()];
+        assert!(
+            c.proxy_trusted_cidrs_in_use().is_empty(),
+            "both listeners off"
+        );
+        c.turn.tcp.enabled = true;
+        assert_eq!(
+            c.proxy_trusted_cidrs_in_use(),
+            vec!["10.2.0.0/24".to_string()]
+        );
+        c.tls.enabled = true;
+        assert_eq!(c.proxy_trusted_cidrs_in_use().len(), 2);
+        c.tls.proxy_protocol = false;
+        assert_eq!(
+            c.proxy_trusted_cidrs_in_use(),
+            vec!["10.2.0.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn cidr_contains_matches() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(cidr_contains("10.0.0.0/8", ip("10.9.9.9")));
+        assert!(!cidr_contains("10.0.0.0/8", ip("11.0.0.1")));
+        assert!(cidr_contains("0.0.0.0/0", ip("1.2.3.4")));
+        assert!(cidr_contains("2001:db8::/32", ip("2001:db8:1::1")));
+        assert!(!cidr_contains("2001:db8::/32", ip("10.0.0.1")));
+        assert!(!cidr_contains("bogus", ip("10.0.0.1")));
+    }
+
+    // ── external_ip PUBLIC/PRIVATE ───────────────────────────────────────────
+
+    #[test]
+    fn external_address_forms() {
+        assert_eq!(parse_external_address("").unwrap(), None);
+        assert_eq!(
+            parse_external_address("203.0.113.10").unwrap(),
+            Some(ExternalAddress {
+                public: "203.0.113.10".parse().unwrap(),
+                private: None
+            })
+        );
+        assert_eq!(
+            parse_external_address(" 203.0.113.10 / 10.0.0.5 ").unwrap(),
+            Some(ExternalAddress {
+                public: "203.0.113.10".parse().unwrap(),
+                private: Some("10.0.0.5".parse().unwrap())
+            })
+        );
+        assert!(parse_external_address("203.0.113.10/2001:db8::1")
+            .unwrap_err()
+            .contains("same address family"));
+        assert!(parse_external_address("10.0.0.0/8")
+            .unwrap_err()
+            .contains("not a CIDR"));
+        assert!(parse_external_address("0.0.0.0/10.0.0.5")
+            .unwrap_err()
+            .contains("unspecified"));
+        assert!(parse_external_address("nope").is_err());
+        assert!(parse_external_address("1.2.3.4/").is_err());
+    }
+
+    #[test]
+    fn mapping_sets_advertised_and_relay_bind() {
+        let mut c = base();
+        c.turn.external_ip = "203.0.113.10/10.0.0.5".into();
+        check(&c).unwrap();
+        assert_eq!(
+            c.turn.advertised_ip(),
+            Some("203.0.113.10".parse().unwrap())
+        );
+        assert_eq!(
+            c.turn.effective_relay_bind_ip(),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        // Plain form: behaviour exactly as before — no bind implied.
+        let c = base();
+        assert_eq!(c.turn.effective_relay_bind_ip(), None);
+        assert_eq!(
+            c.turn.advertised_ip(),
+            Some("203.0.113.10".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn mapping_must_agree_with_bind_ip() {
+        let mut c = base();
+        c.turn.external_ip = "203.0.113.10/10.0.0.5".into();
+        c.turn.relay.bind_ip = "10.0.0.6".into();
+        err_contains(&c, "names a different address");
+        c.turn.relay.bind_ip = "10.0.0.5".into();
+        check(&c).unwrap();
+    }
+
+    #[test]
+    fn v6_mapping_belongs_in_external_ip6() {
+        let mut c = base();
+        c.turn.external_ip = "2001:db8::10/fd00::5".into();
+        err_contains(&c, "must be IPv4 on both sides");
+
+        let mut c = base();
+        c.turn.external_ip6 = "2001:db8::10/fd00::5".into();
+        check(&c).unwrap();
+        assert_eq!(
+            c.turn.advertised_ip6(),
+            Some("2001:db8::10".parse().unwrap())
+        );
+        assert_eq!(
+            c.turn.effective_relay_bind_ip6(),
+            Some("fd00::5".parse().unwrap())
+        );
+        c.turn.relay.bind_ip6 = "fd00::6".into();
+        err_contains(&c, "turn.relay.bind_ip6");
+
+        let mut c = base();
+        c.turn.external_ip6 = "203.0.113.10/10.0.0.5".into();
+        err_contains(&c, "external_ip6 must be an IPv6 address");
+    }
+
+    // ── [turn.tcp] ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tcp_listener_is_off_by_default_and_opt_in_parses() {
+        assert!(!TurnConfig::default().tcp.enabled);
+        let c = TurnaConfig::from_str("[turn.tcp]\nenabled = true\n").expect("defaults are valid");
+        assert_eq!(c.turn.tcp.listen, "0.0.0.0:3478".parse().unwrap());
+        assert_eq!(c.turn.tcp.max_connections_per_ip, 64);
+    }
+
+    #[test]
+    fn tcp_listener_rules() {
+        let mut c = base();
+        c.turn.tcp.enabled = true;
+        c.turn.transport = TransportSelection::IoUring;
+        err_contains(&c, "turn.tcp requires turn.transport");
+
+        let mut c = base();
+        c.turn.tcp.enabled = true;
+        c.tls.enabled = true;
+        c.tls.listen = "0.0.0.0:3478".parse().unwrap();
+        err_contains(&c, "cannot share it");
+
+        let mut c = base();
+        c.turn.tcp.enabled = true;
+        c.turn.tcp.max_frame_size = 10;
+        err_contains(&c, "max_frame_size");
+    }
+
+    #[test]
+    fn tcp_relay_accepts_plain_tcp_as_its_control_listener() {
+        // Only the production branch errors; the rule is expressed in which
+        // listeners count, so check it through the error path.
+        let mut c = base();
+        c.production = true;
+        c.turn.auth.shared_secret = "x".repeat(32);
+        c.turn.relay.quota.allow_unlimited_bandwidth = true;
+        c.turn.tcp_relay.enabled = true;
+        let e = check(&c).unwrap_err();
+        assert!(
+            e.contains("[turn.tcp_relay] needs [tls] or [turn.tcp]"),
+            "{e}"
+        );
+        c.turn.tcp.enabled = true;
+        if let Err(e) = check(&c) {
+            assert!(!e.contains("[turn.tcp_relay] needs"), "{e}");
+        }
+    }
+
+    // ── PROXY protocol ───────────────────────────────────────────────────────
+
+    #[test]
+    fn proxy_protocol_needs_an_allowlist() {
+        let mut c = base();
+        c.tls.proxy_protocol = true;
+        err_contains(
+            &c,
+            "tls.proxy_protocol = true needs proxy_protocol_trusted_cidrs",
+        );
+        c.tls.proxy_protocol_trusted_cidrs = vec!["10.0.0.0/8".into()];
+        check(&c).unwrap();
+        c.tls.proxy_protocol_trusted_cidrs = vec!["10.0.0.0".into()];
+        err_contains(&c, "tls.proxy_protocol_trusted_cidrs");
+
+        let mut c = base();
+        c.turn.tcp.proxy_protocol = true;
+        c.turn.tcp.proxy_protocol_trusted_cidrs = vec!["10.0.0.0/8".into()];
+        c.turn.tcp.proxy_protocol_timeout_secs = 0;
+        err_contains(&c, "turn.tcp.proxy_protocol_timeout_secs");
+    }
+
+    // ── TLS policy ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tls_policy_defaults_are_todays_behaviour() {
+        let t = TlsConfig::default();
+        assert_eq!(t.min_version, "1.2");
+        assert!(t.cipher_suites.is_empty());
+        assert!(!t.proxy_protocol);
+    }
+
+    #[test]
+    fn tls_policy_validation() {
+        let mut c = base();
+        c.tls.min_version = "1.1".into();
+        err_contains(&c, "tls.min_version");
+        c.tls.min_version = "1.3".into();
+        check(&c).unwrap();
+
+        c.tls.cipher_suites = vec!["TLS_RSA_WITH_RC4_128_MD5".into()];
+        err_contains(&c, "not a cipher suite this build implements");
+
+        c.tls.cipher_suites = vec!["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into()];
+        err_contains(&c, "only TLS 1.2 suites");
+
+        c.tls.cipher_suites = vec![
+            "TLS13_AES_256_GCM_SHA384".into(),
+            "TLS13_AES_256_GCM_SHA384".into(),
+        ];
+        err_contains(&c, "twice");
+
+        c.tls.min_version = "1.2".into();
+        c.tls.cipher_suites = vec![
+            "TLS13_AES_256_GCM_SHA384".into(),
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into(),
+        ];
+        check(&c).unwrap();
     }
 }
