@@ -3,30 +3,47 @@
 //! # Shape
 //!
 //! ```text
-//! AllocationStore ──try_send──▶ [queue_capacity] ──▶ dispatcher ──▶ file (append, one line per record)
+//! AllocationStore ──try_send──▶ [queue_capacity] ──▶ dispatcher ──send──▶ file thread (append, one line per record)
 //!   (Stop records at teardown)                         │  ▲
 //!                                                      │  └─ interim tick: store.interim_usage_records()
-//!                                                      └─try_send──▶ [max_pending_batches × batch_size] ──▶ webhook sender
+//!                                                      └─try_send──▶ [max_pending_batches × batch_size] ──▶ webhook task
 //!                                                                                      (batch, POST, retry with backoff)
 //! ```
 //!
-//! Every hand-off is a bounded `try_send`. A full queue drops the record and
-//! counts it (`turna_accounting_records_dropped_total{reason=…}`); nothing here
-//! can block allocation teardown or the datapath. That is a deliberate trade: a
-//! billing record lost under an overload is visible and bounded, a relay stalled
-//! by a slow billing endpoint is an outage for every user.
+//! The datapath side is a bounded `try_send`: a full queue drops the record and
+//! counts it (`turna_accounting_records_dropped_total{reason=…}`), so nothing
+//! here can block allocation teardown. That is a deliberate trade: a billing
+//! record lost under an overload is visible and bounded, a relay stalled by a
+//! slow billing endpoint is an outage for every user.
+//!
+//! The file is written by a dedicated thread, never by the async dispatcher:
+//! a slow disk stalls that thread, not a runtime worker. The dispatcher hands
+//! lines to it with an awaited `send` — local disk is allowed to push back.
+//!
+//! # Shutdown
+//!
+//! On shutdown the dispatcher drains the store's queue, then writes a final
+//! `interim` record per live allocation *with backpressure* (awaited sends,
+//! bounded by the flush budget, not `try_send`), then closes the sinks and waits
+//! — again within the budget — for the file thread and the webhook task to
+//! finish. Whatever the webhook still holds when the budget runs out is counted
+//! as `webhook_failed` and logged.
 //!
 //! # Delivery
 //!
 //! At least once. A POST that timed out may have been processed, and is retried.
-//! Every record carries a deterministic `record_id` (node, allocation id, kind,
-//! event time), which is what the receiver deduplicates on.
+//! Every record carries a deterministic `record_id`, which is what the receiver
+//! deduplicates on.
 //!
 //! # Segments
 //!
-//! Counters are per node. An allocation that moves to another node (failover
-//! rehydrate) starts from zero there, and its records carry that node's `node`.
-//! Sum `stop` records per `(allocation_id, node)` segment.
+//! Counters live in the process. A **segment** is `(allocation_id, node,
+//! boot_id)`: `boot_id` changes on every process start, so an allocation that
+//! survives a restart (rehydrated from the state backend, same `node`, same
+//! `start_ms`) or fails over to another node starts a new segment from zero.
+//! Per segment take the `stop` record, or the latest `interim` if there is no
+//! stop (the process ended while the allocation lived — its shutdown snapshot is
+//! that interim); then sum across segments.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -42,11 +59,15 @@ use turna_session::{AllocationStore, UsageRecord, UsageRecordKind};
 #[derive(Debug, Clone)]
 pub struct AccountingSettings {
     pub node_id: String,
+    /// This process's boot id; see "Segments" in the module docs.
+    pub boot_id: String,
     pub include_addresses: bool,
     pub queue_capacity: usize,
     pub interim: Option<Duration>,
     pub file: Option<PathBuf>,
     pub webhook: Option<WebhookSettings>,
+    /// Budget for the shutdown snapshot and for draining the sinks.
+    pub shutdown_flush: Duration,
 }
 
 #[derive(Clone)]
@@ -60,12 +81,12 @@ pub struct WebhookSettings {
     pub max_pending_batches: usize,
 }
 
-// Hand-written so the Authorization header can never reach a log line through a
-// `{:?}` of the settings.
+// Hand-written so neither the Authorization header nor credentials or a token
+// in the URL can reach a log line through a `{:?}` of the settings.
 impl std::fmt::Debug for WebhookSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebhookSettings")
-            .field("url", &self.url)
+            .field("url", &mask_url(&self.url))
             .field(
                 "authorization",
                 &if self.authorization.is_empty() {
@@ -83,15 +104,66 @@ impl std::fmt::Debug for WebhookSettings {
     }
 }
 
+/// A webhook URL fit for a log line or `--dump-config`: userinfo and the query
+/// string removed. Either can carry a credential (`https://user:pw@host/…`,
+/// `…?token=…`), and a URL is otherwise logged verbatim everywhere.
+pub fn mask_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (format!("{s}://"), r),
+        None => (String::new(), url),
+    };
+    // Authority ends at the first '/', '?' or '#'.
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let host = match authority.rfind('@') {
+        Some(at) => format!("***@{}", &authority[at + 1..]),
+        None => authority.to_string(),
+    };
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let (path, after) = tail.split_at(path_end);
+    let query = if after.starts_with('?') { "?***" } else { "" };
+    format!("{scheme}{host}{path}{query}")
+}
+
+/// A fresh id for this process: 8 random bytes as hex, from `/dev/urandom`,
+/// falling back to the start time and pid (unique enough to separate restarts,
+/// which is all it is for; it is not a secret).
+pub fn new_boot_id() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+    {
+        return buf.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    format!("{:016x}", nanos ^ ((std::process::id() as u64) << 32))
+}
+
+/// The process-wide boot id, generated once.
+pub fn boot_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(new_boot_id)
+}
+
 impl AccountingSettings {
     /// `None` when accounting is off.
-    pub fn from_config(cfg: &turna_config::AccountingConfig, node_id: &str) -> Option<Self> {
+    pub fn from_config(
+        cfg: &turna_config::AccountingConfig,
+        node_id: &str,
+        shutdown_flush: Duration,
+    ) -> Option<Self> {
         if !cfg.enabled {
             return None;
         }
         let w = &cfg.webhook;
         Some(Self {
             node_id: node_id.to_string(),
+            boot_id: boot_id().to_string(),
             include_addresses: cfg.include_addresses,
             queue_capacity: cfg.queue_capacity.max(1),
             interim: (cfg.interim_interval_secs > 0)
@@ -106,6 +178,7 @@ impl AccountingSettings {
                 timeout: Duration::from_secs(w.timeout_secs.max(1)),
                 max_pending_batches: w.max_pending_batches.max(1),
             }),
+            shutdown_flush,
         })
     }
 }
@@ -120,16 +193,30 @@ pub struct AccountingCounters {
     pub dropped_file_error: AtomicU64,
     pub webhook_batches: AtomicU64,
     pub webhook_retries: AtomicU64,
+    /// Records handed to the webhook task and not yet posted or dropped. What
+    /// is left here when the shutdown budget runs out is counted as failed.
+    pub webhook_pending: AtomicU64,
 }
 
 /// One record as a JSON object. Schema version `v = 1`; field names are a
 /// contract with whatever bills from them.
-pub fn record_json(r: &UsageRecord, node_id: &str, include_addresses: bool) -> serde_json::Value {
+pub fn record_json(
+    r: &UsageRecord,
+    node_id: &str,
+    boot_id: &str,
+    include_addresses: bool,
+) -> serde_json::Value {
     let mut o = serde_json::json!({
         "v": 1,
-        "record_id": format!("{node_id}:{}:{}:{}", r.allocation_id, r.kind.as_str(), r.event_ms),
+        "record_id": format!(
+            "{node_id}:{boot_id}:{}:{}:{}",
+            r.allocation_id,
+            r.kind.as_str(),
+            r.event_ms
+        ),
         "type": r.kind.as_str(),
         "node": node_id,
+        "boot_id": boot_id,
         "allocation_id": r.allocation_id,
         "username": r.username,
         "realm": r.realm,
@@ -171,9 +258,10 @@ pub fn start(
     store: Arc<AllocationStore>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Accounting, String> {
+    let counters = Arc::new(AccountingCounters::default());
     let file = match &settings.file {
         Some(p) => Some(
-            FileSink::open(p.clone())
+            FileWriter::spawn(p.clone(), counters.clone())
                 .map_err(|e| format!("[turn.accounting.file] {}: {e}", p.display()))?,
         ),
         None => None,
@@ -182,25 +270,25 @@ pub fn start(
         Some(w) => Some(build_client(w).map_err(|e| format!("[turn.accounting.webhook] {e}"))?),
         None => None,
     };
-    let counters = Arc::new(AccountingCounters::default());
     let (tx, rx) = mpsc::channel::<UsageRecord>(settings.queue_capacity);
     store.attach_usage_sink(tx);
 
-    let webhook_tx = match (webhook, &settings.webhook) {
+    let webhook = match (webhook, &settings.webhook) {
         (Some(client), Some(w)) => {
             let (wtx, wrx) =
                 mpsc::channel::<serde_json::Value>(w.max_pending_batches * w.batch_size);
-            tokio::spawn(run_webhook(client, w.clone(), wrx, counters.clone()));
-            Some(wtx)
+            let handle = tokio::spawn(run_webhook(client, w.clone(), wrx, counters.clone()));
+            Some((wtx, handle))
         }
         _ => None,
     };
 
     info!(
         file = ?settings.file,
-        webhook = settings.webhook.as_ref().map(|w| w.url.as_str()).unwrap_or(""),
+        webhook = %settings.webhook.as_ref().map(|w| mask_url(&w.url)).unwrap_or_default(),
         interim_secs = settings.interim.map(|d| d.as_secs()).unwrap_or(0),
         include_addresses = settings.include_addresses,
+        boot_id = %settings.boot_id,
         "usage accounting enabled"
     );
 
@@ -209,82 +297,163 @@ pub fn start(
         store,
         rx,
         file,
-        webhook_tx,
+        webhook,
         counters.clone(),
         shutdown,
     ));
     Ok(Accounting { counters, handle })
 }
 
-struct FileSink {
-    path: PathBuf,
-    file: std::fs::File,
+enum FileCmd {
+    Line(Vec<u8>),
+    Reopen,
 }
 
-impl FileSink {
-    fn open(path: PathBuf) -> std::io::Result<Self> {
-        let mut o = std::fs::OpenOptions::new();
-        o.create(true).append(true);
-        // Usernames and byte counts: readable by the service and its group.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            o.mode(0o640);
-        }
-        let file = o.open(&path)?;
-        Ok(Self { path, file })
-    }
-
-    fn reopen(&mut self) -> std::io::Result<()> {
-        *self = Self::open(self.path.clone())?;
-        Ok(())
-    }
-
-    /// One `write(2)` per record, so a line is never split across a rotation or
-    /// interleaved with anything.
-    fn write_line(&mut self, v: &serde_json::Value) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(v).map_err(std::io::Error::other)?;
-        line.push(b'\n');
-        self.file.write_all(&line)
-    }
+/// The accounting file, owned by a dedicated thread. Blocking `write(2)` and
+/// `open(2)` never run on a runtime worker.
+struct FileWriter {
+    tx: mpsc::Sender<FileCmd>,
+    thread: std::thread::JoinHandle<()>,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_dispatcher(
-    settings: AccountingSettings,
-    store: Arc<AllocationStore>,
-    mut rx: mpsc::Receiver<UsageRecord>,
-    mut file: Option<FileSink>,
-    webhook_tx: Option<mpsc::Sender<serde_json::Value>>,
-    counters: Arc<AccountingCounters>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let dispatch = |r: &UsageRecord, file: &mut Option<FileSink>| {
-        match r.kind {
-            UsageRecordKind::Stop => counters.stop_records.fetch_add(1, Ordering::Relaxed),
-            UsageRecordKind::Interim => counters.interim_records.fetch_add(1, Ordering::Relaxed),
-        };
-        let v = record_json(r, &settings.node_id, settings.include_addresses);
-        if let Some(f) = file.as_mut() {
-            if let Err(e) = f.write_line(&v) {
-                let prev = counters.dropped_file_error.fetch_add(1, Ordering::Relaxed);
-                if prev == 0 || (prev + 1).is_power_of_two() {
-                    warn!(error = %e, dropped_total = prev + 1,
-                          "accounting file write failed — record lost from the file sink");
+fn open_accounting_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    // Usernames and byte counts: readable by the service and its group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o640);
+    }
+    o.open(path)
+}
+
+impl FileWriter {
+    /// Opens the file here, synchronously, so a file that cannot be opened is a
+    /// startup error; then hands it to the writer thread.
+    fn spawn(path: PathBuf, counters: Arc<AccountingCounters>) -> std::io::Result<Self> {
+        let mut file = open_accounting_file(&path)?;
+        let (tx, mut rx) = mpsc::channel::<FileCmd>(1024);
+        let thread = std::thread::Builder::new()
+            .name("turna-accounting-file".into())
+            .spawn(move || {
+                while let Some(cmd) = rx.blocking_recv() {
+                    match cmd {
+                        // One `write(2)` per record, so a line is never split
+                        // across a rotation or interleaved with anything.
+                        FileCmd::Line(line) => {
+                            if let Err(e) = file.write_all(&line) {
+                                let prev = counters.dropped_file_error.fetch_add(1, Ordering::Relaxed);
+                                if prev == 0 || (prev + 1).is_power_of_two() {
+                                    warn!(error = %e, dropped_total = prev + 1,
+                                          "accounting file write failed — record lost from the file sink");
+                                }
+                            }
+                        }
+                        FileCmd::Reopen => match open_accounting_file(&path) {
+                            Ok(f) => {
+                                file = f;
+                                info!("SIGHUP: accounting file reopened");
+                            }
+                            Err(e) => warn!(error = %e,
+                                "SIGHUP: accounting file could not be reopened; still writing the old handle"),
+                        },
+                    }
                 }
+            })?;
+        Ok(Self { tx, thread })
+    }
+}
+
+/// How the dispatcher hands a record to the webhook task.
+#[derive(Clone, Copy)]
+enum Handoff {
+    /// Steady state: never wait for the webhook (drop and count when full).
+    NoWait,
+    /// Shutdown snapshot: wait for room, until the deadline.
+    Until(tokio::time::Instant),
+}
+
+struct Dispatcher {
+    node_id: String,
+    boot_id: String,
+    include_addresses: bool,
+    file: Option<mpsc::Sender<FileCmd>>,
+    webhook: Option<mpsc::Sender<serde_json::Value>>,
+    counters: Arc<AccountingCounters>,
+}
+
+impl Dispatcher {
+    async fn dispatch(&self, r: &UsageRecord, handoff: Handoff) {
+        match r.kind {
+            UsageRecordKind::Stop => self.counters.stop_records.fetch_add(1, Ordering::Relaxed),
+            UsageRecordKind::Interim => self
+                .counters
+                .interim_records
+                .fetch_add(1, Ordering::Relaxed),
+        };
+        let v = record_json(r, &self.node_id, &self.boot_id, self.include_addresses);
+        if let Some(f) = self.file.as_ref() {
+            let mut line = serde_json::to_vec(&v).unwrap_or_default();
+            line.push(b'\n');
+            // Local disk may push back; the file thread is never far behind.
+            if f.send(FileCmd::Line(line)).await.is_err() {
+                self.counters
+                    .dropped_file_error
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
-        if let Some(tx) = webhook_tx.as_ref() {
-            if tx.try_send(v).is_err() {
-                counters
+        if let Some(tx) = self.webhook.as_ref() {
+            self.counters
+                .webhook_pending
+                .fetch_add(1, Ordering::Relaxed);
+            let sent = match handoff {
+                Handoff::NoWait => tx.try_send(v).is_ok(),
+                Handoff::Until(deadline) => {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    tx.send_timeout(v, left).await.is_ok()
+                }
+            };
+            if !sent {
+                self.counters
+                    .webhook_pending
+                    .fetch_sub(1, Ordering::Relaxed);
+                self.counters
                     .dropped_webhook_queue_full
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+async fn run_dispatcher(
+    settings: AccountingSettings,
+    store: Arc<AllocationStore>,
+    mut rx: mpsc::Receiver<UsageRecord>,
+    file: Option<FileWriter>,
+    webhook: Option<(mpsc::Sender<serde_json::Value>, tokio::task::JoinHandle<()>)>,
+    counters: Arc<AccountingCounters>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let (file_tx, file_thread) = match file {
+        Some(f) => (Some(f.tx), Some(f.thread)),
+        None => (None, None),
+    };
+    let (webhook_tx, webhook_task) = match webhook {
+        Some((tx, h)) => (Some(tx), Some(h)),
+        None => (None, None),
+    };
+    let d = Dispatcher {
+        node_id: settings.node_id.clone(),
+        boot_id: settings.boot_id.clone(),
+        include_addresses: settings.include_addresses,
+        file: file_tx,
+        webhook: webhook_tx,
+        counters: counters.clone(),
     };
 
-    let mut interim = settings.interim.map(|d| {
-        let mut t = tokio::time::interval_at(tokio::time::Instant::now() + d, d);
+    let mut interim = settings.interim.map(|p| {
+        let mut t = tokio::time::interval_at(tokio::time::Instant::now() + p, p);
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         t
     });
@@ -307,7 +476,7 @@ async fn run_dispatcher(
 
         tokio::select! {
             rec = rx.recv() => match rec {
-                Some(r) => dispatch(&r, &mut file),
+                Some(r) => d.dispatch(&r, Handoff::NoWait).await,
                 None => break,
             },
             _ = async {
@@ -317,41 +486,72 @@ async fn run_dispatcher(
                 }
             } => {
                 for r in store.interim_usage_records() {
-                    dispatch(&r, &mut file);
+                    d.dispatch(&r, Handoff::NoWait).await;
                 }
             }
             _ = hup => {
-                if let Some(f) = file.as_mut() {
-                    match f.reopen() {
-                        Ok(()) => info!("SIGHUP: accounting file reopened"),
-                        Err(e) => warn!(error = %e, "SIGHUP: accounting file could not be reopened; still writing the old handle"),
-                    }
+                if let Some(f) = d.file.as_ref() {
+                    let _ = f.send(FileCmd::Reopen).await;
                 }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    // Records already queued first, so a stop record is never
-                    // overtaken by the shutdown snapshot of the same allocation.
-                    while let Ok(r) = rx.try_recv() {
-                        dispatch(&r, &mut file);
-                    }
-                    // Allocations still live when the node stops get a final
-                    // interim record: whatever they relayed on this node is
-                    // otherwise unrecorded, because no stop will follow here.
-                    let live = store.interim_usage_records();
-                    let n = live.len();
-                    for r in live {
-                        dispatch(&r, &mut file);
-                    }
-                    info!(live_allocations = n, "accounting: shutdown snapshot written");
                     break;
                 }
             }
         }
     }
-    // Dropping the webhook sender closes its channel; the sender task flushes
-    // what it holds and exits.
-    drop(webhook_tx);
+
+    // ── Shutdown ────────────────────────────────────────────────────────────
+    let deadline = tokio::time::Instant::now() + settings.shutdown_flush;
+    // Stop records already queued first, so none is overtaken by the snapshot
+    // of the same allocation. Closing the receiver makes a late teardown's
+    // try_send fail as Closed, which the store logs (not only counts).
+    rx.close();
+    while let Some(r) = rx.recv().await {
+        d.dispatch(&r, Handoff::Until(deadline)).await;
+    }
+    // Allocations still live when the node stops get a final interim record:
+    // whatever they relayed in this process is otherwise unrecorded, because no
+    // stop will follow in this boot.
+    let live = store.interim_usage_records();
+    let n = live.len();
+    for r in live {
+        d.dispatch(&r, Handoff::Until(deadline)).await;
+    }
+    info!(
+        live_allocations = n,
+        "accounting: shutdown snapshot handed to the sinks"
+    );
+
+    // Close the sinks and wait for them, within what is left of the budget.
+    drop(d);
+    if let Some(t) = file_thread {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let joined =
+            tokio::time::timeout(left, tokio::task::spawn_blocking(move || t.join())).await;
+        if joined.is_err() {
+            warn!("accounting file thread did not finish within the shutdown budget");
+        }
+    }
+    if let Some(mut t) = webhook_task {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if tokio::time::timeout(left, &mut t).await.is_err() {
+            t.abort();
+            let pending = counters.webhook_pending.swap(0, Ordering::Relaxed);
+            counters
+                .dropped_webhook_failed
+                .fetch_add(pending, Ordering::Relaxed);
+            warn!(
+                records = pending,
+                budget_secs = settings.shutdown_flush.as_secs(),
+                "accounting webhook still had records when the shutdown budget ran out; \
+                 they are lost (counted as webhook_failed) — the file sink, if configured, has them"
+            );
+        } else {
+            info!("accounting: webhook drained");
+        }
+    }
 }
 
 fn build_client(w: &WebhookSettings) -> Result<reqwest::Client, String> {
@@ -434,6 +634,15 @@ async fn post_batch(
         return;
     }
     let n = batch.len() as u64;
+    // However this ends — posted or dropped — these records are no longer
+    // pending in the webhook.
+    struct Settle<'a>(&'a AccountingCounters, u64);
+    impl Drop for Settle<'_> {
+        fn drop(&mut self) {
+            self.0.webhook_pending.fetch_sub(self.1, Ordering::Relaxed);
+        }
+    }
+    let _settle = Settle(counters, n);
     let body = match serde_json::to_vec(&batch) {
         Ok(b) => b,
         Err(_) => {
@@ -458,8 +667,8 @@ async fn post_batch(
                 return;
             }
             Ok(resp) => (Some(resp.status()), None),
-            // The error's Display can carry the URL; never the header.
-            Err(e) => (None, Some(e.to_string())),
+            // Without the URL: it can carry credentials or a token.
+            Err(e) => (None, Some(e.without_url().to_string())),
         };
         if attempt >= w.max_retries || !is_retryable(status) {
             counters
@@ -496,12 +705,53 @@ mod tests {
     fn settings(file: Option<PathBuf>, webhook: Option<WebhookSettings>) -> AccountingSettings {
         AccountingSettings {
             node_id: "node-a".into(),
+            boot_id: "b00t".into(),
             include_addresses: false,
             queue_capacity: 16,
             interim: None,
             file,
             webhook,
+            shutdown_flush: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn mask_url_strips_userinfo_and_query() {
+        assert_eq!(
+            mask_url("https://user:pw@billing.example:8443/v1/usage?token=abc#x"),
+            "https://***@billing.example:8443/v1/usage?***"
+        );
+        assert_eq!(mask_url("http://h/p"), "http://h/p");
+        assert_eq!(mask_url("https://h?k=v"), "https://h?***");
+        assert_eq!(mask_url("https://h"), "https://h");
+    }
+
+    /// A restart on the same node must start a new segment: the rehydrated
+    /// allocation keeps its id and start_ms, its counters restart at 0, and
+    /// only the boot id tells the two apart.
+    #[test]
+    fn a_restart_is_a_new_segment() {
+        let a = new_boot_id();
+        let b = new_boot_id();
+        assert_ne!(a, b, "boot ids must differ between processes");
+        assert_eq!(boot_id(), boot_id(), "stable within one process");
+
+        let s = store();
+        s.create(
+            client(),
+            "10.0.0.1:40050".parse().unwrap(),
+            "alice".into(),
+            vec![],
+            600,
+        )
+        .unwrap();
+        let r = s.interim_usage_records().pop().unwrap();
+        let before = record_json(&r, "node-a", &a, false);
+        let after = record_json(&r, "node-a", &b, false);
+        assert_eq!(before["allocation_id"], after["allocation_id"]);
+        assert_eq!(before["start_ms"], after["start_ms"]);
+        assert_ne!(before["record_id"], after["record_id"]);
+        assert_ne!(before["boot_id"], after["boot_id"]);
     }
 
     #[test]
@@ -557,7 +807,7 @@ mod tests {
             a.add_bytes_to_client(60);
         }
         let r = s.interim_usage_records().pop().unwrap();
-        let v = record_json(&r, "node-a", false);
+        let v = record_json(&r, "node-a", "b00t", false);
         assert_eq!(v["v"], 1);
         assert_eq!(v["type"], "interim");
         assert_eq!(v["username"], "alice");
@@ -572,8 +822,9 @@ mod tests {
             v.get("end_reason").is_none(),
             "interim records carry no end reason"
         );
-        assert!(v["record_id"].as_str().unwrap().starts_with("node-a:"));
-        let with = record_json(&r, "node-a", true);
+        assert!(v["record_id"].as_str().unwrap().starts_with("node-a:b00t:"));
+        assert_eq!(v["boot_id"], "b00t");
+        let with = record_json(&r, "node-a", "b00t", true);
         assert_eq!(with["client_addr"], "192.0.2.10:5000");
     }
 
@@ -753,6 +1004,81 @@ mod tests {
         assert_eq!(
             acct.counters.dropped_webhook_failed.load(Ordering::Relaxed),
             0
+        );
+    }
+
+    /// The shutdown snapshot is sent with backpressure, not try_send: with a
+    /// webhook queue of 2 and 30 live allocations, all 30 interim records must
+    /// reach the endpoint, and the dispatcher must not finish before the
+    /// webhook task has posted them.
+    #[tokio::test]
+    async fn shutdown_snapshot_is_delivered_in_full_and_awaited() {
+        let (url, mut got) = receiver(vec![200; 30]).await;
+        let s = store();
+        let (stx, srx) = watch::channel(false);
+        let mut w = webhook(url, 0);
+        w.max_pending_batches = 1; // channel capacity = 1 × batch_size 2
+        let acct = start(settings(None, Some(w)), s.clone(), srx).unwrap();
+        for i in 0..30u16 {
+            let c: SocketAddr = format!("192.0.2.40:{}", 8000 + i).parse().unwrap();
+            let r: SocketAddr = format!("10.0.0.1:{}", 40030 + i).parse().unwrap();
+            s.create(c, r, format!("u{i}"), vec![], 600).unwrap();
+        }
+        stx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), acct.handle)
+            .await
+            .expect("dispatcher finishes within its budget")
+            .unwrap();
+        // Everything was posted before the dispatcher returned.
+        let mut records = 0;
+        while let Ok((_, body)) = got.try_recv() {
+            records += serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+                .unwrap()
+                .len();
+        }
+        assert_eq!(records, 30);
+        assert_eq!(
+            acct.counters
+                .dropped_webhook_queue_full
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(acct.counters.webhook_pending.load(Ordering::Relaxed), 0);
+    }
+
+    /// An endpoint that never succeeds cannot hold shutdown past the budget:
+    /// the dispatcher returns on time and the undelivered records are counted.
+    #[tokio::test]
+    async fn webhook_is_abandoned_at_the_budget_and_counted() {
+        // A bound-then-dropped port: connection refused, retried with backoff.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let s = store();
+        let (stx, srx) = watch::channel(false);
+        let mut st = settings(
+            None,
+            Some(webhook(format!("http://127.0.0.1:{port}/x"), 20)),
+        );
+        st.shutdown_flush = Duration::from_secs(1);
+        let acct = start(st, s.clone(), srx).unwrap();
+        let c: SocketAddr = "192.0.2.50:9000".parse().unwrap();
+        let r: SocketAddr = "10.0.0.1:40090".parse().unwrap();
+        s.create(c, r, "u".into(), vec![], 600).unwrap();
+        s.remove(&c, r).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let t0 = std::time::Instant::now();
+        stx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), acct.handle)
+            .await
+            .expect("budget bounds shutdown")
+            .unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            acct.counters.dropped_webhook_failed.load(Ordering::Relaxed),
+            1
         );
     }
 
