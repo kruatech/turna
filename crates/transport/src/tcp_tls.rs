@@ -83,6 +83,12 @@ pub enum TlsError {
     AlpnConfig,
     #[error("cipher suite {0:?} is not implemented by this TLS stack")]
     UnknownCipherSuite(String),
+    #[error(
+        "no cipher suite in the allowlist can be used with this {key:?} certificate key: \
+         TLS 1.2 suites must match the key type (ECDSA vs RSA), and the list has no \
+         usable TLS 1.3 suite"
+    )]
+    NoSuiteForKey { key: rustls::SignatureAlgorithm },
     #[error("proxy_protocol = true needs at least one trusted CIDR")]
     ProxyConfig,
     #[error("PROXY protocol: {0}")]
@@ -510,6 +516,15 @@ struct Admission {
     conn_counter: Arc<std::sync::atomic::AtomicU64>,
     stats: Arc<TlsStats>,
     label: &'static str,
+    /// PROXY-protocol listeners only: one permit per connection that has been
+    /// accepted and not yet closed, *including* those still waiting for their
+    /// header. Sized from `max_connections` and taken in the accept loop
+    /// before the header read is spawned, so a trusted source that opens
+    /// connections and sends nothing holds at most `max_connections` tasks and
+    /// descriptors for `proxy_header_timeout`, not an unbounded number. The
+    /// permit then moves into the admitted connection and is released when it
+    /// closes.
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Admission {
@@ -526,34 +541,39 @@ impl Admission {
             warn!(event = "peer_refused_rate_limit", %peer, "{label} connection refused: per-IP handshake rate limit");
             return None;
         }
-        {
-            let c = self.conns.read().await;
-            if c.len() >= self.config.max_connections {
-                self.stats.rejected_over_cap.fetch_add(1, Relaxed);
-                warn!(event = "peer_refused_max_connections", %peer, max = self.config.max_connections, "connection limit reached");
-                return None;
-            }
+        // Check and insert under ONE write lock. On a PROXY-protocol listener
+        // `admit` runs concurrently on every connection's own task, and a
+        // read-locked check followed by a separately locked insert let any
+        // number of them pass the check together and overshoot the cap.
+        // Lock order is `conns` then `per_ip`; `release` takes them one after
+        // the other, never nested, so the order cannot invert.
+        let mut conns = self.conns.write().await;
+        if conns.len() >= self.config.max_connections {
+            drop(conns);
+            self.stats.rejected_over_cap.fetch_add(1, Relaxed);
+            warn!(event = "peer_refused_max_connections", %peer, max = self.config.max_connections, "connection limit reached");
+            return None;
         }
         // Per-source-IP cap (parity with the DTLS listener's DTL-9): without
         // it a single source could hold every one of `max_connections`.
         let max_per_ip = self.config.max_connections_per_ip;
-        if max_per_ip != 0 {
+        {
             let ip = peer.ip();
             let mut m = self.per_ip.write().await;
-            if *m.get(&ip).unwrap_or(&0) as usize >= max_per_ip {
+            if max_per_ip != 0 && *m.get(&ip).unwrap_or(&0) as usize >= max_per_ip {
                 drop(m);
+                drop(conns);
                 self.stats.rejected_per_ip.fetch_add(1, Relaxed);
                 warn!(event = "peer_refused_per_ip_cap", %peer, max_per_ip, "{label} connection refused: per-IP cap reached");
                 return None;
             }
             *m.entry(ip).or_insert(0) += 1;
-        } else {
-            *self.per_ip.write().await.entry(peer.ip()).or_insert(0) += 1;
         }
 
         let conn_id = TcpConnectionId::next(&self.conn_counter);
         let (conn_tx, conn_rx) = mpsc::channel::<ConnCtl>(256);
-        self.conns.write().await.insert(conn_id, conn_tx);
+        conns.insert(conn_id, conn_tx);
+        drop(conns);
         self.stats.accepted.fetch_add(1, Relaxed);
         Some((conn_id, conn_rx))
     }
@@ -738,6 +758,7 @@ impl TlsTransportServer {
             conn_counter: self.conn_counter.clone(),
             stats: stats.clone(),
             label,
+            slots: Arc::new(tokio::sync::Semaphore::new(self.config.max_connections)),
         });
 
         // Route outbound sends AND detach requests to the owning connection over
@@ -880,12 +901,24 @@ impl TlsTransportServer {
                 warn!(event = "proxy_untrusted_source", peer = %socket_peer, "{label} connection refused: source is not in proxy_protocol_trusted_cidrs");
                 continue;
             }
+            // Bound the connections still waiting for a header (see
+            // `Admission::slots`). Refused here, before a task exists.
+            let Ok(slot) = adm.slots.clone().try_acquire_owned() else {
+                stats
+                    .rejected_over_cap
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(event = "peer_refused_max_connections", peer = %socket_peer, max = self.config.max_connections, "{label} connection refused: max_connections reached (including connections awaiting a PROXY header)");
+                continue;
+            };
             // Reading the header waits on the network, so it runs on the
             // connection's own task; admission follows, keyed on the address
             // the header carries.
             let adm = adm.clone();
             let header_timeout = self.config.proxy_header_timeout;
             tokio::spawn(async move {
+                // Held until this task ends: on a refused header, on a refused
+                // admission, or when the admitted connection closes.
+                let _slot = slot;
                 let mut stream = stream;
                 let read = timeout(
                     header_timeout,
@@ -1302,6 +1335,50 @@ impl TlsPolicy {
         Ok(provider)
     }
 
+    /// An allowlist can be valid by name and still refuse every client: TLS 1.2
+    /// suites name their signature algorithm, so a list of only ECDSA suites
+    /// with an RSA certificate negotiates nothing. The key type is known here,
+    /// at certificate load, not at config validation. Nothing usable at all is
+    /// an error (the listener does not start); TLS 1.2 suites that are all
+    /// unusable while TLS 1.3 ones remain is a warning, because TLS 1.3
+    /// clients are still served. Default (empty) allowlists are not checked:
+    /// the provider's full set covers every key type rustls loads.
+    fn check_key(
+        &self,
+        provider: &rustls::crypto::CryptoProvider,
+        key: &PrivateKeyDer<'static>,
+    ) -> Result<()> {
+        if self.cipher_suites.is_empty() {
+            return Ok(());
+        }
+        let alg = provider
+            .key_provider
+            .load_private_key(key.clone_key())?
+            .algorithm();
+        let tls13 = provider
+            .cipher_suites
+            .iter()
+            .any(|s| s.version() == &rustls::version::TLS13);
+        let tls12: Vec<_> = provider
+            .cipher_suites
+            .iter()
+            .filter(|s| s.version() == &rustls::version::TLS12)
+            .collect();
+        let tls12_usable =
+            !self.tls13_only && tls12.iter().any(|s| s.usable_for_signature_algorithm(alg));
+        if !tls13 && !tls12_usable {
+            return Err(TlsError::NoSuiteForKey { key: alg });
+        }
+        if !self.tls13_only && !tls12.is_empty() && !tls12_usable {
+            warn!(
+                key = ?alg,
+                "[tls] cipher_suites: none of the TLS 1.2 suites matches the certificate \
+                 key type, so TLS 1.2 clients will be refused; only TLS 1.3 is usable"
+            );
+        }
+        Ok(())
+    }
+
     fn versions(&self) -> &'static [&'static rustls::SupportedProtocolVersion] {
         static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
         if self.tls13_only {
@@ -1319,6 +1396,7 @@ fn ring_server_config(
     policy: &TlsPolicy,
 ) -> Result<ServerConfig> {
     let provider = Arc::new(policy.provider()?);
+    policy.check_key(&provider, &key)?;
     // `with_protocol_versions` refuses a version set the allowlist leaves with
     // no suite ("no usable cipher suites configured"), so a TLS 1.2-only list
     // with `tls13_only` fails here, at startup.
@@ -1687,14 +1765,35 @@ mod tests {
             build_tls_config(&cfg),
             Err(TlsError::UnknownCipherSuite(_))
         ));
-        // TLS 1.3 only with nothing but a TLS 1.2 suite: rustls refuses the
-        // version set, and that surfaces at construction.
+        // TLS 1.3 only with nothing but a TLS 1.2 suite: refused at
+        // construction. The key check sees it first (no TLS 1.3 suite, TLS 1.2
+        // off); rustls's own "no usable cipher suites" would follow otherwise.
         cfg.cipher_suites = vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".into()];
         cfg.tls13_only = true;
         assert!(matches!(
             build_tls_config(&cfg),
-            Err(TlsError::TlsConfig(_))
+            Err(TlsError::NoSuiteForKey { .. } | TlsError::TlsConfig(_))
         ));
+    }
+
+    #[test]
+    fn allowlist_unusable_with_the_key_type_is_refused() {
+        // rcgen's default key is ECDSA P-256, so RSA-only TLS 1.2 suites
+        // cannot be used with it.
+        let (mut cfg, _) = server_cfg("keytype");
+        cfg.cipher_suites = vec!["TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into()];
+        assert!(matches!(
+            build_tls_config(&cfg),
+            Err(TlsError::NoSuiteForKey { .. })
+        ));
+        // A matching TLS 1.2 suite, or any TLS 1.3 suite alongside, is fine.
+        cfg.cipher_suites = vec!["TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256".into()];
+        assert!(build_tls_config(&cfg).is_ok());
+        cfg.cipher_suites = vec![
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".into(),
+            "TLS13_AES_128_GCM_SHA256".into(),
+        ];
+        assert!(build_tls_config(&cfg).is_ok());
     }
 
     #[tokio::test]
@@ -1946,6 +2045,98 @@ mod tests {
         tls.flush().await.unwrap();
         let peer = first_packet_peer(&mut r.events).await;
         assert_eq!(peer, "198.51.100.4:6000".parse::<SocketAddr>().unwrap());
+    }
+
+    /// `admit` is atomic: fifty concurrent admissions against a cap of three
+    /// admit exactly three. With the old read-check / separate-insert shape
+    /// they could all pass the check before any of them inserted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_admit_never_exceeds_max_connections() {
+        let stats = Arc::new(TlsStats::default());
+        let adm = Arc::new(Admission {
+            config: TlsTransportConfig {
+                max_connections: 3,
+                max_connections_per_ip: 0,
+                ..Default::default()
+            },
+            limiter: crate::ratelimit::HandshakeLimiter::new(0, 0),
+            per_ip: tokio::sync::RwLock::new(HashMap::new()),
+            conns: tokio::sync::RwLock::new(HashMap::new()),
+            conn_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stats: stats.clone(),
+            label: "test",
+            slots: Arc::new(tokio::sync::Semaphore::new(3)),
+        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(50));
+        let mut tasks = Vec::new();
+        for i in 0..50u16 {
+            let adm = adm.clone();
+            let b = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                b.wait().await;
+                let peer = SocketAddr::from(([198, 51, 100, (i % 250) as u8], 1000 + i));
+                adm.admit(peer).await.map(|(id, rx)| (id, rx, peer))
+            }));
+        }
+        let mut admitted = Vec::new();
+        for t in tasks {
+            if let Some(a) = t.await.unwrap() {
+                admitted.push(a);
+            }
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(admitted.len(), 3);
+        assert_eq!(adm.conns.read().await.len(), 3);
+        assert_eq!(stats.accepted.load(Relaxed), 3);
+        assert_eq!(stats.rejected_over_cap.load(Relaxed), 47);
+        // Releasing one frees exactly one slot.
+        let (id, _rx, peer) = admitted.pop().unwrap();
+        adm.release(id, peer).await;
+        assert!(adm.admit("203.0.113.9:1".parse().unwrap()).await.is_some());
+        assert!(adm.admit("203.0.113.9:2".parse().unwrap()).await.is_none());
+    }
+
+    /// Connections still waiting for their PROXY header count against
+    /// `max_connections`: a trusted source that opens many and sends nothing
+    /// has the excess refused at once instead of holding a task and a
+    /// descriptor each for the header timeout.
+    #[tokio::test]
+    async fn pending_proxy_headers_are_bounded_by_max_connections() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = start_plain(TlsTransportConfig {
+            listen_addr: free_tcp_addr(),
+            proxy_protocol: true,
+            proxy_trusted_cidrs: vec!["127.0.0.1/32".into()],
+            proxy_header_timeout: Duration::from_secs(60),
+            max_connections: 2,
+            max_connections_per_ip: 0,
+            ..Default::default()
+        })
+        .await;
+        let mut silent = Vec::new();
+        for _ in 0..2 {
+            silent.push(TcpStream::connect(r.addr).await.unwrap());
+        }
+        // Give the accept loop time to take both permits.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let mut extra = TcpStream::connect(r.addr).await.unwrap();
+        assert_closed(&mut extra).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the over-cap connection waited for the header timeout"
+        );
+        assert_eq!(r.stats.rejected_over_cap.load(Relaxed), 1);
+        // A slot frees up when a pending connection goes away.
+        drop(silent.pop());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut c = TcpStream::connect(r.addr).await.unwrap();
+        let mut wire = b"PROXY TCP4 203.0.113.7 10.0.0.1 51000 3478\r\n".to_vec();
+        wire.extend_from_slice(&stun_msg(&[]));
+        c.write_all(&wire).await.unwrap();
+        let mut r = r;
+        let peer = first_packet_peer(&mut r.events).await;
+        assert_eq!(peer, "203.0.113.7:51000".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
