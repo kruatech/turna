@@ -28,7 +28,7 @@ Suggested home in-repo: `docs/COMPLIANCE.md`.
 | 8016 | Connection Migration (MOBILITY-TICKET) | **Verified, optional** | Off by default; when enabled, a signed ticket + valid credentials re-key an allocation to a new 5-tuple with epoch anti-replay (`processor::try_migration_refresh`, `session::re_key`). |
 | — | Cluster redirect (300 Try Alternate) | **Verified** | New clients redirected to their owning node via a 300 with ALTERNATE-SERVER when clustering is on / during drain (`processor::maybe_redirect_new_client`). |
 | 5389 / 8489 | SASLprep / OpaqueString on credentials | **Verified: not applied (by design)** | `long_term_key` = `MD5(username:realm:password)` and `long_term_key_sha256` = `SHA-256(...)` hash the raw UTF-8 bytes with no normalization (`crypto/lib.rs`, explicitly documented). See §3 constraint. |
-| 8656 | Channel-number range | **Verified** | `is_valid_channel` accepts `0x4000..=0x7FFE` (`CHANNEL_MIN`/`CHANNEL_MAX`, `proto-turn/lib.rs`) — the RFC 8656 usable range. |
+| 8656 | Channel-number range | **Verified — wider than RFC 8656** | `is_valid_channel` accepts `0x4000..=0x7FFE` (`CHANNEL_MIN`/`CHANNEL_MAX`, `proto-turn/lib.rs`). That is RFC 5766's range (less 0x7FFF). RFC 8656 §12 narrows the usable range to 0x4000–0x4FFF and reserves 0x5000–0xFFFF for DTLS-SRTP demultiplexing (RFC 7983); turna still accepts 0x5000–0x7FFE. Current coturn refuses them unless `rfc5766-channel-numbers` is set. (This row used to call 0x4000–0x7FFE "the RFC 8656 usable range", which it is not.) |
 | 5766/8656 | ALTERNATE-SERVER | **Verified** | `build_redirect_response` emits a 300 "Try Alternate" carrying `Attribute::AlternateServer(addr)` (`proto-turn/lib.rs`). |
 
 ---
@@ -74,10 +74,14 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   *unless* `[turn.tcp_relay]` is enabled, in which case `REQUESTED-TRANSPORT = TCP`
   (RFC 6062) is accepted. Two conditions apply to that path: the request must
   arrive over the TCP/TLS control connection (RFC 6062 §4.1) or it is rejected
-  with **400**, and `production = true` refuses to start with
-  `[turn.tcp_relay].enabled = true` at all. So on a production profile the
-  constraint still reads "UDP relay only" — but it is now a config gate, not an
-  absence of implementation. TLS/DTLS *relay-leg* transports remain unoffered.
+  with **400**, and `[tls]` must be enabled (`config::validate()` refuses
+  `[turn.tcp_relay]` without it under `production = true`, and warns otherwise,
+  because there is no plain-TCP listener to carry the control connection). The
+  earlier `production = true` refusal of `[turn.tcp_relay].enabled` was lifted on
+  2026-08-25, after interop with coturn's client
+  (`docs/interop/coturn-2026-08-23.md`); `scripts/check-doc-claims.sh` fails if it
+  comes back. TCP relay is IPv4-only (a v6 TCP allocation answers 440). TLS/DTLS
+  *relay-leg* transports remain unoffered.
   This concerns the turna↔peer leg only. The *client↔turna* leg supports TURNS
   (TURN-over-TLS-over-TCP) via the `tls` feature — verified end-to-end with
   Chrome, Firefox and Safari (see `docs/interop/`).
@@ -138,20 +142,29 @@ coturn and all three major browser engines — Chrome 150, Firefox 152, Safari
 end-to-end relay data, TLS transport, RAF) (`docs/interop/`); a 12-hour relay
 soak with no memory/fd leak (`docs/soak/`).
 
-**Not supported as stable (experimental / out of scope / unverified):** RFC 6062
-TCP relay,
+**Not supported as stable at the v0.4.0 cut (experimental / out of scope /
+unverified):** RFC 6062 TCP relay,
 RFC 7635 OAuth (implemented but refused under
 `production = true`); QUIC / WebTransport ingress (feature-gated); AF_XDP and
-io_uring datapaths (feature-gated, not runtime-verified); TURN-over-DTLS
-(transport verified — DTLS 1.2 handshake + operator cert, `openssl s_client
--dtls`, verify code 0 — but the full allocate-over-DTLS cycle is not exercised
-by a live TURN client; no common DTLS-TURN client exists and browsers use
-TURNS/TCP. The STUN/TURN layer is transport-independent and is verified over
-UDP/TURNS. DTLS requires a PKCS#8 ECDSA-P-256 key and fails closed if a
-configured cert cannot load; see `docs/dtls/`); an exhaustive
+io_uring datapaths (feature-gated); TURN-over-DTLS (DTLS requires a PKCS#8
+ECDSA-P-256 key and fails closed if a configured cert cannot load; see
+`docs/dtls/`); an exhaustive
 browser matrix (three engines verified on macOS; mobile browsers, other OSes
 and older versions not yet); large-scale (10k–50k allocations) and real-network
 (non-loopback) load; SASLprep / non-ASCII credentials (absent by design, §3).
+
+**Moved since that cut** — the list above is the v0.4.0 scope statement, not the
+current one; [feature-support.md](feature-support.md) is. In particular:
+RFC 6062 TCP relay is beta and no longer refused under `production = true`
+(2026-08-25); a full allocate-and-relay cycle over DTLS *has* been exercised by
+an independent TURN client — coturn's `turnutils_uclient`, 40/40 relayed
+(`docs/interop/coturn-2026-08-23.md`) — and DTLS is supported within the scope
+recorded there and in `docs/interop/dtls-stack-2026-09-16.md`; io_uring is
+supported on Linux ([scope](verification/io-uring-supported-2026-09-19.md)) and
+AF_XDP within its verified Linux IPv4 UDP copy-mode scope
+([scope](verification/af-xdp-supported-2026-09-22.md)); QUIC/WebTransport and
+SCTP are supported within their recorded scopes. OAuth remains refused under
+`production = true`.
 
 ## 5. Not covered here / owed verification
 
@@ -165,8 +178,12 @@ before it can be stated as fact — deliberately **not** asserted above:
   **Decided, then implemented as opt-in.** The earlier decision was "out of scope,
   440 always". It is now `[turn] external_ip6`: empty keeps the 440 behaviour, set
   enables per-family relay sockets with RFC 6156 §4.2 enforcement (443 on a
-  cross-family peer). What remains open is *evidence*, not implementation — no
-  test or interop run covers a v6 allocation. Recorded in `README.md`,
+  cross-family peer). Evidence has since been recorded: control-plane conformance
+  in both configurations (`docs/interop/conformance-2026-08-18.md`), relayed media
+  over v6 including between two routable global addresses
+  (`docs/interop/relayed-media-2026-08-19.md`), and agreement with coturn's client
+  (`docs/interop/coturn-2026-08-23.md`). What remains open is routing between
+  different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. Recorded in `README.md`,
   `docs/CONFIGURATION.md`, `docs/feature-support.md` and
   `docs/PRODUCTION_READINESS.md` (R10); gaps in `docs/protocol-gap.md` → IPv6.
 - **Datagram/size constants** — partially closed. The `read_to_end(1 MiB)` on
@@ -193,7 +210,12 @@ before it can be stated as fact — deliberately **not** asserted above:
 - Every metric in an alert `expr:` is actually exported by `turna-health`.
 - Each `production = true` refusal named in the docs still exists in
   `config::validate()`, matched on the operator-visible diagnostic rather than the
-  field path (the field path alone still matches after the gate is deleted).
+  field path (the field path alone still matches after the gate is deleted) — and,
+  in reverse, that the lifted gates (`turn.tcp_relay.enabled`,
+  `turn.sctp.enabled`) have not come back.
+- No document still presents the lifted RFC 6062 production gate as current once
+  `validate()` has dropped it, and none calls OAuth unimplemented while
+  `AuthMode::OAuth` exists.
 - Every bypass-relevant v6 prefix the peer filter denies (NAT64, 6to4, Teredo,
   IPv4-compatible) is mentioned somewhere in the docs. An incomplete deny list
   reads as permission, and this is the one check whose subject is a security
