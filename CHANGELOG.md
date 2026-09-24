@@ -82,6 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Helm: `metrics.serviceMonitor` now renders a Prometheus Operator
+  `ServiceMonitor` (it was declared in `values.yaml` and set by the production
+  example, but no template used it). It is created only when the cluster serves
+  `monitoring.coreos.com/v1`, selects the internal service via the new
+  `app.kubernetes.io/component: internal` label and scrapes `/metrics` on the
+  health port. The chart also gains `NOTES.txt`: service names, a readiness
+  check, the chart's UDP-only scope, and a warning when a ServiceMonitor was
+  requested but the operator API is absent.
+
 - **Stateless address validation on the DTLS demux path (RFC 6347 §4.2.1).** A
   ClientHello without a cookie this node issued is now answered with a
   HelloVerifyRequest and **nothing is allocated** — the cookie is
