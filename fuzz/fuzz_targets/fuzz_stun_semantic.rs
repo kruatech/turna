@@ -1,16 +1,16 @@
 //! Semantic/structured STUN mutation fuzzer
 //!
-//! В отличие от `fuzz_stun` (случайные байты), этот таргет генерирует
-//! **валидные STUN-фреймы** и применяет **семантические мутации**:
+//! Unlike `fuzz_stun` (random bytes), this target generates
+//! **valid STUN frames** and applies **semantic mutations**:
 //!
-//! - дублирующиеся атрибуты
-//! - неверный MESSAGE-INTEGRITY (1 бит флип)
-//! - неверный FINGERPRINT
-//! - неверный порядок атрибутов (INTEGRITY до USERNAME)
-//! - oversized значения ровно на границе MAX_ATTRIBUTE_VALUE_LEN
-//! - невалидные transaction ID паттерны
+//! - duplicate attributes
+//! - wrong MESSAGE-INTEGRITY (1-bit flip)
+//! - wrong FINGERPRINT
+//! - wrong attribute order (INTEGRITY before USERNAME)
+//! - oversized values exactly at the MAX_ATTRIBUTE_VALUE_LEN boundary
+//! - invalid transaction ID patterns
 //!
-//! Контракт: ни один вход не вызывает panic, hang, OOM.
+//! Contract: no input causes a panic, hang or OOM.
 
 #![no_main]
 
@@ -26,31 +26,31 @@ const FUZZ_KEY: &[u8] = b"fuzz_integrity_key_32bytes_pad__";
 
 #[derive(Debug, Arbitrary)]
 enum StunMutation {
-    /// Корректный Binding Request — baseline.
+    /// Valid Binding Request — baseline.
     ValidBinding,
-    /// Дублирующийся USERNAME.
+    /// Duplicate USERNAME.
     DuplicateAttr,
-    /// MESSAGE-INTEGRITY с битом-флипом в HMAC.
+    /// MESSAGE-INTEGRITY with a bit flip in the HMAC.
     CorruptedIntegrity { flip_byte: u8, flip_bit: u8 },
-    /// FINGERPRINT с неверным CRC32.
+    /// FINGERPRINT with a wrong CRC32.
     WrongFingerprint(u32),
-    /// INTEGRITY стоит раньше USERNAME (нарушение RFC 5389 §15.4).
+    /// INTEGRITY placed before USERNAME (violates RFC 5389 §15.4).
     IntegrityBeforeUsername,
-    /// Атрибут длиной ровно MAX_ATTRIBUTE_VALUE_LEN (граничное значение).
+    /// Attribute exactly MAX_ATTRIBUTE_VALUE_LEN long (boundary value).
     AttrAtMaxLen,
-    /// Атрибут длиной MAX_ATTRIBUTE_VALUE_LEN + 1 (должен быть отклонён).
+    /// Attribute MAX_ATTRIBUTE_VALUE_LEN + 1 long (must be rejected).
     AttrOverMaxLen,
-    /// Transaction ID = все нули.
+    /// Transaction ID = all zeros.
     ZeroTransactionId,
-    /// Transaction ID = все 0xFF.
+    /// Transaction ID = all 0xFF.
     MaxTransactionId,
-    /// LIFETIME с максимальным u32.
+    /// LIFETIME with the maximum u32.
     MaxLifetime,
-    /// Невалидный family в XOR-MAPPED-ADDRESS (не 0x01 и не 0x02).
+    /// Invalid family in XOR-MAPPED-ADDRESS (neither 0x01 nor 0x02).
     UnknownAddressFamily(u8),
-    /// Несколько XOR-PEER-ADDRESS подряд.
+    /// Several XOR-PEER-ADDRESS attributes in a row.
     RepeatedPeerAddress(u8),
-    /// Пустой DATA атрибут.
+    /// Empty DATA attribute.
     EmptyData,
 }
 
@@ -67,7 +67,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
         StunMutation::DuplicateAttr => {
             let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
             msg.add(Attribute::Username("user".into()));
-            msg.add(Attribute::Username("user".into())); // дубль
+            msg.add(Attribute::Username("user".into())); // duplicate
             msg.add(Attribute::Realm("realm".into()));
             msg.add(Attribute::Nonce("nonce".into()));
             let mut buf = [0u8; 512];
@@ -81,7 +81,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             let mut buf = [0u8; 512];
             let n = msg.encode_with_integrity(&mut buf, FUZZ_KEY).unwrap();
             let mut raw = buf[..n].to_vec();
-            // Флипаем бит в последних 20 байтах (HMAC-SHA1)
+            // Flip a bit in the last 20 bytes (HMAC-SHA1)
             if n >= 20 {
                 let idx = n - 20 + (*flip_byte as usize % 20);
                 raw[idx] ^= 1 << (*flip_bit % 8);
@@ -91,16 +91,16 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
 
         StunMutation::WrongFingerprint(fp) => {
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
-            msg.add(Attribute::Fingerprint(*fp)); // произвольный CRC
+            msg.add(Attribute::Fingerprint(*fp)); // arbitrary CRC
             let mut buf = [0u8; 512];
             let n = msg.encode(&mut buf).unwrap();
             buf[..n].to_vec()
         }
 
         StunMutation::IntegrityBeforeUsername => {
-            // Собираем сырой буфер вручную: INTEGRITY заголовок перед USERNAME
+            // Build the raw buffer by hand: INTEGRITY header before USERNAME
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
-            // Добавляем в «неправильном» порядке
+            // Add in the "wrong" order
             msg.add(Attribute::MessageIntegrity([0u8; 20]));
             msg.add(Attribute::Username("user".into()));
             let mut buf = [0u8; 512];
@@ -109,7 +109,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
         }
 
         StunMutation::AttrAtMaxLen => {
-            // SOFTWARE длиной ровно 1500 байт — должен приниматься
+            // SOFTWARE exactly 1500 bytes long — must be accepted
             let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
             msg.add(Attribute::Software("X".repeat(1500)));
             let mut buf = vec![0u8; 4096];
@@ -118,8 +118,8 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
         }
 
         StunMutation::AttrOverMaxLen => {
-            // Вручную кодируем атрибут с длиной 1501 (нарушение лимита).
-            // Парсер должен вернуть Err, не паниковать.
+            // Hand-encode an attribute with length 1501 (exceeds the limit).
+            // The parser must return Err, not panic.
             let mut hdr = [0u8; 20];
             // Binding Request header
             hdr[0] = 0x00; hdr[1] = 0x01; // type
@@ -164,7 +164,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
         }
 
         StunMutation::UnknownAddressFamily(family) => {
-            // Вручную строим XOR-MAPPED-ADDRESS с неверным family
+            // Hand-build an XOR-MAPPED-ADDRESS with an invalid family
             let mut hdr = [0u8; 20];
             hdr[0] = 0x01; hdr[1] = 0x01; // Binding Success
             hdr[2] = 0x00; hdr[3] = 0x0C; // length = 12
@@ -172,7 +172,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
             let mut raw = hdr.to_vec();
             raw.extend_from_slice(&[0x00, 0x20]); // XOR-MAPPED-ADDRESS
             raw.extend_from_slice(&8u16.to_be_bytes()); // len = 8
-            raw.push(0x00); raw.push(*family); // неверный family
+            raw.push(0x00); raw.push(*family); // invalid family
             raw.extend_from_slice(&[0x00u8; 6]); // port + addr
             raw
         }
@@ -206,7 +206,7 @@ fn build_mutated(mutation: &StunMutation) -> Vec<u8> {
 fuzz_target!(|mutation: StunMutation| {
     let raw = build_mutated(&mutation);
 
-    // Ни один путь не должен паниковать
+    // No path may panic
     let _ = StunMessage::decode(&raw);
     let _ = turna_proto_stun::message::is_stun_message(&raw);
     let _ = turna_proto_stun::message::is_channel_data(&raw);

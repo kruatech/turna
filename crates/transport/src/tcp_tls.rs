@@ -1,16 +1,16 @@
-//! TLS/TCP Transport (TURNS — RFC 5766/8656 over TLS, порт 5349/443)
+//! TLS/TCP Transport (TURNS — RFC 5766/8656 over TLS, port 5349/443)
 //!
-//! - TLS acceptor на rustls с ALPN "stun.turn"
-//! - STUN/TURN-over-TCP framing: сообщения самоописываются.
-//!   * STUN — длина в заголовке (байты 2..4) + 20-байтовый заголовок
-//!     (RFC 5389/8489 §7.2.2 / §6.2.2; тело уже кратно 4).
-//!   * ChannelData — длина (байты 2..4) + 4-байтовый заголовок, с паддингом
-//!     до кратности 4 поверх TCP/TLS (RFC 5766/8656 §11.5).
-//!     НЕ RFC 4571 (тот — про RTP-over-TCP): стандартные TURN-клиенты
-//!     (браузерный WebRTC, coturn) не добавляют 2-байтовый префикс длины.
-//! - Certificate hot-reload по mtime
+//! - TLS acceptor on rustls with ALPN "stun.turn"
+//! - STUN/TURN-over-TCP framing: messages are self-describing.
+//!   * STUN — length in the header (bytes 2..4) + 20-byte header
+//!     (RFC 5389/8489 §7.2.2 / §6.2.2; the body is already a multiple of 4).
+//!   * ChannelData — length (bytes 2..4) + 4-byte header, padded
+//!     to a multiple of 4 over TCP/TLS (RFC 5766/8656 §11.5).
+//!     NOT RFC 4571 (that one is RTP-over-TCP): standard TURN clients
+//!     (browser WebRTC, coturn) do not add a 2-byte length prefix.
+//! - Certificate hot-reload by mtime
 //! - Connection limit, idle timeout
-//! - События совместимы с UDP-транспортом (PacketProcessor не знает о типе)
+//! - Events are compatible with the UDP transport (PacketProcessor is transport-agnostic)
 
 use std::collections::HashMap;
 use std::io;

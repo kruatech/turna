@@ -8,75 +8,75 @@
 > [the verification record](verification/af-xdp-hardening-2026-09-19.md).
 
 
-**Дата:** 2026-05-16
-**Скоуп:** все `unsafe` блоки в `crates/{transport,relay}/src/`.
-**Примечание:** документ сокращён до крейтов, входящих в этот репозиторий; записи исходного прохода по не вошедшим крейтам удалены, нумерация пунктов сохранена (поэтому в ней есть пропуски), агрегированные счётчики ниже могут отражать исходный объём.
-**Тип аудита:** first-pass — категоризация и фиксация инвариантов, не формальная верификация. Подробнее см. раздел «Методология».
+**Date:** 2026-05-16
+**Scope:** all `unsafe` blocks in `crates/{transport,relay}/src/`.
+**Note:** the document has been trimmed to the crates included in this repository; entries from the original pass for crates not included have been removed, item numbering has been preserved (hence the gaps in it), and the aggregate counts below may reflect the original scope.
+**Audit type:** first-pass — categorization and recording of invariants, not formal verification. See the "Methodology" section for details.
 
 ---
 
-## Сводка
+## Summary
 
-| Категория | Кол-во блоков | Что это значит |
+| Category | Block count | What it means |
 |---|---|---|
-| ✓ **SAFETY** (обоснован) | ~76 | Инварианты ясны из контекста; задокументированы прямо в коде через `// SAFETY: ...`. |
-| ⚠ **NEEDS-REVIEW** | 14 | Корректность зависит от инвариантов, которые из исходника не видны. Нужен экспертный взгляд или дополнительные тесты. |
-| ✓ **SUSPECT (исправлены)** | 9 | Виден был конкретный риск UB / data race. **Все 9 исправлены** до P0 (`summary.suspect_fixed = 9` в `unsafe-inventory.json`); этот раздел — историческая запись находок, а не открытый список. |
+| ✓ **SAFETY** (justified) | ~76 | Invariants are clear from context; documented directly in the code via `// SAFETY: ...`. |
+| ⚠ **NEEDS-REVIEW** | 14 | Correctness depends on invariants that are not visible from the source. Needs expert review or additional tests. |
+| ✓ **SUSPECT (fixed)** | 9 | A concrete UB / data race risk was visible. **All 9 were fixed** before P0 (`summary.suspect_fixed = 9` in `unsafe-inventory.json`); this section is a historical record of findings, not an open list. |
 
-> Статус на момент P0: 9 SUSPECT закрыты (см. ниже), USF-008 (overflow в `Umem::new`) исправлен, инвариант `Sync` у `Umem` задокументирован. Открытыми остаются NEEDS-REVIEW, не дающие прямого UB.
+> Status as of P0: 9 SUSPECT closed (see below), USF-008 (overflow in `Umem::new`) fixed, the `Sync` invariant of `Umem` documented. What remains open are NEEDS-REVIEW items that do not cause direct UB.
 
-**Топ-3 находки (все ИСПРАВЛЕНЫ — историческая запись):**
+**Top 3 findings (all FIXED — historical record):**
 
-1. ✓ **ABA race в `HugePagePool` Treiber stack** (`hugepages.rs`) — *исправлено (USF-001)*: Treiber CAS-стек заменён на `Mutex<Vec<usize>>`, `Drop` ассертит отсутствие активных буферов перед `munmap`.
-2. ✓ **`Umem::frame_slice/frame_slice_mut` без bounds-чека** (`af_xdp.rs`) — *исправлено (USF-002/#2)*: `checked_add` + `assert` на границы перед доступом.
-3. ✓ **Self-referential `MsgHdrStorage` без гарантии стабильности места** (`uring.rs`) — *исправлено (USF-003/#3)*: `Vec<MsgHdrStorage>` → `Box<[MsgHdrStorage]>`, адреса стабильны на всё время жизни `UringEngine`.
+1. ✓ **ABA race in the `HugePagePool` Treiber stack** (`hugepages.rs`) — *fixed (USF-001)*: the Treiber CAS stack was replaced with `Mutex<Vec<usize>>`; `Drop` asserts there are no active buffers before `munmap`.
+2. ✓ **`Umem::frame_slice/frame_slice_mut` without a bounds check** (`af_xdp.rs`) — *fixed (USF-002/#2)*: `checked_add` + `assert` on the bounds before access.
+3. ✓ **Self-referential `MsgHdrStorage` without a guarantee of address stability** (`uring.rs`) — *fixed (USF-003/#3)*: `Vec<MsgHdrStorage>` → `Box<[MsgHdrStorage]>`; addresses are stable for the whole lifetime of `UringEngine`.
 
-Полный список SUSPECT и их статус — в `unsafe-inventory.json` (`suspect_fixed = 9`).
+The full list of SUSPECT items and their status is in `unsafe-inventory.json` (`suspect_fixed = 9`).
 
-> **Текущее состояние (регенерация `scripts/unsafe-inventory.sh`, 2026-06-15).**
-> Воспроизводимый счёт `unsafe`-строк в скоупе `crates/{transport,relay}/src/` — **104**
-> (transport 85, relay 19). Маркеры в коде: `// SAFETY:` 97, `// NEEDS-REVIEW:` 2,
-> `// SUSPECT:` 0. Все 104 задокументированы; `crates/transport/src/tokio_transport.rs` (6
-> блоков) проаудирован и внесён (USF-010/011, SAFETY_JUSTIFIED) — вне audited
-> set ничего нет. Счётчики 76/14/9 ниже относятся
-> к исходному проходу 2026-05-16, а не к перекатегоризации текущих 104.
-
----
-
-## Методология
-
-Прошёл по всем 17 файлам глазами, для каждого `unsafe` блока:
-
-1. Определил, зачем он (FFI, raw pointer math, разделяемая память, lock-free, и т.д.).
-2. Выписал требуемые инварианты (что должно быть истинным, чтобы блок был корректен).
-3. Проверил, выполняются ли инварианты из контекста кода.
-4. Если **да** — добавил `// SAFETY: <обоснование>` в код.
-5. Если **частично** (зависит от внешнего инварианта) — добавил `// NEEDS-REVIEW: <что нужно проверить>`.
-6. Если виден **конкретный риск** — добавил `// SUSPECT: <конкретный сценарий>`.
-
-**Что не входит в этот раунд:**
-
-- Доказательство soundness через [Miri](https://github.com/rust-lang/miri) (несовместимо с kernel API: mmap, io_uring, syscalls).
-- Прогон под [ASan/TSan/MSan](https://github.com/google/sanitizers) — отдельная инфра, нужны интеграционные тесты с трафиком.
-- Формальные модели для lock-free структур (TLA+, Loom).
-- Рефакторинг unsound кода в safe эквиваленты.
-
-Все эти штуки — отдельные большие задачи. Этот документ — **отправная точка**, а не финальный вердикт.
+> **Current state (regeneration via `scripts/unsafe-inventory.sh`, 2026-06-15).**
+> The reproducible count of `unsafe` lines in the `crates/{transport,relay}/src/` scope is **104**
+> (transport 85, relay 19). Markers in the code: `// SAFETY:` 97, `// NEEDS-REVIEW:` 2,
+> `// SUSPECT:` 0. All 104 are documented; `crates/transport/src/tokio_transport.rs` (6
+> blocks) has been audited and added (USF-010/011, SAFETY_JUSTIFIED) — nothing is outside the audited
+> set. The 76/14/9 counts below refer
+> to the original 2026-05-16 pass, not to a recategorization of the current 104.
 
 ---
 
-## SUSPECT — конкретные риски
+## Methodology
 
-### 1. ABA race в `HugePagePool::alloc/free` (HIGH)
+I went through all 17 files by eye; for each `unsafe` block I:
 
-**Файл:** `crates/transport/src/hugepages.rs:122-172`
+1. Determined why it exists (FFI, raw pointer math, shared memory, lock-free, etc.).
+2. Wrote down the required invariants (what must be true for the block to be correct).
+3. Checked whether the invariants hold from the code context.
+4. If **yes** — added `// SAFETY: <justification>` in the code.
+5. If **partially** (depends on an external invariant) — added `// NEEDS-REVIEW: <what needs checking>`.
+6. If a **concrete risk** is visible — added `// SUSPECT: <concrete scenario>`.
+
+**Out of scope for this round:**
+
+- Proving soundness with [Miri](https://github.com/rust-lang/miri) (incompatible with kernel APIs: mmap, io_uring, syscalls).
+- Running under [ASan/TSan/MSan](https://github.com/google/sanitizers) — separate infrastructure; requires integration tests with traffic.
+- Formal models for lock-free structures (TLA+, Loom).
+- Refactoring unsound code into safe equivalents.
+
+Each of these is a separate large task. This document is a **starting point**, not a final verdict.
+
+---
+
+## SUSPECT — concrete risks
+
+### 1. ABA race in `HugePagePool::alloc/free` (HIGH)
+
+**File:** `crates/transport/src/hugepages.rs:122-172`
 
 ```rust
 pub fn alloc(&self) -> Option<PoolBuffer> {
     loop {
         let head = self.free_head.load(Ordering::Acquire);
         if head.is_null() { ... }
-        let next = unsafe { (*head).next };   // ← (1) разыменование, потом
+        let next = unsafe { (*head).next };   // ← (1) dereference, then
         if self.free_head
             .compare_exchange_weak(head, next, ..)    // ← (2) CAS
             .is_ok()
@@ -89,24 +89,24 @@ pub fn alloc(&self) -> Option<PoolBuffer> {
 }
 ```
 
-**Проблема:** между (1) загрузкой `head` и (2) CAS другой поток может:
-1. Сделать `alloc()` того же узла → `head` уже не на стеке.
-2. Сделать `free()` другого узла → `Box::new(FreeNode)` может **переиспользовать тот же адрес**.
-3. Теперь `head` указывает на «новый» узел с другим `.next`.
-4. CAS видит «тот же» указатель и проходит. Но логически это другой узел.
-5. Считываем `(*head).next` повторно → получаем мусор.
+**Problem:** between (1) loading `head` and (2) the CAS, another thread can:
+1. `alloc()` the same node → `head` is no longer on the stack.
+2. `free()` a different node → `Box::new(FreeNode)` may **reuse the same address**.
+3. Now `head` points to a "new" node with a different `.next`.
+4. The CAS sees the "same" pointer and succeeds. But logically it is a different node.
+5. We read `(*head).next` again → we get garbage.
 
-**Сценарий UB:** между шагом 1 и шагом 2 поток вытесняется, другой поток успевает сделать pop+push с тем же адресом. CAS проходит, но `(*head).slot_index` теперь читается из узла, который другой поток ещё держит в работе → race на чтение.
+**UB scenario:** between step 1 and step 2 the thread is preempted, and another thread manages to do a pop+push with the same address. The CAS succeeds, but `(*head).slot_index` is now read from a node that the other thread is still using → read race.
 
-**Стандартный фикс:** epoch-based reclamation (`crossbeam_epoch`) или hazard pointers, либо отказ от Treiber stack в пользу `crossbeam_queue::SegQueue`. Самый прагматичный — заменить лок-фри логику на `Mutex<Vec<usize>>` (буферный пул не на hot path после прогрева).
+**Standard fix:** epoch-based reclamation (`crossbeam_epoch`) or hazard pointers, or dropping the Treiber stack in favor of `crossbeam_queue::SegQueue`. The most pragmatic option is to replace the lock-free logic with `Mutex<Vec<usize>>` (the buffer pool is not on the hot path after warm-up).
 
-**Impact:** под высокой concurrent-нагрузкой (несколько worker-потоков активно alloc/free) — реальный data race. Не воспроизводится в простых тестах из-за вероятностной природы, но в production проявится как редкие краши.
+**Impact:** under high concurrent load (several worker threads actively doing alloc/free) — a real data race. It does not reproduce in simple tests because of its probabilistic nature, but in production it will show up as rare crashes.
 
 ---
 
-### 2. `Umem::frame_slice` без bounds-чека (HIGH)
+### 2. `Umem::frame_slice` without a bounds check (HIGH)
 
-**Файл:** `crates/transport/src/af_xdp.rs:166-174`
+**File:** `crates/transport/src/af_xdp.rs:166-174`
 
 ```rust
 pub fn frame_slice(&self, addr: u64, len: usize) -> &[u8] {
@@ -118,51 +118,51 @@ pub fn frame_slice_mut(&mut self, addr: u64, len: usize) -> &mut [u8] {
 }
 ```
 
-**Проблема:** функции принимают произвольные `addr` и `len` без проверки, что `addr + len <= self.size`. Вызываются с данными из RX-ring kernel'а. Если kernel выдаст некорректный `addr` (баг в драйвере, испорченный ring), или если кто-то в userspace ошибётся при пересчёте offset'ов — UB через OOB-чтение mmap'd региона.
+**Problem:** the functions take arbitrary `addr` and `len` without checking that `addr + len <= self.size`. They are called with data from the kernel's RX ring. If the kernel hands out an invalid `addr` (a driver bug, a corrupted ring), or if something in userspace gets an offset calculation wrong — UB via an OOB read of the mmap'd region.
 
-**Фикс:** добавить `assert!(addr.checked_add(len as u64).map(|end| end <= self.size as u64).unwrap_or(false))` в начало обеих функций. На hot path это один cmp/jne, измеримо ноль на современном CPU.
+**Fix:** add `assert!(addr.checked_add(len as u64).map(|end| end <= self.size as u64).unwrap_or(false))` at the start of both functions. On the hot path this is a single cmp/jne, measurably zero on a modern CPU.
 
 ---
 
 ### 3. Self-referential `MsgHdrStorage` (HIGH)
 
-**Файл:** `crates/transport/src/uring.rs:45-106`
+**File:** `crates/transport/src/uring.rs:45-106`
 
 ```rust
 pub struct MsgHdrStorage {
     pub msgvec: libc::iovec,
     pub addr: libc::sockaddr_storage,
     pub addr_len: libc::socklen_t,
-    pub msghdr: libc::msghdr,         // содержит указатели...
+    pub msghdr: libc::msghdr,         // contains pointers...
     send_buf: Vec<u8>,
 }
 
 pub fn setup_recv(&mut self, buf_ptr: *mut u8, buf_len: usize) {
     ...
-    self.msghdr.msg_name = &mut self.addr as *mut _ as *mut _;   // ← в self
-    self.msghdr.msg_iov  = &mut self.msgvec;                       // ← в self
+    self.msghdr.msg_name = &mut self.addr as *mut _ as *mut _;   // ← into self
+    self.msghdr.msg_iov  = &mut self.msgvec;                       // ← into self
     ...
 }
 ```
 
-**Проблема:** `msghdr` содержит указатели на `addr` и `msgvec`, лежащие в **том же** `MsgHdrStorage`. Структура **не Pin'нута**. Если её переместить — указатели задангилят.
+**Problem:** `msghdr` contains pointers to `addr` and `msgvec`, which live in the **same** `MsgHdrStorage`. The struct is **not pinned**. If it is moved, the pointers will dangle.
 
-**Текущая «спасительная» инвариантa:** `MsgHdrStorage` лежит в `Vec<MsgHdrStorage>` внутри `UringEngine`, и этот `Vec` создаётся с `with_capacity(N)` и заполняется ровно `N` элементами в `UringEngine::new`. Дальше — никаких `push`. Поэтому Vec не реаллоцируется → элементы не двигаются → указатели валидны.
+**The current "saving" invariant:** `MsgHdrStorage` lives in a `Vec<MsgHdrStorage>` inside `UringEngine`, and that `Vec` is created with `with_capacity(N)` and filled with exactly `N` elements in `UringEngine::new`. After that, no `push`. So the Vec does not reallocate → elements do not move → pointers stay valid.
 
-**Почему это suspect, а не safety:** инвариант **невидим** из исходника. Любая будущая правка, которая добавит `push` или `extend` в эти Vec'и (например, динамическое добавление relay-сокетов с расширением пула msghdr'ов), молча сломает корректность без warning'а от компилятора.
+**Why this is suspect rather than safety:** the invariant is **invisible** from the source. Any future change that adds a `push` or `extend` to these Vecs (for example, dynamically adding relay sockets by growing the msghdr pool) will silently break correctness without any compiler warning.
 
-**Связанная проблема:** `relay_pool_size = 512`, каждый relay тратит `2 * 32 = 64` слота → максимум **8 одновременных relay-сокетов**. На 9-м — паника при индексации в `submit_relay_recv`. Не UB, но silent limit без проверки в `add_relay`.
+**Related problem:** `relay_pool_size = 512`, and each relay uses `2 * 32 = 64` slots → at most **8 concurrent relay sockets**. On the 9th — a panic on indexing in `submit_relay_recv`. Not UB, but a silent limit with no check in `add_relay`.
 
-**Фикс:**
-- Либо обернуть в `Box<MsgHdrStorage>` (один Box-allocation, адрес стабилен).
-- Либо использовать `Pin<Box<...>>` явно.
-- В `add_relay` добавить проверку capacity перед инкрементом `relay_msghdr_next`.
+**Fix:**
+- Either wrap it in `Box<MsgHdrStorage>` (one Box allocation, stable address).
+- Or use `Pin<Box<...>>` explicitly.
+- In `add_relay`, add a capacity check before incrementing `relay_msghdr_next`.
 
 ---
 
-### 4. `PoolBuffer::as_mut_slice` отдаёт неинициализированные байты (MEDIUM)
+### 4. `PoolBuffer::as_mut_slice` hands out uninitialized bytes (MEDIUM)
 
-**Файл:** `crates/transport/src/hugepages.rs:225-227`
+**File:** `crates/transport/src/hugepages.rs:225-227`
 
 ```rust
 pub fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -170,17 +170,17 @@ pub fn as_mut_slice(&mut self) -> &mut [u8] {
 }
 ```
 
-**Проблема:** возвращает slice на `capacity` байт, но память из mmap **не зануляется** (хотя `MAP_ANONYMOUS` обычно даёт нули, это поведение Linux, не Rust-инвариант). Если вызывающий читает байты до записи — UB по [«reading uninitialized memory»](https://rust-lang.github.io/unsafe-code-guidelines/glossary.html#uninitialized-memory).
+**Problem:** it returns a slice of `capacity` bytes, but the mmap memory is **not zeroed** (although `MAP_ANONYMOUS` usually yields zeros, that is Linux behavior, not a Rust invariant). If the caller reads bytes before writing them — UB per ["reading uninitialized memory"](https://rust-lang.github.io/unsafe-code-guidelines/glossary.html#uninitialized-memory).
 
-`as_slice` (read-only) использует `self.len` — это OK, если `len` был корректно установлен через `set_len` после записи.
+`as_slice` (read-only) uses `self.len` — this is OK as long as `len` was set correctly via `set_len` after writing.
 
-**Фикс:** возвращать `&mut [MaybeUninit<u8>]` вместо `&mut [u8]` для нерасчитанного хвоста, либо чётко контрактом запретить читать из as_mut_slice до записи (но это слабая гарантия).
+**Fix:** return `&mut [MaybeUninit<u8>]` instead of `&mut [u8]` for the unaccounted tail, or explicitly forbid by contract reading from as_mut_slice before writing (but that is a weak guarantee).
 
 ---
 
-### 5. Stacked borrows fragility в `batch.rs::sendmmsg_batch` (MEDIUM)
+### 5. Stacked borrows fragility in `batch.rs::sendmmsg_batch` (MEDIUM)
 
-**Файл:** `crates/transport/src/batch.rs:75-113`
+**File:** `crates/transport/src/batch.rs:75-113`
 
 ```rust
 for pkt in packets.iter().take(count) {
@@ -198,19 +198,19 @@ for i in 0..count {
 let sent = unsafe { libc::syscall(SYS_sendmmsg, fd, msgs.as_mut_ptr(), ...) };
 ```
 
-**Проблема:** все три Vec'а заранее `with_capacity(count)` — реаллокаций нет, адреса элементов стабильны до конца функции. Это OK.
+**Problem:** all three Vecs are preallocated with `with_capacity(count)` — no reallocations, element addresses are stable until the end of the function. This is OK.
 
-Но: создание `&mut iovecs[i]` в цикле и каст в raw pointer перекрывается во времени с последующими `&mut iovecs[j]`. По stacked borrows это технически создаёт overlapping mutable borrows через raw pointers. Текущая компиляторная политика их не ловит, и фактически memory layout от этого не страдает, но **в строгом смысле UB**.
+But: creating `&mut iovecs[i]` in the loop and casting it to a raw pointer overlaps in time with the subsequent `&mut iovecs[j]`. Under stacked borrows this technically creates overlapping mutable borrows through raw pointers. Current compiler policy does not catch them, and in practice the memory layout is not affected, but it is **UB in the strict sense**.
 
-**Impact:** низкий — текущий код работает. Но если миграция на Tree Borrows / новые SB-правила сломается, начнётся UB-warning от Miri и потенциальные крэши под новыми оптимизациями.
+**Impact:** low — the current code works. But if the migration to Tree Borrows / new SB rules breaks it, Miri will start reporting UB and there may be crashes under new optimizations.
 
-**Фикс:** взять указатели в одном проходе через `as_mut_ptr()` + offset arithmetic.
+**Fix:** take the pointers in a single pass via `as_mut_ptr()` + offset arithmetic.
 
 ---
 
-### 6. `cmsghdr` parsing без alignment-чека (MEDIUM)
+### 6. `cmsghdr` parsing without an alignment check (MEDIUM)
 
-**Файл:** `crates/transport/src/gso.rs:155-178`
+**File:** `crates/transport/src/gso.rs:155-178`
 
 ```rust
 let hdr = unsafe {
@@ -218,17 +218,17 @@ let hdr = unsafe {
 };
 ```
 
-**Проблема:** `cmsghdr` имеет нативное выравнивание (8 байт на 64-bit Linux). `cmsg_buf` — это `&[u8]` без гарантий выравнивания. Если ptr не выровнен — UB при разыменовании.
+**Problem:** `cmsghdr` has native alignment (8 bytes on 64-bit Linux). `cmsg_buf` is a `&[u8]` with no alignment guarantees. If the ptr is not aligned — UB on dereference.
 
-На практике буферы под cmsg обычно идут от kernel'а с правильным выравниванием, и `cmsg_buf` приходит от `recvmsg`. Но user-controlled offset (`offset += aligned`) теоретически мог бы привести к смещённому указателю.
+In practice cmsg buffers usually come from the kernel with correct alignment, and `cmsg_buf` comes from `recvmsg`. But a user-controlled offset (`offset += aligned`) could theoretically produce a misaligned pointer.
 
-**Фикс:** использовать `std::ptr::read_unaligned` либо проверять `align_of_val`.
+**Fix:** use `std::ptr::read_unaligned` or check `align_of_val`.
 
 ---
 
-### 7. Drop of `HugePagePool` без синхронизации (MEDIUM)
+### 7. Drop of `HugePagePool` without synchronization (MEDIUM)
 
-**Файл:** `crates/transport/src/hugepages.rs:190-202`
+**File:** `crates/transport/src/hugepages.rs:190-202`
 
 ```rust
 impl Drop for HugePagePool {
@@ -244,18 +244,18 @@ impl Drop for HugePagePool {
 }
 ```
 
-**Проблема:** munmap'ает `base` без какой-либо проверки, что нет outstanding `PoolBuffer`'ов, которые указывают в эту память. `PoolBuffer` не ссылается на pool через `Arc`, у него просто raw pointer. Если pool дропнут, а buffer'ы живы — UAF.
+**Problem:** it munmaps `base` without any check that there are no outstanding `PoolBuffer`s pointing into that memory. `PoolBuffer` does not reference the pool through an `Arc`; it just holds a raw pointer. If the pool is dropped while buffers are alive — UAF.
 
-**Текущая защита:** никакая. Полагается на корректное использование (pool живёт дольше всех buffer'ов).
+**Current protection:** none. It relies on correct usage (the pool outlives all buffers).
 
-**Фикс:** `Arc<HugePagePool>` + хранение клона `Arc` в каждом `PoolBuffer`, либо `assert!(self.allocated == 0)` в Drop с паникой.
+**Fix:** `Arc<HugePagePool>` + storing an `Arc` clone in each `PoolBuffer`, or `assert!(self.allocated == 0)` in Drop with a panic.
 
 ---
 
 
-### 9. `recv_batch` / `send_to` в AfXdpTransport — stub-функции возвращают пустые результаты (INFO)
+### 9. `recv_batch` / `send_to` in AfXdpTransport — stub functions return empty results (INFO)
 
-**Файл:** `crates/transport/src/af_xdp.rs:401-413`
+**File:** `crates/transport/src/af_xdp.rs:401-413`
 
 ```rust
 pub fn recv_batch(&mut self, max: usize) -> Vec<ReceivedFrame> {
@@ -266,46 +266,46 @@ pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
 }
 ```
 
-**Проблема:** не UB, но **функционал не работает**. Если кто-то поверит сигнатуре и подключит AfXdpTransport — пакеты тихо потеряются. Маркер «placeholder» в комментариях есть, но это не предотвратит ошибку использования.
+**Problem:** not UB, but **the functionality does not work**. If someone trusts the signature and wires up AfXdpTransport, packets will be silently lost. There is a "placeholder" marker in the comments, but that will not prevent misuse.
 
-**Фикс:** либо `unimplemented!()`, либо чётко стуб через cfg-gate с предупреждением при сборке.
+**Fix:** either `unimplemented!()`, or an explicit stub behind a cfg gate with a build-time warning.
 
 ---
 
-## NEEDS-REVIEW — нужен экспертный взгляд
+## NEEDS-REVIEW — needs expert review
 
-| # | Файл | Что | Почему NEEDS-REVIEW |
+| # | File | What | Why NEEDS-REVIEW |
 |---|---|---|---|
-| 1 | `uring.rs:213,229,275,302` | `submission().push(&entry)` | Корректность зависит от того, живёт ли `msghdr` (на который указывает entry) до завершения операции. В коде это держится через `Vec` + slot-индекс, но нет механизма «slot busy». Если slot переиспользовать до completion — UB. |
-| 2 | `splice.rs:155-237` | `splice_relay` через `spawn_blocking` | `client_fd` / `peer_fd` передаются в blocking-task. Если в это время родительский async-таск уронит сокет — fd валиден до конца blocking, но семантика «owner» неясна. |
-| 3 | `graceful.rs:169,180` | `File::from_raw_fd(fd)` + `mem::forget(f)` | Идиома для «передать fd обратно вызывающему». Корректна, но `mem::forget` блокирует RAII — если позже забыть закрыть fd, leak. |
-| 5 | `af_xdp.rs` | `unsafe impl Send/Sync for Umem` | **RESOLVED (P0):** `Send` обоснован (структура единолично владеет mmap-областью). `Sync` теперь снабжён строгим SAFETY-инвариантом (доступ к кадру только после dequeue из RX-ring и до refill, без алиасинга — протокол владения кадрами AF_XDP). Плюс `Umem` владеется по значению одним сокетом и не шарится как `&Umem` между потоками, так что `Sync` при желании можно вообще убрать. Также исправлен USF-008 (overflow в `Umem::new`). |
-| 6 | `worker.rs:329-335` | `pin_to_core` через `sched_setaffinity` | Стандартный pattern, но `CPU_SET` — macro libc, в Rust обёртка делает write через `set_bit`. Если cpuset не достаточен (на машине больше CPU, чем размер `cpu_set_t`) — silent truncation. На современных Linux это >1024 CPU, маловероятно. |
-| 7 | `hugepages.rs:71-72` | `unsafe impl Send/Sync for HugePagePool` | Если ABA-проблема (см. SUSPECT #1) реальна, lock-free свойство неверно — Sync impl становится ложным. |
+| 1 | `uring.rs:213,229,275,302` | `submission().push(&entry)` | Correctness depends on whether the `msghdr` (pointed to by the entry) lives until the operation completes. In the code this is held via `Vec` + a slot index, but there is no "slot busy" mechanism. If a slot is reused before completion — UB. |
+| 2 | `splice.rs:155-237` | `splice_relay` via `spawn_blocking` | `client_fd` / `peer_fd` are passed into a blocking task. If the parent async task drops the socket in the meantime, the fd stays valid until the blocking task ends, but the "owner" semantics are unclear. |
+| 3 | `graceful.rs:169,180` | `File::from_raw_fd(fd)` + `mem::forget(f)` | Idiom for "hand the fd back to the caller". Correct, but `mem::forget` bypasses RAII — if the fd is later not closed, it leaks. |
+| 5 | `af_xdp.rs` | `unsafe impl Send/Sync for Umem` | **RESOLVED (P0):** `Send` is justified (the struct exclusively owns the mmap region). `Sync` now has a strict SAFETY invariant (a frame is accessed only after dequeue from the RX ring and before refill, without aliasing — the AF_XDP frame ownership protocol). In addition, `Umem` is owned by value by a single socket and is not shared as `&Umem` between threads, so `Sync` could be removed altogether if desired. USF-008 (overflow in `Umem::new`) was also fixed. |
+| 6 | `worker.rs:329-335` | `pin_to_core` via `sched_setaffinity` | Standard pattern, but `CPU_SET` is a libc macro; the Rust wrapper writes via `set_bit`. If the cpuset is not large enough (the machine has more CPUs than the size of `cpu_set_t`) — silent truncation. On modern Linux that is >1024 CPUs, unlikely. |
+| 7 | `hugepages.rs:71-72` | `unsafe impl Send/Sync for HugePagePool` | If the ABA problem (see SUSPECT #1) is real, the lock-free property does not hold — the Sync impl becomes false. |
 
 ---
 
-## SAFETY — обоснованные блоки (укрупнённо)
+## SAFETY — justified blocks (aggregated)
 
-Не перечисляю поштучно — таких ~75. Все попадают в одну из категорий:
+Not listed one by one — there are ~75 of them. All fall into one of these categories:
 
-1. **libc syscalls** (≈40): `mmap`, `munmap`, `close`, `setsockopt`, `if_nametoindex`, `sched_setaffinity`, `epoll_*`, `pipe2`, `bpf`, `set_mempolicy`, `socket`, `bind`, `poll`, `sendto`. Все — стандартный pattern: ptr + len, errno check. Аргументы либо stack-локальные структуры, либо валидные slice'ы. SAFETY: `libc syscall with valid local-struct pointer and size; errno checked`.
+1. **libc syscalls** (≈40): `mmap`, `munmap`, `close`, `setsockopt`, `if_nametoindex`, `sched_setaffinity`, `epoll_*`, `pipe2`, `bpf`, `set_mempolicy`, `socket`, `bind`, `poll`, `sendto`. All follow the standard pattern: ptr + len, errno check. The arguments are either stack-local structs or valid slices. SAFETY: `libc syscall with valid local-struct pointer and size; errno checked`.
 
-2. **`mem::zeroed::<libc::*>()`** (≈8): зануление C-структур через `MaybeUninit::zeroed().assume_init()` эквивалент. Корректно для `sockaddr_*`, `cmsghdr`, `epoll_event`, `cpu_set_t`, `iovec`, `msghdr` — все являются POD-структурами с валидным all-zero состоянием.
+2. **`mem::zeroed::<libc::*>()`** (≈8): zeroing C structs, equivalent to `MaybeUninit::zeroed().assume_init()`. Correct for `sockaddr_*`, `cmsghdr`, `epoll_event`, `cpu_set_t`, `iovec`, `msghdr` — all are POD structs with a valid all-zero state.
 
-3. **Raw pointer cast `&T as *mut _ as *mut U`** для FFI structs (≈12): кастуем `&mut sockaddr_storage` к `&mut sockaddr_in` после установки `family`. Layout одинаковый (sockaddr_storage спроектирован как union для всех вариантов). SAFETY: standard sockaddr cast.
+3. **Raw pointer cast `&T as *mut _ as *mut U`** for FFI structs (≈12): casting `&mut sockaddr_storage` to `&mut sockaddr_in` after setting `family`. The layout is the same (sockaddr_storage is designed as a union for all variants). SAFETY: standard sockaddr cast.
 
-4. **`set_len` после `recv_from`** (1, в `server.rs:197`): инициализирует BytesMut до `MAX_UDP_PACKET`, затем `recv_from` пишет первые `n` байт, после чего `truncate(n)`. Между set_len и recv_from байты не читаются. Стандартный pattern для recv-буферов.
+4. **`set_len` after `recv_from`** (1, in `server.rs:197`): initializes the BytesMut up to `MAX_UDP_PACKET`, then `recv_from` writes the first `n` bytes, followed by `truncate(n)`. No bytes are read between set_len and recv_from. Standard pattern for recv buffers.
 
-5. **`from_raw_parts` для mmap'd регионов** (4): `as_slice` / `as_mut_slice` на `PoolBuffer` использует `len`/`capacity`, что является валидной частью mmap-региона. (Исключение — `PoolBuffer::as_mut_slice` отдаёт `capacity` неинициализированных байт; см. SUSPECT #4.)
+5. **`from_raw_parts` for mmap'd regions** (4): `as_slice` / `as_mut_slice` on `PoolBuffer` use `len`/`capacity`, which is a valid part of the mmap region. (The exception is `PoolBuffer::as_mut_slice`, which hands out `capacity` uninitialized bytes; see SUSPECT #4.)
 
-6. **`Box::from_raw` / `into_raw`** (4): идиома владения для FFI и lock-free структур. В FFI контракт документирован. В lock-free — см. SUSPECT #1 для известной проблемы.
+6. **`Box::from_raw` / `into_raw`** (4): ownership idiom for FFI and lock-free structures. For FFI the contract is documented. For lock-free, see SUSPECT #1 for a known issue.
 
 ---
 
 ## Per-file inventory
 
-| Файл | Строки | unsafe-блоков | SAFETY | NEEDS-REVIEW | SUSPECT |
+| File | Lines | unsafe blocks | SAFETY | NEEDS-REVIEW | SUSPECT |
 |---|---|---|---|---|---|
 | transport/hugepages.rs | 421 | 18 | 13 | 1 | **4** |
 | transport/af_xdp.rs | 533 | 17 | 14 | 1 | 2 |
@@ -322,51 +322,51 @@ pub fn send_to(&mut self, data: &[u8], target: SocketAddr) -> Result<()> {
 | relay/processor.rs | 577 | 1 | 1 (doc only) | 0 | 0 |
 | xdp/lib.rs | 228 | 1 | 1 | 0 | 0 |
 | xdp/program.rs | 137 | 1 | 1 | 0 | 0 |
-| **Итого** | **5337** | **99** | **~76** | **14** | **9 (исправлены)** |
+| **Total** | **5337** | **99** | **~76** | **14** | **9 (fixed)** |
 
-(Распределение приблизительное — multi-line блоки иногда содержат несколько отдельных unsafe-операций; точные числа в коде через комментарии `// SAFETY/NEEDS-REVIEW/SUSPECT:`.)
-
----
-
-## Рекомендации
-
-### Срочное (перед production)
-
-1. **Заменить Treiber stack в `HugePagePool`** на `Mutex<Vec<usize>>` (буферный пул всё равно не на hot path после прогрева) или `crossbeam_queue::SegQueue`. Это закрывает SUSPECT #1.
-2. **Добавить bounds-чеки в `Umem::frame_slice*`.** Однострочный assert, ~0 cost. Закрывает SUSPECT #2.
-3. **Box-аллоцировать `MsgHdrStorage`** в `uring.rs` (или Pin'нуть Vec). Закрывает SUSPECT #3.
-4. **`PoolBuffer::as_mut_slice` → MaybeUninit** или удалить (использовать только `as_mut_ptr` + явный `set_len`). Закрывает SUSPECT #4.
-
-### Среднее (в течение квартала)
-
-5. Прогнать `cargo geiger` в CI (informational job — есть в этом архиве).
-6. Прогнать парсеры под Miri (отдельная задача — STUN/TURN парсеры без kernel-зависимостей, Miri-совместимы).
-7. Добавить интеграционные тесты с `RUSTFLAGS=-Z sanitizer=address` (требует nightly).
-
-### Постоянное
-
-8. **Все новые `unsafe` блоки должны иметь `// SAFETY: ...` комментарий.** Включить clippy lint `clippy::undocumented_unsafe_blocks` (warn-level, потом deny).
-9. Пере-генерировать инвентарь через `scripts/unsafe-inventory.sh` после каждого затрагивающего PR. В будущем — автоматически в CI.
+(The distribution is approximate — multi-line blocks sometimes contain several separate unsafe operations; exact numbers are in the code via `// SAFETY/NEEDS-REVIEW/SUSPECT:` comments.)
 
 ---
 
-## Что дальше
+## Recommendations
 
-Этот документ — **отправная точка**. Чтобы продвинуться:
+### Urgent (before production)
 
-- **SUSPECT #1-4** реализуйте как отдельные PR. Каждый — 100-200 строк, легко ревьюится.
-- **Miri-кампанию** для STUN/TURN парсеров запустите параллельно (`cargo +nightly miri test -p turna-proto-stun`).
-- **Fuzzing** (отдельный TODO из критичного списка) логически продолжает этот аудит — найдённые fuzz-крэши скорее всего будут касаться этих же блоков.
+1. **Replace the Treiber stack in `HugePagePool`** with `Mutex<Vec<usize>>` (the buffer pool is not on the hot path after warm-up anyway) or `crossbeam_queue::SegQueue`. This closes SUSPECT #1.
+2. **Add bounds checks to `Umem::frame_slice*`.** A one-line assert, ~0 cost. Closes SUSPECT #2.
+3. **Box-allocate `MsgHdrStorage`** in `uring.rs` (or pin the Vec). Closes SUSPECT #3.
+4. **`PoolBuffer::as_mut_slice` → MaybeUninit** or remove it (use only `as_mut_ptr` + an explicit `set_len`). Closes SUSPECT #4.
+
+### Medium-term (within a quarter)
+
+5. Run `cargo geiger` in CI (informational job — included in this archive).
+6. Run the parsers under Miri (a separate task — the STUN/TURN parsers have no kernel dependencies and are Miri-compatible).
+7. Add integration tests with `RUSTFLAGS=-Z sanitizer=address` (requires nightly).
+
+### Ongoing
+
+8. **All new `unsafe` blocks must have a `// SAFETY: ...` comment.** Enable the clippy lint `clippy::undocumented_unsafe_blocks` (warn level, later deny).
+9. Regenerate the inventory via `scripts/unsafe-inventory.sh` after every PR that touches it. In the future — automatically in CI.
+
+---
+
+## What's next
+
+This document is a **starting point**. To move forward:
+
+- Implement **SUSPECT #1-4** as separate PRs. Each is 100-200 lines and easy to review.
+- Run a **Miri campaign** for the STUN/TURN parsers in parallel (`cargo +nightly miri test -p turna-proto-stun`).
+- **Fuzzing** (a separate TODO from the critical list) is the logical continuation of this audit — fuzz crashes found are most likely to involve these same blocks.
 
 ---
 
 ## USF-010/011 — `tokio_transport.rs` recvmmsg/sendmmsg FFI (SAFETY_JUSTIFIED)
 
-**Файл:** `crates/transport/src/tokio_transport.rs` (Linux-only, `cfg(target_os = "linux")`)
+**File:** `crates/transport/src/tokio_transport.rs` (Linux-only, `cfg(target_os = "linux")`)
 
-6 `unsafe`-блоков в батч-I/O путях `recv_mmsg`/`send_mmsg`:
+6 `unsafe` blocks in the `recv_mmsg`/`send_mmsg` batch I/O paths:
 
-- **USF-010 — `recv_mmsg()`** (4 блока): `mem::zeroed()` для `sockaddr_storage`/`mmsghdr` (C POD, нулевой паттерн валиден), `libc::recvmmsg`, `socket2::SockAddr::new`. Инварианты: `fd` открыт на время жизни сокета (`Arc<UdpSocket>`); `iovecs`/`addrs` живут на время вызова и не реаллоцируются после setup; читаются только записи `[0, r)`, где `r` — результат `recvmmsg`; `msg_namelen <= size_of::<sockaddr_storage>()`. Инлайн `// SAFETY:` присутствуют и корректны. UB/OOB/aliasing не найдено.
-- **USF-011 — `send_mmsg()`** (2 блока): `mem::zeroed()` для `mmsghdr`, `libc::sendmmsg`. Инварианты: `fd` открыт; буферы (`bytes::Bytes` из `pkts`, заимствованы на всю функцию) и `addrs` переживают вызов; `sendmmsg` только читает буферы, поэтому `*const -> *mut` каст безопасен. Инлайн `// SAFETY:` корректны.
+- **USF-010 — `recv_mmsg()`** (4 blocks): `mem::zeroed()` for `sockaddr_storage`/`mmsghdr` (C POD, the all-zero pattern is valid), `libc::recvmmsg`, `socket2::SockAddr::new`. Invariants: `fd` is open for the lifetime of the socket (`Arc<UdpSocket>`); `iovecs`/`addrs` live for the duration of the call and are not reallocated after setup; only entries `[0, r)` are read, where `r` is the result of `recvmmsg`; `msg_namelen <= size_of::<sockaddr_storage>()`. Inline `// SAFETY:` comments are present and correct. No UB/OOB/aliasing found.
+- **USF-011 — `send_mmsg()`** (2 blocks): `mem::zeroed()` for `mmsghdr`, `libc::sendmmsg`. Invariants: `fd` is open; the buffers (`bytes::Bytes` from `pkts`, borrowed for the whole function) and `addrs` outlive the call; `sendmmsg` only reads the buffers, so the `*const -> *mut` cast is safe. Inline `// SAFETY:` comments are correct.
 
-Статус: **SAFETY_JUSTIFIED**. Файл добавлен в `AUDITED_PATHS` (`scripts/unsafe-inventory.sh`) и в `docs/security/unsafe-inventory.json`.
+Status: **SAFETY_JUSTIFIED**. The file has been added to `AUDITED_PATHS` (`scripts/unsafe-inventory.sh`) and to `docs/security/unsafe-inventory.json`.

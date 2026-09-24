@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Tooling: the workspace declares `rust-version = "1.95"` (the toolchain the
+  `msrv` job builds and tests on) and every member inherits it. CI now runs
+  `scripts/check-doc-claims.sh`, which existed and passed but was run by no
+  workflow, and lints the admin frontend with ESLint (`npm run lint`). Dependabot
+  covers the frontend's npm dependencies. A `Makefile` wraps the CI checks for
+  local use; `.editorconfig` added.
+- `deploy/Dockerfile.admin`: Node 24 (LTS) instead of Node 25, which reached end
+  of life on 2026-06-01, and the same pinned `rust:1.95.0` image as
+  `deploy/Dockerfile` instead of `rust:1.98.0`. The CI `frontend` job uses Node 24
+  to match.
+
 - Document AF_XDP as **supported within the verified Linux IPv4 UDP copy-mode scope**
   (SKB/native, Linux 6.8.0-87, `virtio_net`, two RX queues). Record four-hour
   native WAN media and 15-minute churn, resource cleanup and XDP detach. Keep
@@ -141,6 +152,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Admin console: send the `X-Admin-Token` on every `/api` request, not only on
+  `POST /api/manage`. Since 0.5.0 the backend requires the token on reads too, so
+  with a token configured every status/metrics/health poll failed with 401 (and
+  health/ready rendered as "down"). A rejected read now shows an "admin token
+  required" banner with a prompt, and polling pauses until a token is entered.
+- Config: the RBAC doc comment and the "enabled with no bindings" error named the
+  section `[management.rbac]`; the section actually parsed is `[grpc.rbac]`
+  (`[management]` has `deny_unknown_fields`, so the documented form was rejected).
+
 - **Key material was freed without being overwritten.** The shared secret is
   resident for the whole run, and a SIGHUP rotation made that worse rather than
   better: the new `AuthMode` and `TurnaConfig` were swapped in and the old
@@ -159,6 +179,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removes is the long tail of copies that outlive their usefulness. With
   `allow_core_dumps = false` closing the dump and `/proc/<pid>/mem` paths, the
   three exposures the audit listed are now addressed.
+
+- Transport: the per-IP DTLS session counters (both listener paths), the
+  io_uring relay-route table, the UDP buffer pool and the hugepage free list use
+  `parking_lot::Mutex` instead of `std::sync::Mutex` + `.lock().unwrap()`. A
+  panic while one of these was held used to poison it, and every later
+  `.unwrap()` on the recv/send path then panicked too. The demux path already
+  ignored poisoning by hand (`into_inner()`); all of them now share the
+  workspace's stated hot-path lock policy.
 
 - **`file://` secrets were read without checking their permissions.** The whole
   point of the indirection is to keep the value out of the config file, and a
