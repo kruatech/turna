@@ -23,6 +23,7 @@ dtls = ["dep:turna-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
 sctp = ["tls"]
 
 [dependencies]
+parking_lot.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true

@@ -217,8 +217,8 @@ pub(crate) async fn run_demux(
         Arc::new(Mutex::new(HashMap::new()));
     // Concurrent sessions per source IP, held from admission (pre-handshake) to
     // session teardown — unlike the stock path, where it starts post-handshake.
-    let per_ip: Arc<std::sync::Mutex<HashMap<IpAddr, u32>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let per_ip: Arc<parking_lot::Mutex<HashMap<IpAddr, u32>>> =
+        Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let limiter = crate::ratelimit::HandshakeLimiter::new(
         cfg.max_handshakes_per_sec_per_ip,
         cfg.handshake_burst_per_ip,
@@ -348,10 +348,7 @@ pub(crate) async fn run_demux(
                     continue;
                 }
                 {
-                    let mut m = match per_ip.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
+                    let mut m = per_ip.lock();
                     let cur = *m.get(&remote.ip()).unwrap_or(&0);
                     if cfg.max_sessions_per_ip != 0 && cur as usize >= cfg.max_sessions_per_ip {
                         stats.rejected_per_ip.fetch_add(1, Relaxed);
@@ -493,11 +490,8 @@ pub(crate) async fn run_demux(
     Ok(())
 }
 
-fn release_ip(per_ip: &Arc<std::sync::Mutex<HashMap<IpAddr, u32>>>, ip: IpAddr) {
-    let mut m = match per_ip.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
+fn release_ip(per_ip: &Arc<parking_lot::Mutex<HashMap<IpAddr, u32>>>, ip: IpAddr) {
+    let mut m = per_ip.lock();
     if let Some(n) = m.get_mut(&ip) {
         *n = n.saturating_sub(1);
         if *n == 0 {

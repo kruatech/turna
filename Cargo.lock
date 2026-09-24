@@ -4607,6 +4607,7 @@ dependencies = [
  "libc",
  "libxdp-sys",
  "netlink-packet-route",
+ "parking_lot",
  "quinn",
  "rand 0.10.2",
  "rtnetlink",

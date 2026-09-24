@@ -17,11 +17,11 @@
 //! 3. **Drop guard**: `HugePagePool::drop` паникует если есть активные
 //!    буферы — вместо тихого dangling pointer + munmap.
 
+use parking_lot::Mutex;
 use std::io;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use tracing::{debug, info};
 
@@ -139,7 +139,7 @@ impl HugePagePool {
     /// the pool is not on the hot recv path (warm-up only) and Mutex is
     /// trivially correct under concurrent access.
     pub fn alloc(&self) -> Option<PoolBuffer> {
-        let slot_index = self.free_slots.lock().unwrap().pop()?;
+        let slot_index = self.free_slots.lock().pop()?;
 
         self.allocated.fetch_add(1, Ordering::Relaxed);
         self.stats.total_allocs.fetch_add(1, Ordering::Relaxed);
@@ -161,7 +161,7 @@ impl HugePagePool {
         let slot_index = buf.slot_index;
         // `buf` is a plain handle with no Drop; it is consumed here and its slot
         // returned to the pool below (the backing mmap region stays mapped).
-        self.free_slots.lock().unwrap().push(slot_index);
+        self.free_slots.lock().push(slot_index);
         self.allocated.fetch_sub(1, Ordering::Relaxed);
         self.stats.total_frees.fetch_add(1, Ordering::Relaxed);
     }
