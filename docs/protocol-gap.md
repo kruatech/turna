@@ -469,9 +469,18 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   the peer must pass the peer filter and hold an unexpired permission in the
   allocation's own permission table (the one CreatePermission writes and CONNECT
   reads), and the allocation must be a live TCP allocation of the peer's family.
+  The check is also tied to the accepting listener: its port must be the allocation's
+  current relayed port, so a listener left over from an earlier allocation on the same
+  control connection cannot announce peers against a newer allocation's permissions.
   Otherwise the stream is dropped (closed) before it is registered or counted against
   `max_total`, no ConnectionAttempt is sent, and
-  `turna_tcp_relay_peer_refused_total` is incremented. Both address families. Tests:
+  `turna_tcp_relay_peer_refused_total` is incremented.
+  **Listener lifetime:** the relayed listener (`tcp_relay::run_relayed_listener`) now
+  also stops when its allocation *expires* or is replaced — checked every 5 s, the
+  expiry-sweep interval — and cleans up the allocation's pending peer connections.
+  Before, only `CloseRelay` (Refresh 0) and the control connection closing stopped it,
+  so a TTL-expired TCP allocation kept its listener accepting on a port the pool
+  considered free. Both address families. Tests:
   `processor::tcp_relay_peer_permission_tests` (real TCP streams and client sink:
   unpermitted and filter-denied peers closed and not announced, permitted peer
   announced), the v6 variant in `tcp_relay_ipv6_tests` (skips without IPv6), and an

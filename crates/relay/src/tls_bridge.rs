@@ -252,31 +252,22 @@ pub(crate) async fn run_tls_bridge(
                                 listener.set_nonblocking(true).ok();
                                 match tokio::net::TcpListener::from_std(listener) {
                                     Ok(l) => {
+                                        // Runs until the listener fails, the
+                                        // task is aborted (CloseRelay / control
+                                        // connection closed), or the allocation
+                                        // expires.
                                         let handle = tokio::spawn(async move {
-                                            let alloc = AllocationId(relay_port as u64);
-                                            loop {
-                                                match l.accept().await {
-                                                    Ok((stream, peer)) => {
-                                                        // RFC 6062 §5.3 permission check,
-                                                        // registration and ConnectionAttempt.
-                                                        crate::tcp_relay::handle_peer_initiated(
-                                                            &mgr,
-                                                            &proc,
-                                                            &sinks,
-                                                            alloc,
-                                                            client_addr,
-                                                            &owner_key,
-                                                            stream,
-                                                            peer,
-                                                        )
-                                                        .await;
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(port = relay_port, error = %e, "relayed TCP accept failed; stopping listener");
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            crate::tcp_relay::run_relayed_listener(
+                                                mgr,
+                                                proc,
+                                                sinks,
+                                                l,
+                                                relay_port,
+                                                client_addr,
+                                                owner_key,
+                                                crate::tcp_relay::LISTENER_LIVENESS_INTERVAL,
+                                            )
+                                            .await
                                         });
                                         tcp_listeners.insert(relay_port, handle);
                                     }
