@@ -27,11 +27,11 @@ constraints below are taken from `crates/config/src/lib.rs`.
 ### `transport` values
 
 - `tokio` — epoll + `recvmmsg`/`sendmmsg`. Default, safest, all platforms.
-- `io_uring` — Linux io_uring datapath. Requires a binary built with
+- `io_uring` — supported Linux UDP datapath, opt-in. Requires a binary built with
   `--features io-uring`; fails fast at startup if io_uring is unavailable.
-- `af_xdp` — AF_XDP ring datapath. Requires `--features af-xdp`, Linux,
-  `CAP_NET_RAW`, and an external XDP program steering traffic to the bound NIC
-  queue. Never auto-selected.
+- `af_xdp` — opt-in Linux AF_XDP datapath. Requires `--features af-xdp` and
+  privileges to bind XSK sockets and load/attach the embedded selective XDP
+  program. Never auto-selected. See [the runbook](runbooks/af-xdp.md).
 - `auto` — io_uring when available at runtime, else tokio. Opt-in (dev/bench).
 
 ---
@@ -107,7 +107,15 @@ at a time, so enabling IPv6 does not change port accounting or capacity.
 
 ## `[turn.io_uring]`
 
-Used only when `transport = "io_uring"`.
+Used only when `transport = "io_uring"`. See the
+[support record](verification/io-uring-supported-2026-09-19.md) and
+[runbook](runbooks/io-uring.md). Build with `--features io-uring` and select the
+backend explicitly. Kernel policy must permit ring creation.
+
+`TURNA_IOURING_WORKERS` selects a positive worker count; otherwise the node uses
+available parallelism. Buffers/rings consume memory per worker. The latest runs
+held approximately 134 MiB on cloud and 1073 MiB on the local server; these are
+configuration-specific measurements, not fixed requirements or a kernel comparison.
 
 | key | type | default | notes |
 |-----|------|---------|-------|
@@ -126,7 +134,7 @@ TURN over DTLS (RFC 7350). Disabled by default. Requires `--features dtls`.
 | `cert_path` | path | `/etc/turna/tls/cert.pem` | PEM certificate. Must be **readable** — an unreadable path aborts startup (fail-fast). |
 | `key_path` | path | `/etc/turna/tls/key.pem` | PEM private key. Must be readable. |
 | `max_sessions` | usize | `10000` | Post-handshake admission cap (`0` = unlimited). |
-| `max_sessions_per_ip` | usize | `0` | Per-source-IP session cap (`0` = unlimited). Anti slot-exhaustion; rejections counted as `turna_dtls_rejected_per_ip_total`. |
+| `max_sessions_per_ip` | usize | `16` | Per-source-IP session cap (`0` = unlimited). Anti slot-exhaustion; rejections counted as `turna_dtls_rejected_per_ip_total`. |
 | `accept_timeout_secs` | u64 | `10` | Upper bound on one DTLS `accept()`, i.e. on a single handshake. `0` disables it. **Liveness guard, not tuning:** `webrtc-dtls` runs the whole handshake inline inside `accept()` with no timeout of its own ([webrtc-rs/webrtc#614](https://github.com/webrtc-rs/webrtc/issues/614)), so one peer that starts a handshake and goes silent parks the accept loop forever — DTLS stops serving everyone while the socket stays bound and `turna_dtls_readiness` still reads Ready. On timeout the handshake is abandoned and counted (`turna_dtls_accept_timeouts_total`). Keep it comfortably above real handshake latency, or a slow client is dropped. |
 | `demux` | bool | `false` | Own the UDP socket instead of `webrtc_dtls::listen()`. `listen()` runs handshakes **serially** inside `accept()` ([#614](https://github.com/webrtc-rs/webrtc/issues/614)), which forces three compromises: caps apply only *after* the crypto, a handshake rate limit has nowhere to live, and the certificate is fixed at bind time. `demux = true` fixes all three — one task per handshake, admission before any DTLS state exists, live certificate reload. Opt-in because it replaces the path that has recorded verification (`docs/dtls/`). |
 | `max_handshakes_per_sec_per_ip` | u32 | `0` | Per-source-IP handshake **rate** limit (`turna_dtls_rejected_rate_limit_total`). **Requires `demux = true`** — startup fails otherwise, rather than silently doing nothing. |
@@ -228,7 +236,8 @@ what prevents one authenticated client hijacking another's pending connection.
 ## `[turn.quic]` — QUIC / WebTransport
 
 Requires `--features quic` (raw QUIC datapath) or `--features web-transport`
-(browser HTTP/3 CONNECT; implies `quic`). Maturity: **experimental**.
+(browser HTTP/3 CONNECT; implies `quic`). Both are **supported** on Linux/macOS
+with tokio; see [support scope](verification/quic-webtransport-supported-2026-09-18.md).
 
 | key | type | default | notes |
 |-----|------|---------|-------|
@@ -236,25 +245,23 @@ Requires `--features quic` (raw QUIC datapath) or `--features web-transport`
 | `web_transport` | bool | `true` | `true` = WebTransport over HTTP/3; `false` = raw QUIC. Needs `--features web-transport` when `true`. |
 | `listen` | socket addr | `0.0.0.0:5350` | UDP. Numerically collides with `[management].listen` (TCP) — different protocols, so the binds do not conflict. |
 | `cert_path` / `key_path` | path | `/etc/turna/tls/…` | Same PEM material as `[tls]` by default. |
-| `max_bi_streams` | u64 | `256` | Concurrent bidi streams per connection. **Raw QUIC only.** |
-| `max_uni_streams` | u64 | `256` | Concurrent uni streams per connection. **Raw QUIC only.** |
-| `enable_datagrams` | bool | `true` | QUIC datagrams (RFC 9221) for media. **Raw QUIC only.** |
-| `max_datagram_size` | usize | `1200` | Sizes the datagram receive buffer. **Raw QUIC only.** |
-| `idle_timeout_secs` | u64 | `30` | Connection idle timeout. **Raw QUIC only.** |
+| `max_bi_streams` | u64 | `256` | Concurrent bidi streams per connection. Applied on both paths. |
+| `max_uni_streams` | u64 | `256` | Concurrent uni streams per connection. Applied on both paths. |
+| `enable_datagrams` | bool | `true` | QUIC datagrams (RFC 9221) for media. Applied on both paths. |
+| `max_datagram_size` | usize | `1200` | Sizes the datagram receive buffer. Applied on both paths. |
+| `idle_timeout_secs` | u64 | `30` | Connection idle timeout. Applied on both paths. |
 | `keep_alive_secs` | u64 | `10` | Keep-alive interval. |
 | `alpn` | list | `["stun.turn"]` | **Raw QUIC only** — WebTransport negotiates `h3` itself, so this key is inert when `web_transport = true`. |
-| `max_sessions` | usize | `10000` | Session cap (`0` = unlimited), `turna_quic_rejected_over_cap_total`. Enforced **pre**-handshake on the WebTransport path, post-handshake on raw QUIC. |
-| `max_sessions_per_ip` | usize | `0` | Per-source-IP cap (`0` = unlimited), `turna_quic_rejected_per_ip_total`. Same timing as above. |
+| `max_sessions` | usize | `10000` | Session cap (`0` = unlimited), `turna_quic_rejected_over_cap_total`. Enforced before the handshake on both paths. |
+| `max_sessions_per_ip` | usize | `16` | Per-source-IP cap (`0` = unlimited), `turna_quic_rejected_per_ip_total`. Same timing as above. |
 | `cert_reload_secs` | u64 | `30` | Poll `cert_path`/`key_path` and hot-reload the certificate without dropping live sessions. Works on **both** paths (`Endpoint::reload_config` on WebTransport, `Endpoint::set_server_config` on raw QUIC); only new sessions see the new material. `0` disables. |
 | `max_handshakes_per_sec_per_ip` | u32 | `0` | Per-source-IP handshake **rate** limit (`0` = unlimited). Complements `max_sessions_per_ip`, which only bounds *concurrent* sessions: a source that opens and drops sessions in a loop never trips a concurrency cap while still costing a handshake each time. Checked before the handshake on both paths (`turna_quic_rejected_rate_limit_total`). |
 | `handshake_burst_per_ip` | u32 | `0` | Burst allowance for the rate limit. `0` = twice the rate, so a page opening several sessions at once is not penalised. |
 
-On the **WebTransport** path (`web_transport = true`) the keys marked *raw QUIC
-only* have no effect: reaching the underlying `quinn` server config requires an
-API wtransport keeps behind its quinn re-export. The listener names those keys in
-a startup warning, so the config never silently looks effective. Session caps,
-keep-alive and certificate reload do apply there. Set `web_transport = false` if
-you need the transport limits enforced.
+Both paths apply the configured transport limits and certificate reload.
+Only `alpn` is intentionally raw-QUIC-only: WebTransport negotiates `h3`.
+DATAGRAM payloads are bounded by the configured cap and negotiated peer limit;
+media delivery is unreliable and loss remains visible in test reports.
 
 Connection migration (the client's address changing mid-session) is detected by
 polling the peer address every 2s; the listener re-keys its egress registries and
@@ -267,60 +274,68 @@ without `--features web-transport`, is a **startup error**.
 
 ---
 
-## `[turn.sctp]` — TURN-over-SCTP (experimental)
+## `[turn.sctp]` — TURN-over-SCTP (supported on Linux/tokio)
 
-Client **control** transport over an SCTP association: STUN/TURN framed exactly as
-TURN-over-TCP, with the relay socket to the peer staying **UDP**. Requires
-`--features sctp` and the host `sctp` kernel module. Disabled by default.
+Opt-in native SCTP client-to-server transport for STUN/TURN control and
+ChannelData. The peer-side relay stays **UDP**. Requires a Linux node built with
+`--features sctp`, kernel SCTP support (built in or loaded as a module), and
+`[turn] transport = "tokio"` (the default). Other backend selections are rejected
+when SCTP is enabled. `production = true` is allowed; normal production secret,
+address and quota checks still apply. Builds without `sctp` fail at startup.
 
-> **No RFC defines SCTP for TURN.** `TRANSPORT_SCTP = 132` is the IANA protocol
-> number (RFC 4960), not a standardised TURN relayed-transport value — it names the
-> control transport only.
->
-> **Refused in production.** `production = true` rejects `enabled = true`.
+This is a project-specific TURN mapping, not a standardized SCTP relay allocation
+or browser WebRTC DataChannel. IP protocol **132** must pass through the network;
+opening a TCP/UDP port does not open SCTP. Containers use the host kernel support.
 
 | key | type | default | notes |
 |-----|------|---------|-------|
 | `enabled` | bool | `false` | Enable the SCTP listener. |
-| `listen` | socket addr | `0.0.0.0:3478` | No standardised TURN-over-SCTP port. |
-| `max_frame_size` | usize | `65536` | Max framed STUN/ChannelData message (shares the TURNS frame codec). |
-| `read_timeout_secs` | u64 | `300` | Per-connection idle read timeout. |
-| `max_connections` | usize | `10000` | Concurrent SCTP associations. |
-| `backlog` | i32 | `1024` | `listen(2)` backlog. |
+| `listen` | socket addr | `0.0.0.0:3478` | No standardized TURN-over-SCTP port. |
+| `max_frame_size` | usize | `65536` | Framed STUN/ChannelData limit; valid range 20..65555. |
+| `read_timeout_secs` | u64 | `300` | Positive idle read timeout; outbound traffic does not reset it. |
+| `max_connections` | usize | `10000` | Concurrent association cap; 0 disables this cap. |
+| `max_connections_per_ip` | usize | `0` | Per-IP concurrent cap; 0 disables this cap. |
+| `max_associations_per_sec_per_ip` | u32 | `0` | Per-IP accepted-association rate; 0 disables limiting. |
+| `association_burst_per_ip` | u32 | `0` | 0 selects twice the configured rate. |
+| `backlog` | i32 | `1024` | Positive `listen(2)` backlog. |
 
-The control channel is **plaintext** — TLS-over-SCTP is out of scope, so anything
-an operator would protect with TURNS is unprotected here. Awkward in containers
-(needs the host kernel module) and of low real-world use; `docs/protocol-gap.md`
-rates it lowest priority and suggests it may be dropped rather than matured. Only
-wired in the tokio backend, not io_uring.
+The SCTP channel has **no TLS encryption**. TURN authentication does not add
+transport confidentiality. Only one ordered SCTP stream is used; multi-stream
+SCTP and multihoming/failover are not support claims. See
+[SCTP evidence and limitations](verification/sctp-supported-2026-09-18.md) and
+[metrics](OBSERVABILITY.md#turn-over-sctp-turnsctp).
 
 ---
 
 ## `[turn.af_xdp]`
 
-AF_XDP ring datapath. Used only when `transport = "af_xdp"`. Requires
-`--features af-xdp`, Linux, `CAP_NET_RAW`, and an external XDP program steering
-the chosen NIC queue (see `docs/runbooks/af-xdp.md`). **Experimental** — see the
-support tier in `docs/compatibility/transport-backends.md`.
+AF_XDP ring datapath. Used only when `transport = "af_xdp"`. Requires a Linux
+`--features af-xdp` build and privileges for XSK/BPF/XDP setup. The node loads
+its own address/port-selective program. **Supported within the verified Linux
+IPv4 UDP copy-mode scope**; see [evidence and limitations](verification/af-xdp-supported-2026-09-22.md)
+and [the runbook](runbooks/af-xdp.md). Native attach does not imply zero-copy.
 
 | key | type | notes |
 |-----|------|-------|
 | `interface` | string | NIC name, e.g. `eth0`. |
-| `queue_id` | u32 | NIC queue id to bind the AF_XDP socket to. |
-| `frame_count` | u32 | UMEM frame count. |
-| `frame_size` | u32 | UMEM frame size, bytes. Must be ≥ 2048 and ≥ MTU+14. |
-| `fill_ring_size` | u32 | Fill ring size (power of two). |
+| `queue_id` | u32 | Legacy single queue (default 0), used when `queue_ids` is empty. |
+| `queue_ids` | array of u32 | Explicit RX queues; must cover every RX queue reported by the interface. Unique IDs below 64. Empty preserves `queue_id`. |
+| `attach_mode` | string | `auto` (legacy: native if zero-copy, otherwise SKB), `skb`, or `native`. Native + copy is supported as a selectable mode; hardware verification remains required. |
+| `frame_count` | u32 | UMEM frames per queue, at most 4096 with current ring geometry. |
+| `frame_size` | u32 | Fixed at 4096; must fit MTU+14. Inert overrides are rejected. |
+| `fill_ring_size` | u32 | Fixed at 2048, as are completion/RX/TX rings. |
 | `comp_ring_size` | u32 | Completion ring size. |
 | `rx_ring_size` | u32 | RX ring size. |
 | `tx_ring_size` | u32 | TX ring size. |
-| `zero_copy` | bool | Zero-copy mode (requires driver support). |
+| `zero_copy` | bool | Force zero-copy bind (requires driver support and native attach). False forces copy. Actual socket mode is checked with XDP_OPTIONS; no silent fallback. |
 | `need_wakeup` | bool | Use the `NEED_WAKEUP` flag. |
-| `src_mac` | string | Source MAC for TX frames. Empty → placeholder until neighbor resolution lands. |
-| `dst_mac` | string | Next-hop (gateway) MAC. Empty → placeholder. |
+| `src_mac` | string | Source MAC for TX frames. Empty reads the configured interface MAC. |
+| `dst_mac` | string | Fallback next-hop MAC. Empty attempts default-gateway ARP lookup; unresolved fallback remains observable. |
 
-A startup preflight validates ring geometry (power-of-two, `frame_size ≥ 2048`),
-that the interface exists and is up, that the queue exists, `frame_size ≥ MTU+14`,
-and `CAP_NET_RAW`. Any failure aborts startup.
+Validation/preflight checks fixed ring geometry, interface/queue coverage, MTU,
+mode compatibility and `CAP_NET_RAW`. Binding and BPF attach must also succeed;
+NET_RAW alone does not grant all required BPF/XDP privileges. A concrete listen
+IP is required. Readiness follows initialization of every configured queue.
 
 ---
 

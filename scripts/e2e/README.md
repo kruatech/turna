@@ -1,54 +1,40 @@
-# Backend e2e / differential tests (Stage 3 / Milestone 3)
+# Backend end-to-end checks
 
-These scripts exercise the **real** TURN lifecycle against a live `turna-node`
-on each transport backend and compare the results, instead of duplicating
-assertions per backend. They reuse the existing live-server suite in
-`tests/integration` (Binding → Allocate 401→auth → Refresh → CreatePermission →
-ChannelBind → ChannelData → delete).
+## `backend_diff.sh` — tokio and io_uring acceptance
 
-## `backend_diff.sh` — Tokio vs io_uring differential (roadmap §7.1)
-
-Builds one node binary (`--features io-uring`), then boots it once per backend
-by flipping `[turn].transport` in a copy of a base config, runs the integration
-suite against each, and reports **parity** (identical results) or **divergence**.
+From the repository root on Linux:
 
 ```bash
-# defaults: base config deploy/turn.toml, target 127.0.0.1:3478,
-# health http://127.0.0.1:9090/health, backends "tokio io_uring"
-scripts/e2e/backend_diff.sh deploy/turn.toml
-
-# shared-secret (coturn lt-cred) auth, single test:
-TURNA_TEST_SECRET=turna-secret TEST_FILTER=turn_allocate \
-  scripts/e2e/backend_diff.sh deploy/turn.toml
-
-# static-users auth:
-TURNA_TEST_USER=user TURNA_TEST_PASS=pass \
-  scripts/e2e/backend_diff.sh deploy/turn.toml
+OUT=backend-diff-$(date +%Y%m%d-%H%M%S) bash scripts/e2e/backend_diff.sh
 ```
 
-Env knobs: `BACKENDS`, `TARGET`, `HEALTH_URL`, `TEST_FILTER`, `START_TIMEOUT`,
-and the suite's `TURNA_TEST_SECRET` / `TURNA_TEST_USER` / `TURNA_TEST_PASS`
-(forwarded as-is; they must match the base config's `[turn.auth]`).
+Builds the release node with `--locked --features io-uring`, then runs ten named
+STUN/TURN tests per backend. Each test must execute exactly once without SKIP.
+Both backends must pass and exit cleanly after SIGTERM. Matching failures are
+failures, not parity. This is suite-level testing, not a byte-level comparison.
 
-Exit code: `0` = all backends agree, `1` = divergence or a backend failed to
-start. Per-backend node and test logs are printed in the failure summary.
+Defaults: loopback UDP 13478, HTTP `/ready` on 19098, relay ports 23000..23255,
+static test credentials, loopback peers allowed and `production = false`.
+Ports must be free. Output is a new private directory containing `summary.tsv`,
+configurations, build logs and individual test/node logs. Do not publish credentials.
 
-## Coverage matrix
+An optional base config must match `TARGET` and `HEALTH_URL` and use IPv4
+loopback endpoints. Supply matching `TURNA_TEST_USER`/`TURNA_TEST_PASS` or
+`TURNA_TEST_SECRET` for that config. `START_TIMEOUT` controls startup waiting;
+shutdown waits up to 60 seconds, then fails and kills the process. `TEST_FILTER`
+can select a subset, but a subset is not full-suite evidence. `BACKENDS` must
+remain `tokio io_uring`.
 
-| Backend  | Covered here | How |
-|----------|--------------|-----|
-| Tokio    | yes          | `transport = "tokio"`, live suite |
-| io_uring | yes          | `transport = "io_uring"`, same suite, result diffed vs tokio |
-| DTLS     | no (DTL-5)   | needs a DTLS-wrapped client; the UDP suite cannot speak DTLS |
-| AF_XDP   | no (AFX-7)   | needs a privileged veth + XDP lab harness |
-| coturn   | no (§7.2)    | external reference; separate differential |
+Exit 0 means every selected check and both shutdowns passed; any failure returns
+nonzero. The earlier ten-second shutdown budget could kill a healthy draining
+node and has been corrected; successful reruns are recorded in
+[verification](../../docs/verification/io-uring-supported-2026-09-19.md).
 
-## Notes / limitations
+```bash
+python3 -m unittest discover -s scripts/e2e -p test_backend_diff.py
+```
 
-- This is a **suite-level** differential: it compares pass/fail of the whole
-  integration run per backend. Response-byte-level comparison (per §7.1) is a
-  finer follow-up.
-- io_uring requires Linux 5.6+; on other platforms the io_uring run will fail
-  to start and the script reports divergence (expected — run it on Linux).
-- DTLS (DTL-5) and AF_XDP (AFX-7) get their own harnesses; this script
-  deliberately scopes to the two UDP backends the existing client supports.
+These runner unit tests use fake processes. They do not validate a real kernel.
+Live backend tests require Linux with io_uring permitted; no sudo is needed on
+an unrestricted test host. DTLS, QUIC, WebTransport, SCTP, AF_XDP and independent
+coturn interoperability require their own verification procedures.

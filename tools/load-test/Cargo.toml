@@ -21,6 +21,8 @@ dtls = ["dep:webrtc-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
 # library on both sides is also this check's limitation, noted in the module.
 web-transport = ["dep:wtransport"]
 
+sctp = ["dep:socket2", "dep:libc"]
+
 [dependencies]
 tokio.workspace = true
 tracing.workspace = true
@@ -44,3 +46,7 @@ webrtc-util = { version = "0.9", optional = true }
 # is the reason this must never be linked into anything but a test tool.
 wtransport = { version = "0.7", features = ["quinn", "dangerous-configuration"], optional = true }
 async-trait = { version = "0.1", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"], optional = true }
+libc = { version = "0.2", optional = true }

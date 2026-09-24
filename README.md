@@ -28,8 +28,8 @@ This is software other people install on machines we have never seen, so a statu
 to say what was verified and where — a bare "supported" would promise something no
 project in this position can deliver.
 
-- **Supported** — verified end to end, and its behaviour does not depend on the
-  kernel or the hardware underneath. UDP TURN/STUN on the tokio datapath, long-term
+- **Supported** — maintained and verified end to end within the documented
+  platform, backend and protocol scope. UDP TURN/STUN on the tokio datapath, long-term
   credentials and the Tarantool backend are here: three hours under load with no
   leak, 13.7 M allocations, 441 M packets
   ([docs/soak/endurance-2026-08-19.md](docs/soak/endurance-2026-08-19.md)).
@@ -39,41 +39,35 @@ project in this position can deliver.
   public address, and 24 hours under load with zero relayed-frame loss and no leak on
   any signal ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)).
 
-- **Beta, verified on listed configurations** — correctness is on record, but the
-  behaviour depends on your environment in a way we cannot test for you. The
-  `io-uring` datapath is the clearest case: it is verified on Linux **6.8** and
-  **6.14** — 9.6 h of relayed media at 0.006 % loss on the former, no leak on either —
-  and io_uring semantics are version-sensitive, so that is evidence about those two
-  kernels and no others. `af-xdp` is the same with a NIC driver added —
-  the lab attaches in SKB (generic) mode, which copies every frame and reproduces
-  none of the kernel-bypass behaviour the feature exists for.
+- **io_uring — supported on Linux, opt-in.** Recovery/drain checks, live TURN
+  behaviour and load are recorded on Linux 6.8.0-87 and 6.14.0-33. The support
+  scope, resource costs and exact evidence are in the
+  [verification record](docs/verification/io-uring-supported-2026-09-19.md).
+  Revalidate after kernel or deployment changes; tokio remains the default.
 
-  Verify on your kernel and your NIC before enabling either. What is on record is in
-  [docs/interop/](docs/interop/) and [docs/soak/](docs/soak/), with the exact
-  configurations named.
+- **AF_XDP — supported within the verified Linux IPv4 UDP copy-mode scope.**
+  SKB/copy and native/copy are verified on Linux 6.8.0-87 with `virtio_net`,
+  two RX queues. Native evidence includes four-hour WAN media and 15-minute churn.
+  Zero-copy and other NIC/kernel combinations need separate validation.
+  [Evidence and known limitations](docs/verification/af-xdp-supported-2026-09-22.md).
 
-- **Beta, no independent implementation** — **QUIC only.** It carries a TURN
-  allocation and relays media in both directions, but the client that proved it was
-  written here, against the same reading of the spec as the server, so a shared
-  misreading stays invisible. That is correctness evidence, not interop evidence.
+- **Supported QUIC and WebTransport** — opt-in on Linux/macOS with the tokio backend.
+  These are project-specific TURN mappings, not standardized TURN transport URIs.
+  Raw QUIC has no independent TURN-client interoperability evidence; WebTransport
+  has browser evidence for tested Chrome versions. DATAGRAM media remains
+  unreliable. [Support scope and verification](docs/verification/quic-webtransport-supported-2026-09-18.md).
 
-  QUIC is alone here for a structural reason: no RFC defines TURN over raw QUIC, so
-  there is no second implementation to test against and none can be written from a
-  specification that does not exist. The path out is a draft and someone else's
-  implementation, not more testing — see
-  [docs/OPEN-DECISIONS.md](docs/OPEN-DECISIONS.md).
+- **Supported on Linux — TURN-over-SCTP (`sctp`).** Opt-in native SCTP on the
+  tokio backend, allowed with `production = true`. Carries TURN control and
+  ChannelData; the peer-side relay remains UDP. Requires kernel SCTP support and
+  a network permitting IP protocol 132. This project-specific transport is
+  plaintext, not WebRTC DataChannel or SCTP-over-DTLS. Functional, lifecycle,
+  limits and 30-minute WAN verification are recorded in
+  [SCTP support evidence](docs/verification/sctp-supported-2026-09-18.md).
 
-  Everything else has left this group. TURNS: three browser engines. WebTransport: a
-  TURN client written in browser JavaScript, assembling every STUN byte and its own MD5
-  and HMAC. DTLS, UDP, IPv6 and RFC 6062: coturn's `turnutils_uclient`, another
-  language and another reading of the RFC
-  ([docs/interop/coturn-2026-08-23.md](docs/interop/coturn-2026-08-23.md)).
-
-- **Refused in production** — TURN-over-SCTP (`[turn.sctp]`) and RFC 7635 OAuth
-  (`[turn.auth.oauth]`). Implemented and usable for testing; `production = true` makes
-  config validation **reject** them, so they cannot ship by accident. Two are refused in
-  production for different reasons: SCTP has none of the hardening the other listeners
-  received and no users, and OAuth has never run against a real authorization server.
+- **Refused in production** — RFC 7635 OAuth (`[turn.auth.oauth]`). Implemented
+  and usable for testing, but has not been verified with a real authorization
+  server; `production = true` rejects it.
 
   RFC 6062 TCP relay was on this list until 2026-08-25. It came off because the evidence
   the gate was waiting for arrived — interop against coturn's own client
@@ -110,7 +104,7 @@ durable terminal result rather than control-plane-local state.
   the transport/relay datapaths.
 - **Batched UDP I/O** — `SO_REUSEPORT` recv workers with `recvmmsg`/`sendmmsg`
   and per-batch arena buffers; optional `io_uring` and `AF_XDP` datapaths behind
-  features for kernel-bypass throughput.
+  features for reduced syscall overhead (io_uring) or kernel bypass (AF_XDP).
 - **Standalone-first management** — node-targeted, idempotent runtime config
   and user-limit commands with desired/observed versions and Tarantool-backed
   restart restore.
@@ -293,20 +287,19 @@ per-feature production maturity always check
 | Session migration | RFC 8016 | Partial — tickets are issued and re-issued on the tokio datapath; cross-node migration is **unwired** (no allocation is transferred between nodes), treat as same-node |
 | TLS-over-TCP transport (`tls`) | — | **Supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, and 24 h under load ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)) |
 | DTLS transport (`dtls`) | RFC 7350 | Supported — 24 h under load with zero packet loss, a 300 000-packet spoofed-source flood that allocates no state, 20/20 handshakes at 3 % path loss, and interop with OpenSSL and coturn's client ([docs/interop/dtls-stack-2026-09-16.md](docs/interop/dtls-stack-2026-09-16.md)). Not reachable from a browser: WebRTC has no DTLS transport for TURN |
-| QUIC transport (`quic`) | — | Beta — allocation, relayed media both directions and 20 min under load, but **no independent implementation exists** (no RFC defines TURN over raw QUIC), so interop cannot be obtained |
-| WebTransport (`web-transport`) | — | Beta — browser interop recorded ([docs/interop/webtransport-browser-2026-08-20.md](docs/interop/webtransport-browser-2026-08-20.md)) plus 20 min under load |
-| TURN-over-SCTP transport (`sctp`) | none — no RFC defines it | Experimental; **refused under `production = true`**. Control channel only, the relay stays UDP |
+| QUIC (`quic`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
+| WebTransport (`web-transport`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
+| TURN-over-SCTP transport (`sctp`) | Project-specific TURN mapping | **Supported on Linux/tokio**, opt-in, allowed in production. Native SCTP without TLS; control and ChannelData, UDP relay. [Evidence](docs/verification/sctp-supported-2026-09-18.md) |
 | Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
 | NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
 | Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |
-| `io_uring` datapath | — | Beta — endurance and relaying recorded on Linux **6.8 and 6.14** ([docs/soak/endurance-2026-08-19.md](docs/soak/endurance-2026-08-19.md), [docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)); io_uring is version-sensitive — verify on your own kernel |
-| `AF_XDP` datapath | — | Beta — correctness verified on a veth lab ([docs/interop/af-xdp-2026-08-19.md](docs/interop/af-xdp-2026-08-19.md)); validate on your NIC, the lab attaches in SKB mode |
+| `io_uring` datapath | — | **Supported on Linux**, opt-in UDP datapath. Verified on **6.8.0-87 / 6.14.0-33**: recovery/drain, live TURN checks, 30-minute media and four-hour authenticated allocation churn on 6.8; functional checks and short churn on 6.14. [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md). |
+| `AF_XDP` datapath | — | **Supported within verified Linux IPv4 UDP copy-mode scope** — SKB/native on 6.8.0-87, `virtio_net`, two queues. Zero-copy unverified; historical WAN churn timeouts remain unexplained. [Evidence and limits](docs/verification/af-xdp-supported-2026-09-22.md). |
 
-Status legend: **Supported** — exercised on the primary path and intended for
-production use. **Beta** — gated behind a Cargo feature, hardened in source
-(limits, metrics, readiness, graceful drain) but without recorded soak/interop
-evidence; test it with your own client stack first. **Experimental** — gated
+Status legend: **Supported** — maintained and verified within its stated scope;
+platform, interoperability and endurance limits remain explicit. **Beta** —
+verification or operational gaps remain for the intended scope. **Experimental** — gated
 behind a Cargo feature with known functional gaps; not for production. **Partial**
 — the protocol element is present but not the whole feature; the notes say what
 is missing. Anything marked *refused under `production = true`* is rejected by

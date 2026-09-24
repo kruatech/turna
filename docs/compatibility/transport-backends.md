@@ -45,7 +45,7 @@ cargo build --release -p turna-node --features af-xdp
 |---------|:-----:|:-----:|----------------------|
 | tokio   | ✅ | ✅ | none |
 | io_uring | ✅ | ❌ | kernel io_uring; fails fast if unavailable |
-| af_xdp  | ✅ | ❌ | `CAP_NET_RAW`, external XDP program on the bound NIC queue |
+| af_xdp  | ✅ | ❌ | Privileges for XSK/BPF/XDP; node-owned embedded filter; all RX queues configured |
 | dtls    | ✅ | ✅ | ECDSA P-256 cert/key (readable) |
 | sctp    | ✅ | ❌ | host `sctp` kernel module; plaintext control channel |
 
@@ -53,9 +53,12 @@ cargo build --release -p turna-node --features af-xdp
 
 - **tokio — Stable / default.** All platforms. The production default. Full TURN
   cycle covered by the integration suite.
-- **io_uring — Supported (Linux).** Opt-in via `transport = "io_uring"` + build
-  feature. Protocol behaviour verified byte-for-byte against tokio
-  (`scripts/e2e/backend_diff_bytes.sh`).
+- **io_uring — Supported (Linux).** Opt-in via `transport = "io_uring"` and the
+  `io-uring` build feature. Tested on 6.8.0-87 and 6.14.0-33; latest functional
+  comparison is suite-level, not byte-for-byte evidence. Support applies to the
+  documented UDP datapath scope, not all listener combinations.
+  [Verification](../verification/io-uring-supported-2026-09-19.md),
+  [operations](../runbooks/io-uring.md).
 - **dtls — Beta.** Opt-in listener. Fail-fast on misconfig, graceful shutdown,
   session + per-IP caps, idle reaper, bounded outbound queue (drop-newest),
   outbound MTU enforcement. TURN-over-DTLS exercised by `tests/integration`
@@ -67,21 +70,23 @@ cargo build --release -p turna-node --features af-xdp
   per-IP), handshake timeout, certificate hot-reload, cooperative drain,
   accept-error resilience, `turna_tls_*` metrics. This is also the control
   transport RFC 6062 TCP allocations require.
-- **sctp — Experimental, refused in production, not being matured.** Opt-in
-  client *control* transport (the relay stays UDP). No RFC defines SCTP for TURN,
-  the control channel is plaintext, and `production = true` rejects
-  `[turn.sctp].enabled`. Only wired in the tokio backend, and it has none of the
-  hardening the other listeners received. Treat it as test-only; the open question
-  is whether to delete it, not how to promote it (`docs/protocol-gap.md`).
-- **quic / web-transport — Experimental.** Opt-in. Both paths apply the full
-  `[turn.quic]` transport config; raw QUIC also routes control replies per stream.
-  `alpn` is inert on the H3 path (wtransport forces `h3`). No interop test yet. Build the two features separately — `web-transport` bundles its own
-  quinn, which can conflict with the standalone `quinn` dep under
-  `--all-features`.
-- **af_xdp — Experimental / Phase 1.** Opt-in (Linux + `CAP_NET_RAW` + external
-  XDP). Compiles and passes startup preflight; neighbor (ARP/NDP) resolution for
-  TX MACs is a placeholder/follow-up, and runtime requires a veth lab or an
-  XDP-capable NIC (`scripts/lab/af_xdp_*.sh`). Not recommended for production yet.
+- **sctp — Supported on Linux/tokio.** Opt-in native one-to-one SCTP carrying
+  TURN control and ChannelData; the peer-side relay remains UDP. Allowed in
+  production, with global/per-IP caps, rate limiting, metrics, readiness and
+  cooperative drain. Requires kernel SCTP and network access for IP protocol 132.
+  Plaintext and project-specific; no WebRTC DataChannel or independent client
+  interoperability claim. Other backend selections are rejected when enabled.
+  See [support evidence](../verification/sctp-supported-2026-09-18.md).
+- **quic / web-transport — Supported on Linux/macOS with tokio.** Opt-in.
+  Both paths apply transport limits, admission and per-stream reply routing.
+  WebTransport negotiates `h3`; configured `alpn` applies only to raw QUIC.
+  Both features can be built together. [Evidence and scope](../verification/quic-webtransport-supported-2026-09-18.md).
+- **af_xdp — Supported within the verified Linux IPv4 UDP copy-mode scope.**
+  Opt-in; embedded selective filter, all RX queues covered, fixed ring geometry.
+  Linux 6.8.0-87 / `virtio_net`: SKB/copy and native/copy. Four-hour native
+  media and 15-minute native churn passed the documented criteria. Zero-copy
+  and other NIC/kernel combinations remain unverified; earlier WAN control
+  timeouts remain unexplained. [Evidence](../verification/af-xdp-supported-2026-09-22.md).
 
 ## Lifecycle (all backends)
 
@@ -103,7 +108,8 @@ cargo build --release -p turna-node --features af-xdp
 
 ## Differential testing
 
-- Suite-level Tokio↔io_uring parity: `scripts/e2e/backend_diff.sh <config>`.
+- Suite-level Tokio↔io_uring acceptance: `bash scripts/e2e/backend_diff.sh`
+  (isolated default config; both backends must pass, including shutdown).
 - Byte-level Tokio↔io_uring parity: `scripts/e2e/backend_diff_bytes.sh A B [--json]`
   (point at two instances differing only in `[turn].transport`).
 - vs. coturn: the same `diff-test` tool with `--coturn` aimed at a coturn instance.
@@ -119,8 +125,8 @@ cargo build --release -p turna-node --features af-xdp
 | io_uring  | Linux    | `io-uring`   | Supported |
 | TURNS (TLS/TCP) | Linux/macOS | `tls` | **Supported** |
 | DTLS      | Linux/macOS | `dtls`    | Beta |
-| SCTP      | Linux    | `sctp`       | Experimental (refused in production) |
-| QUIC      | Linux/macOS | `quic`    | Beta (control-plane interop recorded) |
-| WebTransport | Linux/macOS | `web-transport` | Beta (browser interop recorded) |
-| AF_XDP    | Linux    | `af-xdp`     | Experimental (Phase 1) |
+| SCTP      | Linux    | `sctp`       | Supported with tokio; native SCTP, plaintext |
+| QUIC (`quic`) | Linux/macOS, tokio | `quic` | Supported; see [scope](../verification/quic-webtransport-supported-2026-09-18.md). |
+| WebTransport (`web-transport`) | Linux/macOS, tokio | `web-transport` | Supported; see [scope](../verification/quic-webtransport-supported-2026-09-18.md). |
+| AF_XDP    | Linux | `af-xdp` | Supported within verified IPv4 UDP copy-mode scope; see support evidence above |
 ```

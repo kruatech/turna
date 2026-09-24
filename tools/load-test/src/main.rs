@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand};
 use tokio::net::UdpSocket;
 use tokio::sync::Barrier;
 
+#[cfg(all(feature = "sctp", target_os = "linux"))]
+mod sctp_client;
 mod turn_client;
 // Framing and the test certificate verifier, shared by the stream transports.
 // Gated together with them: the TCP relay client used to keep the framer alive
@@ -28,7 +30,8 @@ mod turn_client;
     feature = "tls",
     feature = "quic",
     feature = "dtls",
-    feature = "web-transport"
+    feature = "web-transport",
+    all(feature = "sctp", target_os = "linux")
 ))]
 mod stream_common;
 // RFC 6062 runs over TURNS, so this needs the TLS stack like the others.
@@ -40,6 +43,12 @@ mod quic_client;
 mod tcp_relay_client;
 #[cfg(feature = "tls")]
 mod tls_client;
+#[cfg(any(
+    feature = "quic",
+    feature = "web-transport",
+    all(feature = "sctp", target_os = "linux")
+))]
+mod transport_probe;
 #[cfg(feature = "web-transport")]
 mod wt_client;
 use turn_client::{Creds, FAMILY_V4, FAMILY_V6};
@@ -113,6 +122,32 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Mode {
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    TransportNetwork {
+        #[arg(long)]
+        transport: String,
+        #[arg(long, default_value = "127.0.0.1:39001")]
+        peer: SocketAddr,
+        #[arg(long, default_value_t = 10)]
+        pps: u64,
+    },
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    TransportProbe {
+        #[arg(long)]
+        transport: String,
+        #[arg(long, default_value = "hold")]
+        action: String,
+        #[arg(long, default_value_t = 0)]
+        hold_secs: u64,
+    },
     /// Establish N allocations, drop them all at once, and re-establish them
     /// simultaneously — a link flap or a node loss, from the server's side.
     ///
@@ -161,6 +196,17 @@ enum Mode {
         /// the attribute, and the `conformance` mode only checks the control plane.
         #[arg(long, default_value = "v4")]
         family: String,
+    },
+    #[cfg(all(feature = "sctp", target_os = "linux"))]
+    SctpCheck,
+    #[cfg(all(feature = "sctp", target_os = "linux"))]
+    Sctp {
+        #[arg(short = 'c', long, default_value = "10")]
+        concurrency: usize,
+        #[arg(long, default_value = "10")]
+        pps: u64,
+        #[arg(long, default_value = "160")]
+        payload: usize,
     },
     /// TURN over WebTransport (HTTP/3): session, control stream, allocation and
     /// relayed media both ways.
@@ -343,6 +389,16 @@ enum Mode {
 impl Mode {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(any(
+                feature = "quic",
+                feature = "web-transport",
+                all(feature = "sctp", target_os = "linux")
+            ))]
+            Mode::TransportProbe { .. } | Mode::TransportNetwork { .. } => "transport-probe",
+            #[cfg(all(feature = "sctp", target_os = "linux"))]
+            Mode::SctpCheck => "sctp-check",
+            #[cfg(all(feature = "sctp", target_os = "linux"))]
+            Mode::Sctp { .. } => "sctp",
             Mode::Binding { .. } => "binding",
             Mode::Allocate { .. } => "allocate",
             Mode::ReconnectStorm { .. } => "reconnect-storm",
@@ -450,12 +506,16 @@ impl Stats {
     }
 
     fn reset(&self) {
+        self.errs.store(0, Ordering::Relaxed);
+        self.reset_preserving_errors();
+    }
+
+    fn reset_preserving_errors(&self) {
         // P0 #14: begin the steady-state window. Discard everything collected
         // during warmup so the report reflects steady state only, not
         // connection setup / allocation handshakes / ramp-up.
         self.sent.store(0, Ordering::Relaxed);
         self.recv.store(0, Ordering::Relaxed);
-        self.errs.store(0, Ordering::Relaxed);
         self.bytes_out.store(0, Ordering::Relaxed);
         self.bytes_in.store(0, Ordering::Relaxed);
         self.lat_sum.store(0, Ordering::Relaxed);
@@ -830,10 +890,10 @@ async fn run_binding(
 
 /// Closed-loop authenticated Allocate benchmark.
 ///
-/// Each task repeats: full Allocate handshake (401 challenge →
-/// MESSAGE-INTEGRITY request) → Refresh(0) to release. `recv` counts
-/// successful allocations; latency is the full two-round-trip
-/// handshake as a client experiences it.
+/// Each worker obtains a challenge once, retains its UDP socket and repeats
+/// authenticated Allocate -> confirmed Refresh(0). `recv` counts complete
+/// create/delete cycles; latency includes both operations. Nonce expiry retries
+/// are bounded. Warmup failures remain visible in the final error count.
 async fn run_allocate(
     server: SocketAddr,
     concurrency: usize,
@@ -846,42 +906,84 @@ async fn run_allocate(
     let stats = Arc::new(Stats::new());
     let barrier = Arc::new(Barrier::new(concurrency + 1));
     let mut handles = Vec::new();
+    let measuring = Arc::new(AtomicBool::new(false));
 
-    for _ in 0..concurrency {
+    for worker in 0..concurrency {
         let stats = stats.clone();
         let barrier = barrier.clone();
         let creds = creds.clone();
+        let measuring = measuring.clone();
         handles.push(tokio::spawn(async move {
+            let mut session: Option<turn_client::Session> = None;
+            let mut failures = 0u64;
             barrier.wait().await;
             while stats.is_running() {
+                let measured = measuring.load(Ordering::Acquire);
                 let t = Instant::now();
-                stats.sent.fetch_add(1, Ordering::Relaxed);
-                match turn_client::allocate(server, &creds, rtt_ms).await {
-                    Ok(mut sess) => {
-                        stats.recv.fetch_add(1, Ordering::Relaxed);
-                        stats.record_latency(t.elapsed());
-                        sess.release().await;
+                let result = async {
+                    if let Some(current) = session.as_mut() {
+                        current.churn_request(true).await?;
+                    } else {
+                        session =
+                            Some(turn_client::allocate_family(server, &creds, rtt_ms, None).await?);
                     }
-                    Err(_) => {
-                        stats.errs.fetch_add(1, Ordering::Relaxed);
+                    // Count success only after the server confirms deletion.
+                    session.as_mut().unwrap().churn_request(false).await
+                }
+                .await;
+                if measured {
+                    stats.sent.fetch_add(1, Ordering::Relaxed);
+                    match &result {
+                        Ok(()) => {
+                            stats.recv.fetch_add(1, Ordering::Relaxed);
+                            stats.record_latency(t.elapsed());
+                        }
+                        Err(_) => {
+                            stats.errs.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
+                if let Err(error) = result {
+                    failures += 1;
+                    if failures <= 8 || failures.is_power_of_two() {
+                        eprintln!(
+                            "allocate worker={worker} failure={failures} stage={} stun_code={:?}",
+                            error.0, error.1
+                        );
+                    }
+                    // A timed-out operation has uncertain state. Do not reuse it.
+                    if let Some(mut sess) = session.take() {
+                        sess.release().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
+            // Include warmup failures in the final error count; never erase them.
+            failures
         }));
     }
 
     barrier.wait().await;
     progress_reporter(&stats, json);
-    // P0 #14: run warmup, then reset to measure only steady state.
+    // Mark operations at their start so warmup cannot split accounting.
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
-        stats.reset();
     }
+    stats.reset_preserving_errors();
+    measuring.store(true, Ordering::Release);
     tokio::time::sleep(duration).await;
     stats.stop();
+    let mut failures = 0;
     for h in handles {
-        let _ = h.await;
+        failures += match h.await {
+            Ok(n) => n,
+            Err(error) => {
+                eprintln!("allocate worker failed: {error}");
+                1
+            }
+        };
     }
+    stats.errs.store(failures, Ordering::Relaxed);
     stats
 }
 
@@ -1013,6 +1115,9 @@ async fn run_channeldata(
             let mut next_refresh = Instant::now() + Duration::from_secs(240);
             while stats.is_running() {
                 tick.tick().await;
+                if !stats.is_running() {
+                    break;
+                }
                 if Instant::now() >= next_refresh {
                     if sess.refresh(ch, peer_addr).await.is_err() {
                         stats.errs.fetch_add(1, Ordering::Relaxed);
@@ -1035,8 +1140,18 @@ async fn run_channeldata(
                 }
             }
 
+            // Drain the peer before deleting the allocation. Bound teardown
+            // even if unrelated traffic keeps its receive loop alive.
+            let mut recv_task = recv_task;
+            match tokio::time::timeout(Duration::from_secs(2), &mut recv_task).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    stats.errs.fetch_add(1, Ordering::Relaxed);
+                    recv_task.abort();
+                    let _ = recv_task.await;
+                }
+            }
             sess.release().await;
-            let _ = recv_task.await;
         }));
     }
 
@@ -1300,9 +1415,74 @@ async fn main() {
         Creds::Rest {
             secret: cli.secret.clone(),
             uid: cli.uid.clone(),
-            ttl_s: 3600,
+            // Credentials must outlive warmup, the measured run and teardown.
+            ttl_s: cli.duration.saturating_add(cli.warmup).saturating_add(3600),
         }
     };
+
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    if let Mode::TransportNetwork {
+        transport,
+        peer,
+        pps,
+    } = &cli.mode
+    {
+        let result = tokio::time::timeout(
+            Duration::from_secs(cli.duration.saturating_add(30)),
+            transport_probe::network(transport, cli.server, &creds, *peer, cli.duration, *pps),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => std::process::exit(0),
+            other => {
+                eprintln!("transport-network failed: {other:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(any(
+        feature = "quic",
+        feature = "web-transport",
+        all(feature = "sctp", target_os = "linux")
+    ))]
+    if let Mode::TransportProbe {
+        transport,
+        action,
+        hold_secs,
+    } = &cli.mode
+    {
+        let result = tokio::time::timeout(
+            Duration::from_secs(hold_secs.saturating_add(25)),
+            transport_probe::run(transport, cli.server, &creds, action, *hold_secs),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => std::process::exit(0),
+            other => {
+                eprintln!("transport-probe failed: {other:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(all(feature = "sctp", target_os = "linux"))]
+    if let Mode::SctpCheck = &cli.mode {
+        match sctp_client::check(cli.server, &creds, cli.rtt_timeout_ms).await {
+            Ok(steps) => {
+                for s in steps {
+                    println!("  ok   {s}");
+                }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("sctp-check: FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     #[cfg(feature = "web-transport")]
     if let Mode::WtCheck { url } = &cli.mode {
@@ -1465,7 +1645,9 @@ async fn main() {
                     println!("  ok   {s}");
                 }
                 println!("\nquic-check: OK — the QUIC ingress carries a full TURN allocation.");
-                println!("Control plane only: relayed media over QUIC is not exercised here");
+                println!(
+                    "Relayed media verified in both directions; this is not an endurance test."
+                );
                 println!("(docs/verification/interop-plan.md, Tier 2).");
                 std::process::exit(0);
             }
@@ -1535,6 +1717,35 @@ async fn main() {
                 cli.json,
                 creds,
                 cli.rtt_timeout_ms,
+            )
+            .await
+        }
+        #[cfg(any(
+            feature = "quic",
+            feature = "web-transport",
+            all(feature = "sctp", target_os = "linux")
+        ))]
+        Mode::TransportProbe { .. } | Mode::TransportNetwork { .. } => {
+            unreachable!("handled above")
+        }
+        #[cfg(all(feature = "sctp", target_os = "linux"))]
+        Mode::SctpCheck => unreachable!("handled above"),
+        #[cfg(all(feature = "sctp", target_os = "linux"))]
+        Mode::Sctp {
+            concurrency,
+            pps,
+            payload,
+        } => {
+            sctp_client::load(
+                cli.server,
+                creds,
+                cli.rtt_timeout_ms,
+                concurrency,
+                pps,
+                payload,
+                dur,
+                wu,
+                cli.json,
             )
             .await
         }

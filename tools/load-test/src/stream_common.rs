@@ -107,7 +107,12 @@ pub use verifier::AcceptAnyServerCert;
 /// detail a hand-rolled framer gets wrong.
 ///
 /// Returns the message *without* the padding, so callers see exactly what was sent.
-#[cfg(any(feature = "tls", feature = "quic", feature = "web-transport"))]
+#[cfg(any(
+    feature = "tls",
+    feature = "quic",
+    feature = "web-transport",
+    all(feature = "sctp", target_os = "linux")
+))]
 pub fn next_stream_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     loop {
         if buf.len() < 4 {
@@ -134,4 +139,63 @@ pub fn next_stream_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
         let msg: Vec<u8> = buf.drain(0..wire).collect();
         return Some(msg[..logical].to_vec());
     }
+}
+
+/// Exercise interleaved requests and FIN on real independent QUIC/H3 streams.
+/// Uses a manually encoded Binding request, independent of server framing code.
+#[cfg(any(feature = "quic", feature = "web-transport"))]
+pub async fn check_parallel_streams<W, R>(mut a: (W, R), mut b: (W, R)) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn binding(tid: u8) -> [u8; 20] {
+        let mut msg = [0; 20];
+        msg[1] = 1;
+        msg[4..8].copy_from_slice(&0x2112a442u32.to_be_bytes());
+        msg[8..].fill(tid);
+        msg
+    }
+    async fn response<R: tokio::io::AsyncRead + Unpin>(
+        recv: &mut R,
+        tid: u8,
+    ) -> std::io::Result<()> {
+        let mut header = [0; 20];
+        recv.read_exact(&mut header).await?;
+        if header[0..2] != [1, 1] || header[8..20] != [tid; 12] {
+            return Err(std::io::Error::other(
+                "wrong Binding response or stream transaction",
+            ));
+        }
+        let mut body = vec![0; u16::from_be_bytes([header[2], header[3]]) as usize];
+        recv.read_exact(&mut body).await?;
+        Ok(())
+    }
+    let probe = async {
+        let first = binding(17);
+        a.0.write_all(&first[..9]).await?;
+        b.0.write_all(&binding(29)).await?;
+        // B must complete while A is incomplete: no cross-stream framing/HoL.
+        response(&mut b.1, 29).await?;
+        a.0.write_all(&first[9..]).await?;
+        a.0.shutdown().await?;
+        response(&mut a.1, 17).await?;
+        // Closing only the request half must still deliver its final response.
+        let mut byte = [0];
+        if a.1.read(&mut byte).await? != 0 {
+            return Err(std::io::Error::other(
+                "unexpected bytes after final response",
+            ));
+        }
+        b.0.shutdown().await?;
+        if b.1.read(&mut byte).await? != 0 {
+            return Err(std::io::Error::other("unexpected trailing stream bytes"));
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+        .await
+        .map_err(|_| "parallel streams / half-close timed out".to_string())?
+        .map_err(|e| format!("parallel streams: {e}"))
 }

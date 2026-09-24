@@ -64,7 +64,7 @@ pub fn spawn_quic(
         cert_reload_interval: std::time::Duration::from_secs(cfg.cert_reload_secs),
         max_handshakes_per_sec_per_ip: cfg.max_handshakes_per_sec_per_ip,
         handshake_burst_per_ip: cfg.handshake_burst_per_ip,
-        allow_migration: true,
+        allow_migration: cfg.allow_migration,
     };
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<QuicEvent>(1024);
@@ -172,10 +172,25 @@ pub fn spawn_quic(
                 QuicEvent::NewSession(s) => {
                     let session_id = s.session_id.clone();
                     let addr = s.remote_addr;
-                    session_addr.insert(session_id.clone(), addr);
-
+                    if client_sinks.contains_key(&addr) || released.store().get(&addr).is_some() {
+                        tracing::warn!(%addr, "QUIC source address already owns a transport/allocation");
+                        if let Ok(mut reg) = outbound.lock() {
+                            reg.remove(&session_id);
+                        }
+                        continue;
+                    }
                     let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-                    client_sinks.insert(addr, sink_tx);
+                    let inserted = client_sinks
+                        .entry(addr)
+                        .or_insert_with(|| sink_tx.clone())
+                        .same_channel(&sink_tx);
+                    if !inserted {
+                        if let Ok(mut reg) = outbound.lock() {
+                            reg.remove(&session_id);
+                        }
+                        continue;
+                    }
+                    session_addr.insert(session_id.clone(), addr);
 
                     let reg = outbound.clone();
                     let st_pump = stats_out.clone();
@@ -198,6 +213,7 @@ pub fn spawn_quic(
                                         session_id: session_id.clone(),
                                         data: bytes,
                                         via_datagram,
+                                        finish_stream: false,
                                         // Relay return path: no originating
                                         // request stream, so answer on whichever
                                         // bidi stream the client has open.
@@ -219,16 +235,59 @@ pub fn spawn_quic(
                     old_addr,
                     new_addr,
                 } => {
-                    // Re-key the egress sink to the client's new address, and the
-                    // bridge's addr -> session index with it: without the latter
-                    // `session_for_addr` would still answer on the old address
-                    // and peer->client traffic would be lost after a migration.
-                    if let Some((_, sink)) = client_sinks.remove(old_addr) {
-                        client_sinks.insert(*new_addr, sink);
+                    // Publish the new egress sink before re-keying the allocation:
+                    // a concurrent peer reply must never fall back to plain UDP.
+                    let sink = client_sinks
+                        .get(old_addr)
+                        .map(|entry| entry.value().clone());
+                    let installed = sink.as_ref().is_some_and(|sink| {
+                        let entry = client_sinks
+                            .entry(*new_addr)
+                            .or_insert_with(|| sink.clone());
+                        entry.same_channel(sink)
+                    });
+                    if !installed || !bridge.migrate(session_id, *old_addr, *new_addr) {
+                        if installed {
+                            client_sinks.remove(new_addr);
+                        }
+                        tracing::warn!(%old_addr, %new_addr, "QUIC migration refused: address conflict");
+                        if let Ok(mut reg) = outbound.lock() {
+                            reg.remove(session_id);
+                        }
+                        continue;
                     }
+                    client_sinks.remove(old_addr);
                     session_addr.insert(session_id.clone(), *new_addr);
-                    bridge.migrate(session_id, *old_addr, *new_addr);
                     tracing::debug!(%old_addr, %new_addr, "QUIC connection migrated (egress re-keyed)");
+                }
+                QuicEvent::StreamReadClosed {
+                    session_id,
+                    stream_id,
+                } => {
+                    // Same FIFO as responses: FIN must not discard the last reply.
+                    let sender = outbound
+                        .lock()
+                        .ok()
+                        .and_then(|r| r.get(session_id).cloned());
+                    if let Some(tx) = sender {
+                        if tx
+                            .try_send(QuicOutbound {
+                                session_id: session_id.clone(),
+                                data: Vec::new(),
+                                via_datagram: false,
+                                finish_stream: true,
+                                stream_id: Some(*stream_id),
+                            })
+                            .is_err()
+                        {
+                            stats_out
+                                .send_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if let Ok(mut reg) = outbound.lock() {
+                                reg.remove(session_id);
+                            }
+                        }
+                    }
                 }
                 QuicEvent::SessionClosed { session_id, .. } => {
                     if let Some(addr) = session_addr.remove(session_id) {
@@ -245,7 +304,14 @@ pub fn spawn_quic(
                 _ => {}
             }
 
-            for action in bridge.on_event(ev) {
+            let actions = bridge.on_event(ev);
+            for failed in bridge.take_failed_sessions() {
+                tracing::warn!(session = %failed, "invalid QUIC stream framing; closing session");
+                if let Ok(mut reg) = outbound.lock() {
+                    reg.remove(&failed);
+                }
+            }
+            for action in actions {
                 // Relay-plane actions go into the shared relay egress; a control
                 // Send comes back here for delivery over this QUIC session.
                 let Some((data, target)) = egress.dispatch(action).await else {
@@ -277,6 +343,7 @@ pub fn spawn_quic(
                             session_id,
                             data: data.to_vec(),
                             via_datagram,
+                            finish_stream: false,
                             stream_id,
                         })
                         .is_err()

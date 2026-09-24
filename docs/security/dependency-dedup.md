@@ -106,7 +106,7 @@ a release binary:
 `rustls-pemfile` (RUSTSEC-2025-0134, unmaintained) is **gone from the graph
 entirely**. It was removed as a direct dependency when PEM parsing in
 `turna-transport` moved to `rustls-pki-types`, and the last transitive path —
-`wtransport` under the experimental `web-transport` feature — disappeared with
+`wtransport` under the opt-in `web-transport` feature — disappeared with
 `wtransport 0.7.1`. Verified against `Cargo.lock`:
 `cargo tree -p turna-transport --features web-transport -i rustls-pemfile`
 reports no matching package. RISK-001 in `accepted-risks.md` is closed.

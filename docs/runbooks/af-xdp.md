@@ -1,100 +1,101 @@
-# AF_XDP datapath — deploy & runbook
+# AF_XDP datapath — build and verification
 
-> **Status: Experimental (Phase 1).** Compiles and passes startup preflight;
-> TX neighbor (ARP/NDP) MAC resolution is a placeholder/follow-up, and runtime
-> needs a veth lab or an XDP-capable NIC. Not recommended for production yet.
-> See `docs/compatibility/transport-backends.md`.
+**Status: supported within the verified Linux IPv4 UDP copy-mode scope.**
+See [support evidence and unresolved limitations](../verification/af-xdp-supported-2026-09-22.md).
+Validated deployment: Linux 6.8.0-87 / `virtio_net`, queues 0 and 1, SKB/copy
+and native/copy. Other drivers/kernels, IPv6 WAN and zero-copy are not established
+by these runs. Revalidate the target deployment before enabling.
 
-The AF_XDP backend binds an AF_XDP socket to a specific NIC queue and runs a
-busy-poll RX → process → TX loop. It assumes an **externally-loaded XDP program**
-steers the relevant traffic to that queue; the server never loads or removes the
-XDP program itself, and leaves it untouched on shutdown.
+WAN media acceptance permits up to 0.01% missing echoes; it is not a zero-loss
+guarantee. Churn acceptance requires zero operation errors and full cleanup.
+Earlier WAN churn timeouts remain unexplained; the later PASS is not a proven fix.
+Use [bounded TX diagnostics](../verification/af-xdp-tx-trace.md) if they recur.
 
-## Capabilities & prerequisites
+The node loads its embedded selective XDP program; do not load a redirect-all
+program manually. It redirects only the configured destination IP and registered
+TURN/relay UDP ports. TCP and ARP/NDP remain on the kernel path.
 
-- Linux, binary built with `--features af-xdp`.
-- Build deps for `xsk-rs`/libbpf: `clang llvm libelf-dev zlib1g-dev libbpf-dev`.
-- `CAP_NET_RAW` on the process:
-  ```bash
-  sudo setcap cap_net_raw+ep ./target/release/turna-node
-  ```
-- A NIC (or veth) whose target queue is steered to the AF_XDP socket by an
-  XDP program you load and own.
+## Build first, without sudo
 
-## Configuration
-
-`transport = "af_xdp"` plus a `[turn.af_xdp]` section. See
-`docs/CONFIGURATION.md` for the full key list; the constrained ones:
-
-- `frame_size` ≥ 2048 and ≥ MTU+14.
-- `fill_ring_size` a power of two.
-- `interface` must exist and be up; `queue_id` must exist on it.
-
-```toml
-[turn]
-transport = "af_xdp"
-
-[turn.af_xdp]
-interface = "eth0"
-queue_id = 0
-frame_count = 4096
-frame_size = 2048
-fill_ring_size = 2048
-comp_ring_size = 2048
-rx_ring_size = 2048
-tx_ring_size = 2048
-zero_copy = false
-need_wakeup = true
-src_mac = ""        # placeholder until neighbor resolution lands
-dst_mac = ""
-```
-
-## Startup preflight
-
-Before touching any kernel resource the node validates: ring geometry
-(power-of-two, `frame_size ≥ 2048`), interface exists/up (`/sys/class/net`),
-queue `rx-<N>` exists, `frame_size ≥ MTU+14`, and `CAP_NET_RAW`
-(`/proc/self/status` `CapEff`). Any failure aborts startup with the list of
-problems.
-
-## Local veth lab
-
-Scripts under `scripts/lab/` exercise the datapath on a veth pair without a real
-NIC. Run as root, in order:
+Linux build dependencies: clang, llvm, linux-libc-dev, libelf-dev, zlib1g-dev,
+libbpf-dev, pkg-config and protobuf-compiler. Use the repository's pinned toolchain.
 
 ```bash
-sudo scripts/lab/af_xdp_veth_setup.sh    # create veth pair + addressing
-sudo scripts/lab/af_xdp_smoke.sh         # boot node on af_xdp + smoke traffic
-sudo scripts/lab/af_xdp_cleanup.sh       # tear down
+cargo test --locked -p turna-config
+cargo test --locked -p turna-transport --features af-xdp
+cargo test --locked -p turna-node --features af-xdp af_xdp_listener
+cargo build --locked --release -p turna-node --features af-xdp
+cargo build --locked --release -p turna-load-test
+python3 scripts/verify/test_af_xdp_filter.py
 ```
 
-## Metrics
+The C filter test uses GCC on x86_64 Linux. It mocks BPF helpers and cannot establish
+kernel verifier acceptance. The Rust ownership tests do not substitute for live rings.
 
-Loop-level counters on `/metrics`:
+## Isolated lab
 
-- `turna_afxdp_rx_frames_total`, `turna_afxdp_tx_frames_total`
-- `turna_afxdp_rx_bytes_total`, `turna_afxdp_tx_bytes_total`
-- `turna_afxdp_parse_drops_total` — frames received that matched no TURN/relay
-  port (undemuxable)
-- `turna_afxdp_tx_drops_total` — send failures
-- `turna_afxdp_relay_ports_registered` — relay ports currently demuxed (gauge)
-- `turna_afxdp_umem_free_frames` — free UMEM frames (gauge)
+```bash
+sudo env SKIP_BUILD=1 bash scripts/verify/af-xdp-lab.sh
+```
 
-Not yet exposed (need datapath/ARP internals): ARP/NDP reply counts,
-neighbor-miss, per-ring (fill/comp/rx/tx) pending depths, `{queue}` labels.
+Uses a new veth/network namespace and health port 19100, never the public NIC.
+Existing lab links/namespaces/output directories or an occupied health port cause
+failure. Conformance and relayed media must pass. Zero client loss/errors and clean
+node exit are required; a forced kill after the 60-second deadline is a failure.
+The trap tears down only the lab resources created by this invocation.
 
-Alert rules covering `turna_afxdp_parse_drops_total` and
-`turna_afxdp_umem_free_frames` are in `docs/alerts/transport-backends.yml`.
+## Real interface preparation
 
-## Graceful shutdown
+For the cloud host discussed in this record:
 
-`SIGTERM`/`SIGINT` (after the optional drain grace) flips the shutdown watch; the
-busy-poll loop observes it within one poll interval and returns, releasing the
-XSK socket and UMEM via RAII. The operator-owned XDP program is not modified.
+```bash
+bash scripts/verify/af-xdp-preflight.sh ens3
+```
 
-## Known limitations (Phase 1)
+This command only inventories the NIC. No attach, queue changes or offload changes.
+Cloud has `virtio_net` and two reported RX queues. Configuration must cover both:
 
-- TX `src_mac`/`dst_mac` are static config; ARP/netlink neighbor resolution is a
-  follow-up. Empty values are placeholders.
-- Single queue, no `{queue}`-labelled metrics.
-- Runtime not yet validated here beyond compilation + preflight.
+```toml
+[turn.af_xdp]
+interface = "ens3"
+queue_ids = [0, 1]
+attach_mode = "skb"
+zero_copy = false
+```
+
+Set the existing `[turn].listen` to the intended concrete address; wildcard is
+refused. Use an isolated test port/range and validate authentication/peer policy.
+Do not reuse production credentials in exported test artifacts.
+
+`attach_mode = "native"` with `zero_copy = false` requests native XDP with copy;
+`zero_copy = true` forces native zero-copy. The kernel-reported socket mode is
+checked and logged. Unsupported modes fail without silently downgrading.
+`auto` preserves legacy selection: native with zero-copy, otherwise SKB.
+
+All RX queues enumerated in sysfs must be covered. Empty `queue_ids` uses the
+legacy `queue_id` (0 by default) and therefore works only for a matching
+single-queue interface. Per-queue UMEM increases memory proportionally.
+
+Privileged lab execution uses root. A capability-only production setup must allow
+XSK bind, BPF load and XDP attach; `CAP_NET_RAW` alone is not a complete recipe.
+Do not replace/detach someone else's existing XDP program to make a test pass.
+
+## Geometry and monitoring
+
+Current library geometry is fixed: frames 4096 bytes, all rings 2048 entries,
+frame_count at most 4096. Configuration rejects inert size overrides. MTU plus
+Ethernet header must fit the frame. Native zero-copy support is driver-dependent.
+
+Track `turna_afxdp_readiness`, `turna_transport_readiness`, RX/TX counters,
+`turna_afxdp_tx_drops_total`, `turna_afxdp_relay_ports_registered`,
+`turna_afxdp_umem_free_frames`, `turna_afxdp_tx_inflight`, neighbor cache size,
+RSS, open FDs and allocations. Ring gauges aggregate across queues; TX counters
+record submission, not proof that a peer received media. Verify echoed payloads.
+
+SIGTERM/SIGINT follows node drain, then each XSK drains TX with a bounded wait.
+The last shared program owner detaches Turna's program; detach failures are logged.
+After a run, verify node exit, released ports and the interface's XDP state.
+
+Historical `scripts/lab/af_xdp_smoke.sh` predates the embedded loader; use the
+verification script above. Long cloud runs and 30–40 minute physical-NIC checks
+follow only after the short build/lab/hardware gates pass.

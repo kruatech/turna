@@ -1,25 +1,7 @@
-//! AF_XDP transport backend (AF_XDP Phase 4).
-//!
-//! Drives the xsk-rs ring datapath (`turna_transport::af_xdp::xsk`) for the
-//! main TURN socket: `recv_batch` → `PacketProcessor::process_slice` →
-//! `send_to`. This is a transport *backend* (selected via
-//! `transport = "af_xdp"`), not an additional listener like QUIC.
-//!
-//! Scope: handles the main client↔server control path AND the relay data plane.
-//! Because the XDP redirect funnels all ingress on the queue into the xsk, relay
-//! traffic is demuxed here by destination port (main TURN port → `process_slice`;
-//! relay ports → `process_relay_recv`) and emitted via the xsk (`send_to` for
-//! client responses, `send_to_from` for client→peer with the relay source port).
-//! Peer MACs use the configured `dst_mac` (same-subnet); general ARP/neighbor
-//! resolution is a follow-up. The loop is blocking; the caller runs it via
-//! `spawn_blocking`.
-//!
-//! ARP: the XDP redirect also steals ARP off the queue, so the datapath answers
-//! ARP requests for its own IP in-band (`XskDatapath::maybe_arp_reply`) — clients
-//! and peers can resolve us without a static neighbor entry. This only fires when
-//! bound to a specific IP; with `listen = 0.0.0.0` add a static neighbor (or a
-//! selective XDP program that leaves ARP to the kernel). turna→peer ARP
-//! resolution (us as requester) remains the documented `dst_mac` follow-up.
+//! AF_XDP UDP datapath with one XSK per configured RX queue and a shared
+//! address/port-scoped XDP filter. TCP, ARP/NDP and unrelated UDP pass to the
+//! kernel. The loop owns relay sockets, map updates, expiry and ring maintenance.
+//! Per-destination MAC resolution uses the configured interface's routes/neighbors.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,8 +12,7 @@ use turna_relay::PacketProcessor;
 
 type DynErr = Box<dyn std::error::Error + Send + Sync>;
 
-/// Run the AF_XDP datapath loop. Blocks until the process exits (shutdown
-/// signalling is a follow-up).
+/// Run until cooperative shutdown, then drain submitted TX frames.
 #[cfg(all(target_os = "linux", feature = "af-xdp"))]
 pub fn run_af_xdp(
     cfg: turna_config::AfXdpSection,
@@ -77,15 +58,34 @@ pub fn run_af_xdp(
         rx_ring_size: cfg.rx_ring_size,
         tx_ring_size: cfg.tx_ring_size,
         zero_copy: cfg.zero_copy,
+        native_mode: cfg.attach_mode == "native" || (cfg.attach_mode == "auto" && cfg.zero_copy),
         need_wakeup: cfg.need_wakeup,
     };
 
-    let mut dp = XskDatapath::bind(&xdp_cfg, listen, src_mac, dst_mac)
-        .map_err(|e| -> DynErr { Box::new(e) })?;
+    if listen.ip().is_unspecified() {
+        return Err("AF_XDP requires a concrete listen IP".into());
+    }
+    let _main_socket = std::net::UdpSocket::bind(listen)?;
+    let queue_ids = if cfg.queue_ids.is_empty() {
+        vec![cfg.queue_id]
+    } else {
+        cfg.queue_ids.clone()
+    };
+    let mut datapaths: Vec<XskDatapath> = Vec::new();
+    for &queue in &queue_ids {
+        let mut selected = xdp_cfg.clone();
+        selected.queue_id = queue;
+        let dp = if let Some(first) = datapaths.first() {
+            first.bind_sibling(&selected, src_mac, dst_mac)?
+        } else {
+            XskDatapath::bind(&selected, listen, src_mac, dst_mac)?
+        };
+        datapaths.push(dp);
+    }
 
     tracing::info!(
         interface = %cfg.interface,
-        queue = cfg.queue_id,
+        queues = ?queue_ids,
         "AF_XDP datapath running (main TURN socket)"
     );
 
@@ -95,22 +95,30 @@ pub fn run_af_xdp(
     // cache miss the send paths fall back to the static dst_mac and queue a
     // resolve, so a resolver failure degrades to Phase-1 behaviour.
     {
-        use turna_transport::neighbor::{run_resolver, NeighborCache};
+        use turna_transport::neighbor::{run_resolver_on_interface, NeighborCache};
         let cache = NeighborCache::new();
         // B6: bounded neighbor-resolve queue (drop-on-full in the datapath).
         let (req_tx, req_rx) = tokio::sync::mpsc::channel(1024);
         let resolver_cache = cache.clone();
+        let resolver_interface = cfg.interface.clone();
         tokio::runtime::Handle::current().spawn(async move {
-            if let Err(e) = run_resolver(resolver_cache, req_rx).await {
+            if let Err(e) =
+                run_resolver_on_interface(resolver_cache, req_rx, &resolver_interface).await
+            {
                 tracing::warn!(%e, "AF_XDP neighbor resolver exited; using static dst_mac");
             }
         });
-        dp.attach_neighbor(cache, req_tx, std::time::Duration::from_secs(30));
+        for dp in &mut datapaths {
+            dp.attach_neighbor(
+                cache.clone(),
+                req_tx.clone(),
+                std::time::Duration::from_secs(30),
+            );
+        }
     }
 
-    // Relay ports owned by this datapath. The XDP redirect funnels ALL ingress
-    // on the queue into the xsk, so relay traffic (peer→client) arrives here too
-    // — there are no separate kernel relay sockets to receive it. We demux by
+    // Relay ports owned by this datapath. The selective XDP map redirects their
+    // traffic across all configured queues. We demux by
     // destination port: the main TURN port goes to `process_slice`; an
     // allocation's relay port goes to `process_relay_recv`. `held` keeps the
     // kernel relay socket alive purely to reserve the OS port; its I/O is unused.
@@ -123,6 +131,12 @@ pub fn run_af_xdp(
     // "the XSK socket died but the process is fine" is a distinct and far more
     // likely failure than the process dying, and `/ready` will not show it.
     metrics.set_afxdp_readiness(turna_health::Readiness::Ready);
+    metrics.set_transport_readiness(turna_health::Readiness::Ready);
+    metrics.set_readiness(turna_health::Readiness::Ready);
+    let mut maintenance = std::time::Instant::now();
+    let mut next_queue = 0usize;
+    let mut queue_counts = vec![(0u64, 0u64, 0u64, 0u64); datapaths.len()];
+    let mut queue_report = std::time::Instant::now();
 
     // Busy-poll RX → process → TX, backing off briefly when idle so a quiet
     // socket doesn't peg a core.
@@ -130,33 +144,76 @@ pub fn run_af_xdp(
         // AFX-5: cooperative shutdown. The signal task flips this watch to
         // `true` (after the optional drain grace); recv_batch is non-blocking,
         // so we observe it within one poll interval and return cleanly. RAII
-        // drop of `dp` (XSK socket + UMEM) and `held` (reserved relay ports)
-        // releases all resources; the operator-owned XDP program is untouched.
+        // Drop releases sockets/UMEM and the shared embedded XDP program.
+        // Do not detach an unrelated operator-owned program.
         if *shutdown.borrow() {
             tracing::info!("AF_XDP datapath: shutdown signalled, stopping");
             metrics.set_afxdp_readiness(turna_health::Readiness::Draining);
+            for dp in &mut datapaths {
+                dp.drain_tx(std::time::Duration::from_secs(1))?;
+            }
+            for (i, &(rx, tx, parse_drops, tx_drops)) in queue_counts.iter().enumerate() {
+                tracing::info!(
+                    queue = queue_ids[i],
+                    rx,
+                    tx,
+                    parse_drops,
+                    tx_drops,
+                    final_snapshot = true,
+                    "AF_XDP queue stats"
+                );
+            }
             return Ok(());
         }
+        // Reap even when no client sends another packet. Reconcile held sockets
+        // against the store after expiry or management-side deletion.
+        if maintenance.elapsed() >= std::time::Duration::from_secs(1) {
+            let removed = processor.store().cleanup_expired();
+            metrics
+                .active_allocations
+                .fetch_sub(removed as u64, Relaxed);
+            let live: std::collections::HashSet<u16> =
+                processor.store().live_relay_ports().into_iter().collect();
+            let stale: Vec<u16> = relay_ports.difference(&live).copied().collect();
+            for port in stale {
+                datapaths[0].del_relay_port(port)?;
+                relay_ports.remove(&port);
+                held.remove(&port);
+            }
+            metrics
+                .afxdp_relay_ports_registered
+                .store(relay_ports.len() as u64, Relaxed);
+            maintenance = std::time::Instant::now();
+        }
+        if queue_report.elapsed() >= std::time::Duration::from_secs(10) {
+            for (i, &(rx, tx, parse_drops, tx_drops)) in queue_counts.iter().enumerate() {
+                tracing::info!(
+                    queue = queue_ids[i],
+                    rx,
+                    tx,
+                    parse_drops,
+                    tx_drops,
+                    final_snapshot = false,
+                    "AF_XDP queue stats"
+                );
+            }
+            queue_report = std::time::Instant::now();
+        }
+        let index = next_queue;
+        next_queue = (next_queue + 1) % datapaths.len();
+        let dp = &mut datapaths[index];
+        dp.check_io()?;
+        let before_parse = dp.parse_drops();
         let frames = dp.recv_batch(64);
+        queue_counts[index].0 += frames.len() as u64;
+        queue_counts[index].2 += dp.parse_drops() - before_parse;
         metrics
-            .afxdp_umem_free_frames
-            .store(dp.free_frames() as u64, Relaxed);
-        metrics
-            .afxdp_arp_replies_total
-            .store(dp.arp_replies(), Relaxed);
-        metrics
-            .afxdp_ndp_replies_total
-            .store(dp.ndp_replies(), Relaxed);
-        metrics
-            .afxdp_neighbor_unresolved
-            .store(if dp.neighbor_resolved() { 0 } else { 1 }, Relaxed);
-        metrics.afxdp_tx_inflight.store(dp.tx_inflight(), Relaxed);
-        metrics
-            .afxdp_neighbor_cache_entries
-            .store(dp.neighbor_cache_entries(), Relaxed);
+            .afxdp_parse_drops_total
+            .fetch_add(dp.parse_drops() - before_parse, Relaxed);
+        dp.check_io()?;
+        // Ring gauges are aggregated after frame processing below.
         if frames.is_empty() {
             std::thread::sleep(std::time::Duration::from_micros(50));
-            continue;
         }
         metrics
             .afxdp_rx_frames_total
@@ -171,6 +228,7 @@ pub fn run_af_xdp(
                 // Peer→client relay data arriving on an allocation's relay port.
                 processor.process_relay_recv(&f.data, f.source, f.dst)
             } else {
+                queue_counts[index].2 += 1;
                 metrics.afxdp_parse_drops_total.fetch_add(1, Relaxed);
                 continue;
             };
@@ -178,12 +236,14 @@ pub fn run_af_xdp(
                 match action {
                     Action::Send { data, target } => match dp.send_to(&data, target) {
                         Ok(()) => {
+                            queue_counts[index].1 += 1;
                             metrics.afxdp_tx_frames_total.fetch_add(1, Relaxed);
                             metrics
                                 .afxdp_tx_bytes_total
                                 .fetch_add(data.len() as u64, Relaxed);
                         }
                         Err(e) => {
+                            queue_counts[index].3 += 1;
                             metrics.afxdp_tx_drops_total.fetch_add(1, Relaxed);
                             tracing::debug!(%e, "AF_XDP send_to failed");
                         }
@@ -201,12 +261,14 @@ pub fn run_af_xdp(
                         // Client→peer relay: emit from the allocation's relay port.
                         match dp.send_to_from(relay_port, &data, target) {
                             Ok(()) => {
+                                queue_counts[index].1 += 1;
                                 metrics.afxdp_tx_frames_total.fetch_add(1, Relaxed);
                                 metrics
                                     .afxdp_tx_bytes_total
                                     .fetch_add(data.len() as u64, Relaxed);
                             }
                             Err(e) => {
+                                queue_counts[index].3 += 1;
                                 metrics.afxdp_tx_drops_total.fetch_add(1, Relaxed);
                                 tracing::debug!(%e, port = relay_port, "AF_XDP relay send failed");
                             }
@@ -224,34 +286,43 @@ pub fn run_af_xdp(
                         // is gone. `f.data` is alive for this whole iteration.
                         match dp.send_to_from(relay_port, &f.data[offset..offset + len], target) {
                             Ok(()) => {
+                                queue_counts[index].1 += 1;
                                 metrics.afxdp_tx_frames_total.fetch_add(1, Relaxed);
                                 metrics.afxdp_tx_bytes_total.fetch_add(len as u64, Relaxed);
                             }
                             Err(e) => {
+                                queue_counts[index].3 += 1;
                                 metrics.afxdp_tx_drops_total.fetch_add(1, Relaxed);
                                 tracing::debug!(%e, port = relay_port, "AF_XDP zero-copy relay send failed");
                             }
                         }
                     }
-                    Action::RegisterRelay { port, socket, .. } => {
+                    Action::RegisterRelay {
+                        port,
+                        socket,
+                        client_addr,
+                        ..
+                    } => {
+                        if let Err(e) = dp.add_relay_port(port) {
+                            // Do not emit the queued Allocate success when its relay
+                            // cannot receive. Roll back the allocation and fail loudly.
+                            let _ = processor.release_for_closed_connection(client_addr);
+                            metrics.set_afxdp_readiness(turna_health::Readiness::Degraded);
+                            return Err(Box::new(e));
+                        }
                         relay_ports.insert(port);
                         held.insert(port, socket);
-                        // 1.1: tell the XDP filter to redirect this relay port too.
-                        dp.add_relay_port(port);
                         metrics
                             .afxdp_relay_ports_registered
                             .store(relay_ports.len() as u64, Relaxed);
-                        tracing::debug!(port, "AF_XDP: relay port registered");
                     }
                     Action::CloseRelay { port } => {
+                        dp.del_relay_port(port)?;
                         relay_ports.remove(&port);
                         held.remove(&port);
-                        // 1.1: stop redirecting this relay port in the XDP filter.
-                        dp.del_relay_port(port);
                         metrics
                             .afxdp_relay_ports_registered
                             .store(relay_ports.len() as u64, Relaxed);
-                        tracing::debug!(port, "AF_XDP: relay port closed");
                     }
                     // RFC 6062 TCP relay listeners are bound synchronously
                     // elsewhere and never traverse the af-xdp datagram send
@@ -261,6 +332,27 @@ pub fn run_af_xdp(
                 }
             }
         }
+        dp.check_io()?;
+        metrics.afxdp_umem_free_frames.store(
+            datapaths.iter().map(|d| d.free_frames() as u64).sum(),
+            Relaxed,
+        );
+        metrics
+            .afxdp_tx_inflight
+            .store(datapaths.iter().map(|d| d.tx_inflight()).sum(), Relaxed);
+        metrics
+            .afxdp_arp_replies_total
+            .store(datapaths.iter().map(|d| d.arp_replies()).sum(), Relaxed);
+        metrics
+            .afxdp_ndp_replies_total
+            .store(datapaths.iter().map(|d| d.ndp_replies()).sum(), Relaxed);
+        metrics.afxdp_neighbor_unresolved.store(
+            u64::from(datapaths.iter().any(|d| !d.neighbor_resolved())),
+            Relaxed,
+        );
+        metrics
+            .afxdp_neighbor_cache_entries
+            .store(datapaths[0].neighbor_cache_entries(), Relaxed);
     }
 }
 
@@ -324,13 +416,32 @@ fn preflight_af_xdp(cfg: &turna_config::AfXdpSection) -> Result<(), Vec<String>>
         Err(e) => tracing::warn!(%e, iface = %cfg.interface, "could not read operstate"),
     }
 
-    // queue existence
-    let q_dir = format!("{if_dir}/queues/rx-{}", cfg.queue_id);
-    if !Path::new(&q_dir).is_dir() {
-        problems.push(format!(
-            "queue rx-{} not present on '{}' ({q_dir} missing); choose a queue_id within the NIC channel count (ethtool -l {})",
-            cfg.queue_id, cfg.interface, cfg.interface
-        ));
+    // Every active RX queue must have an XSK; an unbound queue would PASS
+    // TURN traffic to a kernel socket with no datapath reader.
+    let selected: std::collections::HashSet<u32> = if cfg.queue_ids.is_empty() {
+        [cfg.queue_id].into_iter().collect()
+    } else {
+        cfg.queue_ids.iter().copied().collect()
+    };
+    let queues_dir = format!("{if_dir}/queues");
+    match std::fs::read_dir(&queues_dir) {
+        Ok(entries) => {
+            let actual: std::collections::HashSet<u32> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|s| s.strip_prefix("rx-"))
+                        .and_then(|s| s.parse().ok())
+                })
+                .collect();
+            if actual.is_empty() || actual != selected {
+                problems.push(format!(
+                    "queue_ids must cover all RX queues: selected={selected:?}, actual={actual:?}"
+                ));
+            }
+        }
+        Err(e) => problems.push(format!("cannot enumerate RX queues: {e}")),
     }
 
     // MTU vs frame_size: the frame must hold ETH(14) + the IP MTU

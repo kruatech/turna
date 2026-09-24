@@ -177,6 +177,10 @@ allows the default to flip.
 
 ### 6. QUIC / WebTransport
 
+Current status: **supported** on Linux/macOS with tokio; see
+[the support record](quic-webtransport-supported-2026-09-18.md). The account below
+describes earlier verification work, not outstanding blockers.
+
 No interop test had ever been recorded for either path, and the stated reason was
 that no off-the-shelf TURN-over-QUIC client exists. True, and not a reason to stop:
 the wire format inside a QUIC bidi stream is the same length-delimited STUN that
@@ -214,11 +218,10 @@ H3: set small stream counts and a small datagram buffer in `[turn.quic]` and con
 external XDP program on the bound queue. Neither is a production recommendation
 today, so treat these as capacity experiments rather than release gates.
 
-SCTP is deliberately excluded: it stays refused under `production = true` and is not
-being matured, so spending a stand slot on it would be work for a feature with no
-RFC and no users. If the decision is ever to keep it, it needs the hardening every
-other listener already has first (per-IP cap, rate limit, metrics, readiness gauge,
-cooperative drain) — not an interop run.
+SCTP is supported on Linux/tokio as a project-specific native transport. Its
+functional, lifecycle/limits and WAN results are documented separately in
+[SCTP support evidence](sctp-supported-2026-09-18.md). They do not establish
+independent implementation interoperability or browser DataChannel compatibility.
 
 ---
 

@@ -209,7 +209,7 @@ if [ -f "$CONFIG" ]; then
   # Match the operator-visible diagnostic, not just the field path: the field path
   # also appears in the schema and in unrelated checks, so grepping for it would
   # still pass after the gate itself was deleted (verified with a negative test).
-  for key in turn.sctp.enabled turn.auth.oauth.enabled; do
+  for key in turn.auth.oauth.enabled; do
     field=$(printf '%s' "$key" | sed 's/^turn\.//; s/\.enabled$//')
     if grep -qF "$key = true in production" "$CONFIG"; then
       pass "validate() refuses $key in production"
@@ -231,7 +231,8 @@ if [ -f "$CONFIG" ]; then
   #
   # If you are reintroducing the refusal on purpose, delete the matching entry
   # here and move the key back to the loop above.
-  LIFTED_GATES="turn.tcp_relay.enabled"
+  # SCTP: native Linux/tokio evidence is in verification/sctp-supported-2026-09-18.md.
+  LIFTED_GATES="turn.tcp_relay.enabled turn.sctp.enabled"
   for key in $LIFTED_GATES; do
     if grep -qF "$key = true in production" "$CONFIG"; then
       fail "$key is refused in production again, but the docs say the gate was lifted" \

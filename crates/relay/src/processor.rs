@@ -537,6 +537,7 @@ pub enum ConnBindDecision {
 }
 
 pub struct PacketProcessor {
+    udp_transactions: crate::udp_transactions::UdpTransactions,
     store: Arc<AllocationStore>,
     auth: Arc<AuthRegistry>,
     rate_limiter: TieredRateLimiter,
@@ -739,6 +740,7 @@ impl PacketProcessor {
         cluster: Option<ClusterRouting>,
     ) -> Self {
         Self {
+            udp_transactions: crate::udp_transactions::UdpTransactions::new(),
             store,
             auth,
             rate_limiter: TieredRateLimiter::new(RateLimitSettings::env_overrides(
@@ -887,6 +889,27 @@ impl PacketProcessor {
             "allocation released: control connection closed"
         );
         vec![Action::CloseRelay { port }]
+    }
+
+    /// Called only after QUIC has validated a new network path for the same
+    /// connection. Unlike RFC 8016 this is not a client-supplied mobility ticket.
+    /// Re-key every allocation index before the bridge starts using the new src.
+    pub fn migrate_quic_allocation(
+        &self,
+        old_addr: SocketAddr,
+        new_addr: SocketAddr,
+    ) -> Result<(), SessionError> {
+        if old_addr == new_addr {
+            return Ok(());
+        }
+        if self.store.get(&old_addr).is_some() {
+            self.store.re_key(&old_addr, new_addr).map(|_| ())
+        } else if self.store.get(&new_addr).is_some() {
+            Err(SessionError::MigrationTargetInUse)
+        } else {
+            // A session may migrate before its first Allocate.
+            Ok(())
+        }
     }
 
     /// Owned-buffer ingress for the encrypted session transports (DTLS records,
@@ -1252,44 +1275,90 @@ impl PacketProcessor {
             }
         };
 
+        let cacheable = !ingress_tcp
+            && raw.len() <= 4096
+            && matches!(msg.class, MessageClass::Request)
+            && msg.get_username().is_some()
+            && (matches!(msg.method, Method::Refresh)
+                || (matches!(msg.method, Method::Allocate)
+                    && msg.get_requested_transport() == Some(17)));
+        if cacheable {
+            // Serializes duplicate transactions through mutation and publication.
+            // Only response bytes are replayed: never RegisterRelay/CloseRelay.
+            let mut cache = self.udp_transactions.lock(src);
+            cache.expire(Instant::now());
+            match cache.lookup(src, &raw) {
+                crate::udp_transactions::Lookup::Reply(data) => {
+                    self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .bytes_sent
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    return vec![Action::Send { data, target: src }];
+                }
+                crate::udp_transactions::Lookup::Conflict => return vec![Action::None],
+                crate::udp_transactions::Lookup::Miss => {}
+            }
+            let actions = self.dispatch_stun(&msg, &raw, src, ingress_tcp);
+            for action in &actions {
+                if let Action::Send { data, target } = action {
+                    if *target == src
+                        && data.len() >= 20
+                        && data[0] & 0x01 != 0
+                        && data[1] & 0x10 == 0
+                    {
+                        cache.insert(src, raw.clone(), data.clone(), Instant::now());
+                        break;
+                    }
+                }
+            }
+            return actions;
+        }
+        self.dispatch_stun(&msg, &raw, src, ingress_tcp)
+    }
+
+    fn dispatch_stun(
+        &self,
+        msg: &StunMessage,
+        raw: &Bytes,
+        src: SocketAddr,
+        ingress_tcp: bool,
+    ) -> Vec<Action> {
         if matches!(msg.class, MessageClass::Request) {
             // I3: reject unknown comprehension-required attributes with 420 before
             // routing/auth — a request we can't parse must not be redirected.
-            if let Some(actions) = self.reject_unknown_comprehension_required(&msg, src) {
+            if let Some(actions) = self.reject_unknown_comprehension_required(msg, src) {
                 return actions;
             }
-            if let Some(actions) = self.maybe_redirect_new_client(&msg, src) {
+            if let Some(actions) = self.maybe_redirect_new_client(msg, src) {
                 return actions;
             }
         }
 
         match (&msg.class, &msg.method) {
-            (MessageClass::Request, Method::Binding) => self.handle_binding(&msg, &raw, src),
+            (MessageClass::Request, Method::Binding) => self.handle_binding(msg, raw, src),
             (MessageClass::Request, Method::Allocate) => {
                 if !self.limiter_for(src.ip()).check_allocate(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-                    return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
+                    return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
-                self.handle_allocate(&msg, &raw, src, ingress_tcp)
+                self.handle_allocate(msg, raw, src, ingress_tcp)
             }
-            (MessageClass::Request, Method::Refresh) => self.handle_refresh(&msg, &raw, src),
+            (MessageClass::Request, Method::Refresh) => self.handle_refresh(msg, raw, src),
             (MessageClass::Request, Method::CreatePermission) => {
                 if !self.limiter_for(src.ip()).check_create_permission(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-                    return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
+                    return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
-                self.handle_create_permission(&msg, &raw, src)
+                self.handle_create_permission(msg, raw, src)
             }
             (MessageClass::Request, Method::ChannelBind) => {
                 if !self.limiter_for(src.ip()).check_channel_bind(src.ip()) {
                     self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
-                    return self.encode_error(&msg, src, 486, "Allocation Quota Reached");
+                    return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
-                self.handle_channel_bind(&msg, &raw, src)
+                self.handle_channel_bind(msg, raw, src)
             }
-            (MessageClass::Indication, Method::Send) => {
-                self.handle_send_indication(&msg, &raw, src)
-            }
+            (MessageClass::Indication, Method::Send) => self.handle_send_indication(msg, raw, src),
             _ => vec![Action::None],
         }
     }
@@ -2938,5 +3007,125 @@ mod a3_f4_dont_fragment_tests {
         };
         assert_eq!(rc, 0, "getsockopt IPV6_MTU_DISCOVER failed");
         assert_eq!(val, libc::IP_PMTUDISC_DO);
+    }
+}
+
+#[cfg(test)]
+mod udp_replay_tests {
+    use super::*;
+
+    fn test_password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD
+            .get_or_init(|| {
+                turna_crypto::random_key_32()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .as_str()
+    }
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(24000, 24999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "retry-test",
+                [("retry", test_password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+    fn request(p: &PacketProcessor, src: SocketAddr, method: Method, lifetime: u32) -> Bytes {
+        let mut msg = StunMessage::new(method, MessageClass::Request);
+        if matches!(method, Method::Allocate) {
+            msg.add(Attribute::RequestedTransport(17));
+        }
+        msg.add(Attribute::Lifetime(lifetime));
+        msg.add(Attribute::Username("retry".into()));
+        msg.add(Attribute::Realm("retry-test".into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let mut buf = [0; 1024];
+        let n = msg
+            .encode_with_integrity(
+                &mut buf,
+                &turna_crypto::long_term_key("retry", "retry-test", test_password()),
+            )
+            .unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+    fn response(actions: &[Action]) -> Bytes {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+    #[test]
+    fn udp_replay_lost_allocate_and_delete_responses() {
+        let p = processor();
+        let src = "127.0.0.1:40111".parse().unwrap();
+        let alloc = request(&p, src, Method::Allocate, 600);
+        // Keep the bound relay socket alive, as a real action executor does.
+        let first = p.process(alloc.clone(), src);
+        assert!(matches!(
+            StunMessage::decode(&response(&first)).unwrap().class,
+            MessageClass::SuccessResponse
+        ));
+        assert!(first
+            .iter()
+            .any(|a| matches!(a, Action::RegisterRelay { .. })));
+        let repeated = p.process(alloc.clone(), src);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(response(&first), response(&repeated));
+        assert_eq!(p.metrics.total_allocations.load(Ordering::Relaxed), 1);
+        let delete = request(&p, src, Method::Refresh, 0);
+        let deleted = p.process(delete.clone(), src);
+        assert!(deleted
+            .iter()
+            .any(|a| matches!(a, Action::CloseRelay { .. })));
+        let repeated = p.process(delete, src);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(response(&deleted), response(&repeated));
+        assert_eq!(p.metrics.active_allocations.load(Ordering::Relaxed), 0);
+        // Delayed old Allocate must not resurrect the released allocation.
+        assert_eq!(response(&first), response(&p.process(alloc, src)));
+        assert!(p.store.get(&src).is_none());
+    }
+    #[test]
+    fn udp_replay_changed_bytes_and_concurrent_duplicates() {
+        let p = Arc::new(processor());
+        let src = "127.0.0.1:40112".parse().unwrap();
+        let raw = request(&p, src, Method::Allocate, 600);
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                let raw = raw.clone();
+                std::thread::spawn(move || p.process(raw, src))
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            results
+                .iter()
+                .flatten()
+                .filter(|a| matches!(a, Action::RegisterRelay { .. }))
+                .count(),
+            1
+        );
+        for r in &results {
+            assert_eq!(response(r), response(&results[0]));
+        }
+        let mut changed = raw.to_vec();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        assert!(matches!(
+            p.process(Bytes::from(changed), src).as_slice(),
+            [Action::None]
+        ));
+        assert_eq!(p.metrics.total_allocations.load(Ordering::Relaxed), 1);
     }
 }
