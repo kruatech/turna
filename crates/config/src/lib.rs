@@ -866,6 +866,12 @@ impl TurnaConfig {
             }
         }
         errors.extend(self.turn.auto_ban.validate());
+        errors.extend(
+            self.turn
+                .auth
+                .webhook
+                .validate(prod, self.turn.auth.oauth.enabled),
+        );
         // A node-wide cap below one full-size datagram per second would drop
         // every packet: that is never what anyone means, so say so at startup.
         let cap = self.turn.relay.max_total_bytes_per_sec;
@@ -1211,6 +1217,8 @@ impl AuthConfig {
         use zeroize::Zeroize;
         self.shared_secret.zeroize();
         self.previous_shared_secret.zeroize();
+        self.webhook.bearer_token.zeroize();
+        self.webhook.signing_secret.zeroize();
     }
 }
 
@@ -1314,6 +1322,9 @@ pub struct AuthConfig {
     /// challenge); one with credentials must carry a valid NONCE and is answered
     /// with a response signed with the same MESSAGE-INTEGRITY variant.
     pub require_binding_auth: bool,
+    /// Look up unknown long-term users through the signalling service
+    /// (`[turn.auth.webhook]`). Off by default.
+    pub webhook: WebhookConfig,
 }
 
 impl Default for AuthConfig {
@@ -1328,6 +1339,7 @@ impl Default for AuthConfig {
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
             require_binding_auth: false,
+            webhook: WebhookConfig::default(),
         }
     }
 }
@@ -1362,6 +1374,140 @@ pub struct OAuthConfig {
     /// of falling back to trial-decrypt. Default false keeps the rotation-friendly
     /// trial-decrypt behaviour; enable for a strict RFC / high-assurance profile.
     pub strict_kid: bool,
+}
+
+/// `[turn.auth.webhook]` — ask the operator's signalling service for a
+/// long-term user's key.
+///
+/// When enabled, the base realm uses long-term credentials: `static_users` are
+/// resolved locally first, and any other USERNAME is looked up by POSTing
+/// `{"username", "realm"}` to `url`. The answer (the user's password or its
+/// pre-derived keys, or 404 for "no such user") is cached. The request contract
+/// is in `docs/auth-webhook.md`.
+///
+/// The lookup never runs on the packet path: the datapath consults the cache,
+/// and a miss queues one fetch and parks the request (UDP clients retransmit
+/// into the warm cache; TURNS/SCTP requests are re-processed when the answer
+/// lands). Every failure — timeout, error status, malformed body, full queue —
+/// refuses the request (500) for `error_ttl_secs`: fail closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub enabled: bool,
+    /// Endpoint. `https://` required; `http://` only with `production = false`
+    /// (a test stub on localhost). Subject to `${VAR}` / `file://` substitution.
+    pub url: String,
+    /// Sent as `Authorization: Bearer <token>`. Empty = not sent.
+    pub bearer_token: String,
+    /// HMAC-SHA256 key for `X-Turna-Signature`, see the contract. Empty = not
+    /// signed. Under `production = true` at least one of `bearer_token` and
+    /// `signing_secret` is required.
+    pub signing_secret: String,
+    /// PEM bundle to trust instead of the system roots (a private CA). Empty =
+    /// system roots.
+    pub ca_file: String,
+    /// Whole-request timeout, milliseconds (1..=10000). A timeout is a failure.
+    pub timeout_ms: u64,
+    /// Lookups in flight at once.
+    pub max_concurrency: usize,
+    /// Lookups waiting for a free slot. Beyond it a request fails closed.
+    pub queue_depth: usize,
+    /// How long a found user's keys are cached. The endpoint may shorten it per
+    /// answer with `ttl_secs`.
+    pub positive_ttl_secs: u64,
+    /// How long "no such user" (404) is cached.
+    pub negative_ttl_secs: u64,
+    /// How long a failed lookup keeps failing before it is retried.
+    pub error_ttl_secs: u64,
+    /// Cap on cached users.
+    pub max_entries: usize,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            bearer_token: String::new(),
+            signing_secret: String::new(),
+            ca_file: String::new(),
+            timeout_ms: 2_000,
+            max_concurrency: 32,
+            queue_depth: 1_024,
+            positive_ttl_secs: 300,
+            negative_ttl_secs: 30,
+            error_ttl_secs: 2,
+            max_entries: 100_000,
+        }
+    }
+}
+
+impl WebhookConfig {
+    pub(crate) fn validate(&self, prod: bool, oauth_enabled: bool) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        let lower = self.url.to_ascii_lowercase();
+        if self.url.is_empty() {
+            errors
+                .push("turn.auth.webhook.enabled = true but turn.auth.webhook.url is empty".into());
+        } else if lower.starts_with("http://") {
+            if prod {
+                errors.push(
+                    "turn.auth.webhook.url uses http:// in production; the request \
+                     carries the webhook credential and the answer carries user keys, \
+                     so it must be https://"
+                        .into(),
+                );
+            } else {
+                warn!(
+                    "turn.auth.webhook.url is plain http:// — acceptable for a local test \
+                     stub, refused under production = true"
+                );
+            }
+        } else if !lower.starts_with("https://") {
+            errors.push(
+                "turn.auth.webhook.url must start with https:// (or http:// outside production)"
+                    .into(),
+            );
+        }
+        if prod && self.bearer_token.is_empty() && self.signing_secret.is_empty() {
+            errors.push(
+                "turn.auth.webhook has neither bearer_token nor signing_secret in production: \
+                 the endpoint could not tell turna from anyone else asking for user keys"
+                    .into(),
+            );
+        }
+        if oauth_enabled {
+            errors.push(
+                "turn.auth.webhook and turn.auth.oauth are both enabled; the base realm \
+                 authenticates with one of them. Pick one."
+                    .into(),
+            );
+        }
+        if !(1..=10_000).contains(&self.timeout_ms) {
+            errors.push("turn.auth.webhook.timeout_ms must be in 1..=10000".into());
+        }
+        if self.max_concurrency == 0 || self.queue_depth == 0 || self.max_entries == 0 {
+            errors.push(
+                "turn.auth.webhook.max_concurrency, queue_depth and max_entries must be > 0".into(),
+            );
+        }
+        // A zero TTL would re-fetch on every packet, and a zero error TTL would
+        // let a stream client's re-processed request find no answer and be
+        // parked again.
+        for (name, v) in [
+            ("positive_ttl_secs", self.positive_ttl_secs),
+            ("negative_ttl_secs", self.negative_ttl_secs),
+            ("error_ttl_secs", self.error_ttl_secs),
+        ] {
+            if v == 0 {
+                errors.push(format!("turn.auth.webhook.{name} must be >= 1"));
+            }
+        }
+        errors
+    }
 }
 
 /// RFC 7635 kid-tagged AS-RS key (see [`OAuthConfig::keys`]).
@@ -4861,5 +5007,76 @@ mod abuse_controls_tests {
             .expect_err("a cap below one packet must be refused")
             .to_string();
         assert!(err.contains("max_total_bytes_per_sec"), "{err}");
+    }
+
+    #[test]
+    fn webhook_is_off_by_default() {
+        let w = WebhookConfig::default();
+        assert!(!w.enabled);
+        assert!(
+            w.validate(true, false).is_empty(),
+            "disabled means unchecked"
+        );
+    }
+
+    #[test]
+    fn webhook_requires_https_and_a_credential_in_production() {
+        let base = |url: &str, token: &str| WebhookConfig {
+            enabled: true,
+            url: url.into(),
+            bearer_token: token.into(),
+            ..WebhookConfig::default()
+        };
+        // Production: http refused, credential required.
+        let e = base("http://127.0.0.1:9000/turn", "t").validate(true, false);
+        assert!(
+            e.iter().any(|m| m.contains("http:// in production")),
+            "{e:?}"
+        );
+        let e = base("https://sig.example/turn", "").validate(true, false);
+        assert!(
+            e.iter().any(|m| m.contains("neither bearer_token")),
+            "{e:?}"
+        );
+        assert!(base("https://sig.example/turn", "t")
+            .validate(true, false)
+            .is_empty());
+        // Development: http allowed (a local stub), credential optional.
+        assert!(base("http://127.0.0.1:9000/turn", "")
+            .validate(false, false)
+            .is_empty());
+        // Nonsense schemes, empty url, and oauth together are refused anywhere.
+        assert!(!base("ftp://x", "t").validate(false, false).is_empty());
+        assert!(!base("", "t").validate(false, false).is_empty());
+        let e = base("https://sig.example/turn", "t").validate(false, true);
+        assert!(e.iter().any(|m| m.contains("Pick one")), "{e:?}");
+    }
+
+    #[test]
+    fn webhook_bounds_are_validated() {
+        let w = WebhookConfig {
+            enabled: true,
+            url: "https://sig.example/turn".into(),
+            bearer_token: "t".into(),
+            timeout_ms: 0,
+            error_ttl_secs: 0,
+            max_entries: 0,
+            ..WebhookConfig::default()
+        };
+        let e = w.validate(false, false);
+        assert!(e.iter().any(|m| m.contains("timeout_ms")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("error_ttl_secs")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("max_entries")), "{e:?}");
+    }
+
+    #[test]
+    fn webhook_section_parses_from_toml() {
+        let cfg = parse_dev(
+            "[turn.auth.webhook]\nenabled = true\nurl = \"http://127.0.0.1:1/x\"\n\
+             timeout_ms = 500\npositive_ttl_secs = 60\n",
+        )
+        .expect("a dev webhook section loads");
+        assert!(cfg.turn.auth.webhook.enabled);
+        assert_eq!(cfg.turn.auth.webhook.timeout_ms, 500);
     }
 }

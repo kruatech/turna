@@ -98,6 +98,24 @@ All four read 0 while the feature is off, which is the default.
 | `turna_relay_capacity_dropped_bytes_total` | counter | Bytes in those packets. Divided by the interval, how far over the cap demand is. |
 | `turna_binding_auth_challenges_total` | counter | Binding requests without credentials answered with 401 because `[turn.auth] require_binding_auth` is on. A steady rate after enabling it usually means a client that uses this node as its STUN server — the case the option breaks. |
 
+#### Credential webhook (`[turn.auth.webhook]`)
+
+All read 0 while the webhook is off (the default). See [auth-webhook.md](auth-webhook.md).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `turna_auth_webhook_requests_total` | counter | Lookups sent to the endpoint. Should track `turna_auth_webhook_cache_misses_total`; far above the number of distinct users is a TTL set too low. |
+| `turna_auth_webhook_errors_total` | counter | Lookups that failed: timeout, connection refused, a status other than 200/404 (401/403 included — the endpoint refused turna's own credential), a malformed or oversized body. Each makes that user's requests fail with 500 for `error_ttl_secs`. **Alert on a sustained rate.** |
+| `turna_auth_webhook_not_found_total` | counter | Lookups answered 404 (no such user). A surge is someone enumerating usernames — the negative cache and `[turn.auto_ban]` are what bound it. |
+| `turna_auth_webhook_cache_hits_total` | counter | Requests answered from a cached found user. |
+| `turna_auth_webhook_cache_negative_hits_total` | counter | Requests answered from a cached 404. |
+| `turna_auth_webhook_cache_misses_total` | counter | Requests that had no usable entry and queued a lookup. Concurrent requests for one user queue one lookup. |
+| `turna_auth_webhook_rejected_total` | counter | Lookups that could not be queued (`queue_depth` full, or the cache full of in-flight lookups). Those requests failed closed with 500. Non-zero means the endpoint is too slow for the arrival rate: raise `max_concurrency`, or look at the endpoint. |
+| `turna_auth_webhook_cache_entries` | gauge | Users in the cache (including expired ones not yet swept, every 5 s). Bounded by `max_entries`. |
+| `turna_auth_webhook_deferred_total` | counter | Requests parked unanswered while their user was looked up (UDP clients retransmit; TURNS/SCTP requests are re-processed). Not failures. |
+| `turna_auth_webhook_unavailable_total` | counter | Requests refused with `500 Server Error` because the lookup failed or could not be queued. **The number of users the endpoint's trouble turned away.** Not counted in `turna_auth_failures`, and never auto-ban evidence. |
+| `turna_auth_webhook_duration_seconds` | histogram | Endpoint round trip, including timeouts (which land at `timeout_ms`). |
+
 ### RTP/QoS metrics
 
 | Metric | Type | Meaning |
@@ -144,6 +162,7 @@ All four read 0 while the feature is off, which is the default.
 | `turna_stun_request_duration_seconds` | STUN/TURN request processing latency. |
 | `turna_relay_forward_duration_seconds` | ChannelData relay forwarding latency. |
 | `turna_auth_duration_seconds` | Authentication processing latency. |
+| `turna_auth_webhook_duration_seconds` | `[turn.auth.webhook]` endpoint round trip, including timeouts. Empty while the webhook is off. |
 | `turna_allocation_lifetime_seconds` | Allocation lifetime distribution. |
 
 Use `histogram_quantile` in Prometheus:

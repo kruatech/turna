@@ -112,6 +112,13 @@ pub enum Action {
     /// its fd is freed and the port can be safely reused.
     CloseRelay { port: u16 },
 
+    /// `[turn.auth.webhook]`: the request's USERNAME is being looked up and
+    /// nothing has been answered. Datagram transports drop this — the client's
+    /// STUN retransmission comes back after the lookup and is served from the
+    /// cache. Stream transports (TURNS, SCTP), whose clients do not retransmit,
+    /// wait on `wait` and process the same request again.
+    AwaitCredentials { wait: turna_auth::webhook::Waiter },
+
     /// No action needed.
     None,
 }
@@ -1324,23 +1331,32 @@ impl PacketProcessor {
     /// `AuthError` variant. The per-reason counters are a breakdown *under* the
     /// total `auth_failures`, which the call sites still bump — so the totals
     /// stay consistent and behaviour is unchanged.
+    ///
+    /// `allow_fetch` is passed to the credential webhook: `false` for requests
+    /// whose source address has not been proven by a NONCE round trip.
     fn auth_validate(
         &self,
         msg: &StunMessage,
         raw: &[u8],
+        allow_fetch: bool,
     ) -> Result<turna_auth::AuthResolution, turna_auth::AuthError> {
         let r = if should_sample() {
             let started = std::time::Instant::now();
-            let r = self.auth.validate(msg, raw);
+            let r = self.auth.validate_opts(msg, raw, allow_fetch);
             self.metrics
                 .histograms
                 .observe("turna_auth_duration_seconds", started.elapsed());
             r
         } else {
-            self.auth.validate(msg, raw)
+            self.auth.validate_opts(msg, raw, allow_fetch)
         };
         if let Err(e) = &r {
             let counter = match e {
+                // Not failures: a lookup in flight, or a credential backend that
+                // is down. Counted by `auth_deferred` instead.
+                turna_auth::AuthError::Pending(_) | turna_auth::AuthError::Unavailable => {
+                    return r;
+                }
                 turna_auth::AuthError::MissingCredentials => {
                     &self.metrics.auth_fail_missing_credentials
                 }
@@ -1354,6 +1370,36 @@ impl PacketProcessor {
             counter.fetch_add(1, Ordering::Relaxed);
         }
         r
+    }
+
+    /// `[turn.auth.webhook]` outcomes that are not authentication failures.
+    ///
+    /// `Pending`: the request is parked, not answered — see
+    /// [`Action::AwaitCredentials`]. `Unavailable`: fail closed with
+    /// `500 Server Error` (RFC 8489: a temporary error, try again). Neither is
+    /// counted in `auth_failures` nor fed to auto-ban: the client did nothing
+    /// wrong. `None` for every other error, which the caller handles as before.
+    fn auth_deferred(
+        &self,
+        e: &turna_auth::AuthError,
+        msg: &StunMessage,
+        src: SocketAddr,
+    ) -> Option<Vec<Action>> {
+        match e {
+            turna_auth::AuthError::Pending(wait) => {
+                self.metrics
+                    .auth_webhook_deferred
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(vec![Action::AwaitCredentials { wait: wait.clone() }])
+            }
+            turna_auth::AuthError::Unavailable => {
+                self.metrics
+                    .auth_webhook_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(self.encode_error(msg, src, 500, "Server Error"))
+            }
+            _ => None,
+        }
     }
 
     fn process_stun(&self, raw: Bytes, src: SocketAddr, ingress_tcp: bool) -> Vec<Action> {
@@ -1628,9 +1674,16 @@ impl PacketProcessor {
             }
         }
         let binding_key = if has_integrity {
-            match self.auth_validate(msg, raw) {
+            // The webhook may only be called for a Binding whose NONCE was
+            // checked above; otherwise a forged source could make the node send
+            // HTTP requests on its behalf. Without the check, an unknown user
+            // is simply unknown.
+            match self.auth_validate(msg, raw, self.require_binding_auth) {
                 Ok(r) => Some(r.key),
-                Err(_) => {
+                Err(e) => {
+                    if let Some(a) = self.auth_deferred(&e, msg, src) {
+                        return a;
+                    }
                     // Counted, but never auto-ban evidence: without the nonce
                     // check above this source address may be forged.
                     self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -1698,9 +1751,12 @@ impl PacketProcessor {
             return stale;
         }
 
-        let resolution = match self.auth_validate(msg, raw) {
+        let resolution = match self.auth_validate(msg, raw, true) {
             Ok(r) => r,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
                 if let Some(occurrences) = AUTH_FAILED_LOG.should_log() {
                     warn!(src = %loggable_addr(&src), %e, occurrences, "auth failed");
                 }
@@ -2165,9 +2221,12 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return ConnectDecision::Reject(stale);
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, true) {
             Ok(r) => r.key,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return ConnectDecision::Reject(a);
+                }
                 self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return ConnectDecision::Reject(self.encode_error(
@@ -2296,9 +2355,12 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return ConnBindDecision::Reject(stale);
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, true) {
             Ok(r) => r.key,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return ConnBindDecision::Reject(a);
+                }
                 self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return ConnBindDecision::Reject(self.encode_error(
@@ -2361,9 +2423,12 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let resolution = match self.auth_validate(msg, raw) {
+        let resolution = match self.auth_validate(msg, raw, true) {
             Ok(r) => r,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
                 self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
@@ -2564,9 +2629,12 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, true) {
             Ok(r) => r.key,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
                 self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
@@ -2655,9 +2723,12 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, true) {
             Ok(r) => r.key,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
                 self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
@@ -3621,5 +3692,176 @@ mod capacity_and_binding_auth_tests {
         let src: SocketAddr = "203.0.113.4:4000".parse().unwrap();
         let r = reply(&p.process(binding(Some(("none", &p, src))), src));
         assert!(matches!(r.class, MessageClass::ErrorResponse));
+    }
+}
+
+/// `[turn.auth.webhook]` in the processor: a pending lookup parks the request
+/// without answering or counting a failure; the retransmission is served from
+/// the cache; a failed lookup is a 500, never a 401, and never auto-ban
+/// evidence.
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+    use turna_auth::webhook::{CredentialCache, FetchOutcome, WebhookSettings};
+
+    fn password() -> String {
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn setup() -> (
+        PacketProcessor,
+        Arc<CredentialCache>,
+        tokio::sync::mpsc::Receiver<turna_auth::webhook::FetchJob>,
+    ) {
+        let (cache, rx) = CredentialCache::new(
+            "hook",
+            WebhookSettings {
+                positive_ttl: Duration::from_secs(60),
+                negative_ttl: Duration::from_secs(60),
+                error_ttl: Duration::from_secs(60),
+                max_entries: 64,
+                queue_depth: 64,
+            },
+        );
+        let mode = turna_auth::AuthMode::long_term("hook", [("local", password())])
+            .with_webhook(cache.clone());
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(28000, 28999, 16)),
+            Arc::new(AuthRegistry::new(mode)),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: Some(Arc::new(crate::abuse::AutoBan::new(
+                crate::abuse::AutoBanSettings {
+                    auth_failures: 1,
+                    rate_limit_violations: 0,
+                    window: Duration::from_secs(60),
+                    ban: Duration::from_secs(60),
+                    prefix_scope: false,
+                    allowlist: Vec::new(),
+                    max_tracked: 64,
+                    max_bans: 64,
+                },
+            ))),
+            bandwidth_cap: None,
+            require_binding_auth: false,
+        });
+        (p, cache, rx)
+    }
+
+    fn allocate(p: &PacketProcessor, src: SocketAddr, user: &str, pass: &str) -> Bytes {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.add(Attribute::RequestedTransport(17));
+        msg.add(Attribute::Username(user.into()));
+        msg.add(Attribute::Realm("hook".into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key(user, "hook", pass);
+        let mut buf = [0; 512];
+        let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn reply(actions: &[Action]) -> Option<StunMessage> {
+        actions.iter().find_map(|a| match a {
+            Action::Send { data, .. } => StunMessage::decode(data).ok(),
+            _ => None,
+        })
+    }
+
+    fn code(m: &StunMessage) -> Option<u16> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn pending_parks_then_the_retransmission_is_served_from_the_cache() {
+        let (p, cache, mut rx) = setup();
+        let pw = password();
+        let src: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let req = allocate(&p, src, "remote", &pw);
+
+        let first = p.process(req.clone(), src);
+        assert!(reply(&first).is_none(), "nothing is answered while pending");
+        assert!(first
+            .iter()
+            .any(|a| matches!(a, Action::AwaitCredentials { .. })));
+        assert_eq!(p.metrics.auth_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(p.metrics.auth_webhook_deferred.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap().username, "remote");
+
+        cache.complete(
+            "remote",
+            FetchOutcome::Found {
+                keys: turna_auth::UserKeys::derive("remote", "hook", &pw),
+                ttl: None,
+            },
+        );
+        // The client's retransmission: byte-identical.
+        let second = reply(&p.process(req, src)).expect("answered");
+        assert!(matches!(second.class, MessageClass::SuccessResponse));
+        assert!(p.store().get(&src).is_some(), "allocation created");
+    }
+
+    #[test]
+    fn unknown_user_is_a_401_and_a_failed_lookup_a_500() {
+        let (p, cache, _rx) = setup();
+        let ghost_src: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+        let _ = p.process(allocate(&p, ghost_src, "ghost", &password()), ghost_src);
+        cache.complete("ghost", FetchOutcome::NotFound);
+        let r = reply(&p.process(allocate(&p, ghost_src, "ghost", &password()), ghost_src))
+            .expect("answered");
+        assert_eq!(code(&r), Some(401));
+
+        let down_src: SocketAddr = "203.0.113.22:5000".parse().unwrap();
+        let _ = p.process(allocate(&p, down_src, "down", &password()), down_src);
+        cache.complete("down", FetchOutcome::Failed);
+        for _ in 0..3 {
+            let r = reply(&p.process(allocate(&p, down_src, "down", &password()), down_src))
+                .expect("answered");
+            assert_eq!(code(&r), Some(500), "fail closed, and not as a 401");
+        }
+        assert_eq!(
+            p.metrics.auth_webhook_unavailable.load(Ordering::Relaxed),
+            3
+        );
+        // auth_failures = 1 threshold: the ghost's 401 banned its source, but the
+        // backend outage banned nobody.
+        let binding = {
+            let m = StunMessage::new(Method::Binding, MessageClass::Request);
+            let mut b = [0; 64];
+            let n = m.encode(&mut b).unwrap();
+            Bytes::copy_from_slice(&b[..n])
+        };
+        assert!(reply(&p.process(binding.clone(), down_src)).is_some());
+        assert!(reply(&p.process(binding, ghost_src)).is_none());
+    }
+
+    /// A Binding with MESSAGE-INTEGRITY needs no NONCE, so its source may be
+    /// forged: it must not make the node call the webhook.
+    #[test]
+    fn binding_never_triggers_a_lookup() {
+        let (p, _cache, mut rx) = setup();
+        let src: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        msg.add(Attribute::Username("stranger".into()));
+        msg.add(Attribute::Realm("hook".into()));
+        let key = turna_crypto::long_term_key("stranger", "hook", &password());
+        let mut buf = [0; 256];
+        let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+        let r = reply(&p.process(Bytes::copy_from_slice(&buf[..n]), src)).expect("answered");
+        assert_eq!(code(&r), Some(401));
+        assert!(
+            rx.try_recv().is_err(),
+            "no HTTP lookup on a forgeable request"
+        );
     }
 }

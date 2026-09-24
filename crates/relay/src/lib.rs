@@ -18,6 +18,9 @@ pub mod tls_bridge;
 #[cfg(feature = "sctp")]
 pub mod sctp_bridge;
 
+#[cfg(any(feature = "tls", feature = "sctp"))]
+mod stream_retry;
+
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod handler;
 

@@ -62,6 +62,9 @@ pub(crate) async fn run_tls_bridge(
 
     // Events from the TLS server (opened / packet / closed).
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
+    // A handle on our own event queue, for re-processing a request that was
+    // parked on a credential lookup (see `stream_retry`).
+    let retry_tx = event_tx.clone();
     // Commands to the TLS server (write to a connection, keyed by conn_id).
     let (tls_send_tx, tls_send_rx) = mpsc::channel::<TcpSendCommand>(8192);
     // RFC 6062 role transition: detach requests (bridge -> transport) and the
@@ -187,6 +190,7 @@ pub(crate) async fn run_tls_bridge(
                 // RFC 6062 TCP allocation with 400 (§4.1 requires a TCP/TLS
                 // control connection) — making the whole CONNECT /
                 // ConnectionBind / detach path below unreachable.
+                let retry_raw = raw.clone();
                 for action in processor.process_tcp_control(raw, peer_addr) {
                     match action {
                         Action::Send { data, target } => {
@@ -329,6 +333,20 @@ pub(crate) async fn run_tls_bridge(
                                 %peer_addr,
                                 "TURNS bridge: unexpected ForwardZeroCopy on owning-process path; dropping"
                             );
+                        }
+                        // A TCP client does not retransmit, so an unanswered
+                        // request would sit until its 39.5 s transaction
+                        // timeout. Park it and process it again once the
+                        // credential lookup has finished.
+                        Action::AwaitCredentials { wait } => {
+                            let again = TcpTransportEvent::PacketReceived {
+                                conn_id,
+                                peer_addr,
+                                data: bytes::BytesMut::from(&retry_raw[..]),
+                            };
+                            if !crate::stream_retry::park(wait, &retry_tx, again) {
+                                debug!(%peer_addr, "credential-wait slots full; request dropped");
+                            }
                         }
                         Action::None => {}
                     }

@@ -46,6 +46,8 @@ constraints below are taken from `crates/config/src/lib.rs`.
 | `require_binding_auth` | bool | `false` | coturn `secure-stun`. When `true`, a STUN Binding without MESSAGE-INTEGRITY is answered with a 401 challenge; one with credentials must carry a valid NONCE and gets a response signed with the same MESSAGE-INTEGRITY variant. **Leave off** on a node browsers also use as their STUN server: they send Binding unauthenticated and would lose their server-reflexive candidate. Counted in `turna_binding_auth_challenges_total`. |
 
 Use **one** of: `static_users` (long-term) or `shared_secret` (time-limited).
+`[turn.auth.webhook]` (below) extends the long-term form with users looked up
+on your signalling service.
 
 ```toml
 [turn.auth]
@@ -53,6 +55,30 @@ static_users = [{ username = "alice", password = "s3cret" }]
 # or:
 # shared_secret = "${TURNA_SHARED_SECRET}"
 ```
+
+---
+
+## `[turn.auth.webhook]`
+
+Look up long-term users that are not in `static_users` through your signalling
+service. **Off by default.** The request/response contract, the signature, the
+caching and fail-closed behaviour, and what each transport does while a lookup is
+in flight are in **[auth-webhook.md](auth-webhook.md)**.
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Enabling it makes the base realm long-term (static users first, then the webhook). Refused together with `[turn.auth.oauth]`. |
+| `url` | string | `""` | `https://` required; `http://` only with `production = false`. `${VAR}` / `file://` substitution applies. |
+| `bearer_token` | string | `""` | Sent as `Authorization: Bearer …`. Masked in `--dump-config`. |
+| `signing_secret` | string | `""` | HMAC-SHA256 key for `X-Turna-Signature`. Masked in `--dump-config`. Under `production = true` at least one of this and `bearer_token` is required. |
+| `ca_file` | string | `""` | PEM bundle trusted **instead of** the system roots (private CA). An unreadable or empty file stops startup. |
+| `timeout_ms` | u64 | `2000` | Whole-request timeout, 1..=10000. A timeout is a failure. |
+| `max_concurrency` | usize | `32` | Lookups in flight at once. |
+| `queue_depth` | usize | `1024` | Lookups waiting for a slot; beyond it a request fails closed (500). |
+| `positive_ttl_secs` | u64 | `300` | Cache lifetime of a found user. Also the revocation lag. The endpoint can shorten it per user with `ttl_secs`. |
+| `negative_ttl_secs` | u64 | `30` | Cache lifetime of a 404. |
+| `error_ttl_secs` | u64 | `2` | How long a failed lookup keeps failing (500) before it is retried. ≥ 1. |
+| `max_entries` | usize | `100000` | Cap on cached users. |
 
 ---
 

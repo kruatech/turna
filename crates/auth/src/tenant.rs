@@ -154,12 +154,29 @@ impl AuthRegistry {
         self.base.load().oauth_identity().map(str::to_string)
     }
 
+    /// The base realm's credential webhook cache, if it has one.
+    pub fn base_webhook(&self) -> Option<std::sync::Arc<crate::webhook::CredentialCache>> {
+        self.base.load().webhook().cloned()
+    }
+
     /// Resolve the tenant and validate credentials in one step.
     ///
     /// The realm carried by the (integrity-protected) request selects the
     /// backend; MESSAGE-INTEGRITY is then verified against THAT backend. Only a
     /// successful verification yields a `tenant_id`. Network hints never enter.
     pub fn validate(&self, msg: &StunMessage, raw: &[u8]) -> Result<AuthResolution, AuthError> {
+        self.validate_opts(msg, raw, true)
+    }
+
+    /// [`validate`](Self::validate) with control over the credential webhook
+    /// (see [`AuthMode::validate_opts`]): `allow_fetch = false` never starts an
+    /// HTTP lookup.
+    pub fn validate_opts(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        allow_fetch: bool,
+    ) -> Result<AuthResolution, AuthError> {
         let realm = msg.get_realm().ok_or(AuthError::MissingCredentials)?;
         // Normalise to &str regardless of whether get_realm yields &str/String.
         let realm_ref: &str = realm;
@@ -169,7 +186,8 @@ impl AuthRegistry {
             // the current backend for this request; a concurrent rotation
             // publishes a new one for the next request without disturbing this.
             let mode = auth.load();
-            let (key, max_lifetime_secs) = mode.validate_with_lifetime(msg, raw)?;
+            let (key, max_lifetime_secs) =
+                mode.validate_with_lifetime_opts(msg, raw, allow_fetch)?;
             Ok(AuthResolution {
                 tenant_id: Some(tenant_id.clone()),
                 realm: realm_ref.to_string(),
@@ -180,7 +198,8 @@ impl AuthRegistry {
         } else if realm_ref == self.base_realm {
             // Base realm: default/single-tenant.
             let base = self.base.load();
-            let (key, max_lifetime_secs) = base.validate_with_lifetime(msg, raw)?;
+            let (key, max_lifetime_secs) =
+                base.validate_with_lifetime_opts(msg, raw, allow_fetch)?;
             Ok(AuthResolution {
                 tenant_id: None,
                 realm: realm_ref.to_string(),

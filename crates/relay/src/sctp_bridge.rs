@@ -49,6 +49,8 @@ pub(crate) async fn run_sctp_bridge(
     let server = SctpTransportServer::new(cfg)?;
 
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
+    // For re-processing a request parked on a credential lookup.
+    let retry_tx = event_tx.clone();
     let (sctp_send_tx, sctp_send_rx) = mpsc::channel::<TcpSendCommand>(8192);
 
     let stats = Arc::new(turna_transport::sctp::SctpStats::default());
@@ -170,6 +172,7 @@ pub(crate) async fn run_sctp_bridge(
                 }
                 // One de-framed STUN/ChannelData message — process like a UDP datagram.
                 let raw = data.freeze();
+                let retry_raw = raw.clone();
                 for action in processor.process(raw, peer_addr) {
                     match action {
                         Action::Send { data, target } => {
@@ -225,6 +228,18 @@ pub(crate) async fn run_sctp_bridge(
                                 %peer_addr,
                                 "SCTP bridge: unexpected ForwardZeroCopy on process() path; dropping"
                             );
+                        }
+                        // SCTP is reliable: the client will not retransmit.
+                        // Re-process once the credential lookup has finished.
+                        Action::AwaitCredentials { wait } => {
+                            let again = TcpTransportEvent::PacketReceived {
+                                conn_id,
+                                peer_addr,
+                                data: bytes::BytesMut::from(&retry_raw[..]),
+                            };
+                            if !crate::stream_retry::park(wait, &retry_tx, again) {
+                                debug!(%peer_addr, "credential-wait slots full; request dropped");
+                            }
                         }
                         Action::None => {}
                     }

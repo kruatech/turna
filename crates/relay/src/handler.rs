@@ -111,6 +111,8 @@ impl RelayHandler {
             // here (mirrors the UDP dispatch paths in server.rs / sctp_bridge).
             Action::RegisterTcpListener { .. } => ForwardAction::None,
 
+            // UDP: the client retransmits into a warm credential cache.
+            Action::AwaitCredentials { .. } => ForwardAction::None,
             Action::None => ForwardAction::None,
         }
     }

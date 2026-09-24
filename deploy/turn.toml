@@ -113,6 +113,20 @@ token_ttl     = 86400
 # Binding without credentials and would lose their reflexive candidate.
 # require_binding_auth = false
 
+# Look up users that are not configured here through your signalling service
+# (docs/auth-webhook.md has the request/response contract). Off by default;
+# when on, this realm uses long-term credentials: static users first, then the
+# webhook. https:// and a bearer token or signing secret are required in
+# production. Any lookup failure refuses the user (500) — fail closed.
+# [turn.auth.webhook]
+# enabled = true
+# url = "https://signalling.internal/turn/credentials"
+# bearer_token = "${TURNA_WEBHOOK_TOKEN}"
+# signing_secret = "file:///run/secrets/turna_webhook_hmac"
+# timeout_ms = 2000
+# positive_ttl_secs = 300
+# negative_ttl_secs = 30
+
 # Static long-term credentials — uncomment if you want fixed users
 # instead of (or in addition to) shared-secret. When non-empty,
 # AuthMode::LongTerm is selected in main.rs.

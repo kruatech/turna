@@ -328,6 +328,8 @@ pub fn run_af_xdp(
                     // elsewhere and never traverse the af-xdp datagram send
                     // path, so there is nothing to do here.
                     Action::RegisterTcpListener { .. } => {}
+                    // UDP: the client retransmits into a warm credential cache.
+                    Action::AwaitCredentials { .. } => {}
                     Action::None => {}
                 }
             }

@@ -50,5 +50,11 @@ turna-state-backend.workspace = true
 turna-proto-turn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `[turn.auth.webhook]` HTTPS client. Already in the node's graph through
+# opentelemetry-http (with no TLS), and with `rustls` in services/admin, so no
+# new package enters Cargo.lock. `rustls` selects rustls + aws-lc-rs (both
+# already linked by the node) and rustls-platform-verifier for system roots.
+# No OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # PR A (task 2.4): system resource metrics in heartbeat.
 sysinfo = "0.39"

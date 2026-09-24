@@ -325,6 +325,22 @@ pub struct Metrics {
     /// `[turn.auth] require_binding_auth` is on.
     pub binding_auth_challenges: AtomicU64,
 
+    // ── Credential webhook (`[turn.auth.webhook]`) ─────────────────────────────
+    // Counted by the node's fetcher (requests/errors/not_found), the processor
+    // (deferred/unavailable) or mirrored from the cache's own counters.
+    pub auth_webhook_requests: AtomicU64,
+    pub auth_webhook_errors: AtomicU64,
+    pub auth_webhook_not_found: AtomicU64,
+    pub auth_webhook_cache_hits: AtomicU64,
+    pub auth_webhook_cache_negative_hits: AtomicU64,
+    pub auth_webhook_cache_misses: AtomicU64,
+    pub auth_webhook_rejected: AtomicU64,
+    pub auth_webhook_cache_entries: AtomicU64,
+    /// Requests parked (not answered) while their user was looked up.
+    pub auth_webhook_deferred: AtomicU64,
+    /// Requests refused with 500 because the lookup failed (fail closed).
+    pub auth_webhook_unavailable: AtomicU64,
+
     // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
     // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
     // task in the node listeners (the transport crate is leaf-level and cannot
@@ -567,6 +583,16 @@ impl Metrics {
             capacity_dropped_packets: AtomicU64::new(0),
             capacity_dropped_bytes: AtomicU64::new(0),
             binding_auth_challenges: AtomicU64::new(0),
+            auth_webhook_requests: AtomicU64::new(0),
+            auth_webhook_errors: AtomicU64::new(0),
+            auth_webhook_not_found: AtomicU64::new(0),
+            auth_webhook_cache_hits: AtomicU64::new(0),
+            auth_webhook_cache_negative_hits: AtomicU64::new(0),
+            auth_webhook_cache_misses: AtomicU64::new(0),
+            auth_webhook_rejected: AtomicU64::new(0),
+            auth_webhook_cache_entries: AtomicU64::new(0),
+            auth_webhook_deferred: AtomicU64::new(0),
+            auth_webhook_unavailable: AtomicU64::new(0),
             quic_active: AtomicU64::new(0),
             quic_sessions_total: AtomicU64::new(0),
             quic_closed_total: AtomicU64::new(0),
@@ -826,7 +852,37 @@ impl Metrics {
              turna_relay_capacity_dropped_bytes_total {}\n\
              # HELP turna_binding_auth_challenges_total Binding requests without credentials challenged because require_binding_auth is on\n\
              # TYPE turna_binding_auth_challenges_total counter\n\
-             turna_binding_auth_challenges_total {}\n",
+             turna_binding_auth_challenges_total {}\n\
+             # HELP turna_auth_webhook_requests_total Credential lookups sent to the auth webhook\n\
+             # TYPE turna_auth_webhook_requests_total counter\n\
+             turna_auth_webhook_requests_total {}\n\
+             # HELP turna_auth_webhook_errors_total Auth webhook lookups that failed (timeout, transport, non-2xx other than 404, malformed body)\n\
+             # TYPE turna_auth_webhook_errors_total counter\n\
+             turna_auth_webhook_errors_total {}\n\
+             # HELP turna_auth_webhook_not_found_total Auth webhook lookups answered 404 (unknown user)\n\
+             # TYPE turna_auth_webhook_not_found_total counter\n\
+             turna_auth_webhook_not_found_total {}\n\
+             # HELP turna_auth_webhook_cache_hits_total Credential lookups answered from a cached found user\n\
+             # TYPE turna_auth_webhook_cache_hits_total counter\n\
+             turna_auth_webhook_cache_hits_total {}\n\
+             # HELP turna_auth_webhook_cache_negative_hits_total Credential lookups answered from a cached unknown user\n\
+             # TYPE turna_auth_webhook_cache_negative_hits_total counter\n\
+             turna_auth_webhook_cache_negative_hits_total {}\n\
+             # HELP turna_auth_webhook_cache_misses_total Credential lookups that had to call the webhook\n\
+             # TYPE turna_auth_webhook_cache_misses_total counter\n\
+             turna_auth_webhook_cache_misses_total {}\n\
+             # HELP turna_auth_webhook_rejected_total Credential lookups refused because the fetch queue or cache was full\n\
+             # TYPE turna_auth_webhook_rejected_total counter\n\
+             turna_auth_webhook_rejected_total {}\n\
+             # HELP turna_auth_webhook_cache_entries Users currently held in the credential cache\n\
+             # TYPE turna_auth_webhook_cache_entries gauge\n\
+             turna_auth_webhook_cache_entries {}\n\
+             # HELP turna_auth_webhook_deferred_total Requests parked unanswered while their user was looked up\n\
+             # TYPE turna_auth_webhook_deferred_total counter\n\
+             turna_auth_webhook_deferred_total {}\n\
+             # HELP turna_auth_webhook_unavailable_total Requests refused with 500 because the credential lookup failed (fail closed)\n\
+             # TYPE turna_auth_webhook_unavailable_total counter\n\
+             turna_auth_webhook_unavailable_total {}\n",
             l(&self.autoban_bans),
             l(&self.autoban_active),
             l(&self.autoban_dropped),
@@ -835,6 +891,16 @@ impl Metrics {
             l(&self.capacity_dropped_packets),
             l(&self.capacity_dropped_bytes),
             l(&self.binding_auth_challenges),
+            l(&self.auth_webhook_requests),
+            l(&self.auth_webhook_errors),
+            l(&self.auth_webhook_not_found),
+            l(&self.auth_webhook_cache_hits),
+            l(&self.auth_webhook_cache_negative_hits),
+            l(&self.auth_webhook_cache_misses),
+            l(&self.auth_webhook_rejected),
+            l(&self.auth_webhook_cache_entries),
+            l(&self.auth_webhook_deferred),
+            l(&self.auth_webhook_unavailable),
         )
     }
 
