@@ -285,10 +285,22 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   and `init.lua` carries an explicit "change one place, change both" coupling with
   the Rust script. Full analysis, per-option edit lists, the test list and the
   ordering argument: [docs/design/additional-address-family.md](design/additional-address-family.md).
-- **Absent**: IPv6 for RFC 6062 TCP relay. 440 is returned both when the client asks
-  for the v6 family and when `[turn] external_ip` is a v6 literal; the latter would
-  otherwise advertise a relayed address the `0.0.0.0` listener never serves. (The TCP relay datapath
-  has no v6 path).
+- **IPv6 for RFC 6062 TCP relay — implemented, opt-in (2026-09-24).** With
+  `[turn.tcp_relay] allow_ipv6 = true` *and* `[turn] external_ip6` set, a TCP Allocate
+  with `REQUESTED-ADDRESS-FAMILY = IPv6` binds its relayed listener v6 (`IPV6_V6ONLY`,
+  on `[turn.relay] bind_ip6`, `session::bind_relay_tcp_listener`) and advertises
+  `external_ip6`. The UDP family rules carry over unchanged: CreatePermission refuses a
+  cross-family peer with 443, so CONNECT (which needs a permission) cannot reach one,
+  and the v6-only listener cannot accept one; the peer filter's v6 classes apply
+  through CreatePermission. Default off, so an existing node keeps answering 440. A v6
+  literal in `[turn] external_ip` with no family attribute still answers 440 (the
+  allocation is IPv4 by RFC 8656 §7.2 step 7, and would otherwise advertise an address
+  the v4 listener never serves). **Not exercised at runtime yet**: the development
+  container has no IPv6, so the v6 bind path is covered by tests that skip without v6.
+  Two pre-existing RFC 6062 gaps apply to both families and are unchanged: outbound
+  CONNECT does not bind the relayed address as its local endpoint (§5.2), and a
+  peer-initiated connection is not checked against the permission list before the
+  ConnectionAttempt (§5.3).
 - **Verified 2026-08-18** (`docs/interop/conformance-2026-08-18.md`): the control
   plane, in both configurations — 440 with `external_ip6` unset, an IPv6 relayed
   address when set, 443 in both directions on a cross-family peer, and all four

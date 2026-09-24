@@ -606,6 +606,16 @@ impl TurnaConfig {
         //
         // Hard error under production, warning otherwise: a dev box that flips the
         // flag while reading the code should be told, not blocked.
+        // An IPv6 TCP allocation advertises `external_ip6`; without one the
+        // switch could only ever produce 440, which is the config lying.
+        if self.turn.tcp_relay.allow_ipv6 && self.turn.external_ip6.trim().is_empty() {
+            errors.push(
+                "turn.tcp_relay.allow_ipv6 = true requires turn.external_ip6: an IPv6 TCP \
+                 allocation advertises that address, and without it every IPv6 TCP \
+                 Allocate would still be answered 440"
+                    .into(),
+            );
+        }
         if self.turn.tcp_relay.enabled && !self.tls.enabled {
             if prod {
                 errors.push(
@@ -2687,6 +2697,15 @@ pub struct TcpRelaySection {
     pub max_total: usize,
     /// Per-direction relay buffer size, bytes.
     pub buffer_size: usize,
+    /// Serve IPv6 TCP allocations (`REQUESTED-ADDRESS-FAMILY = IPv6`), relaying
+    /// from `[turn] external_ip6` with the listener on `[turn.relay] bind_ip6`.
+    ///
+    /// Off by default so that a node already relaying UDP over IPv6 and TCP
+    /// over IPv4 keeps answering an IPv6 TCP Allocate with 440 until the
+    /// operator opts in: a TCP allocation is a listener plus a connection per
+    /// peer, sized differently from a UDP socket. Requires `external_ip6`.
+    #[serde(default)]
+    pub allow_ipv6: bool,
 }
 
 impl Default for TcpRelaySection {
@@ -2698,6 +2717,7 @@ impl Default for TcpRelaySection {
             max_per_allocation: 10,
             max_total: 50_000,
             buffer_size: 16384,
+            allow_ipv6: false,
         }
     }
 }
@@ -3852,6 +3872,23 @@ mod tests {
         }
         ok.expect("two addresses and free ports");
         moved.expect("ports moved off the TURN listener");
+    }
+
+    #[test]
+    fn tcp_relay_ipv6_is_opt_in_and_needs_external_ip6() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        assert!(!TcpRelaySection::default().allow_ipv6, "off by default");
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.tcp_relay.allow_ipv6 = true;
+        let without = cfg.validate();
+        cfg.turn.external_ip6 = "2001:db8::10".into();
+        let with = cfg.validate();
+        restore_turna_production(saved);
+        let msg = without.expect_err("needs external_ip6").to_string();
+        assert!(msg.contains("allow_ipv6"), "{msg}");
+        with.expect("allow_ipv6 with external_ip6 is valid");
     }
 
     #[test]

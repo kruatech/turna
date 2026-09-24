@@ -251,7 +251,8 @@ answered `440 Address Family not Supported`.
   `docs/verification/encrypted-transports.md` → relayed address family.
 - **Known limits:** one family per allocation (cross-family peers get `443`);
   `ADDITIONAL-ADDRESS-FAMILY` not implemented (storage decision pending —
-  `docs/design/additional-address-family.md`); RFC 6062 TCP relay stays IPv4-only.
+  `docs/design/additional-address-family.md`); RFC 6062 TCP relay is IPv4-only
+  unless `[turn.tcp_relay] allow_ipv6` is set (opt-in, not yet exercised on a v6 host).
   The relay socket *is* bound `IPV6_V6ONLY`, so the family separation is enforced
   at the socket as well as by the 443 check.
 

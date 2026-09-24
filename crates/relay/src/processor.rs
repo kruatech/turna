@@ -2095,41 +2095,54 @@ impl PacketProcessor {
         if msg.get_even_port().is_some() || msg.get_reservation_token().is_some() || has_df {
             return self.encode_error(msg, src, 400, "Bad Request");
         }
-        // RFC 6062 TCP allocations stay IPv4-only even when `external_ip6` is set:
-        // the TCP relay datapath has no v6 path yet, so an IPv6 family request is
-        // refused with 440 rather than accepted and then unable to CONNECT.
+        // RFC 6156 family for an RFC 6062 TCP allocation.
         //
-        // Two ways a v6 family can arrive here, and BOTH have to be refused:
+        // IPv6 is served only when BOTH switches are on: `[turn] external_ip6`
+        // (an address to advertise) and `[turn.tcp_relay] allow_ipv6` (default
+        // off). The second exists so that a deployment already running v6 UDP
+        // relaying and TCP relaying side by side keeps answering an IPv6 TCP
+        // Allocate with 440 until it opts in — the TCP datapath is a listener
+        // and a connection per peer, a different thing to size than a UDP
+        // socket. With both on, the relayed listener binds v6 (`IPV6_V6ONLY`, on
+        // `[turn.relay] bind_ip6`) and `external_ip6` is advertised; the family
+        // rules are the UDP ones — CreatePermission refuses a cross-family peer
+        // with 443, so CONNECT (which needs a permission) cannot reach one, and
+        // the v6-only listener cannot accept one.
         //
-        //  1. the client asks for it (REQUESTED-ADDRESS-FAMILY = IPv6);
-        //  2. the operator configured `[turn] external_ip` as a v6 literal, which
-        //     `config::validate()` accepts and nothing downstream ties to
-        //     `tcp_relay`. The client sends no family attribute, so case 1 never
-        //     fires — yet `relay_addr` below is built from `self.external_ip` and
-        //     would advertise a v6 XOR-RELAYED-ADDRESS while the relayed listener
-        //     binds `0.0.0.0`. The Allocate would SUCCEED and peer-initiated
-        //     connections (RFC 6062 §4.4) could never arrive at the address the
-        //     client was just handed, with nothing logged and no error anywhere.
+        // Two ways a v6 family can arrive here, and the second is still refused
+        // whatever the switches say:
         //
-        // Case 2 is the dangerous one precisely because it looks like it worked.
-        // Refusing with the same 440 keeps the observable behaviour equal to what
-        // docs/feature-support.md already promises ("an IPv6 TCP allocation answers
-        // 440") instead of splitting it by how the family was chosen.
+        //  1. the client asks for it (REQUESTED-ADDRESS-FAMILY = IPv6) — served
+        //     when both switches are on, 440 otherwise;
+        //  2. the operator configured `[turn] external_ip` as a v6 literal. The
+        //     client sends no family attribute, which means IPv4 (RFC 8656
+        //     §7.2), so the listener binds v4 while `relay_addr` would be built
+        //     from a v6 `external_ip` — the Allocate would SUCCEED and hand the
+        //     client an address nothing serves, with nothing logged. That case
+        //     answers 440 and says why.
         let requested_v6 = matches!(
             msg.get_requested_address_family(),
             Some(turna_proto_stun::attribute::AddressFamily::Ipv6)
         );
-        if requested_v6 || self.external_ip.is_ipv6() {
-            if !requested_v6 {
-                warn!(
-                    external_ip = %self.external_ip,
-                    "RFC 6062: refusing TCP allocation because [turn] external_ip is IPv6 \
-                     and the TCP relay datapath is IPv4-only; the relayed listener would \
-                     bind 0.0.0.0 and never receive peer-initiated connections"
-                );
-            }
+        let v6_allowed = self.external_ip6.is_some()
+            && self.tcp_relay.as_ref().is_some_and(|m| m.ipv6_enabled());
+        if requested_v6 && !v6_allowed {
             return self.encode_error(msg, src, 440, "Address Family not Supported");
         }
+        if !requested_v6 && self.external_ip.is_ipv6() {
+            warn!(
+                external_ip = %self.external_ip,
+                "RFC 6062: refusing TCP allocation because [turn] external_ip is IPv6 \
+                 while the allocation is IPv4 (no REQUESTED-ADDRESS-FAMILY); the relayed \
+                 listener would bind 0.0.0.0 and never receive peer-initiated connections"
+            );
+            return self.encode_error(msg, src, 440, "Address Family not Supported");
+        }
+        let relay_family = if requested_v6 {
+            turna_session::RelayFamily::V6
+        } else {
+            turna_session::RelayFamily::V4
+        };
 
         let mut lifetime = msg
             .get_lifetime()
@@ -2158,7 +2171,12 @@ impl PacketProcessor {
             Ok(p) => p,
             Err(_) => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
         };
-        let relay_addr = SocketAddr::new(self.external_ip, relay_port);
+        let relay_addr = match (relay_family, self.external_ip6) {
+            (turna_session::RelayFamily::V6, Some(ip6)) => {
+                SocketAddr::new(std::net::IpAddr::V6(ip6), relay_port)
+            }
+            _ => SocketAddr::new(self.external_ip, relay_port),
+        };
         let mut port_reservation = turna_session::PortReservationGuard::new(
             self.store.pool_for_port(relay_port),
             relay_port,
@@ -2168,18 +2186,17 @@ impl PacketProcessor {
         // allocation (peer-initiated connections require it). Bind it before
         // committing the allocation; on failure, release the port and reject the
         // Allocate rather than hand back a half-working allocation.
-        // Same bind address as the UDP relay sockets: a TCP allocation that
-        // listened on every interface while the UDP ones were pinned to the
-        // public address would reopen on the private side exactly the surface
-        // `[turn.relay] bind_ip` exists to close.
-        let listener =
-            match std::net::TcpListener::bind((turna_session::relay_bind_addr_v4(), relay_port)) {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
-                    return self.encode_error(msg, src, 508, "Insufficient Capacity");
-                }
-            };
+        // Same bind address as the UDP relay sockets of the same family: a TCP
+        // allocation that listened on every interface while the UDP ones were
+        // pinned to the public address would reopen on the private side exactly
+        // the surface `[turn.relay] bind_ip` / `bind_ip6` exist to close.
+        let listener = match turna_session::bind_relay_tcp_listener(relay_family, relay_port) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
+                return self.encode_error(msg, src, 508, "Insufficient Capacity");
+            }
+        };
 
         if let Err(e) = self.store.create_for_identity(
             src,
@@ -3771,5 +3788,198 @@ mod nat_discovery_tests {
             .unwrap();
         assert!(r.get_other_address().is_none());
         assert!(r.get_response_origin().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tcp_relay_ipv6_tests {
+    //! RFC 6062 TCP allocations in the IPv6 family. The paths that bind a v6
+    //! socket skip on a host without IPv6 and say so; the refusals run
+    //! everywhere.
+    use super::*;
+    use crate::tcp_relay::{TcpRelayConfig, TcpRelayManager};
+    use turna_proto_stun::attribute::AddressFamily;
+
+    const REALM: &str = "tcp6";
+
+    fn processor(allow_ipv6: bool, ip6: Option<&str>) -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(29000, 29999, 64)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                REALM,
+                [("u", "pw")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_tcp_relay(Some(Arc::new(TcpRelayManager::new(TcpRelayConfig {
+            allow_ipv6,
+            ..Default::default()
+        }))))
+        .with_external_ip6(ip6.map(|s| s.parse().unwrap()))
+    }
+
+    fn signed(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        method: Method,
+        extra: Vec<Attribute>,
+    ) -> Bytes {
+        let mut m = StunMessage::new(method, MessageClass::Request);
+        for a in extra {
+            m.add(a);
+        }
+        m.add(Attribute::Username("u".into()));
+        m.add(Attribute::Realm(REALM.into()));
+        m.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key("u", REALM, "pw");
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn tcp_allocate(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        family: Option<AddressFamily>,
+    ) -> Vec<Action> {
+        let mut extra = vec![Attribute::RequestedTransport(turn::TRANSPORT_TCP)];
+        if let Some(f) = family {
+            extra.push(Attribute::RequestedAddressFamily(f));
+        }
+        p.process_tcp_control(signed(p, src, Method::Allocate, extra), src)
+    }
+
+    fn reply(actions: &[Action]) -> StunMessage {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
+    fn code(m: &StunMessage) -> Option<u16> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    fn relayed(m: &StunMessage) -> Option<SocketAddr> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::XorRelayedAddress(x) => Some(*x),
+            _ => None,
+        })
+    }
+
+    fn host_has_ipv6() -> bool {
+        std::net::TcpListener::bind("[::1]:0").is_ok()
+    }
+
+    /// The default: `allow_ipv6 = false` answers 440 exactly as before, even
+    /// with `external_ip6` configured for UDP.
+    #[test]
+    fn ipv6_tcp_allocation_is_refused_unless_opted_in() {
+        let p = processor(false, Some("2001:db8::10"));
+        let src: SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        let r = reply(&tcp_allocate(&p, src, Some(AddressFamily::Ipv6)));
+        assert_eq!(code(&r), Some(440));
+        assert!(p.store.get(&src).is_none());
+    }
+
+    /// Opted in but with no v6 address to advertise: still 440, rather than a
+    /// v6 allocation carrying an address nobody routes.
+    #[test]
+    fn ipv6_tcp_allocation_needs_external_ip6() {
+        let p = processor(true, None);
+        let src: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let r = reply(&tcp_allocate(&p, src, Some(AddressFamily::Ipv6)));
+        assert_eq!(code(&r), Some(440));
+    }
+
+    /// Turning v6 on changes nothing for a v4 TCP allocation.
+    #[test]
+    fn ipv4_tcp_allocation_is_unchanged_with_ipv6_enabled() {
+        let p = processor(true, Some("2001:db8::10"));
+        let src: SocketAddr = "127.0.0.1:42003".parse().unwrap();
+        let actions = tcp_allocate(&p, src, None);
+        let r = reply(&actions);
+        assert!(
+            matches!(r.class, MessageClass::SuccessResponse),
+            "{:?}",
+            code(&r)
+        );
+        assert!(relayed(&r).unwrap().is_ipv4());
+        let listener_v4 = actions.iter().any(|a| {
+            matches!(a, Action::RegisterTcpListener { listener, .. }
+                if listener.local_addr().unwrap().is_ipv4())
+        });
+        assert!(listener_v4, "v4 allocation must bind a v4 listener");
+    }
+
+    #[test]
+    fn ipv6_tcp_allocation_binds_v6_and_enforces_family() {
+        if !host_has_ipv6() {
+            eprintln!("skipping: no IPv6 on this host; the v6 TCP relay path is not exercised");
+            return;
+        }
+        let p = processor(true, Some("2001:db8::10"));
+        let src: SocketAddr = "127.0.0.1:42004".parse().unwrap();
+        let actions = tcp_allocate(&p, src, Some(AddressFamily::Ipv6));
+        let r = reply(&actions);
+        assert!(
+            matches!(r.class, MessageClass::SuccessResponse),
+            "{:?}",
+            code(&r)
+        );
+        let addr = relayed(&r).unwrap();
+        assert_eq!(
+            addr.ip(),
+            "2001:db8::10".parse::<std::net::IpAddr>().unwrap()
+        );
+        let listener_v6 = actions.iter().any(|a| {
+            matches!(a, Action::RegisterTcpListener { listener, relay_port, .. }
+                if listener.local_addr().unwrap().is_ipv6() && *relay_port == addr.port())
+        });
+        assert!(
+            listener_v6,
+            "v6 allocation must bind a v6 listener on the advertised port"
+        );
+
+        // RFC 6156: a v4 peer on a v6 allocation is a family mismatch (443),
+        // so CONNECT — which needs a permission — cannot reach one either.
+        let perm = signed(
+            &p,
+            src,
+            Method::CreatePermission,
+            vec![Attribute::XorPeerAddress("8.8.8.8:80".parse().unwrap())],
+        );
+        assert_eq!(code(&reply(&p.process_tcp_control(perm, src))), Some(443));
+        let connect = signed(
+            &p,
+            src,
+            Method::Connect,
+            vec![Attribute::XorPeerAddress("8.8.8.8:80".parse().unwrap())],
+        );
+        let msg = StunMessage::decode(&connect).unwrap();
+        match p.connect_decision(&msg, &connect, src) {
+            ConnectDecision::Reject(a) => assert_eq!(code(&reply(&a)), Some(403)),
+            ConnectDecision::Proceed { .. } => panic!("CONNECT to a v4 peer on a v6 allocation"),
+        }
+        // A v6 peer in the global range is permitted.
+        let perm6 = signed(
+            &p,
+            src,
+            Method::CreatePermission,
+            vec![Attribute::XorPeerAddress(
+                "[2001:4860:4860::8888]:80".parse().unwrap(),
+            )],
+        );
+        assert!(matches!(
+            reply(&p.process_tcp_control(perm6, src)).class,
+            MessageClass::SuccessResponse
+        ));
     }
 }

@@ -95,9 +95,10 @@ Rules that hold in both modes:
 - Putting an IPv6 literal in `external_ip` does **not** enable IPv6 relaying; it
   only changes what is advertised for v4-family allocations. `external_ip6` is the
   key that matters, and validation rejects a v4 literal in it.
-- RFC 6062 **TCP** relay allocations stay IPv4-only regardless of `external_ip6`:
-  the TCP relay datapath has no v6 path, so an IPv6 family request there is still
-  `440`.
+- RFC 6062 **TCP** relay allocations are IPv4-only unless `[turn.tcp_relay]
+  allow_ipv6 = true` is also set; then an IPv6 family request binds the relayed TCP
+  listener v6 (`IPV6_V6ONLY`, on `[turn.relay] bind_ip6`) and advertises
+  `external_ip6`. Without that key an IPv6 TCP request is `440`, as before.
 - `ADDITIONAL-ADDRESS-FAMILY` (one Allocate asking for both families at once) is
   **not** implemented — see `docs/protocol-gap.md` → IPv6.
 
@@ -213,10 +214,10 @@ UDP. Disabled by default. **Requires `[tls]` enabled:** RFC 6062 §4.1 mandates 
 TCP/TLS control connection, and an Allocate with `REQUESTED-TRANSPORT = 6`
 arriving over UDP, DTLS or QUIC is refused with `400 Bad Request`.
 
-> **Refused in production.** With `production = true`, config validation rejects
-> `enabled = true` and the node does not start. The feature is implemented and
-> testable with `production = false`; the gate lifts once interop and
-> pipelined-client hardening are done (`docs/protocol-gap.md` → TCP relay).
+> **Allowed in production since 2026-08-25** (the refusal this note used to
+> describe was lifted once coturn interop was recorded — `docs/feature-support.md`).
+> With `production = true` and `[tls]` disabled, validation refuses it, because no
+> client could open the control connection.
 
 | key | type | default | notes |
 |-----|------|---------|-------|
@@ -226,6 +227,7 @@ arriving over UDP, DTLS or QUIC is refused with `400 Bad Request`.
 | `max_per_allocation` | usize | `10` | Concurrent peer connections per allocation. |
 | `max_total` | usize | `50000` | Concurrent peer connections overall (`446`/`508` beyond it). |
 | `buffer_size` | usize | `16384` | Per-direction relay buffer. |
+| `allow_ipv6` | bool | `false` | Serve `REQUESTED-ADDRESS-FAMILY = IPv6` TCP allocations: listener bound v6 (`IPV6_V6ONLY`, `[turn.relay] bind_ip6`), `[turn] external_ip6` advertised. **Requires `external_ip6`** (validation). Off → `440`, as before. Cross-family peers get `443` on CreatePermission, so CONNECT cannot reach them. |
 
 A `ConnectionBind` must be authenticated with the **same credentials** as the
 `CONNECT` (or the allocation owner, for peer-initiated connections) —

@@ -61,7 +61,7 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
 - **420** Unknown Attribute — unknown comprehension-required attribute (I3).
 - **437** Allocation Mismatch — no allocation on the 5-tuple; lost create race (B1); migration ticket/epoch mismatch.
 - **438** Stale Nonce — expired/rotated nonce.
-- **440** Address Family not Supported — `REQUESTED-ADDRESS-FAMILY = IPv6` when `[turn] external_ip6` is unset, or on an RFC 6062 TCP allocation (always).
+- **440** Address Family not Supported — `REQUESTED-ADDRESS-FAMILY = IPv6` when `[turn] external_ip6` is unset, or on an RFC 6062 TCP allocation unless `[turn.tcp_relay] allow_ipv6` is also set.
 - **442** Unsupported Transport Protocol — REQUESTED-TRANSPORT is neither UDP nor (TCP with `[turn.tcp_relay]` enabled).
 - **443** Peer Address Family Mismatch — CreatePermission/ChannelBind naming a peer in a different family than the allocation's relayed address (RFC 6156 §4.2).
 - **486** Allocation Quota Reached — per-allocation permission/channel cap (B5); rate-limit rejections.

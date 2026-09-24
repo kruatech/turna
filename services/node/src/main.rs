@@ -591,6 +591,7 @@ fn build_tcp_relay_config(
         max_per_allocation: c.max_per_allocation,
         max_total: c.max_total,
         buffer_size: c.buffer_size,
+        allow_ipv6: c.allow_ipv6,
     }
 }
 

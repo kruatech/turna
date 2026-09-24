@@ -92,6 +92,10 @@ pub struct TcpRelayConfig {
     pub max_per_allocation: usize,
     pub max_total: usize,
     pub buffer_size: usize,
+    /// Accept an IPv6 TCP allocation (`REQUESTED-ADDRESS-FAMILY = IPv6`) when the
+    /// processor also has an `external_ip6` to advertise. `false` (the default)
+    /// keeps the historical 440 — `[turn.tcp_relay] allow_ipv6`.
+    pub allow_ipv6: bool,
 }
 
 impl Default for TcpRelayConfig {
@@ -102,6 +106,7 @@ impl Default for TcpRelayConfig {
             max_per_allocation: 10,
             max_total: 50_000,
             buffer_size: 16384,
+            allow_ipv6: false,
         }
     }
 }
@@ -152,6 +157,11 @@ impl TcpRelayManager {
             alloc_peers: Arc::new(RwLock::new(HashMap::new())),
             counter: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
+    }
+
+    /// Whether IPv6 TCP allocations are enabled (see [`TcpRelayConfig::allow_ipv6`]).
+    pub fn ipv6_enabled(&self) -> bool {
+        self.config.allow_ipv6
     }
 
     fn next_id(&self) -> TcpConnectionId {

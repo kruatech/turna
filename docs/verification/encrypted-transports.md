@@ -226,8 +226,11 @@ the boxes below stay as the checklist to repeat in your own environment:
       RESERVATION-TOKEN claims its pair.
 - [ ] A v4 literal in `external_ip6` fails validation at startup.
 - [ ] RFC 6062: with `[turn.tcp_relay]` enabled and `external_ip6` set, an IPv6
-      family TCP Allocate is still refused `440` (the TCP relay datapath has no v6
-      path).
+      family TCP Allocate is still refused `440` while `allow_ipv6` is unset.
+- [ ] RFC 6062 with `allow_ipv6 = true`: the IPv6 TCP Allocate advertises
+      `external_ip6`; the relayed listener is bound v6-only (`ss -ltn` shows `[::]`
+      or `bind_ip6`, and the same v4 port is free); CONNECT to a permitted v6 peer
+      relays data; CreatePermission for a v4 peer answers `443`.
 - [ ] Peer-filter bypass check. On a v6 allocation, CreatePermission for each of
       `64:ff9b::a9fe:a9fe` (NAT64 form of the cloud metadata address),
       `2002:c000:0204::1` (6to4), `2001::1` (Teredo) and `::203.0.113.1`
