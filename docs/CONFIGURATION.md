@@ -114,6 +114,7 @@ filter's self-deny, as `bind_ip` does.
 | `token_ttl` | u64 | `86400` | Token lifetime, seconds. |
 | `static_users` | array of `{ username, password }` | `[]` | Long-term static credentials. |
 | `advertise_userhash` | bool | `false` | RFC 8489 username anonymity. When true every nonce carries the §9.2 nonce cookie with "Username anonymity" set, so conforming clients send `USERHASH` instead of `USERNAME`. **Refused** unless the base realm and every tenant use `static_users` (TURN REST / OAuth cannot resolve a hash). A `USERHASH` request is *accepted* on long-term realms whatever this says. A SIGHUP reload that would switch a realm between `static_users` and a shared secret (or back) is refused for that realm and logged — the mechanism, and with it USERHASH eligibility, changes only on restart. |
+| `require_binding_auth` | bool | `false` | coturn `secure-stun`. When `true`, a STUN Binding without MESSAGE-INTEGRITY is answered with a 401 challenge; one with credentials must carry a valid NONCE and gets a response signed with the same MESSAGE-INTEGRITY variant. **Leave off** on a node browsers also use as their STUN server: they send Binding unauthenticated and would lose their server-reflexive candidate. Counted in `turna_binding_auth_challenges_total`. |
 
 Use **one** of: `static_users` (long-term) or `shared_secret` (time-limited).
 
@@ -571,6 +572,7 @@ IP is required. Readiness follows initialization of every configured queue.
 | `rate_soft_percent` | u64 | `60` | Percent of the above at which `/capacity` reports `DEGRADED`. |
 | `rate_hard_percent` | u64 | `80` | Percent at which it reports `SATURATED`. |
 | `drain_timeout_secs` | u64 | `30` | How long shutdown waits for allocations to end. |
+| `max_total_bytes_per_sec` | u64 | `0` | Node-wide cap on relayed bytes/second, both directions and all allocations combined (coturn `bps-capacity`, different mechanism — see below). `0` = no cap. Values below 1500 are refused. |
 
 **Measure `max_packets_per_sec`; do not estimate it.**
 `scripts/verify/capacity-profile.sh` on the hardware in question. A figure from
@@ -585,6 +587,18 @@ perfect and broken.
 
 At 80 % that leaves 30 400 pps of headroom before the cliff. At 90 % it would leave
 19 200, which at these rates is seconds of traffic growth.
+
+**`max_total_bytes_per_sec` drops, it does not refuse sessions.** One token
+bucket (one second of burst) shared by every allocation and datapath. Once it is
+empty, relayed packets — ChannelData, Send indications and peer→client traffic
+alike — are dropped and counted in `turna_relay_capacity_dropped_packets_total` /
+`_bytes_total`; the configured figure is exported as
+`turna_relay_capacity_bytes_per_sec`. coturn's `bps-capacity` instead reserves
+bandwidth per session at allocation time and refuses new sessions when it runs
+out. The practical difference: under turna's cap every call on the node degrades
+together, so size it as a ceiling you never expect to reach (a paid egress
+allowance, a shared uplink), not as admission control. Every relayed packet
+updates one shared atomic while the cap is on; it costs nothing when off.
 
 **`drain_timeout_secs` is a bound, not a target.** The drain loop also exits early
 when three consecutive polls remove nothing: a node whose clients vanished without
