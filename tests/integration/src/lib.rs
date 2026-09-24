@@ -295,6 +295,119 @@ fn assert_refused_transport(what: &str, body: &str, transport: &str, expect_in_m
     );
 }
 
+/// `log_to_stdout = false` with no other sink would leave a node nobody can
+/// debug. Refused at load, with the reason.
+#[test]
+fn refuses_to_log_nowhere() {
+    assert_refused(
+        "log_to_stdout = false with no sink",
+        "[turn.observability]\nlog_to_stdout = false\n",
+        "log nowhere",
+    );
+}
+
+/// The file sink through the real binary: the node writes its startup lines to
+/// the file (and not to stdout, which is switched off), and SIGHUP after an
+/// external move makes it write a fresh file at the configured path — the
+/// logrotate contract for `rotation = "external"`.
+#[cfg(target_os = "linux")]
+#[test]
+fn node_logs_to_file_and_reopens_on_sighup() {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: {bin:?} not built — run `cargo build -p turna-node`");
+        return;
+    }
+    let turn_port = free_port(true);
+    let health_port = free_port(false);
+    let dir = std::env::temp_dir().join(format!("turna-logfile-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let log = dir.join("turna.log");
+    let cfg_path = dir.join("turn.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [turn.relay]\n\
+             min_port = 24710\n\
+             max_port = 24790\n\
+             max_allocations = 32\n\
+             [turn.observability]\n\
+             log_to_stdout = false\n\
+             [turn.observability.log_file]\n\
+             path = \"{}\"\n\
+             rotation = \"external\"\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n",
+            log.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .env("RUST_LOG", "info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn node");
+    let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !http_ready(&health) {
+        if std::time::Instant::now() >= deadline || child.try_wait().expect("try_wait").is_some() {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("output");
+            panic!(
+                "node did not become ready with a log file configured:\n{}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let first = std::fs::read_to_string(&log).unwrap_or_default();
+    let moved = dir.join("turna.log.1");
+    std::fs::rename(&log, &moved).expect("move log like logrotate");
+    // SAFETY: kill(2) with a pid we spawned and still own.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGHUP);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut reopened = String::new();
+    while std::time::Instant::now() < deadline {
+        reopened = std::fs::read_to_string(&log).unwrap_or_default();
+        if reopened.contains("log file reopened") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("output");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        first.contains("starting turna"),
+        "startup lines must reach the file:\n{first}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("starting turna"),
+        "log_to_stdout = false, yet stdout carried the log"
+    );
+    assert!(
+        reopened.contains("log file reopened"),
+        "after SIGHUP the node must write a fresh file at the path; got:\n{reopened}"
+    );
+}
+
 /// Production policy must not hide invalid transport configuration. RFC 6062
 /// and Linux/tokio SCTP are allowed; OAuth retains its separate refusal below.
 #[test]
@@ -2744,4 +2857,329 @@ fn metric_value(health: &SocketAddr, name: &str) -> f64 {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0)
+}
+
+/// Accounting and RTP metrics through the real binary.
+#[cfg(test)]
+mod ops_it {
+    use super::*;
+
+    struct Node {
+        child: std::process::Child,
+        turn: SocketAddr,
+        health: SocketAddr,
+    }
+
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Start a node with `extra` appended to a minimal config (static user
+    /// testuser/testpass, relay ports `ports`), and wait for /ready.
+    async fn spawn_node(dir: &std::path::Path, ports: (u16, u16), extra: &str) -> Option<Node> {
+        let bin = node_binary();
+        if !bin.exists() {
+            eprintln!("skipping: {bin:?} not built — run `cargo build -p turna-node`");
+            return None;
+        }
+        let turn_port = free_port(true);
+        let health_port = free_port(false);
+        let cfg_path = dir.join("turn.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "production = false\n\
+                 [turn]\n\
+                 listen = \"127.0.0.1:{turn_port}\"\n\
+                 external_ip = \"127.0.0.1\"\n\
+                 realm = \"turna\"\n\
+                 transport = \"tokio\"\n\
+                 [[turn.auth.static_users]]\n\
+                 username = \"testuser\"\n\
+                 password = \"testpass\"\n\
+                 [turn.relay]\n\
+                 min_port = {}\n\
+                 max_port = {}\n\
+                 max_allocations = 32\n\
+                 [health]\n\
+                 listen = \"127.0.0.1:{health_port}\"\n\
+                 {extra}\n",
+                ports.0, ports.1
+            ),
+        )
+        .expect("write config");
+        let child = std::process::Command::new(&bin)
+            .arg(&cfg_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn node");
+        let mut node = Node {
+            child,
+            turn: format!("127.0.0.1:{turn_port}").parse().unwrap(),
+            health: format!("127.0.0.1:{health_port}").parse().unwrap(),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !http_ready(&node.health) {
+            assert!(
+                std::time::Instant::now() < deadline
+                    && node.child.try_wait().expect("try_wait").is_none(),
+                "node did not become ready with:\n{extra}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Some(node)
+    }
+
+    /// Allocate as testuser; returns (key, realm, latest nonce, relay address).
+    async fn allocate(
+        socket: &UdpSocket,
+        target: SocketAddr,
+    ) -> (Vec<u8>, String, String, SocketAddr) {
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let (resp, _) = send_recv(socket, target, &probe.encode(), 2000)
+            .await
+            .expect("probe answered");
+        let realm = extract_realm(&resp).expect("realm");
+        let nonce = extract_nonce(&resp).expect("nonce");
+        let key = long_term_key("testuser", &realm, "testpass");
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_username("testuser");
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let (resp, _) = send_recv(socket, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
+            .expect("allocate answered");
+        assert!(
+            is_success(&resp),
+            "Allocate: {:?}",
+            extract_error_code(&resp)
+        );
+        let relay = extract_xor_relayed_address(&resp).expect("relayed address");
+        let nonce = extract_nonce(&resp).unwrap_or(nonce);
+        (key, realm, nonce, relay)
+    }
+
+    /// An authenticated request built by `build`; returns the response.
+    async fn request(
+        socket: &UdpSocket,
+        target: SocketAddr,
+        key: &[u8],
+        realm: &str,
+        nonce: &str,
+        build: impl FnOnce(&mut TurnMsg),
+        method: u16,
+    ) -> Vec<u8> {
+        let mut m = TurnMsg::request(method);
+        build(&mut m);
+        m.add_username("testuser");
+        m.add_realm(realm);
+        m.add_nonce(nonce);
+        send_recv(socket, target, &m.encode_with_integrity(key), 2000)
+            .await
+            .expect("request answered")
+            .0
+    }
+
+    async fn wait_metric(health: &SocketAddr, name: &str, at_least: f64, secs: u64) -> f64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        let mut v = 0.0;
+        while std::time::Instant::now() < deadline {
+            v = metric_value(health, name);
+            if v >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        v
+    }
+
+    /// An Allocate followed by a Refresh(lifetime = 0) produces one `stop`
+    /// record with reason `released` in the JSON-lines file, and the metric
+    /// counts it.
+    #[tokio::test]
+    async fn released_allocation_writes_a_stop_record() {
+        let dir = std::env::temp_dir().join(format!("turna-acct-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let usage = dir.join("usage.jsonl");
+        let Some(node) = spawn_node(
+            &dir,
+            (24800, 24900),
+            &format!(
+                "[turn.accounting]\nenabled = true\n[turn.accounting.file]\npath = \"{}\"\n",
+                usage.display()
+            ),
+        )
+        .await
+        else {
+            return;
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (key, realm, nonce, _) = allocate(&socket, node.turn).await;
+        let resp = request(
+            &socket,
+            node.turn,
+            &key,
+            &realm,
+            &nonce,
+            |m| m.add_lifetime(0),
+            0x0004,
+        )
+        .await;
+        assert!(
+            is_success(&resp),
+            "Refresh(0): {:?}",
+            extract_error_code(&resp)
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut text = String::new();
+        while std::time::Instant::now() < deadline {
+            text = std::fs::read_to_string(&usage).unwrap_or_default();
+            if text.contains("\"type\":\"stop\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Metrics are mirrored on a 5 s tick.
+        let stops = wait_metric(
+            &node.health,
+            "turna_accounting_records_total{type=\"stop\"}",
+            1.0,
+            12,
+        )
+        .await;
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let line = text
+            .lines()
+            .find(|l| l.contains("\"type\":\"stop\""))
+            .unwrap_or_else(|| panic!("no stop record in the accounting file:\n{text}"));
+        assert!(line.contains("\"username\":\"testuser\""), "{line}");
+        assert!(line.contains("\"end_reason\":\"released\""), "{line}");
+        assert!(line.contains("\"transport\":\"udp\""), "{line}");
+        assert!(
+            !line.contains("client_addr"),
+            "include_addresses defaults to false: {line}"
+        );
+        assert!(
+            stops >= 1.0,
+            "turna_accounting_records_total{{type=\"stop\"}} = {stops}"
+        );
+    }
+
+    /// RTP relayed through the node shows up in the new counters and
+    /// histograms — the node-level sampler is wired, not just the analyzer.
+    /// Needs a non-loopback local address for the peer (loopback peers are
+    /// always refused by the peer filter).
+    #[tokio::test]
+    async fn relayed_rtp_reaches_the_quality_metrics() {
+        // The interface address used to reach the outside; no packet is sent.
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        if probe.connect("192.0.2.1:9").is_err() {
+            eprintln!("skipping: no non-loopback route");
+            return;
+        }
+        let peer_ip = probe.local_addr().unwrap().ip();
+        if peer_ip.is_loopback() || peer_ip.is_unspecified() {
+            eprintln!("skipping: no non-loopback address");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("turna-rtp-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let Some(node) = spawn_node(
+            &dir,
+            (24910, 24990),
+            "[turn.peer_filter]\nprofile = \"lan\"\n",
+        )
+        .await
+        else {
+            return;
+        };
+        let peer = UdpSocket::bind(SocketAddr::new(peer_ip, 0)).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (key, realm, nonce, _) = allocate(&client, node.turn).await;
+        let resp = request(
+            &client,
+            node.turn,
+            &key,
+            &realm,
+            &nonce,
+            |m| m.add_xor_peer_address(peer_addr),
+            0x0008,
+        )
+        .await;
+        assert!(
+            is_success(&resp),
+            "CreatePermission: {:?}",
+            extract_error_code(&resp)
+        );
+        let nonce = extract_nonce(&resp).unwrap_or(nonce);
+        let channel = 0x4002u16;
+        let resp = request(
+            &client,
+            node.turn,
+            &key,
+            &realm,
+            &nonce,
+            |m| {
+                m.add_channel_number(channel);
+                m.add_xor_peer_address(peer_addr);
+            },
+            0x0009,
+        )
+        .await;
+        assert!(
+            is_success(&resp),
+            "ChannelBind: {:?}",
+            extract_error_code(&resp)
+        );
+
+        // 40 sequence numbers, 3 never sent (loss), one pair swapped (reorder).
+        let mut seqs: Vec<u16> = (1..=40).filter(|s| ![10, 20, 30].contains(s)).collect();
+        let i = seqs.iter().position(|&s| s == 15).unwrap();
+        seqs.swap(i, i + 1);
+        let mut buf = [0u8; 256];
+        for s in &seqs {
+            let mut rtp = vec![0u8; 60];
+            rtp[0] = 0x80;
+            rtp[1] = 96; // dynamic video PT
+            rtp[2..4].copy_from_slice(&s.to_be_bytes());
+            rtp[4..8].copy_from_slice(&(*s as u32 * 3000).to_be_bytes());
+            rtp[8..12].copy_from_slice(&0x5eed_0001u32.to_be_bytes());
+            client
+                .send_to(&build_channel_data(channel, &rtp), node.turn)
+                .await
+                .unwrap();
+            // Relayed to the peer: proves the packet crossed the node.
+            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .expect("peer receives relayed RTP")
+                .unwrap();
+        }
+
+        let packets = wait_metric(&node.health, "turna_rtp_packets_total", 37.0, 15).await;
+        let lost = metric_value(&node.health, "turna_rtp_packets_lost_total");
+        let ooo = metric_value(&node.health, "turna_rtp_packets_out_of_order_total");
+        let jitter_count = metric_value(&node.health, "turna_rtp_stream_jitter_seconds_count");
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(packets, 37.0, "turna_rtp_packets_total");
+        assert_eq!(lost, 3.0, "turna_rtp_packets_lost_total");
+        assert_eq!(ooo, 1.0, "turna_rtp_packets_out_of_order_total");
+        assert!(
+            jitter_count >= 1.0,
+            "turna_rtp_stream_jitter_seconds_count = {jitter_count}"
+        );
+    }
 }

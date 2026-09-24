@@ -16,6 +16,53 @@ public IP. For multi-node clusters, read this first, then
 - [ ] Inbound TCP **blocked** on 9090 (metrics) and 5350 (gRPC management)
       from the public Internet. Expose only to your monitoring host.
 
+## 0. Installing from a .deb or .rpm (alternative to steps 2–4)
+
+Each release attaches `turna-node_<version>-1_amd64.deb` and
+`turna-node-<version>-1.x86_64.rpm` (linux/amd64, built with the default
+features, i.e. with TURNS), each with a `.sha256`, an SPDX SBOM and a GitHub
+build-provenance attestation:
+
+```sh
+sha256sum -c turna-node_0.5.0-1_amd64.deb.sha256
+gh attestation verify turna-node_0.5.0-1_amd64.deb --repo kruatech/turna
+sudo apt install ./turna-node_0.5.0-1_amd64.deb      # or: sudo dnf install ./turna-node-0.5.0-1.x86_64.rpm
+```
+
+What the package installs, and why each piece is where it is:
+
+| Path | What |
+|---|---|
+| `/usr/bin/turna-node` | The binary (stripped). |
+| `/etc/turna/turn.toml` | `deploy/turn.toml`. A **conffile** (dpkg) / `%config(noreplace)` (rpm): your edits survive upgrades; a changed upstream default arrives as a dpkg prompt or `turn.toml.rpmnew`. Mode `0640 root:turna`. |
+| `/usr/lib/systemd/system/turna-node.service` | `deploy/systemd/turna-node.service`, unchanged. |
+| `/usr/lib/systemd/system/turna-node.service.d/10-package.conf` | Drop-in: `ExecStart=/usr/bin/turna-node …` (the shared unit says `/usr/local/bin`, for manual installs) and an optional `EnvironmentFile=-/etc/turna/secrets.env`. |
+| `/usr/lib/sysctl.d/99-turna.conf` | `deploy/sysctl.d/99-turna.conf`. **Host-wide**; applied at the next boot or by `sudo sysctl --system`. Read §3a first; to opt out, `sudo ln -s /dev/null /etc/sysctl.d/99-turna.conf`. |
+| `/usr/lib/sysusers.d/turna-node.conf` | The `turna` system user (no home, no shell), created on install (`systemd-sysusers` on Debian, `useradd` in `%pre` on RPM). |
+| `/usr/share/doc/turna-node/examples/logrotate-turna-node` | The logrotate policy for `[turn.observability.log_file] rotation = "external"`. Not installed into `/etc/logrotate.d` because no log file is configured by default. |
+
+**The service is installed but neither enabled nor started.** The shipped config
+uses the public placeholder shared secret, and a TURN server that mints
+credentials from a placeholder must not come up by itself. After install:
+
+```sh
+sudoedit /etc/turna/turn.toml          # production = true, external_ip, [turn.auth]
+# or keep turn.toml as shipped and put TURNA_* variables in /etc/turna/secrets.env
+# (mode 0640 root:turna) — see step 1 and .env.example
+sudo systemctl enable --now turna-node
+```
+
+Upgrades restart a running service (`restart-after-upgrade`); removal stops and
+disables it. The user and `/etc/turna/turn.toml` are kept on remove (purge
+removes the conffile on Debian).
+
+Why cargo-deb and cargo-generate-rpm rather than nfpm: both install with
+`cargo install --locked --version <exact>` from the same toolchain the release
+already uses, read their metadata from `services/node/Cargo.toml` next to the
+binary they package, and need neither `rpmbuild` nor a Go binary fetched from
+outside the lockfile. The trade is two metadata sections instead of one — kept
+in step by pointing both at the same files under `deploy/`.
+
 ## 1. Generate secrets
 
 ```sh

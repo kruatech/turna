@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — operations and observability
+
+- Log sinks: optional log file with size/daily/hourly/external rotation (SIGHUP
+  reopens it for logrotate) and optional full-log syslog to `/dev/log` or a remote
+  collector. All sinks share address redaction plus a credential-field backstop.
+- `[turn.accounting]` (opt-in): per-allocation stop and interim usage records
+  (user, realm, tenant, bytes/packets per direction, end reason, boot id) to a
+  JSON-lines file and/or an HTTP(S) webhook with batching, retries and dedup ids.
+- RTP media quality: `turna_rtp_*` counters, jitter and loss histograms, an RTP
+  panel on the admin Traffic page, Grafana rows and alerts.
+- `.deb` and `.rpm` packages for `turna-node` on each release, with checksums,
+  SBOM and provenance.
+
+### Fixed — operations and observability
+
+- RTP metrics were published only by the tokio datapath.
+- The RTP analyzer double-counted reordered packets as loss, spiked jitter on
+  reordering, did not resync after a sequence restart, and analysed RTCP as RTP.
+- gRPC `TrafficStats.bytes_to_client` / `packets_to_client` always read 0.
+
+### Changed — operations and observability
+
+- gRPC `bytes_from_client` / `packets_from_client` now count client→peer only
+  (they previously counted both directions).
+
 ### Changed
 
 - Document AF_XDP as **supported within the verified Linux IPv4 UDP copy-mode scope**

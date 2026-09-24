@@ -25,7 +25,7 @@ pub struct Histogram {
     help: String,
     buckets: Vec<f64>,
     counts: Vec<AtomicU64>,
-    sum: AtomicU64,   // sum in nanoseconds
+    sum: AtomicU64,   // sum in nano-units (ns for durations, 1e-9 for plain values)
     count: AtomicU64, // total observations
 }
 
@@ -45,10 +45,22 @@ impl Histogram {
 
     /// Record an observation.
     pub fn observe(&self, value: Duration) {
-        let secs = value.as_secs_f64();
+        self.observe_value(value.as_secs_f64());
+    }
+
+    /// Record a dimensionless observation (a ratio, a count). Buckets and the
+    /// rendered `_sum` are in the value's own unit; the sum is kept in
+    /// billionths so the same lock-free counter serves both kinds. Negative
+    /// and non-finite values are recorded as 0.
+    pub fn observe_value(&self, value: f64) {
+        let secs = if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.0
+        };
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum
-            .fetch_add(value.as_nanos() as u64, Ordering::Relaxed);
+            .fetch_add((secs * 1_000_000_000.0) as u64, Ordering::Relaxed);
 
         // Increment all buckets where value <= boundary
         for (i, &boundary) in self.buckets.iter().enumerate() {
@@ -261,6 +273,29 @@ impl HistogramRegistry {
             ),
         );
 
+        // Media quality, one observation per RTP stream per sampling interval
+        // (5 s, the node's RTP sampler). See docs/OBSERVABILITY.md for what an
+        // observation means; the analyzer's clock-rate guess makes jitter a
+        // trend rather than an absolute.
+        histograms.insert(
+            "turna_rtp_stream_jitter_seconds".into(),
+            Histogram::new(
+                "turna_rtp_stream_jitter_seconds",
+                "RFC 3550 interarrival jitter per RTP stream, sampled every 5 s",
+                vec![
+                    0.001, 0.0025, 0.005, 0.010, 0.020, 0.030, 0.050, 0.100, 0.200, 0.500,
+                ],
+            ),
+        );
+        histograms.insert(
+            "turna_rtp_stream_loss_ratio".into(),
+            Histogram::new(
+                "turna_rtp_stream_loss_ratio",
+                "Per-stream RTP loss ratio over a 5 s interval (streams with at least 10 expected packets)",
+                vec![0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0],
+            ),
+        );
+
         Self { histograms }
     }
 
@@ -268,6 +303,13 @@ impl HistogramRegistry {
     pub fn observe(&self, name: &str, duration: Duration) {
         if let Some(h) = self.histograms.get(name) {
             h.observe(duration);
+        }
+    }
+
+    /// Observe a dimensionless value for a named histogram.
+    pub fn observe_value(&self, name: &str, value: f64) {
+        if let Some(h) = self.histograms.get(name) {
+            h.observe_value(value);
         }
     }
 
@@ -358,6 +400,28 @@ mod tests {
         h.observe(Duration::from_secs(4));
         let avg = h.avg_seconds();
         assert!((avg - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn value_histogram_buckets_and_sum() {
+        let h = Histogram::new("r", "h", vec![0.0, 0.01, 0.1, 1.0]);
+        h.observe_value(0.0);
+        h.observe_value(0.05);
+        h.observe_value(0.5);
+        h.observe_value(f64::NAN); // recorded as 0
+        let out = h.render();
+        assert!(out.contains("r_bucket{le=\"0.000000\"} 2"), "{out}");
+        assert!(out.contains("r_bucket{le=\"0.100000\"} 3"), "{out}");
+        assert!(out.contains("r_bucket{le=\"1.000000\"} 4"), "{out}");
+        assert!(out.contains("r_sum 0.550000000"), "{out}");
+        assert!(out.contains("r_count 4"), "{out}");
+    }
+
+    #[test]
+    fn rtp_histograms_are_registered() {
+        let reg = HistogramRegistry::new();
+        assert!(reg.get("turna_rtp_stream_jitter_seconds").is_some());
+        assert!(reg.get("turna_rtp_stream_loss_ratio").is_some());
     }
 
     #[test]

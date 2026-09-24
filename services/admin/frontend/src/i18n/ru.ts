@@ -80,7 +80,7 @@ export const ru: Record<string, string> = {
   'bp.warn': 'Рост сбросов — перегрузка очереди',
   'panel.transports': 'Экспериментальные транспорты',
 
-  'panel.rtp': 'RTP / SFU',
+  'panel.rtp': 'Качество RTP-медиа',
   'rtp.streams': 'Активные RTP-потоки',
   'rtp.avgLoss': 'Средние потери',
   'rtp.none': 'Нет активных RTP-потоков',
@@ -304,4 +304,12 @@ export const ru: Record<string, string> = {
   'users.usernameRequired': 'Для user scope нужен username',
   'users.patchRequired': 'Выберите хотя бы одно поле лимита',
   'users.versionInvalid': 'Expected version должна быть целым неотрицательным числом',
+  'rtp.lossNow': 'Потери (за интервал)',
+  'rtp.lossNowSub': 'потеряно / ожидалось с прошлого опроса',
+  'rtp.jitterP95': 'Джиттер p95',
+  'rtp.lossP95': 'Потери потока p95',
+  'rtp.outOfOrder': 'Не по порядку',
+  'rtp.lostOf': 'потеряно из',
+  'rtp.lossChart': 'Потери RTP по интервалам опроса',
+  'rtp.note': 'Считается по заголовкам RTP ретранслируемого медиа (у SRTP они открыты). Потери и порядок точны для каждого потока; джиттер использует угаданную тактовую частоту (48 кГц для PT 0/8/111, иначе 90 кГц), поэтому это тренд, а не абсолют. p95 — по 5-секундным выборкам с запуска узла.',
 }

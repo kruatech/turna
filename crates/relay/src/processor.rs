@@ -31,7 +31,7 @@ use turna_proto_stun::message::{self, StunMessage};
 use turna_proto_stun::method::Method;
 use turna_proto_turn as turn;
 use turna_qos::{TieredLimits, TieredRateLimiter};
-use turna_rtp_analyzer::RtpAnalyzer;
+use turna_rtp_analyzer::{Direction as RtpDirection, RtpAnalyzer};
 use turna_session::{AllocationStore, SessionError, TransportProto};
 use turna_transport::migration::MigrationManager;
 
@@ -764,7 +764,10 @@ impl PacketProcessor {
             external_ip6: None,
             nonce_mgr: NonceManager::new(),
             metrics,
-            rtp_analyzer: Arc::new(RtpAnalyzer::new()),
+            // One analyzer per processor (per io_uring worker), registered so
+            // the node's publisher samples all of them — see
+            // `RtpAnalyzer::registered`.
+            rtp_analyzer: RtpAnalyzer::registered(),
             mtu,
             cluster,
             migration: None,
@@ -1103,7 +1106,9 @@ impl PacketProcessor {
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
-        alloc.add_bytes(data.len() as u64);
+        // Peer→client: the direction share feeds usage records and the gRPC
+        // per-direction traffic fields.
+        alloc.add_bytes_to_client(data.len() as u64);
         let ca = alloc.client_addr;
         let channel = alloc.get_peer_channel(&peer_addr);
         drop(alloc);
@@ -1112,7 +1117,8 @@ impl PacketProcessor {
         self.metrics
             .bytes_sent
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.rtp_analyzer.analyze(data, peer_addr);
+        self.rtp_analyzer
+            .analyze(data, peer_addr, RtpDirection::PeerToClient);
 
         // Prefer ChannelData if a channel is bound.
         if let Some(ch) = channel {
@@ -1193,7 +1199,8 @@ impl PacketProcessor {
         let relay_port = alloc.relay_addr.port();
         drop(alloc);
 
-        self.rtp_analyzer.analyze(data_slice, src);
+        self.rtp_analyzer
+            .analyze(data_slice, src, RtpDirection::ClientToPeer);
 
         // data_slice points into `raw` (guaranteed by decode_channel_data), so
         // this offset is valid against the very buffer the caller still holds.

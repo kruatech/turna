@@ -4,6 +4,7 @@
 //! - tokio (default): multi-threaded async, works everywhere
 //! - io_uring (--features io-uring): io_uring for main socket + tokio for relay sockets
 
+mod accounting;
 mod af_xdp_listener;
 mod audit_layer;
 mod bulk_load;
@@ -132,8 +133,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             latency_threshold_us: 10_000,
             always_sample_methods: vec!["Allocate".into(), "Refresh".into()],
         },
+        log_to_stdout: obs.log_to_stdout,
+        log_file: log_file_sink(&obs.log_file),
+        log_syslog: log_syslog_sink(&obs.log_syslog),
         ..Default::default()
     };
+    // Kept to report below, once a subscriber exists to report it with.
+    let log_sinks_requested = (
+        !obs.log_file.path.is_empty(),
+        !obs.log_syslog.endpoint.is_empty(),
+    );
 
     // Installed now, armed later. A tracing layer can only join the chain while
     // the subscriber is being built, and the audit log it writes to is opened
@@ -161,6 +170,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if used_defaults {
         info!("no config file, using defaults");
+    }
+    // The fallback above installs stdout only. A configured file or syslog sink
+    // that could not be opened is then absent, and the eprintln above is easy to
+    // miss in a unit's journal, so it is said again at WARN on the channel that
+    // did come up.
+    {
+        let active_file = turna_observability::log_file::active().is_some();
+        let active_syslog = turna_observability::syslog_log::stats().is_some();
+        if log_sinks_requested.0 && !active_file {
+            warn!(
+                path = %config.observability.log_file.path,
+                "[turn.observability.log_file] is configured but the file could not be opened; \
+                 logging to stdout only"
+            );
+        }
+        if log_sinks_requested.1 && !active_syslog {
+            warn!(
+                endpoint = %config.observability.log_syslog.endpoint,
+                "[turn.observability.log_syslog] is configured but could not be set up; \
+                 log lines are not going to syslog"
+            );
+        }
+        if active_file {
+            info!(path = %config.observability.log_file.path,
+                  rotation = %config.observability.log_file.rotation, "logging to file");
+        }
+        if active_syslog {
+            info!(endpoint = %config.observability.log_syslog.endpoint,
+                  level = %config.observability.log_syslog.level, "logging to syslog");
+        }
     }
     info!(listen = %config.listen, realm = %config.realm, "starting turna");
 
@@ -616,6 +655,10 @@ const PERSISTENCE_FLUSH_TIMEOUT_SECS: u64 = 10;
 /// other than the persistence writer (heartbeat, failover). They only need to
 /// observe the shutdown signal and stop; the writer gets the larger flush budget.
 const TASK_JOIN_TIMEOUT_SECS: u64 = 5;
+/// Budget for `[turn.accounting]` at shutdown: the final snapshot (sent with
+/// backpressure) and draining the file thread and the webhook. Undelivered
+/// webhook records past it are counted as `webhook_failed` and logged.
+const ACCOUNTING_FLUSH_TIMEOUT_SECS: u64 = 10;
 /// P0.2: how long a claimed command's lease is held before another claim may
 /// reclaim it (the claimant is expected to complete well within this window).
 const COMMAND_LEASE_MS: u64 = 30_000;
@@ -1109,6 +1152,30 @@ fn run_tokio(
     #[cfg(not(unix))]
     let _ = &reload_path;
 
+    // SIGHUP also reopens the log file, which is what logrotate expects of a
+    // daemon after moving its file (`rotation = "external"`). A second listener
+    // rather than a line in the rotation handler above: that one exists only
+    // when the node was started with a config path, and it `continue`s on a
+    // config that fails to load — neither of which should stop a reopen.
+    #[cfg(unix)]
+    if turna_observability::log_file::active().is_some() {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%e, "cannot install SIGHUP handler; the log file will not be reopened");
+                    return;
+                }
+            };
+            loop {
+                sighup.recv().await;
+                turna_observability::log_file::reopen();
+                info!(event = "log_file_reopened", "SIGHUP: log file reopened");
+            }
+        });
+    }
+
     let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
         turna_observability::syslog::SyslogConfig {
             endpoint: config.observability.syslog_endpoint.clone(),
@@ -1135,6 +1202,22 @@ fn run_tokio(
                 metrics
                     .syslog_dropped
                     .store(syslog.dropped.load(Relaxed), Relaxed);
+                // Optional log sinks. Zero when not configured, which the
+                // metric descriptions say.
+                let sinks = turna_observability::log_sink_stats();
+                metrics
+                    .log_file_rotations
+                    .store(sinks.file_rotations, Relaxed);
+                metrics
+                    .log_file_write_errors
+                    .store(sinks.file_write_errors, Relaxed);
+                metrics
+                    .log_file_rotation_errors
+                    .store(sinks.file_rotation_errors, Relaxed);
+                metrics.log_syslog_sent.store(sinks.syslog_sent, Relaxed);
+                metrics
+                    .log_syslog_dropped
+                    .store(sinks.syslog_dropped, Relaxed);
                 // Requests that validated against previous_shared_secret. Lives in
                 // a static inside turna-auth because the check happens inside
                 // validate(), which has no Metrics handle — same reason the syslog
@@ -1469,6 +1552,71 @@ fn run_tokio(
         let mut heartbeat_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut failover_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut command_log_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        // ── RTP quality sampler ───────────────────────────────────────────────
+        // Every processor (each io_uring worker too) has its own registered
+        // analyzer; this is the one task that samples them all, whichever
+        // backend runs. It used to live
+        // in the tokio server's maintenance loop only, so io_uring and AF_XDP
+        // nodes reported no RTP figures at all.
+        {
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    turna_relay::rtp_metrics::publish_global(&metrics);
+                }
+            });
+        }
+
+        // ── Usage accounting ([turn.accounting]) ──────────────────────────────
+        // Off by default. Started before the datapath so no allocation can end
+        // unrecorded, and refused outright when a configured sink cannot be
+        // opened: billing that silently records nothing is found at the end of
+        // the month.
+        let accounting_handle: Option<tokio::task::JoinHandle<()>> =
+            match accounting::AccountingSettings::from_config(
+                &config.accounting,
+                &cluster.node_id,
+                Duration::from_secs(ACCOUNTING_FLUSH_TIMEOUT_SECS),
+            ) {
+                Some(settings) => {
+                    let acct = accounting::start(settings, store.clone(), shutdown_rx.clone())
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    let counters = acct.counters.clone();
+                    let metrics = metrics.clone();
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let mut tick = tokio::time::interval(Duration::from_secs(5));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tick.tick().await;
+                            let m = &metrics;
+                            let c = &counters;
+                            m.accounting_stop_records.store(c.stop_records.load(Relaxed), Relaxed);
+                            m.accounting_interim_records
+                                .store(c.interim_records.load(Relaxed), Relaxed);
+                            m.accounting_dropped_queue_full
+                                .store(store.usage_dropped_count(), Relaxed);
+                            m.accounting_dropped_webhook_queue_full
+                                .store(c.dropped_webhook_queue_full.load(Relaxed), Relaxed);
+                            m.accounting_dropped_webhook_failed
+                                .store(c.dropped_webhook_failed.load(Relaxed), Relaxed);
+                            m.accounting_dropped_file_error
+                                .store(c.dropped_file_error.load(Relaxed), Relaxed);
+                            m.accounting_webhook_batches
+                                .store(c.webhook_batches.load(Relaxed), Relaxed);
+                            m.accounting_webhook_retries
+                                .store(c.webhook_retries.load(Relaxed), Relaxed);
+                        }
+                    });
+                    Some(acct.handle)
+                }
+                None => None,
+            };
 
         // ── PR2: write-behind writer task ─────────────────────────────────────
         // P0 #16: hoisted so the readiness monitor (spawned below, outside this
@@ -2237,6 +2385,11 @@ fn run_tokio(
         let shutdown_budget_secs =
             cluster.drain_grace_secs + PERSISTENCE_FLUSH_TIMEOUT_SECS
                 + 2 * TASK_JOIN_TIMEOUT_SECS
+                + if config.accounting.enabled {
+                    ACCOUNTING_FLUSH_TIMEOUT_SECS + 1
+                } else {
+                    0
+                }
                 + 2;
         info!(
             drain_grace_secs = cluster.drain_grace_secs,
@@ -2697,6 +2850,15 @@ fn run_tokio(
             Duration::from_secs(PERSISTENCE_FLUSH_TIMEOUT_SECS),
         )
         .await;
+        // Accounting bounds its own drain by ACCOUNTING_FLUSH_TIMEOUT_SECS (the
+        // snapshot, the file thread, the webhook); the extra second is for the
+        // task to return after it.
+        join_within_budget(
+            "accounting",
+            accounting_handle,
+            Duration::from_secs(ACCOUNTING_FLUSH_TIMEOUT_SECS + 1),
+        )
+        .await;
         join_within_budget(
             "heartbeat",
             heartbeat_handle,
@@ -2896,6 +3058,41 @@ fn mask_uri_credentials(uri: &str) -> String {
     }
 }
 
+/// `[turn.observability.log_file]` → the telemetry sink, or `None` when off.
+///
+/// The strings were checked by config validation; an unparseable one here can
+/// only mean a config that skipped validation, and it maps to "off" rather than
+/// to a guess.
+fn log_file_sink(s: &turna_config::LogFileSection) -> Option<turna_observability::FileSink> {
+    if s.path.is_empty() {
+        return None;
+    }
+    let rotation = turna_observability::log_file::Rotation::parse(
+        &s.rotation,
+        s.max_size_mb.saturating_mul(1024 * 1024),
+    )?;
+    Some(turna_observability::FileSink {
+        file: turna_observability::log_file::LogFileConfig {
+            path: s.path.clone().into(),
+            rotation,
+            max_files: s.max_files.max(1),
+        },
+        level: s.level.parse().ok()?,
+    })
+}
+
+/// `[turn.observability.log_syslog]` → the telemetry sink, or `None` when off.
+fn log_syslog_sink(s: &turna_config::LogSyslogSection) -> Option<turna_observability::SyslogSink> {
+    if s.endpoint.is_empty() {
+        return None;
+    }
+    Some(turna_observability::SyslogSink {
+        endpoint: s.endpoint.clone(),
+        level: s.level.parse().ok()?,
+        queue_capacity: s.queue_capacity,
+    })
+}
+
 fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     let mask = |s: &str| -> String {
         match mode {
@@ -2976,6 +3173,40 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
         "max_spans_per_second = {}",
         t.observability.max_spans_per_second
     );
+    println!("log_to_stdout        = {}", t.observability.log_to_stdout);
+    println!();
+    let lf = &t.observability.log_file;
+    println!("[turn.observability.log_file]");
+    println!("path        = \"{}\"", lf.path);
+    println!("rotation    = \"{}\"", lf.rotation);
+    println!("max_size_mb = {}", lf.max_size_mb);
+    println!("max_files   = {}", lf.max_files);
+    println!("level       = \"{}\"", lf.level);
+    println!();
+    let ac = &t.accounting;
+    println!("[turn.accounting]");
+    println!("enabled               = {}", ac.enabled);
+    println!("interim_interval_secs = {}", ac.interim_interval_secs);
+    println!("include_addresses     = {}", ac.include_addresses);
+    println!("queue_capacity        = {}", ac.queue_capacity);
+    println!("file.path             = \"{}\"", ac.file.path);
+    println!(
+        "webhook.url           = \"{}\"",
+        match mode {
+            DumpMode::Raw => ac.webhook.url.clone(),
+            DumpMode::Masked => accounting::mask_url(&ac.webhook.url),
+        }
+    );
+    println!(
+        "webhook.authorization = \"{}\"",
+        mask(&ac.webhook.authorization)
+    );
+    println!();
+    let ls = &t.observability.log_syslog;
+    println!("[turn.observability.log_syslog]");
+    println!("endpoint       = \"{}\"", ls.endpoint);
+    println!("level          = \"{}\"", ls.level);
+    println!("queue_capacity = {}", ls.queue_capacity);
     println!();
 
     println!("[health]");

@@ -287,3 +287,70 @@ groups:
           description: >-
             Average relayed RTP jitter is above 50ms for 10m. Watch alongside
             loss; sustained high jitter degrades real-time media.
+
+      - alert: TurnaRtpLossRate
+        # Counter-based, so it reflects the last 5m rather than whole-stream
+        # lifetimes like the avg gauge above. The second clause keeps a node
+        # relaying a handful of packets from alerting on one lost frame.
+        expr: >-
+          (
+            sum by (instance) (rate(turna_rtp_packets_lost_total[5m]))
+              / sum by (instance) (rate(turna_rtp_packets_expected_total[5m]))
+          ) > 0.05
+          and sum by (instance) (rate(turna_rtp_packets_expected_total[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna relayed RTP loss above 5% on {{ $labels.instance }}"
+          description: >-
+            More than 5% of RTP sequence numbers relayed in the last 5m never
+            arrived at the relay. This is loss between senders and this node
+            (both call directions), not loss the relay caused — check
+            turna_send_queue_dropped_total and the host's UDP receive errors
+            before blaming the network.
+
+  # ── Optional sinks: log file, full-log syslog, usage accounting ─────────────
+  # All three families read 0 when the feature is off, so these never fire on a
+  # node that does not use them.
+  - name: turna.ops_sinks
+    rules:
+      - alert: TurnaAccountingRecordsDropped
+        expr: sum by (instance, reason) (increase(turna_accounting_records_dropped_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna usage records lost ({{ $labels.reason }}) on {{ $labels.instance }}"
+          description: >-
+            [turn.accounting] dropped usage records in the last 10m. A lost
+            record is unbilled usage. queue_full / webhook_queue_full: the sink
+            is behind (raise queue_capacity / max_pending_batches or fix the
+            endpoint); webhook_failed: the endpoint rejected a batch or retries
+            ran out; file_error: the accounting file could not be written.
+
+      - alert: TurnaLogFileWriteErrors
+        expr: increase(turna_log_file_write_errors_total[10m]) > 0 or increase(turna_log_file_rotation_errors_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna log file writes failing on {{ $labels.instance }}"
+          description: >-
+            The [turn.observability.log_file] sink lost log lines, or could not
+            rotate — usually a full disk or a directory the service may not
+            write. Lost lines are gone and nothing else records them; a failed
+            rotation lets the active file grow past its limit.
+
+      - alert: TurnaLogSyslogDrops
+        expr: increase(turna_log_syslog_dropped_total[10m]) > 100
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "turna full-log syslog sink dropping lines on {{ $labels.instance }}"
+          description: >-
+            The [turn.observability.log_syslog] queue is overflowing or the
+            collector is unreachable. The relay is unaffected (lines are dropped,
+            never waited on); raise queue_capacity, lower level, or fix the
+            collector.

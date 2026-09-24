@@ -80,14 +80,80 @@ scrape_configs:
 
 ### RTP/QoS metrics
 
+Measured by `crates/rtp-analyzer` from the RTP header of every relayed
+ChannelData / Send / Data payload that parses as RTP (version 2, payload type
+outside the RTCP range 64–95). SRTP leaves that header in the clear, so this
+works on encrypted media. Each packet processor — each io_uring worker, the
+QUIC/DTLS processor, the tokio path — has its own analyzer, so the per-packet
+update never contends across workers; one node task samples all of them every
+5 s whichever datapath runs. (Until this release the gauges were published only
+by the tokio datapath, so io_uring and AF_XDP nodes read zero while relaying
+media.)
+
+What the analyzer computes, per stream — keyed by **(SSRC, direction)**, so the
+client→peer and peer→client legs are separate streams:
+
+- **loss** — sequence numbers skipped. A late packet that fills a gap is
+  credited back; a duplicate of a packet already received is not (a bitmap of
+  the last 128 sequence numbers tells them apart).
+- **resync** (RFC 3550 A.1) — a jump of 3000 or more ahead, or more than 100
+  behind, is set aside; the stream restarts on the new numbering only when the
+  next packet follows it (a sender restart). A single stray packet is ignored.
+  Neither counts as loss.
+- **out of order** — a sequence number below the highest seen that had not been
+  received yet. Duplicates count as neither.
+- **jitter** — RFC 3550 §6.4.1 interarrival jitter. The analyzer cannot see SDP,
+  so it *guesses* the clock rate from the payload type: 48 kHz for PT 0/8/111,
+  90 kHz otherwise. PCMU/PCMA really run at 8 kHz, so their jitter reads 6x low.
+  Treat jitter as a trend on this node, not an absolute to compare with a
+  client's `getStats()`.
+
+Loss seen here is loss **upstream of the relay** (sender → relay), for both
+directions of the call; loss between the relay and the receiver is not visible
+to it. Cardinality is constant: nothing is labelled by stream, user or tenant.
+
+**Hairpinned media** — both endpoints are clients of this server — crosses it
+twice, and is measured once per leg: two streams, and twice in the packet
+counters, as in the relay's own byte counters. Each leg's loss is exact; it is
+not double-counted *within* a stream.
+
 | Metric | Type | Meaning |
 |---|---|---|
-| `turna_rtp_streams` | gauge | Active RTP streams tracked by QoS. |
-| `turna_rtp_avg_loss_percent` | gauge | Average packet loss. |
-| `turna_rtp_max_loss_percent` | gauge | Max packet loss. |
-| `turna_rtp_avg_jitter_ms` | gauge | Average jitter. |
-| `turna_rtp_max_jitter_ms` | gauge | Max jitter. |
+| `turna_rtp_streams` | gauge | Active RTP streams (SSRCs seen in the last 30 s). |
+| `turna_rtp_avg_loss_percent` | gauge | Mean over live streams of each stream's loss since it began. |
+| `turna_rtp_max_loss_percent` | gauge | Worst live stream's loss since it began. |
+| `turna_rtp_avg_jitter_ms` | gauge | Mean current jitter over live streams. |
+| `turna_rtp_max_jitter_ms` | gauge | Worst current jitter. |
 | `turna_rtp_total_bitrate_kbps` | gauge | Aggregate RTP bitrate. |
+| `turna_rtp_packets_total` | counter | RTP packets analysed (both directions). |
+| `turna_rtp_packets_expected_total` | counter | Sequence numbers spanned by analysed streams. |
+| `turna_rtp_packets_lost_total` | counter | Sequence numbers missing. `rate(lost) / rate(expected)` is the node's current RTP loss rate — better than the `avg_loss` gauge, which averages whole-stream lifetimes. A late packet that arrives after the 5 s sample which counted its gap stays counted. |
+| `turna_rtp_packets_out_of_order_total` | counter | Packets that arrived below the highest sequence seen. |
+| `turna_rtp_stream_jitter_seconds` | histogram | One observation per stream that received packets in the 5 s interval: its current jitter. Buckets 1 ms – 500 ms. |
+| `turna_rtp_stream_loss_ratio` | histogram | One observation per stream per 5 s interval in which it spanned at least 10 sequence numbers: lost / expected over that interval. Buckets 0 – 1 (the `le="0.000000"` bucket counts loss-free intervals). |
+
+```promql
+# Current RTP loss rate per node
+sum by (instance) (rate(turna_rtp_packets_lost_total[5m]))
+  / sum by (instance) (rate(turna_rtp_packets_expected_total[5m]))
+# Share of stream-intervals worse than 2% loss
+1 - sum(rate(turna_rtp_stream_loss_ratio_bucket{le="0.020000"}[5m]))
+      / sum(rate(turna_rtp_stream_loss_ratio_count[5m]))
+```
+
+`/status` carries the counters as `rtp_packets_total`,
+`rtp_packets_expected_total`, `rtp_packets_lost_total`,
+`rtp_packets_out_of_order_total`, plus `rtp_jitter_p95_ms` and
+`rtp_loss_p95_percent` (p95 of the two histograms since the node started). The
+admin UI's Traffic page shows them in the **RTP media quality** panel, with the
+loss rate over each polling interval computed from the counters.
+
+Analyzer fixes that came with these metrics, because the new counters made them
+visible: a reordered packet used to be counted as lost and then, because the
+tracked sequence number moved backwards, the next in-order packet was counted as
+a second gap; its earlier RTP timestamp wrapped an unsigned subtraction and spiked
+the jitter estimate by hours; and multiplexed RTCP was analysed as RTP streams
+with nonsense SSRCs.
 
 ### Tarantool and persistence metrics
 
@@ -125,6 +191,8 @@ scrape_configs:
 | `turna_relay_forward_duration_seconds` | ChannelData relay forwarding latency. |
 | `turna_auth_duration_seconds` | Authentication processing latency. |
 | `turna_allocation_lifetime_seconds` | Allocation lifetime distribution. |
+| `turna_rtp_stream_jitter_seconds` | Per-stream RTP jitter, sampled every 5 s (see RTP/QoS metrics). |
+| `turna_rtp_stream_loss_ratio` | Per-stream 5 s RTP loss ratio; a ratio, not seconds — `_sum` is in ratio units. |
 
 Use `histogram_quantile` in Prometheus:
 
@@ -197,6 +265,50 @@ outside and the search space then collapses against four billion addresses. It
 is eight bytes from `/dev/urandom`, and if that read fails the node logs why and
 writes addresses verbatim rather than substituting something that looks like a
 hash and protects nothing.
+
+#### Log sinks (`[turn.observability.log_file]`, `[turn.observability.log_syslog]`)
+
+Optional, off by default. The file sink writes the same lines as stdout to a
+rotating file; the full-log syslog sink sends every line at or above its level to
+`unix:///dev/log` or a remote collector with MSGID `LOG` (distinct from every
+security MSGID above, so SIEM rules keep matching exactly what they matched).
+Both render fields through the same redacting formatter as stdout, so
+`log_allocation_addresses = false` hashes addresses on them too, and fields named
+like a credential (`password`, `secret`, `shared_secret`, `token`,
+`authorization`, …) are written as `[redacted]` on every sink. All four series
+are emitted unconditionally and read `0` when the sink is off.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_log_file_rotations_total` | counter | Rotations performed by the file sink (size or time). Stays `0` with `rotation = "external"`, where logrotate rotates and SIGHUP reopens. |
+| `turna_log_file_write_errors_total` | counter | Log lines lost to a write error — usually a full disk or a directory the service may not write. **Alert on any increase**: the lines are gone and nothing else says so. |
+| `turna_log_file_rotation_errors_total` | counter | Rotations (renames) or prunes of old files that failed. No line is lost: the active file is reopened and keeps growing, and the rotation is retried no sooner than 60 s later. A rising value means the file will grow past `max_size_mb` or keep old periods — check the directory. |
+| `turna_log_syslog_sent_total` | counter | Lines written to the full-log syslog sink. |
+| `turna_log_syslog_dropped_total` | counter | Lines lost by the full-log syslog sink: its queue (`queue_capacity`) was full, or the transport failed. Lines are formatted on the logging thread and sent by one background thread, so a slow collector drops lines rather than stalling the relay. |
+
+#### Usage accounting (`[turn.accounting]`)
+
+Off by default; see `docs/CONFIGURATION.md` for the record schema. All series
+are emitted unconditionally and read `0` while accounting is off. Labels are
+fixed sets — record type and drop reason — never a user or tenant.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_accounting_records_total{type="stop"\|"interim"}` | counter | Records handed to the sinks. `stop` grows by one per allocation that ended; compare with the allocation churn to see that none are missing. |
+| `turna_accounting_records_dropped_total{reason=…}` | counter | Records lost. `queue_full`: the datapath→dispatcher queue (`queue_capacity`) was full; `webhook_queue_full`: the webhook sender was behind by more than `max_pending_batches`; `webhook_failed`: a batch was rejected (4xx), retries ran out, or the webhook still held it when the 10 s shutdown budget ended; `queue_full` also counts records from allocations that ended after accounting shut down (logged at WARN); `file_error`: the append failed. **Alert on any increase** — a lost record is unbilled usage. |
+| `turna_accounting_webhook_batches_total` | counter | Batches the webhook accepted (2xx). |
+| `turna_accounting_webhook_retries_total` | counter | Retries after a transient failure (transport error, 5xx, 408, 429). A steady rate with no `webhook_failed` drops means the endpoint is flaky but the backoff is absorbing it. |
+
+Per-tenant cumulative traffic was already exported and is what a
+per-tenant billing view graphs:
+`turna_tenant_bytes_relayed_total{tenant}`,
+`turna_tenant_packets_relayed_total{tenant}` and
+`turna_tenant_allocations_closed_total{tenant}`, accrued when an allocation
+closes (so live allocations appear once they end — use interim records for
+long sessions). Tenants come from `[[tenants]]` in the config, so the label set
+is bounded; above the per-family cap the smallest are folded into `__other`
+(`turna_tenant_series_omitted`). Users are never a label. The tenant totals and
+the `stop` records are fed by the same teardown hook, so they agree.
 
 #### Dashboard
 
@@ -552,7 +664,43 @@ Do not promote high-cardinality values such as `client_addr`, `relay_addr`, or
 query time.
 
 Secrets (`shared_secret`, passwords, HMAC keys) must never appear in logs. Treat
-logs as network metadata and apply retention controls.
+logs as network metadata and apply retention controls. As a backstop, a field
+whose *name* is a credential name (`password`, `secret`, `shared_secret`,
+`previous_shared_secret`, `token`, `auth_token`, `api_key`, `authorization`,
+`auth_header`) is replaced with `[redacted]` by the formatter every sink shares.
+No line in the tree logs such a field today; the list exists so that one added
+later does not reach a file or a remote collector.
+
+### Writing the log to a file
+
+```toml
+[turn.observability.log_file]
+path = "/var/log/turna/turna.log"
+rotation = "size"      # size | daily | hourly | external
+max_size_mb = 100
+max_files = 7
+```
+
+Same format as stdout (`json_logs` applies), no ANSI colour, file mode `0640`.
+`size` rotates to `turna.log.1 … .N`; `daily`/`hourly` rename to
+`turna.log.YYYY-MM-DD[THH]` (UTC) at the first line of a new period; `external`
+never rotates and relies on logrotate plus SIGHUP (`deploy/logrotate/turna-node`).
+SIGHUP reopens the file in every mode. `log_to_stdout = false` stops the stdout
+copy once a file or syslog sink carries the log.
+
+### Sending the whole log to syslog
+
+```toml
+[turn.observability.log_syslog]
+endpoint = "unix:///dev/log"   # or udp://host:514, tcp://host:601
+level = "info"
+```
+
+`unix://` sends the RFC 3164 shape glibc's `syslog(3)` writes, which journald and
+rsyslog parse without configuration; the network forms send RFC 5424, framed with
+octet counting over TCP. The facility is `local0`, as for security events.
+`level` narrows what is sent; it cannot add lines the global filter (`RUST_LOG`)
+already removed.
 
 ## OpenTelemetry traces
 

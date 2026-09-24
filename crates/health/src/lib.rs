@@ -149,6 +149,26 @@ pub struct Metrics {
     pub syslog_sent: AtomicU64,
     pub syslog_dropped: AtomicU64,
 
+    /// Optional log sinks (`[turn.observability.log_file]` / `log_syslog`),
+    /// mirrored from turna-observability by the node. All read 0 when the
+    /// sink is not configured.
+    pub log_file_rotations: AtomicU64,
+    pub log_file_write_errors: AtomicU64,
+    pub log_file_rotation_errors: AtomicU64,
+    pub log_syslog_sent: AtomicU64,
+    pub log_syslog_dropped: AtomicU64,
+
+    /// Usage accounting (`[turn.accounting]`), mirrored by the node. All 0 when
+    /// accounting is off.
+    pub accounting_stop_records: AtomicU64,
+    pub accounting_interim_records: AtomicU64,
+    pub accounting_dropped_queue_full: AtomicU64,
+    pub accounting_dropped_webhook_queue_full: AtomicU64,
+    pub accounting_dropped_webhook_failed: AtomicU64,
+    pub accounting_dropped_file_error: AtomicU64,
+    pub accounting_webhook_batches: AtomicU64,
+    pub accounting_webhook_retries: AtomicU64,
+
     pub host_cpu_percent: AtomicU64,
     pub host_memory_percent: AtomicU64,
 
@@ -183,6 +203,13 @@ pub struct Metrics {
     pub rtp_avg_jitter_us: AtomicU64, // jitter in microseconds
     pub rtp_max_jitter_us: AtomicU64,
     pub rtp_total_bitrate_kbps: AtomicU64,
+    /// Cumulative RTP counters, summed from the analyzer's interval deltas by
+    /// the node's RTP sampler. Monotonic, unlike the per-stream figures the
+    /// gauges above are averaged from, which vanish with their stream.
+    pub rtp_packets: AtomicU64,
+    pub rtp_packets_expected: AtomicU64,
+    pub rtp_packets_lost: AtomicU64,
+    pub rtp_packets_out_of_order: AtomicU64,
     pub start_time: std::time::Instant,
 
     // ── Tarantool reconnect metrics ───────────────────────────────────────────
@@ -461,6 +488,19 @@ impl Metrics {
             capacity_rate_hard_percent: AtomicU64::new(80),
             syslog_sent: AtomicU64::new(0),
             syslog_dropped: AtomicU64::new(0),
+            log_file_rotations: AtomicU64::new(0),
+            log_file_write_errors: AtomicU64::new(0),
+            log_file_rotation_errors: AtomicU64::new(0),
+            log_syslog_sent: AtomicU64::new(0),
+            log_syslog_dropped: AtomicU64::new(0),
+            accounting_stop_records: AtomicU64::new(0),
+            accounting_interim_records: AtomicU64::new(0),
+            accounting_dropped_queue_full: AtomicU64::new(0),
+            accounting_dropped_webhook_queue_full: AtomicU64::new(0),
+            accounting_dropped_webhook_failed: AtomicU64::new(0),
+            accounting_dropped_file_error: AtomicU64::new(0),
+            accounting_webhook_batches: AtomicU64::new(0),
+            accounting_webhook_retries: AtomicU64::new(0),
             host_cpu_percent: AtomicU64::new(u64::MAX),
             host_memory_percent: AtomicU64::new(u64::MAX),
             relay_ports_in_use: AtomicU64::new(0),
@@ -483,6 +523,10 @@ impl Metrics {
             rtp_avg_jitter_us: AtomicU64::new(0),
             rtp_max_jitter_us: AtomicU64::new(0),
             rtp_total_bitrate_kbps: AtomicU64::new(0),
+            rtp_packets: AtomicU64::new(0),
+            rtp_packets_expected: AtomicU64::new(0),
+            rtp_packets_lost: AtomicU64::new(0),
+            rtp_packets_out_of_order: AtomicU64::new(0),
             start_time: std::time::Instant::now(),
             tarantool_reconnect_attempts: AtomicU64::new(0),
             tarantool_reconnect_successes: AtomicU64::new(0),
@@ -708,6 +752,91 @@ impl Metrics {
             Readiness::Ready
         };
         self.readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    /// Optional log-sink counters. Emitted unconditionally, at 0 when the sink
+    /// is off, so a dashboard does not have to cope with series that appear
+    /// only on some nodes.
+    fn render_log_sink_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_log_file_rotations_total Log file rotations performed ([turn.observability.log_file]; 0 when off)\n\
+             # TYPE turna_log_file_rotations_total counter\n\
+             turna_log_file_rotations_total {}\n\
+             # HELP turna_log_file_write_errors_total Log lines lost to a file write or rotation error\n\
+             # TYPE turna_log_file_write_errors_total counter\n\
+             turna_log_file_write_errors_total {}\n\
+             # HELP turna_log_file_rotation_errors_total Log file rotations or prunes that failed; lines keep going to the active file and the retry backs off 60 s\n\
+             # TYPE turna_log_file_rotation_errors_total counter\n\
+             turna_log_file_rotation_errors_total {}\n\
+             # HELP turna_log_syslog_sent_total Log lines written to the full-log syslog sink ([turn.observability.log_syslog])\n\
+             # TYPE turna_log_syslog_sent_total counter\n\
+             turna_log_syslog_sent_total {}\n\
+             # HELP turna_log_syslog_dropped_total Log lines lost by the full-log syslog sink: queue full or transport error\n\
+             # TYPE turna_log_syslog_dropped_total counter\n\
+             turna_log_syslog_dropped_total {}\n",
+            l(&self.log_file_rotations),
+            l(&self.log_file_write_errors),
+            l(&self.log_file_rotation_errors),
+            l(&self.log_syslog_sent),
+            l(&self.log_syslog_dropped),
+        )
+    }
+
+    /// Cumulative RTP counters (see the field docs). Unlabelled: per-stream or
+    /// per-user series would be unbounded.
+    fn render_rtp_counter_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_rtp_packets_total RTP packets analysed on the relay path (both directions)\n\
+             # TYPE turna_rtp_packets_total counter\n\
+             turna_rtp_packets_total {}\n\
+             # HELP turna_rtp_packets_expected_total RTP sequence numbers spanned by analysed streams\n\
+             # TYPE turna_rtp_packets_expected_total counter\n\
+             turna_rtp_packets_expected_total {}\n\
+             # HELP turna_rtp_packets_lost_total RTP packets missing from sequence (upstream of this relay or on the path to it)\n\
+             # TYPE turna_rtp_packets_lost_total counter\n\
+             turna_rtp_packets_lost_total {}\n\
+             # HELP turna_rtp_packets_out_of_order_total RTP packets that arrived with a sequence number below the highest seen\n\
+             # TYPE turna_rtp_packets_out_of_order_total counter\n\
+             turna_rtp_packets_out_of_order_total {}\n",
+            l(&self.rtp_packets),
+            l(&self.rtp_packets_expected),
+            l(&self.rtp_packets_lost),
+            l(&self.rtp_packets_out_of_order),
+        )
+    }
+
+    /// Usage-accounting counters. Label values are fixed sets (record type,
+    /// drop reason), never a user or tenant, so cardinality is constant.
+    fn render_accounting_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_accounting_records_total Usage records handed to the accounting sinks ([turn.accounting]; 0 when off)\n\
+             # TYPE turna_accounting_records_total counter\n\
+             turna_accounting_records_total{{type=\"stop\"}} {}\n\
+             turna_accounting_records_total{{type=\"interim\"}} {}\n\
+             # HELP turna_accounting_records_dropped_total Usage records lost, by where: queue_full (datapath to dispatcher), webhook_queue_full, webhook_failed (retries exhausted or rejected), file_error\n\
+             # TYPE turna_accounting_records_dropped_total counter\n\
+             turna_accounting_records_dropped_total{{reason=\"queue_full\"}} {}\n\
+             turna_accounting_records_dropped_total{{reason=\"webhook_queue_full\"}} {}\n\
+             turna_accounting_records_dropped_total{{reason=\"webhook_failed\"}} {}\n\
+             turna_accounting_records_dropped_total{{reason=\"file_error\"}} {}\n\
+             # HELP turna_accounting_webhook_batches_total Accounting webhook batches accepted (2xx)\n\
+             # TYPE turna_accounting_webhook_batches_total counter\n\
+             turna_accounting_webhook_batches_total {}\n\
+             # HELP turna_accounting_webhook_retries_total Accounting webhook POST retries after a transient failure\n\
+             # TYPE turna_accounting_webhook_retries_total counter\n\
+             turna_accounting_webhook_retries_total {}\n",
+            l(&self.accounting_stop_records),
+            l(&self.accounting_interim_records),
+            l(&self.accounting_dropped_queue_full),
+            l(&self.accounting_dropped_webhook_queue_full),
+            l(&self.accounting_dropped_webhook_failed),
+            l(&self.accounting_dropped_file_error),
+            l(&self.accounting_webhook_batches),
+            l(&self.accounting_webhook_retries),
+        )
     }
 
     /// Record one allocation for a tenant (multi-tenancy observability).
@@ -1699,6 +1828,14 @@ struct StatusResponse {
     rtp_avg_jitter_ms: f64,
     rtp_max_jitter_ms: f64,
     rtp_total_bitrate_kbps: u64,
+    rtp_packets_total: u64,
+    rtp_packets_expected_total: u64,
+    rtp_packets_lost_total: u64,
+    rtp_packets_out_of_order_total: u64,
+    /// p95 of the per-stream interval jitter / loss histograms since start.
+    /// 0 until a stream has been sampled.
+    rtp_jitter_p95_ms: f64,
+    rtp_loss_p95_percent: f64,
 }
 
 /// Snapshot of the io_uring relay-route forwarding counters (RFC 8016 sharded
@@ -2105,6 +2242,24 @@ pub async fn serve_on(
                         rtp_total_bitrate_kbps: metrics
                             .rtp_total_bitrate_kbps
                             .load(Ordering::Relaxed),
+                        rtp_packets_total: metrics.rtp_packets.load(Ordering::Relaxed),
+                        rtp_packets_expected_total: metrics
+                            .rtp_packets_expected
+                            .load(Ordering::Relaxed),
+                        rtp_packets_lost_total: metrics.rtp_packets_lost.load(Ordering::Relaxed),
+                        rtp_packets_out_of_order_total: metrics
+                            .rtp_packets_out_of_order
+                            .load(Ordering::Relaxed),
+                        rtp_jitter_p95_ms: metrics
+                            .histograms
+                            .get("turna_rtp_stream_jitter_seconds")
+                            .map(|h| h.percentile(0.95) * 1000.0)
+                            .unwrap_or(0.0),
+                        rtp_loss_p95_percent: metrics
+                            .histograms
+                            .get("turna_rtp_stream_loss_ratio")
+                            .map(|h| h.percentile(0.95) * 100.0)
+                            .unwrap_or(0.0),
                     };
                     (
                         "200 OK",
@@ -2302,6 +2457,9 @@ pub async fn serve_on(
                         m.processor_panics.load(Ordering::Relaxed)
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
+                    body.push_str(&m.render_log_sink_metrics());
+                    body.push_str(&m.render_accounting_metrics());
+                    body.push_str(&m.render_rtp_counter_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());

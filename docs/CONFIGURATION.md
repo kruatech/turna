@@ -464,6 +464,31 @@ and the revoked certificate would then work.
 | `log_allocation_addresses` | bool | `true` | Log client IP addresses on the three per-allocation INFO lines. |
 | `node_audit_path` | string | `""` | Where the node writes its audit chain. Empty keeps it in memory only. |
 | `node_audit_entries` | usize | `256` | Entries kept in the in-memory ring. |
+| `log_to_stdout` | bool | `true` | Write the log to stdout. `false` is refused unless a file or syslog log sink is configured. |
+| `log_file.path` | string | `""` | Also write the log to this file. Empty disables. The directory must exist and be writable by the service user. |
+| `log_file.rotation` | string | `"size"` | `size`, `daily`, `hourly` (UTC) or `external` (never rotate; logrotate + SIGHUP). |
+| `log_file.max_size_mb` | u64 | `100` | Size limit for `rotation = "size"`. Must be > 0. |
+| `log_file.max_files` | usize | `7` | Rotated files kept, 1..=1000. The active file is not counted. |
+| `log_file.level` | string | `"trace"` | Narrows the file: `error`/`warn`/`info`/`debug`/`trace`. Applied after `RUST_LOG`, so it cannot widen it. |
+| `log_syslog.endpoint` | string | `""` | Send **every** log line (not only security events) to `unix:///dev/log`, `udp://host:514` or `tcp://host:601`. Empty disables. |
+| `log_syslog.level` | string | `"info"` | Lowest level sent. Applied after `RUST_LOG`. |
+| `log_syslog.queue_capacity` | usize | `8192` | Lines buffered for the sender thread; beyond it they are dropped and counted in `turna_log_syslog_dropped_total`. |
+
+`syslog_endpoint` also accepts `unix:///dev/log` since the log-sink work: the
+exporter gained the local socket, and the security events can use it too.
+
+**Log file and full-log syslog are opt-in and change nothing when unset.** They
+carry the same lines as stdout, rendered by the same redacting formatter: the
+`log_allocation_addresses` switch applies to them, and credential-named fields are
+replaced with `[redacted]`. `log_syslog` is not the security export —
+`syslog_endpoint` keeps sending only the curated security events, and the full
+log carries MSGID `LOG` so SIEM rules on the security MSGIDs are unaffected.
+
+SIGHUP reopens the log file (for logrotate with `rotation = "external"`) and also
+reloads shared secrets, which is idempotent: a reload with an unchanged file
+changes nothing. A log file or syslog sink that cannot be opened at startup is
+reported on stderr and again at WARN once stdout logging is up; the node keeps
+serving with stdout only rather than refusing to start over a log destination.
 
 **`syslog_endpoint` carries security events only** — authentication failures,
 authorisation denials, peer refusals, rate-limit trips, audit entries, readiness
@@ -505,6 +530,104 @@ existing chain is replayed and **verified**, `seq` resumes across rotation
 boundaries, and a break fails closed. That is what makes start and stop events
 worth recording there as well as in syslog: the chain survives the restart they
 describe, and syslog puts them where a compromised node cannot reach them.
+
+---
+
+## `[turn.accounting]` — usage records for billing
+
+Off by default. When enabled, every allocation that ends produces a `stop`
+record, and — with `interim_interval_secs` — every live allocation produces an
+`interim` record on that interval. On a clean shutdown each still-live
+allocation gets a final `interim` record, because no `stop` will follow in this
+process. That snapshot is handed to the sinks with backpressure (not dropped
+when a queue is full), and the node waits up to 10 s for the file thread and the
+webhook to finish; records the webhook still holds after that are counted as
+`webhook_failed` and logged at WARN. The shutdown budget the node logs at start
+includes those 10 s when accounting is enabled.
+
+```toml
+[turn.accounting]
+enabled = true
+interim_interval_secs = 300     # 0 = stop records only; otherwise >= 60
+include_addresses = false       # client IP:port in each record
+queue_capacity = 10000
+
+[turn.accounting.file]          # JSON lines; SIGHUP reopens (rotate externally)
+path = "/var/lib/turna/usage.jsonl"
+
+[turn.accounting.webhook]       # POST batches as a JSON array
+url = "https://billing.example/v1/turn-usage"
+authorization = "Bearer ${TURNA_ACCOUNTING_TOKEN}"
+batch_size = 100
+flush_interval_secs = 5
+max_retries = 5                 # backoff 1, 2, 4 … 60 s; at most 20
+timeout_secs = 10
+max_pending_batches = 64
+```
+
+| key | default | notes |
+|-----|---------|-------|
+| `enabled` | `false` | Refused with neither a file nor a webhook. |
+| `interim_interval_secs` | `0` | `0` or `>= 60`. |
+| `include_addresses` | `false` | Off because an address is personal data with its own retention rules, and billing needs the user and the bytes. |
+| `queue_capacity` | `10000` | Datapath→dispatcher queue. Full = record dropped and counted, never a stalled teardown. |
+| `file.path` | `""` | Created `0640`. The node refuses to start if it cannot be opened. |
+| `webhook.url` | `""` | `http://` or `https://` (system trust store). Plain `http://` warns under `production = true`. Logged and shown by `--dump-config` with userinfo and query string masked. |
+| `webhook.authorization` | `""` | Sent as the `Authorization` header. `${VAR}`/`file:///` substitution applies; `--dump-config` masks it. |
+| `webhook.batch_size` | `100` | 1..=10000 records per POST. |
+| `webhook.flush_interval_secs` | `5` | Longest a record waits for its batch. |
+| `webhook.max_retries` | `5` | Retries on transport errors, 5xx, 408, 429, at most 20 (with the 60 s backoff cap that is already ~17 minutes, and a batch being retried holds up the ones behind it). Any other 4xx drops the batch immediately. |
+| `webhook.timeout_secs` | `10` | Per request. |
+| `webhook.max_pending_batches` | `64` | Webhook backlog before records are dropped. |
+
+### Record schema (`v = 1`)
+
+One JSON object per line in the file; a JSON array of them per POST.
+
+| field | meaning |
+|-------|---------|
+| `v` | Schema version, `1`. |
+| `record_id` | `<node>:<boot_id>:<allocation_id>:<type>:<event_ms>` — deterministic; **deduplicate on it**, delivery is at least once. |
+| `type` | `stop` or `interim`. |
+| `end_reason` | `stop` only: `expired`, `released` (Refresh lifetime 0), `admin_deleted` (management API), `migration_lost`. |
+| `node` | `[cluster] node_id` of the node that relayed the bytes. |
+| `boot_id` | Random per process start (16 hex). Separates segments across a restart of the same node. |
+| `allocation_id` | Stable across RFC 8016 migration and failover. |
+| `username`, `realm` | As authenticated. |
+| `tenant` | `[[tenants]] id`, or `null` for the base realm. |
+| `transport` | Relayed transport: `udp` (RFC 8656) or `tcp` (RFC 6062). The client-leg protocol (UDP/TLS/DTLS/QUIC) is not recorded. |
+| `relay_addr` | The relayed transport address (server side). |
+| `client_addr` | Only with `include_addresses = true`. |
+| `start_ms`, `event_ms` | ms since the Unix epoch: allocation start, and this record's time (the end, for `stop`). |
+| `duration_secs` | `event_ms - start_ms`, whole seconds. |
+| `bytes_from_client`, `packets_from_client` | Payload relayed client → peer. |
+| `bytes_to_client`, `packets_to_client` | Payload relayed peer → client. |
+| `bytes_counted` | `false` for RFC 6062 TCP allocations, whose spliced data path does not feed these counters — their byte fields read 0 and mean "not measured", not "idle". |
+
+**What the byte counts are.** Relayed *payload*: the data inside ChannelData or
+Send/Data indications, excluding TURN framing and STUN control traffic. Each
+direction's payload crosses both legs, so `bytes_from_client` is both "in on the
+client leg" and "out on the peer leg". Packets dropped by the bandwidth quota or
+a missing permission are not counted.
+
+**Segments.** Counters live in the process. A segment is
+`(allocation_id, node, boot_id)`: an allocation that survives a restart of the
+same node (rehydrated from the state backend with the same `allocation_id` and
+`start_ms`) or fails over to another node restarts at 0 in a new segment.
+Per segment, take the `stop` record — or, if there is none, the latest `interim`
+(the process ended while the allocation lived; its shutdown snapshot is that
+interim). Then sum the segments. Never add `interim` records within a segment:
+they are cumulative.
+
+**Cost.** Nothing new on the ChannelData hot path except the peer→client
+direction share (two relaxed atomic increments on the peer→client path; the
+client→peer figure is derived). Records are built at teardown and on the interim
+tick, never per packet.
+
+The same direction split now fills the gRPC `TrafficStats.bytes_to_client` /
+`packets_to_client` fields of `ListAllocations`/`WatchAllocations`, which read
+`0` before; `bytes_from_client` is now client→peer only (it used to carry both
+directions).
 
 ---
 

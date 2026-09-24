@@ -64,8 +64,41 @@ fn is_log_bridge_field(name: &str) -> bool {
     )
 }
 
-/// Replace a value with its salted label when the field name names an address.
+/// Field names whose value is a credential, whatever the address switch says.
+///
+/// No line in the workspace logs a field under any of these names today — the
+/// list is a backstop, not a fix. It exists because the sinks multiplied: a value
+/// that once reached only stdout now also reaches a log file with its own
+/// retention and a syslog collector off the host, and a secret written by a
+/// future `debug!` would go to all three. Matching is on the exact name, like the
+/// address list: `credential` (the TURN username the relay logs on allocation
+/// lines) is deliberately NOT here, because it is an identifier, not a secret.
+pub(crate) fn is_secret_field(name: &str) -> bool {
+    matches!(
+        name,
+        "password"
+            | "passwd"
+            | "secret"
+            | "shared_secret"
+            | "previous_shared_secret"
+            | "token"
+            | "auth_token"
+            | "api_key"
+            | "authorization"
+            | "auth_header"
+    )
+}
+
+/// What a secret-named field is replaced with. Constant, not a hash: a hash of a
+/// low-entropy secret is a crackable record of it.
+const SECRET_PLACEHOLDER: &str = "[redacted]";
+
+/// Replace a value with its salted label when the field name names an address,
+/// and with a fixed placeholder when it names a credential.
 fn value_for(name: &str, raw: &str) -> String {
+    if is_secret_field(name) {
+        return SECRET_PLACEHOLDER.to_string();
+    }
     if redacting() && looks_like_address(name) {
         match process_salt() {
             Some(salt) => hash_address(salt, raw),
@@ -218,9 +251,34 @@ impl<'writer> FormatFields<'writer> for RedactingJsonFields {
     }
 }
 
+/// Render an event's fields as the text formatter would — message first, then
+/// `key=value` — with the same redaction applied.
+///
+/// For sinks that are not a `fmt` layer (the full-log syslog sink). Going
+/// through [`RedactingFields`] rather than a second visitor is the point: one
+/// redaction path, so a sink added later cannot quietly skip it.
+pub fn render_fields<R: RecordFields>(fields: R) -> String {
+    let mut out = String::new();
+    let _ = RedactingFields.format_fields(Writer::new(&mut out), fields);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_named_fields_are_replaced_whatever_the_address_switch_says() {
+        for name in ["password", "shared_secret", "token", "authorization"] {
+            assert_eq!(value_for(name, "hunter2"), SECRET_PLACEHOLDER, "{name}");
+        }
+        // The username the relay logs on allocation lines is an identifier.
+        assert_eq!(
+            value_for("credential", "1700000000:alice"),
+            "1700000000:alice"
+        );
+        assert_eq!(value_for("username", "alice"), "alice");
+    }
 
     #[test]
     fn json_escape_covers_the_cases_that_break_a_line() {

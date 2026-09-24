@@ -158,6 +158,51 @@ trace_sample_rate    = 0.01
 json_logs            = false
 # Hard cap on spans/second to protect against runaway tracing.
 max_spans_per_second = 1000
+# Write the log to stdout (default true). Set false only together with a
+# log_file or log_syslog sink below; validation refuses logging nowhere.
+# log_to_stdout = true
+
+# Optional: also write the log to a rotating file. Same lines and redaction as
+# stdout. The directory must exist and be writable by the service user (the
+# systemd unit's LogsDirectory= line creates /var/log/turna).
+# [turn.observability.log_file]
+# path        = "/var/log/turna/turna.log"
+# rotation    = "size"     # size | daily | hourly | external (logrotate + SIGHUP)
+# max_size_mb = 100
+# max_files   = 7
+# level       = "trace"    # narrows only; RUST_LOG still applies first
+
+# Optional: send EVERY log line at or above `level` to syslog (the security-only
+# export is syslog_endpoint; this is separate and uses MSGID LOG).
+# [turn.observability.log_syslog]
+# endpoint       = "unix:///dev/log"   # or udp://host:514, tcp://host:601
+# level          = "info"
+# queue_capacity = 8192
+
+# =============================================================================
+# [turn.accounting] — usage records for billing (off by default)
+# =============================================================================
+# A `stop` record per ended allocation (user, realm, tenant, relayed transport,
+# start/end, payload bytes and packets per direction), optional `interim`
+# records. Schema: docs/CONFIGURATION.md "[turn.accounting]".
+#
+# [turn.accounting]
+# enabled               = true
+# interim_interval_secs = 300      # 0 = stop records only; otherwise >= 60
+# include_addresses     = false    # client IP:port in each record
+# queue_capacity        = 10000
+#
+# [turn.accounting.file]
+# path = "/var/lib/turna/usage.jsonl"   # needs ReadWritePaths=/var/lib/turna
+#
+# [turn.accounting.webhook]
+# url                 = "https://billing.example/v1/turn-usage"
+# authorization       = "Bearer ${TURNA_ACCOUNTING_TOKEN}"
+# batch_size          = 100
+# flush_interval_secs = 5
+# max_retries         = 5
+# timeout_secs        = 10
+# max_pending_batches = 64
 
 # =============================================================================
 # [turn.rate_limit] — tiered rate limiting
