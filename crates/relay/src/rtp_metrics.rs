@@ -3,7 +3,9 @@
 //! One caller, on a fixed interval: the node spawns it once, whichever datapath
 //! is running. It used to live in `RelayServer::run`'s maintenance loop, which
 //! only the tokio datapath runs — so on io_uring and AF_XDP the RTP gauges read
-//! zero while media flowed.
+//! zero while media flowed. Each processor (each io_uring worker) has its own
+//! analyzer; this samples every registered one, one after another, so no lock
+//! is held across workers.
 //!
 //! Every number here is one the analyzer computes from RTP headers
 //! (`turna_rtp_analyzer`): sequence gaps, late arrivals, RFC 3550 jitter.
@@ -11,8 +13,10 @@
 
 use std::sync::atomic::Ordering::Relaxed;
 
+use std::sync::Arc;
 use turna_health::Metrics;
-use turna_rtp_analyzer::RtpAnalyzer;
+
+use turna_rtp_analyzer::{AggregateQuality, RtpAnalyzer};
 
 /// Minimum sequence numbers a stream must span in an interval before its loss
 /// ratio is recorded. Below it a single lost packet reads as 50 % loss and the
@@ -29,8 +33,16 @@ pub const MIN_INTERVAL_PACKETS: u64 = 10;
 ///
 /// Sampling precedes the stale-stream cleanup, so a stream's last packets are
 /// counted before it is forgotten.
-pub fn publish(analyzer: &RtpAnalyzer, metrics: &Metrics) {
-    let report = analyzer.sample();
+pub fn publish(analyzers: &[Arc<RtpAnalyzer>], metrics: &Metrics) {
+    let mut report = turna_rtp_analyzer::SampleReport::default();
+    for a in analyzers {
+        let r = a.sample();
+        report.received += r.received;
+        report.expected += r.expected;
+        report.lost += r.lost;
+        report.out_of_order += r.out_of_order;
+        report.streams.extend(r.streams);
+    }
     metrics.rtp_packets.fetch_add(report.received, Relaxed);
     metrics
         .rtp_packets_expected
@@ -56,7 +68,8 @@ pub fn publish(analyzer: &RtpAnalyzer, metrics: &Metrics) {
         }
     }
 
-    let agg = analyzer.aggregate();
+    let all: Vec<_> = analyzers.iter().flat_map(|a| a.get_all_quality()).collect();
+    let agg = AggregateQuality::from_streams(&all);
     metrics.rtp_streams.store(agg.total_streams, Relaxed);
     metrics
         .rtp_avg_loss_pct_x100
@@ -73,12 +86,14 @@ pub fn publish(analyzer: &RtpAnalyzer, metrics: &Metrics) {
     metrics
         .rtp_total_bitrate_kbps
         .store(agg.total_bitrate_bps / 1000, Relaxed);
-    analyzer.cleanup_stale();
+    for a in analyzers {
+        a.cleanup_stale();
+    }
 }
 
-/// [`publish`] for the process-wide analyzer every `PacketProcessor` feeds.
+/// [`publish`] for every analyzer registered by a live `PacketProcessor`.
 pub fn publish_global(metrics: &Metrics) {
-    publish(&RtpAnalyzer::global(), metrics);
+    publish(&RtpAnalyzer::all_registered(), metrics);
 }
 
 #[cfg(test)]
@@ -97,14 +112,18 @@ mod tests {
 
     #[test]
     fn publish_adds_deltas_and_observes_histograms() {
-        let a = RtpAnalyzer::new();
+        let a = Arc::new(RtpAnalyzer::new());
         let m = Metrics::new();
         let src = "192.0.2.1:1".parse().unwrap();
         // 20 spanned, 2 lost (seq 5 and 6), one late arrival of 6 → 1 lost.
         for s in (1..=4).chain(7..=20).chain(std::iter::once(6)) {
-            a.analyze(&pkt(s, 42), src);
+            a.analyze(
+                &pkt(s, 42),
+                src,
+                turna_rtp_analyzer::Direction::ClientToPeer,
+            );
         }
-        publish(&a, &m);
+        publish(std::slice::from_ref(&a), &m);
         assert_eq!(m.rtp_packets.load(Relaxed), 19);
         assert_eq!(m.rtp_packets_expected.load(Relaxed), 20);
         assert_eq!(m.rtp_packets_lost.load(Relaxed), 1);
@@ -117,21 +136,37 @@ mod tests {
         assert_eq!(jitter.total_count(), 1);
 
         // Second publish with no traffic: counters unchanged, no observations.
-        publish(&a, &m);
+        publish(std::slice::from_ref(&a), &m);
         assert_eq!(m.rtp_packets.load(Relaxed), 19);
         assert_eq!(loss.total_count(), 1);
         assert_eq!(jitter.total_count(), 1);
     }
 
+    /// Two workers' analyzers are summed, and the aggregate gauges cover both.
+    #[test]
+    fn publish_sums_across_worker_analyzers() {
+        let a = Arc::new(RtpAnalyzer::new());
+        let b = Arc::new(RtpAnalyzer::new());
+        let m = Metrics::new();
+        let src = "192.0.2.1:1".parse().unwrap();
+        for s in 1..=10u16 {
+            a.analyze(&pkt(s, 1), src, turna_rtp_analyzer::Direction::ClientToPeer);
+            b.analyze(&pkt(s, 2), src, turna_rtp_analyzer::Direction::PeerToClient);
+        }
+        publish(&[a, b], &m);
+        assert_eq!(m.rtp_packets.load(Relaxed), 20);
+        assert_eq!(m.rtp_streams.load(Relaxed), 2);
+    }
+
     #[test]
     fn short_intervals_are_not_recorded_as_loss() {
-        let a = RtpAnalyzer::new();
+        let a = Arc::new(RtpAnalyzer::new());
         let m = Metrics::new();
         let src = "192.0.2.1:1".parse().unwrap();
         for s in [1u16, 3] {
-            a.analyze(&pkt(s, 7), src);
+            a.analyze(&pkt(s, 7), src, turna_rtp_analyzer::Direction::ClientToPeer);
         }
-        publish(&a, &m);
+        publish(std::slice::from_ref(&a), &m);
         assert_eq!(
             m.histograms
                 .get("turna_rtp_stream_loss_ratio")
