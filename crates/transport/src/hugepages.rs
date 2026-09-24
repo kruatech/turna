@@ -1,21 +1,21 @@
-//! Huge Pages — буферный пул на huge pages для снижения TLB-промахов
+//! Huge Pages — buffer pool on huge pages to reduce TLB misses
 //!
-//! На Linux: mmap(MAP_HUGETLB) с fallback на обычные страницы.
-//! На macOS/других: только обычные страницы (mmap без MAP_HUGETLB).
+//! On Linux: mmap(MAP_HUGETLB) with fallback to regular pages.
+//! On macOS/others: regular pages only (mmap without MAP_HUGETLB).
 //!
-//! # Изменения от оригинала (unsafe-audit PR1)
+//! # Changes from the original (unsafe-audit PR1)
 //!
-//! 1. **ABA race устранена**: Treiber lock-free stack заменён на
-//!    `Mutex<Vec<usize>>`. Pool не на горячем recv-пути (инициализируется
-//!    один раз при старте), поэтому потеря throughput от мьютекса нулевая.
-//!    Removed: `FreeNode`, `AtomicPtr`, CAS-цикл в alloc/free.
+//! 1. **ABA race eliminated**: Treiber lock-free stack replaced with
+//!    `Mutex<Vec<usize>>`. The pool is not on the hot recv path (initialized
+//!    once at startup), so the mutex costs zero throughput.
+//!    Removed: `FreeNode`, `AtomicPtr`, CAS loop in alloc/free.
 //!
-//! 2. **MaybeUninit**: `as_mut_slice` теперь возвращает только
-//!    инициализированные байты (до `self.len`). Для записи в сырой буфер
-//!    используй `uninit_buf_mut() -> &mut [MaybeUninit<u8>]`.
+//! 2. **MaybeUninit**: `as_mut_slice` now returns only
+//!    initialized bytes (up to `self.len`). To write into the raw buffer
+//!    use `uninit_buf_mut() -> &mut [MaybeUninit<u8>]`.
 //!
-//! 3. **Drop guard**: `HugePagePool::drop` паникует если есть активные
-//!    буферы — вместо тихого dangling pointer + munmap.
+//! 3. **Drop guard**: `HugePagePool::drop` panics if there are active
+//!    buffers, instead of a silent dangling pointer + munmap.
 
 use parking_lot::Mutex;
 use std::io;
@@ -31,15 +31,15 @@ use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct HugePagesConfig {
-    /// Размер одного слота (байты). Default: 2048.
+    /// Size of one slot (bytes). Default: 2048.
     pub slot_size: usize,
-    /// Количество слотов. Default: 65536 (128 MiB при 2 KiB).
+    /// Number of slots. Default: 65536 (128 MiB at 2 KiB).
     pub slot_count: usize,
-    /// Использовать huge pages на Linux (2 MiB).
+    /// Use huge pages on Linux (2 MiB).
     pub try_huge_pages: bool,
-    /// Fallback на обычные страницы если huge pages недоступны.
+    /// Fall back to regular pages if huge pages are unavailable.
     pub fallback_to_regular: bool,
-    /// Prefault: touch all pages при создании.
+    /// Prefault: touch all pages on creation.
     pub prefault: bool,
 }
 
