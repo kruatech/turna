@@ -182,7 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // block in `run_tokio` is `#[cfg]`-ed away and `tls_cfg` is dropped by a
     // `let _ =` — no error, no warning, and `EXPOSE 5349/tcp` in the image says
     // the port is served. An operator on a UDP-blocked network then has no way
-    // in at all, because this node ships no plain TURN-over-TCP listener either.
+    // in at all: the opt-in plain TURN-over-TCP listener is built from the same
+    // feature, so it is missing from such a binary too.
     // `tls` is in the node's default features, so reaching this means the binary
     // was built with `--no-default-features`.
     if tls_cfg.enabled && !turna_transport::TLS_AVAILABLE {
@@ -200,6 +201,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the additional `web-transport` feature; `web_transport = true` is the
     // config default, so a `--features quic`-only build must say so explicitly
     // rather than fall back to raw QUIC the operator did not ask for.
+    // Plain TURN over TCP runs on the TURNS listener code (`tcp_tls`), which a
+    // build without `tls` does not contain.
+    if config.tcp.enabled && !turna_transport::TLS_AVAILABLE {
+        return Err(
+            "[turn.tcp] is enabled in the configuration, but this binary was built \
+                    without the `tls` feature, which carries the TCP listener code as \
+                    well; rebuild with `--features tls` (a default feature) or disable \
+                    [turn.tcp]"
+                .into(),
+        );
+    }
+
     if config.sctp.enabled && (!cfg!(feature = "sctp") || !cfg!(target_os = "linux")) {
         return Err("[turn.sctp] requires a Linux node built with --features sctp".into());
     }
@@ -226,23 +239,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let external_ip: std::net::IpAddr = if config.external_ip.is_empty() {
+    // The public half of `external_ip` (which may be `PUBLIC/PRIVATE`); the
+    // fallback for an empty or unparseable value is unchanged.
+    let external_ip: std::net::IpAddr = config.advertised_ip().unwrap_or_else(|| {
         let ip = config.listen.ip();
         if ip.is_unspecified() {
             "127.0.0.1".parse().unwrap()
         } else {
             ip
         }
-    } else {
-        config.external_ip.parse().unwrap_or_else(|_| {
-            let ip = config.listen.ip();
-            if ip.is_unspecified() {
-                "127.0.0.1".parse().unwrap()
-            } else {
-                ip
-            }
-        })
-    };
+    });
 
     // Base ([turn]) auth backend.
     let base_auth = if config.auth.oauth.enabled {
@@ -343,16 +349,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before the first allocation, and `AllocationStore::new` builds the pool.
     // Empty config values mean the wildcard bind, i.e. the pre-0.5.0 behaviour.
     // Both strings are validated as the right address family at config load.
-    turna_session::init_relay_bind(
-        (!config.relay.bind_ip.is_empty())
-            .then(|| config.relay.bind_ip.parse().ok())
-            .flatten(),
-        (!config.relay.bind_ip6.is_empty())
-            .then(|| config.relay.bind_ip6.parse().ok())
-            .flatten(),
-    );
-    if !config.relay.bind_ip.is_empty() {
-        info!(bind_ip = %config.relay.bind_ip, "relay sockets pinned to one address");
+    // The private half of an `external_ip = "PUBLIC/PRIVATE"` mapping stands in
+    // for an unset `bind_ip` (validation refused the two disagreeing).
+    let relay_bind_v4 = config.effective_relay_bind_ip();
+    let relay_bind_v6 = config.effective_relay_bind_ip6();
+    turna_session::init_relay_bind(relay_bind_v4, relay_bind_v6);
+    if let Some(bind_ip) = relay_bind_v4 {
+        info!(%bind_ip, advertised = %external_ip, "relay sockets pinned to one address");
+    }
+    if let Some(bind_ip6) = relay_bind_v6 {
+        info!(%bind_ip6, "IPv6 relay sockets pinned to one address");
     }
 
     let store = Arc::new({
@@ -511,17 +517,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // traffic through the STUN path, and relaying to the health port reaches the
     // whole Prometheus surface when it is not on loopback.
     let mut self_addrs: Vec<std::net::IpAddr> = vec![config.listen.ip(), health_listen.ip()];
+    self_addrs.extend(config.listen_extra.iter().map(|a| a.ip()));
+    if config.tcp.enabled {
+        self_addrs.push(config.tcp.listen.ip());
+    }
     self_addrs.push(external_ip);
     // Resolved here rather than reused: `external_ip6` is computed inside
     // `run_tokio`, which has not started yet.
     if let Some(v6) = resolve_external_ip6(&config) {
         self_addrs.push(std::net::IpAddr::V6(v6));
     }
-    for s in [&config.relay.bind_ip, &config.relay.bind_ip6] {
-        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-            self_addrs.push(ip);
-        }
-    }
+    self_addrs.extend(relay_bind_v4.map(std::net::IpAddr::V4));
+    self_addrs.extend(relay_bind_v6.map(std::net::IpAddr::V6));
     turna_relay::peer_filter::init_peer_policy(
         turna_relay::peer_filter::PeerPolicy::from_config(
             &config.peer_filter.profile,
@@ -571,6 +578,34 @@ fn build_tls_transport_config(
         alpn_required: c.alpn_required,
         client_ca_path: c.client_ca.clone(),
         require_client_cert: c.require_client_cert,
+        // Validated as "1.2" | "1.3" at config load.
+        tls13_only: c.min_version.trim() == "1.3",
+        cipher_suites: c.cipher_suites.clone(),
+        proxy_protocol: c.proxy_protocol,
+        proxy_trusted_cidrs: c.proxy_protocol_trusted_cidrs.clone(),
+        proxy_header_timeout: std::time::Duration::from_secs(c.proxy_protocol_timeout_secs),
+    }
+}
+
+/// Map `[turn.tcp]` onto the stream-listener config the plain TCP listener
+/// shares with TURNS. The TLS-only fields keep their defaults and are ignored
+/// by `TlsTransportServer::new_plain`.
+#[cfg(feature = "tls")]
+fn build_tcp_transport_config(
+    c: &turna_config::TcpListenerSection,
+) -> turna_transport::tcp_tls::TlsTransportConfig {
+    turna_transport::tcp_tls::TlsTransportConfig {
+        listen_addr: c.listen,
+        max_frame_size: c.max_frame_size,
+        read_timeout: std::time::Duration::from_secs(c.read_timeout_secs),
+        max_connections: c.max_connections,
+        max_connections_per_ip: c.max_connections_per_ip,
+        max_handshakes_per_sec_per_ip: c.max_connections_per_sec_per_ip,
+        handshake_burst_per_ip: c.connection_burst_per_ip,
+        proxy_protocol: c.proxy_protocol,
+        proxy_trusted_cidrs: c.proxy_protocol_trusted_cidrs.clone(),
+        proxy_header_timeout: std::time::Duration::from_secs(c.proxy_protocol_timeout_secs),
+        ..Default::default()
     }
 }
 
@@ -805,14 +840,15 @@ fn resolve_external_ip6(cfg: &TurnConfig) -> Option<std::net::Ipv6Addr> {
     if cfg.external_ip6.is_empty() {
         return None;
     }
-    match cfg.external_ip6.parse::<std::net::Ipv6Addr>() {
-        Ok(v6) => {
+    // `advertised_ip6` takes the public half of a `PUBLIC/PRIVATE` mapping.
+    match cfg.advertised_ip6() {
+        Some(v6) => {
             info!(%v6, "IPv6 relayed transport enabled (RFC 6156)");
             Some(v6)
         }
-        Err(e) => {
+        None => {
             warn!(
-                value = %cfg.external_ip6, %e,
+                value = %cfg.external_ip6,
                 "turn.external_ip6 is not a valid IPv6 address; IPv6 relaying stays disabled"
             );
             None
@@ -2372,6 +2408,23 @@ fn run_tokio(
                 } else {
                     turna_transport::TokioTransport::bind(config.listen).await?
                 };
+                // `[turn] listen_extra`, bound here with the primary so a bad
+                // address fails startup instead of leaving a listener absent.
+                let mut extra_transports = Vec::with_capacity(config.listen_extra.len());
+                for addr in &config.listen_extra {
+                    let t = if turna_relay::server::recv_workers() > 1 {
+                        turna_transport::TokioTransport::bind_reuseport(*addr).await
+                    } else {
+                        turna_transport::TokioTransport::bind(*addr).await
+                    };
+                    extra_transports.push(t.map_err(|e| {
+                        format!(
+                            "[turn] listen_extra = \"{addr}\" could not be bound: {e}. \
+                             Check that the address is configured on this host and the \
+                             port is free; the node will not start with a listener missing"
+                        )
+                    })?);
+                }
                 // #8: the TURN listener is now bound — only now is it honest to
                 // report Ready, so `/ready=200` implies the socket is accepting.
                 metrics.set_readiness(turna_health::Readiness::Ready);
@@ -2396,11 +2449,23 @@ fn run_tokio(
                     Some(&rate_limits),
                 )
                 .with_external_ip6(external_ip6)
-                .with_drain_timeout_secs(config.relay.drain_timeout_secs);
+                .with_drain_timeout_secs(config.relay.drain_timeout_secs)
+                .with_extra_listeners(extra_transports);
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
                     info!(listen = %tls_cfg.listen, cert = %tls_cfg.cert_path.display(), "TURNS (TLS) enabled");
                     server.with_tls(build_tls_transport_config(&tls_cfg))
+                } else {
+                    server
+                };
+                #[cfg(feature = "tls")]
+                let server = if config.tcp.enabled {
+                    info!(
+                        listen = %config.tcp.listen,
+                        proxy_protocol = config.tcp.proxy_protocol,
+                        "plain TURN over TCP enabled"
+                    );
+                    server.with_tcp(build_tcp_transport_config(&config.tcp))
                 } else {
                     server
                 };
@@ -2924,6 +2989,14 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     let t = &cfg.turn;
     println!("[turn]");
     println!("listen      = \"{}\"", t.listen);
+    println!(
+        "listen_extra = [{}]",
+        t.listen_extra
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("external_ip = \"{}\"", t.external_ip);
     println!("external_ip6 = \"{}\"", t.external_ip6);
     println!("realm       = \"{}\"", t.realm);
@@ -2953,6 +3026,15 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
         t.relay.quota.max_bytes_per_sec_per_allocation
     );
     println!("max_per_user      = {}", t.relay.quota.max_per_user);
+    println!();
+    println!("[turn.tcp]");
+    println!("enabled        = {}", t.tcp.enabled);
+    println!("listen         = \"{}\"", t.tcp.listen);
+    println!("proxy_protocol = {}", t.tcp.proxy_protocol);
+    println!(
+        "proxy_protocol_trusted_cidrs = {:?}",
+        t.tcp.proxy_protocol_trusted_cidrs
+    );
     println!();
     println!("[turn.migration]");
     println!("enabled         = {}", t.migration.enabled);
@@ -3049,6 +3131,29 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("read_timeout_secs     = {}", t.read_timeout_secs);
     println!("max_connections       = {}", t.max_connections);
     println!("enable_alpn           = {}", t.enable_alpn);
+    println!("min_version           = \"{}\"", t.min_version);
+    println!("cipher_suites         = {:?}", t.cipher_suites);
+    println!("proxy_protocol        = {}", t.proxy_protocol);
+    println!(
+        "proxy_protocol_trusted_cidrs = {:?}",
+        t.proxy_protocol_trusted_cidrs
+    );
+}
+
+/// `[tls] cipher_suites` is validated in turna-config against a copied list,
+/// because that crate does not depend on rustls. This is the check that the
+/// copy is still true: a rustls upgrade that adds or drops a suite fails here
+/// instead of turning a valid name into a startup error (or the reverse).
+#[cfg(all(test, feature = "tls"))]
+mod tls_policy_tests {
+    #[test]
+    fn config_cipher_list_matches_rustls() {
+        let mut ours: Vec<&str> = turna_config::RUSTLS_CIPHER_SUITES.to_vec();
+        let mut theirs = turna_transport::tcp_tls::supported_cipher_suite_names();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(ours, theirs);
+    }
 }
 
 #[cfg(test)]

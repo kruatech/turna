@@ -56,6 +56,12 @@ pub(crate) enum OutMsg {
     RegisterRelay {
         port: u16,
         socket: std::net::UdpSocket,
+        /// UDP socket peer→client data for this allocation leaves from, when
+        /// it is not the egress's `main_out`: the `[turn] listen_extra`
+        /// listener the Allocate arrived on. A client sent to that address,
+        /// so its NAT (and any client that `connect()`s its socket) accepts
+        /// replies from that address only. `None` = `main_out`.
+        reply_via: Option<TokioTransport>,
     },
     CloseRelay {
         port: u16,
@@ -118,7 +124,11 @@ pub(crate) fn spawn_relay_egress(
                         h.abort();
                     }
                 }
-                OutMsg::RegisterRelay { port, socket } => {
+                OutMsg::RegisterRelay {
+                    port,
+                    socket,
+                    reply_via,
+                } => {
                     // Socket is already bound (in handle_allocate). Adopt it
                     // into the tokio runtime — this cannot fail to bind.
                     let socket = match tokio::net::UdpSocket::from_std(socket) {
@@ -132,7 +142,7 @@ pub(crate) fn spawn_relay_egress(
 
                     // Spawn relay recv task (peer → client).
                     let proc = processor.clone();
-                    let main_out = main_out.clone();
+                    let main_out = reply_via.unwrap_or_else(|| main_out.clone());
                     let sockets = relay_sockets.clone();
                     let ext_ip = external_ip;
                     let client_sinks_relay = client_sinks.clone();
@@ -242,7 +252,14 @@ impl RelayEgress {
             }
             Action::RegisterRelay { port, socket, .. } => {
                 // Control-plane: must not be dropped — await for queue capacity.
-                let _ = self.tx.send(OutMsg::RegisterRelay { port, socket }).await;
+                let _ = self
+                    .tx
+                    .send(OutMsg::RegisterRelay {
+                        port,
+                        socket,
+                        reply_via: None,
+                    })
+                    .await;
             }
             Action::CloseRelay { port } => {
                 let _ = self.tx.send(OutMsg::CloseRelay { port }).await;
@@ -332,6 +349,9 @@ pub fn start_relay_egress(
 /// Async TURN relay server.
 pub struct RelayServer {
     transport: TokioTransport,
+    /// `[turn] listen_extra`: further UDP listeners served by this server's
+    /// processor. Empty unless configured.
+    extra_transports: Vec<TokioTransport>,
     processor: Arc<PacketProcessor>,
     relay_sockets: Arc<DashMap<u16, TokioTransport>>,
     external_ip: std::net::IpAddr,
@@ -345,6 +365,10 @@ pub struct RelayServer {
     /// TURNS (TLS) listener config; `None` disables it.
     #[cfg(feature = "tls")]
     tls_config: Option<turna_transport::tcp_tls::TlsTransportConfig>,
+    /// Plain TURN-over-TCP listener config (`[turn.tcp]`); `None` disables it.
+    /// Shares the TURNS code path, hence the same feature gate.
+    #[cfg(feature = "tls")]
+    tcp_config: Option<turna_transport::tcp_tls::TlsTransportConfig>,
     /// TURN-over-SCTP listener config; `None` disables it.
     #[cfg(feature = "sctp")]
     sctp_config: Option<turna_transport::sctp::SctpTransportConfig>,
@@ -440,6 +464,7 @@ impl RelayServer {
         let processor = Arc::new(processor);
         Self {
             transport,
+            extra_transports: Vec::new(),
             processor,
             relay_sockets: Arc::new(DashMap::new()),
             external_ip,
@@ -447,6 +472,8 @@ impl RelayServer {
             tcp_relay,
             #[cfg(feature = "tls")]
             tls_config: None,
+            #[cfg(feature = "tls")]
+            tcp_config: None,
             #[cfg(feature = "sctp")]
             sctp_config: None,
             drain_timeout_secs: 30,
@@ -467,6 +494,23 @@ impl RelayServer {
     #[cfg(feature = "tls")]
     pub fn with_tls(mut self, cfg: turna_transport::tcp_tls::TlsTransportConfig) -> Self {
         self.tls_config = Some(cfg);
+        self
+    }
+
+    /// Enable the plain TURN-over-TCP listener (`[turn.tcp]`). Same connection
+    /// handling as TURNS without the handshake; needs the `tls` feature
+    /// because that is where the shared code lives.
+    #[cfg(feature = "tls")]
+    pub fn with_tcp(mut self, cfg: turna_transport::tcp_tls::TlsTransportConfig) -> Self {
+        self.tcp_config = Some(cfg);
+        self
+    }
+
+    /// Serve these additional bound UDP sockets (`[turn] listen_extra`) with
+    /// the same processor. Each gets its own recv workers, and an allocation
+    /// made through one has its relayed data sent back from it.
+    pub fn with_extra_listeners(mut self, transports: Vec<TokioTransport>) -> Self {
+        self.extra_transports = transports;
         self
     }
 
@@ -619,6 +663,8 @@ impl RelayServer {
         // may still be serving.
         #[cfg(feature = "tls")]
         let mut tls_handle: Option<tokio::task::JoinHandle<()>> = None;
+        #[cfg(feature = "tls")]
+        let mut tcp_handle: Option<tokio::task::JoinHandle<()>> = None;
         #[cfg(feature = "sctp")]
         let mut sctp_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -640,6 +686,7 @@ impl RelayServer {
             let bridge_shutdown = shutdown.clone();
             tls_handle = Some(tokio::spawn(async move {
                 let res = crate::tls_bridge::run_tls_bridge(
+                    crate::tls_bridge::StreamKind::Tls,
                     tls_cfg,
                     proc,
                     relay_tx,
@@ -652,6 +699,43 @@ impl RelayServer {
                     match res {
                         Ok(()) => error!(event = "task_died", "TURNS bridge exited unexpectedly"),
                         Err(e) => error!(error = %e, "TURNS bridge failed"),
+                    }
+                    listener_metrics.set_readiness(turna_health::Readiness::Degraded);
+                }
+            }));
+        }
+
+        // ── Plain TURN-over-TCP bridge ───────────────────────────────────────
+        // The TURNS bridge minus the handshake: same sinks, same relay channel,
+        // same RFC 6062 manager (a plain TCP control connection is a valid
+        // RFC 6062 control connection).
+        #[cfg(feature = "tls")]
+        if let Some(tcp_cfg) = self.tcp_config.clone() {
+            let proc = self.processor.clone();
+            let relay_tx = send_tx.clone();
+            let sinks = self.client_sinks.clone();
+            let tcp_relay = self.tcp_relay.clone();
+            let listener_metrics = self.processor.metrics().clone();
+            let listener_shutdown = shutdown.clone();
+            let bridge_shutdown = shutdown.clone();
+            tcp_handle = Some(tokio::spawn(async move {
+                let res = crate::tls_bridge::run_tls_bridge(
+                    crate::tls_bridge::StreamKind::Plain,
+                    tcp_cfg,
+                    proc,
+                    relay_tx,
+                    sinks,
+                    tcp_relay,
+                    bridge_shutdown,
+                )
+                .await;
+                if !*listener_shutdown.borrow() {
+                    match res {
+                        Ok(()) => error!(
+                            event = "task_died",
+                            "TURN-over-TCP bridge exited unexpectedly"
+                        ),
+                        Err(e) => error!(error = %e, "TURN-over-TCP bridge failed"),
                     }
                     listener_metrics.set_readiness(turna_health::Readiness::Degraded);
                 }
@@ -701,145 +785,42 @@ impl RelayServer {
         // В бенче с одного IP отключай TURNA_RATE_LIMIT_* и TURNA_PREFIX_*.
         let n_workers = recv_workers();
         let listen_addr = self.transport.local_addr()?;
-        let mut workers = Vec::with_capacity(n_workers);
+        let mut workers = Vec::with_capacity(n_workers * (1 + self.extra_transports.len()));
 
-        for i in 0..n_workers {
-            let transport = if i == 0 {
-                self.transport.clone()
-            } else {
-                match TokioTransport::bind_reuseport(listen_addr).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(event = "bind_failed", worker = i, %e, "SO_REUSEPORT bind failed, continuing with fewer workers");
-                        break;
-                    }
-                }
-            };
-
-            let processor = self.processor.clone();
-            let send_tx = send_tx.clone();
-
-            workers.push(tokio::spawn(async move {
-                // До BATCH датаграмм на один recvmmsg; ответы — одним sendmmsg.
-                const BATCH: usize = 32;
-                let zero: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 0));
-                let mut metas = [(0usize, zero); BATCH];
-                loop {
-                    // Одна арена на батч: 1 malloc на 32 пакета; каждый пакет —
-                    // Bytes-слайс арены без копирования (zero-copy Forward жив).
-                    let mut arena = bytes::BytesMut::with_capacity(BATCH * MAX_UDP_PACKET);
-                    // SAFETY: capacity == BATCH*MAX_UDP_PACKET; recvmmsg пишет
-                    // первые len байт каждого слота, slice(..len) ниже не даёт
-                    // прочитать неинициализированный хвост.
-                    unsafe {
-                        arena.set_len(BATCH * MAX_UDP_PACKET);
-                    }
-
-                    let n = {
-                        let mut slots: Vec<&mut [u8]> = arena.chunks_mut(MAX_UDP_PACKET).collect();
-                        match transport.recv_mmsg(&mut slots, &mut metas).await {
-                            Ok(n) => n,
-                            Err(e) => {
-                                error!(event = "worker_stopped", worker = i, %e, "recv error, worker stopping");
-                                break;
-                            }
-                        }
-                    };
-
-                    let mut replies: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(n);
-                    #[allow(clippy::needless_range_loop)]
-                    for k in 0..n {
-                        let (len, src) = metas[k];
-                        let chunk = arena.split_to(MAX_UDP_PACKET);
-                        let raw: Bytes = chunk.freeze().slice(..len);
-                        // A3-O1: isolate per-packet panics so a single bad packet
-                        // can't take down the whole worker task. `processor` is
-                        // &self over Arc/lock-free state (DashMap + atomics +
-                        // parking_lot, which has no poisoning), so dropping the
-                        // offending packet and continuing leaves no torn state.
-                        let actions =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                processor.process(raw, src)
-                            }))
-                            .unwrap_or_else(|_| {
-                                processor
-                                    .metrics()
-                                    .processor_panics
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                Vec::new()
-                            });
-                        for action in actions {
-                            match action {
-                                Action::Send { data, target } => {
-                                    replies.push((data, target));
-                                }
-                                Action::Forward {
-                                    data,
-                                    target,
-                                    relay_port,
-                                }
-                                | Action::SendViaRelay {
-                                    data,
-                                    target,
-                                    relay_port,
-                                } => {
-                                    if send_tx
-                                        .try_send(OutMsg::Relay {
-                                            port: relay_port,
-                                            data,
-                                            target,
-                                        })
-                                        .is_err()
-                                    {
-                                        processor
-                                            .metrics()
-                                            .send_queue_dropped
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                }
-                                // Control-plane: не дропаем при полной очереди.
-                                Action::RegisterRelay { port, socket, .. } => {
-                                    if send_tx
-                                        .send(OutMsg::RegisterRelay { port, socket })
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                Action::CloseRelay { port } => {
-                                    if send_tx.send(OutMsg::CloseRelay { port }).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Action::RegisterTcpListener { .. } => {
-                                    // Unreachable (see dispatch path): TCP-allocate over
-                                    // non-TCP ingress is rejected at handle_allocate.
-                                    tracing::debug!(
-                                        "unexpected RegisterTcpListener on the UDP recvmmsg path; dropping"
-                                    );
-                                }
-                                // io_uring / AF_XDP-only; never produced by the
-                                // tokio `process()` path. Defensive, keeps the
-                                // match exhaustive.
-                                Action::ForwardZeroCopy { .. } => {
-                                    debug_assert!(
-                                        false,
-                                        "ForwardZeroCopy reached the tokio recvmmsg path"
-                                    );
-                                }
-                                Action::None => {}
-                            }
+        // The primary listener replies to relayed traffic through the egress's
+        // `main_out` (`reply_via = None`); each `listen_extra` listener through
+        // its own socket, so a client hears back from the address it used.
+        let listeners = std::iter::once((self.transport.clone(), None)).chain(
+            self.extra_transports
+                .iter()
+                .map(|t| (t.clone(), Some(t.clone()))),
+        );
+        for (first, reply_via) in listeners {
+            let addr = first.local_addr()?;
+            for k in 0..n_workers {
+                let i = workers.len();
+                let transport = if k == 0 {
+                    first.clone()
+                } else {
+                    match TokioTransport::bind_reuseport(addr).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!(event = "bind_failed", worker = i, %addr, %e, "SO_REUSEPORT bind failed, continuing with fewer workers");
+                            break;
                         }
                     }
-
-                    if !replies.is_empty() {
-                        if let Err(e) = transport.send_mmsg(&replies).await {
-                            error!(worker = i, %e, "send_mmsg failed");
-                        }
-                    }
-                }
-            }));
+                };
+                workers.push(spawn_recv_worker(
+                    i,
+                    transport,
+                    self.processor.clone(),
+                    send_tx.clone(),
+                    reply_via.clone(),
+                ));
+            }
+            if reply_via.is_some() {
+                info!(%addr, "additional UDP listener (listen_extra) serving");
+            }
         }
 
         info!(workers = workers.len(), %listen_addr, "recv workers started");
@@ -946,6 +927,17 @@ impl RelayServer {
                     .set_readiness(turna_health::Readiness::Degraded);
                 break;
             }
+            #[cfg(feature = "tls")]
+            if tcp_handle.as_ref().is_some_and(|h| h.is_finished()) {
+                error!(
+                    event = "task_died",
+                    "TURN-over-TCP listener task exited unexpectedly (possible panic) — degraded"
+                );
+                self.processor
+                    .metrics()
+                    .set_readiness(turna_health::Readiness::Degraded);
+                break;
+            }
             #[cfg(feature = "sctp")]
             if sctp_handle.as_ref().is_some_and(|h| h.is_finished()) {
                 error!(
@@ -974,6 +966,10 @@ impl RelayServer {
         cleanup_handle.abort();
         #[cfg(feature = "tls")]
         if let Some(h) = tls_handle {
+            h.abort();
+        }
+        #[cfg(feature = "tls")]
+        if let Some(h) = tcp_handle {
             h.abort();
         }
         #[cfg(feature = "sctp")]
@@ -1044,4 +1040,138 @@ impl RelayServer {
             info!(event = "drain_complete", "all allocations drained");
         }
     }
+}
+
+/// One SO_REUSEPORT recv worker: recvmmsg a batch, run each packet through the
+/// processor, answer STUN from this socket with one sendmmsg, and hand relay
+/// traffic to the egress. `reply_via` rides along on every `RegisterRelay`
+/// this worker emits (see [`OutMsg::RegisterRelay`]).
+fn spawn_recv_worker(
+    i: usize,
+    transport: TokioTransport,
+    processor: Arc<PacketProcessor>,
+    send_tx: mpsc::Sender<OutMsg>,
+    reply_via: Option<TokioTransport>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // До BATCH датаграмм на один recvmmsg; ответы — одним sendmmsg.
+        const BATCH: usize = 32;
+        let zero: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 0));
+        let mut metas = [(0usize, zero); BATCH];
+        loop {
+            // Одна арена на батч: 1 malloc на 32 пакета; каждый пакет —
+            // Bytes-слайс арены без копирования (zero-copy Forward жив).
+            let mut arena = bytes::BytesMut::with_capacity(BATCH * MAX_UDP_PACKET);
+            // SAFETY: capacity == BATCH*MAX_UDP_PACKET; recvmmsg пишет
+            // первые len байт каждого слота, slice(..len) ниже не даёт
+            // прочитать неинициализированный хвост.
+            unsafe {
+                arena.set_len(BATCH * MAX_UDP_PACKET);
+            }
+
+            let n = {
+                let mut slots: Vec<&mut [u8]> = arena.chunks_mut(MAX_UDP_PACKET).collect();
+                match transport.recv_mmsg(&mut slots, &mut metas).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(event = "worker_stopped", worker = i, %e, "recv error, worker stopping");
+                        break;
+                    }
+                }
+            };
+
+            let mut replies: Vec<(Bytes, SocketAddr)> = Vec::with_capacity(n);
+            #[allow(clippy::needless_range_loop)]
+            for k in 0..n {
+                let (len, src) = metas[k];
+                let chunk = arena.split_to(MAX_UDP_PACKET);
+                let raw: Bytes = chunk.freeze().slice(..len);
+                // A3-O1: isolate per-packet panics so a single bad packet
+                // can't take down the whole worker task. `processor` is
+                // &self over Arc/lock-free state (DashMap + atomics +
+                // parking_lot, which has no poisoning), so dropping the
+                // offending packet and continuing leaves no torn state.
+                let actions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    processor.process(raw, src)
+                }))
+                .unwrap_or_else(|_| {
+                    processor
+                        .metrics()
+                        .processor_panics
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Vec::new()
+                });
+                for action in actions {
+                    match action {
+                        Action::Send { data, target } => {
+                            replies.push((data, target));
+                        }
+                        Action::Forward {
+                            data,
+                            target,
+                            relay_port,
+                        }
+                        | Action::SendViaRelay {
+                            data,
+                            target,
+                            relay_port,
+                        } => {
+                            if send_tx
+                                .try_send(OutMsg::Relay {
+                                    port: relay_port,
+                                    data,
+                                    target,
+                                })
+                                .is_err()
+                            {
+                                processor
+                                    .metrics()
+                                    .send_queue_dropped
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        // Control-plane: не дропаем при полной очереди.
+                        Action::RegisterRelay { port, socket, .. } => {
+                            if send_tx
+                                .send(OutMsg::RegisterRelay {
+                                    port,
+                                    socket,
+                                    reply_via: reply_via.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Action::CloseRelay { port } => {
+                            if send_tx.send(OutMsg::CloseRelay { port }).await.is_err() {
+                                break;
+                            }
+                        }
+                        Action::RegisterTcpListener { .. } => {
+                            // Unreachable (see dispatch path): TCP-allocate over
+                            // non-TCP ingress is rejected at handle_allocate.
+                            tracing::debug!(
+                                "unexpected RegisterTcpListener on the UDP recvmmsg path; dropping"
+                            );
+                        }
+                        // io_uring / AF_XDP-only; never produced by the
+                        // tokio `process()` path. Defensive, keeps the
+                        // match exhaustive.
+                        Action::ForwardZeroCopy { .. } => {
+                            debug_assert!(false, "ForwardZeroCopy reached the tokio recvmmsg path");
+                        }
+                        Action::None => {}
+                    }
+                }
+            }
+
+            if !replies.is_empty() {
+                if let Err(e) = transport.send_mmsg(&replies).await {
+                    error!(worker = i, %e, "send_mmsg failed");
+                }
+            }
+        }
+    })
 }
