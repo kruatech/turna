@@ -2324,6 +2324,51 @@ impl PacketProcessor {
         }
     }
 
+    /// RFC 6062 §5.3: may the peer that just connected to `client`'s relayed
+    /// TCP listener be announced with a ConnectionAttempt?
+    ///
+    /// "If no permission for this peer has been installed for this allocation,
+    /// the server MUST close the connection with the peer immediately after it
+    /// has been accepted." Until 2026-09-24 nothing checked this: anyone who
+    /// found a relayed port could open connections that the client was then
+    /// invited to bind, bypassing the permission model CONNECT enforces.
+    ///
+    /// Same state as CreatePermission and CONNECT — the allocation's own
+    /// permission table via `Allocation::has_permission`, which honours expiry
+    /// — plus the peer filter, which CreatePermission already applied to every
+    /// permitted address but which is re-run here because the filter policy
+    /// can be stricter than it was when the permission was installed. The
+    /// allocation must still exist, be unexpired and be a TCP allocation, and
+    /// the peer must be in its relayed family (the v6 listener is v6-only, so
+    /// that last check is belt and braces).
+    ///
+    /// A `false` is counted in `turna_tcp_relay_peer_refused_total`; the caller
+    /// drops (closes) the stream.
+    pub fn peer_connection_permitted(&self, client: SocketAddr, peer: SocketAddr) -> bool {
+        let peer = normalize_addr(peer);
+        let permitted = !is_forbidden_peer(peer.ip())
+            && match self.store.get(&client) {
+                Some(a) => {
+                    !a.is_expired()
+                        && a.transport == TransportProto::Tcp
+                        && a.relay_addr.is_ipv6() == peer.is_ipv6()
+                        && a.has_permission(&peer)
+                }
+                None => false,
+            };
+        if !permitted {
+            self.metrics
+                .tcp_relay_peer_refused
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                client = %loggable_addr(&client),
+                peer = %loggable_addr(&peer),
+                "RFC 6062: peer-initiated connection without permission closed"
+            );
+        }
+        permitted
+    }
+
     /// Build a signed RFC 6062 CONNECT success response carrying CONNECTION-ID.
     pub fn build_connect_success(
         &self,
@@ -3981,5 +4026,219 @@ mod tcp_relay_ipv6_tests {
             reply(&p.process_tcp_control(perm6, src)).class,
             MessageClass::SuccessResponse
         ));
+        // RFC 6062 §5.3 on the v6 listener: the permitted v6 peer may be
+        // announced; a v4 peer and an unpermitted v6 peer may not.
+        assert!(p.peer_connection_permitted(src, "[2001:4860:4860::8888]:5000".parse().unwrap()));
+        assert!(!p.peer_connection_permitted(src, "8.8.8.8:5000".parse().unwrap()));
+        assert!(!p.peer_connection_permitted(src, "[2001:4860:4860::8844]:5000".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod tcp_relay_peer_permission_tests {
+    //! RFC 6062 §5.3 through the shared accept handler, with real TCP streams
+    //! and a real client sink. The accepted stream is loopback; the `peer`
+    //! address handed to the handler is what the listener's `accept()` would
+    //! report, so a global address stands in for it — loopback peers are
+    //! denied by the default peer filter, which is itself one of the cases.
+    use super::*;
+    use crate::tcp_relay::{
+        handle_peer_initiated, AllocationId, PeerAcceptOutcome, TcpRelayConfig, TcpRelayManager,
+    };
+    use std::time::Duration;
+
+    const REALM: &str = "tcp-perm";
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(30000, 30999, 64)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                REALM,
+                [("u", "pw")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_tcp_relay(Some(Arc::new(TcpRelayManager::new(
+            TcpRelayConfig::default(),
+        ))))
+    }
+
+    fn signed(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        method: Method,
+        extra: Vec<Attribute>,
+    ) -> Bytes {
+        let mut m = StunMessage::new(method, MessageClass::Request);
+        for a in extra {
+            m.add(a);
+        }
+        m.add(Attribute::Username("u".into()));
+        m.add(Attribute::Realm(REALM.into()));
+        m.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key("u", REALM, "pw");
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn is_success(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::Send { data, .. }
+                if matches!(StunMessage::decode(data).unwrap().class, MessageClass::SuccessResponse))
+        })
+    }
+
+    /// A connected loopback stream pair; returns the server side (what the
+    /// relayed listener's accept() yields) and the peer's end.
+    async fn stream_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let connect =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (accepted, _) = l.accept().await.unwrap();
+        (accepted, connect.await.unwrap())
+    }
+
+    /// The peer's end sees EOF promptly when the server side was closed.
+    async fn closed_by_server(mut peer_end: tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut b = [0u8; 1];
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), peer_end.read(&mut b)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn peer_without_permission_is_closed_and_not_announced() {
+        let p = processor();
+        let mgr = p.tcp_relay.clone().unwrap();
+        let client: SocketAddr = "127.0.0.1:43001".parse().unwrap();
+        let alloc = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::Allocate,
+                vec![Attribute::RequestedTransport(turn::TRANSPORT_TCP)],
+            ),
+            client,
+        );
+        assert!(is_success(&alloc));
+        let perm = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::CreatePermission,
+                vec![Attribute::XorPeerAddress("8.8.8.8:0".parse().unwrap())],
+            ),
+            client,
+        );
+        assert!(is_success(&perm));
+
+        let sinks = crate::server::new_client_sinks();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        sinks.insert(client, tx);
+        let port = p.store.get(&client).unwrap().relay_addr.port();
+        let id = AllocationId(port as u64);
+
+        // 1. No permission for 8.8.4.4: closed, nothing delivered, counted.
+        let (server_side, peer_end) = stream_pair().await;
+        let out = handle_peer_initiated(
+            &mgr,
+            &p,
+            &sinks,
+            id,
+            client,
+            b"k",
+            server_side,
+            "8.8.4.4:5000".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(out, PeerAcceptOutcome::Refused);
+        assert!(
+            closed_by_server(peer_end).await,
+            "unpermitted peer must be closed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no ConnectionAttempt for an unpermitted peer"
+        );
+        assert_eq!(p.metrics.tcp_relay_peer_refused.load(Ordering::Relaxed), 1);
+
+        // 2. A peer the filter denies (loopback) is refused the same way.
+        let (server_side, peer_end) = stream_pair().await;
+        let out = handle_peer_initiated(
+            &mgr,
+            &p,
+            &sinks,
+            id,
+            client,
+            b"k",
+            server_side,
+            "127.0.0.1:5000".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(out, PeerAcceptOutcome::Refused);
+        assert!(closed_by_server(peer_end).await);
+        assert!(rx.try_recv().is_err());
+
+        // 3. The permitted peer (8.8.8.8, any port) is announced.
+        let (server_side, _peer_end) = stream_pair().await;
+        let out = handle_peer_initiated(
+            &mgr,
+            &p,
+            &sinks,
+            id,
+            client,
+            b"k",
+            server_side,
+            "8.8.8.8:5001".parse().unwrap(),
+        )
+        .await;
+        let PeerAcceptOutcome::Announced(conn) = out else {
+            panic!("permitted peer must be announced, got {out:?}");
+        };
+        let ind = StunMessage::decode(&rx.try_recv().expect("ConnectionAttempt queued")).unwrap();
+        assert!(matches!(ind.method, Method::ConnectionAttempt));
+        assert_eq!(ind.get_connection_id(), Some(conn.value()));
+        assert_eq!(
+            ind.get_xor_peer_address(),
+            Some("8.8.8.8:5001".parse().unwrap())
+        );
+        assert_eq!(p.metrics.tcp_relay_peer_refused.load(Ordering::Relaxed), 2);
+    }
+
+    /// No allocation, or a UDP allocation, on that 5-tuple: refused.
+    #[tokio::test]
+    async fn peer_for_missing_or_udp_allocation_is_refused() {
+        let p = processor();
+        assert!(!p.peer_connection_permitted(
+            "127.0.0.1:43002".parse().unwrap(),
+            "8.8.8.8:1".parse().unwrap()
+        ));
+        let client: SocketAddr = "127.0.0.1:43003".parse().unwrap();
+        let udp = p.process(
+            signed(
+                &p,
+                client,
+                Method::Allocate,
+                vec![Attribute::RequestedTransport(turn::TRANSPORT_UDP)],
+            ),
+            client,
+        );
+        assert!(is_success(&udp));
+        let perm = p.process(
+            signed(
+                &p,
+                client,
+                Method::CreatePermission,
+                vec![Attribute::XorPeerAddress("8.8.8.8:0".parse().unwrap())],
+            ),
+            client,
+        );
+        assert!(is_success(&perm));
+        assert!(!p.peer_connection_permitted(client, "8.8.8.8:1".parse().unwrap()));
     }
 }
