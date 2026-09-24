@@ -214,6 +214,29 @@ proptest! {
     }
 }
 
+// ── Property: USERHASH roundtrip ─────────────────────────────────────────────
+
+proptest! {
+    /// RFC 8489 §14.4 USERHASH: every 32-byte value survives encode → decode,
+    /// alongside the attributes a real request carries with it.
+    #[test]
+    fn prop_userhash_roundtrip(h in any::<[u8; 32]>(), realm in arb_short_string()) {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.add(Attribute::UserHash(h));
+        msg.add(Attribute::Realm(realm.clone()));
+
+        let mut buf = [0u8; 1024];
+        let len = msg.encode(&mut buf).unwrap();
+        let decoded = StunMessage::decode(&buf[..len]).unwrap();
+
+        prop_assert_eq!(decoded.get_userhash(), Some(&h));
+        prop_assert!(decoded.has_user_identity());
+        prop_assert_eq!(decoded.get_username(), None);
+        prop_assert_eq!(decoded.get_realm(), Some(realm.as_str()));
+    }
+
+}
+
 // ── Property: encode length == HEADER + attr_bytes (4-aligned) ───────────────
 
 proptest! {

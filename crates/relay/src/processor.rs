@@ -244,6 +244,27 @@ fn software_attribute() -> Option<&'static str> {
     }
 }
 
+/// `[turn.auth] advertise_userhash`: prefix every nonce with the RFC 8489
+/// "nonce cookie" that sets Security Feature bit 1, "Username anonymity", so a
+/// conforming client sends USERHASH instead of USERNAME (§9.2.5).
+///
+/// Accepting USERHASH needs no switch — a request carrying it used to be
+/// answered 420 and is now authenticated, which no working client can have
+/// depended on. *Advertising* it is a switch, because it changes every nonce on
+/// the wire and obliges clients to change what they send. Off by default.
+///
+/// Process-wide, like `SOFTWARE_MODE`: set once at startup, before any
+/// processor is built, and read by each processor's nonce issuer when it is
+/// constructed. The node builds up to three processors (main, QUIC/DTLS,
+/// AF_XDP); a builder on each would be three places to forget.
+static ADVERTISE_USERHASH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the node before any processor is constructed.
+pub fn set_advertise_userhash(on: bool) {
+    ADVERTISE_USERHASH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static DECODE_ERROR_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
 static UNAUTH_BUDGET_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
 static AUTH_FAILED_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
@@ -423,15 +444,35 @@ struct NonceManager {
     /// How long an issued nonce stays valid, including a grace window for the
     /// client's in-flight retry.
     max_age: Duration,
+    /// RFC 8489 §9.2 "nonce cookie" prepended to every issued nonce, or `None`
+    /// (the default) for the historical cookie-less nonce.
+    cookie: Option<&'static str>,
 }
 
+/// RFC 8489 §9.2 nonce cookie with only Security Feature bit 1, "Username
+/// anonymity", set (§18.1): `"obMatJos2"` followed by the base64 of the
+/// 24-bit feature set `0x40 0x00 0x00`, which is `"QAAA"`.
+///
+/// Bit 0, "Password algorithms", is deliberately clear. Setting it obliges the
+/// server to send PASSWORD-ALGORITHMS in every 401 and 438 (§9.2.4), and a
+/// client that sees the bit without the attribute must give up (§9.2.5) —
+/// turna does not send PASSWORD-ALGORITHMS, so setting that bit would lock out
+/// every RFC 8489 client.
+const USERHASH_NONCE_COOKIE: &str = "obMatJos2QAAA";
+
 impl NonceManager {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_cookie(None)
+    }
+
+    fn with_cookie(cookie: Option<&'static str>) -> Self {
         Self {
             server_key: turna_crypto::random_key_32(),
             start: Instant::now(),
             // 600s lifetime + 30s grace, matching the previous rotation policy.
             max_age: Duration::from_secs(630),
+            cookie,
         }
     }
 
@@ -442,13 +483,28 @@ impl NonceManager {
 
     /// Issue a fresh nonce bound to `client`.
     fn issue(&self, client: SocketAddr) -> String {
-        turna_crypto::issue_client_nonce(&self.server_key, &client.to_string(), self.now_ms())
+        let nonce =
+            turna_crypto::issue_client_nonce(&self.server_key, &client.to_string(), self.now_ms());
+        match self.cookie {
+            Some(cookie) => format!("{cookie}{nonce}"),
+            None => nonce,
+        }
     }
 
     /// Validate `nonce` for `client`: the MAC must match (same client + key) and
     /// the nonce must not be older than `max_age`.
     fn validate(&self, client: SocketAddr, nonce: &str) -> NonceStatus {
         let max_age_ms = self.max_age.as_millis() as u64;
+        // With a cookie configured, a nonce without it was not issued by this
+        // process (or was issued before a restart that turned the cookie on):
+        // stale, so the client is handed a fresh one carrying the feature bits.
+        let nonce = match self.cookie {
+            Some(cookie) => match nonce.strip_prefix(cookie) {
+                Some(rest) => rest,
+                None => return NonceStatus::Stale,
+            },
+            None => nonce,
+        };
         match turna_crypto::verify_client_nonce(&self.server_key, &client.to_string(), nonce) {
             Some(issued_ms) if self.now_ms().saturating_sub(issued_ms) <= max_age_ms => {
                 NonceStatus::Valid
@@ -739,6 +795,10 @@ impl PacketProcessor {
         mtu: u16,
         cluster: Option<ClusterRouting>,
     ) -> Self {
+        let nonce_mgr = NonceManager::with_cookie(Self::nonce_cookie_for(
+            &auth,
+            ADVERTISE_USERHASH.load(Ordering::Relaxed),
+        ));
         Self {
             udp_transactions: crate::udp_transactions::UdpTransactions::new(),
             store,
@@ -762,7 +822,7 @@ impl PacketProcessor {
             }),
             external_ip,
             external_ip6: None,
-            nonce_mgr: NonceManager::new(),
+            nonce_mgr,
             metrics,
             rtp_analyzer: Arc::new(RtpAnalyzer::new()),
             mtu,
@@ -774,6 +834,27 @@ impl PacketProcessor {
 
     pub fn store(&self) -> &Arc<AllocationStore> {
         &self.store
+    }
+
+    /// The nonce cookie this processor issues, per [`set_advertise_userhash`].
+    ///
+    /// Withheld (with a warning) unless every realm can resolve a USERHASH:
+    /// advertising the bit to a TURN REST client would make it send a hash
+    /// that cannot be inverted, and it would never authenticate again. Config
+    /// validation refuses that combination first; this is the second line, for
+    /// embedders that call the setter without going through the config.
+    fn nonce_cookie_for(auth: &AuthRegistry, advertise: bool) -> Option<&'static str> {
+        if !advertise {
+            return None;
+        }
+        if !auth.all_realms_support_userhash() {
+            warn!(
+                "advertise_userhash ignored: a realm on this node uses TURN REST or \
+                 OAuth credentials, which cannot resolve a USERHASH"
+            );
+            return None;
+        }
+        Some(USERHASH_NONCE_COOKIE)
     }
 
     /// Attach an RFC 8016 migration ticket signer/verifier. Builder-style so
@@ -1278,7 +1359,7 @@ impl PacketProcessor {
         let cacheable = !ingress_tcp
             && raw.len() <= 4096
             && matches!(msg.class, MessageClass::Request)
-            && msg.get_username().is_some()
+            && msg.has_user_identity()
             && (matches!(msg.method, Method::Refresh)
                 || (matches!(msg.method, Method::Allocate)
                     && msg.get_requested_transport() == Some(17)));
@@ -1558,7 +1639,7 @@ impl PacketProcessor {
         // before auth let an unauthenticated client probe whether an allocation
         // already exists on this 5-tuple (437 vs 401 disclosure). Challenge and
         // validate first, then do the allocation-mismatch / transport checks.
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -1735,8 +1816,11 @@ impl PacketProcessor {
         if let Some(max) = token_max_lifetime {
             lifetime = lifetime.min(max);
         }
-        // Kept for the log line below; accounting uses `subject`.
-        let credential = msg.get_username().unwrap_or("").to_string();
+        // Kept for the log line below; accounting uses `subject`. A USERHASH
+        // request has no USERNAME to log, and logging the hash would only
+        // re-identify what the client chose to hide; `subject` already names
+        // the user for the operator.
+        let credential = msg.get_username().unwrap_or("(userhash)").to_string();
         let (dynamic_lifetime, lifetime_disabled) =
             self.store
                 .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &subject);
@@ -1917,8 +2001,11 @@ impl PacketProcessor {
         if let Some(max) = token_max_lifetime {
             lifetime = lifetime.min(max);
         }
-        // Kept for the log line below; accounting uses `subject`.
-        let credential = msg.get_username().unwrap_or("").to_string();
+        // Kept for the log line below; accounting uses `subject`. A USERHASH
+        // request has no USERNAME to log, and logging the hash would only
+        // re-identify what the client chose to hide; `subject` already names
+        // the user for the operator.
+        let credential = msg.get_username().unwrap_or("(userhash)").to_string();
         let (dynamic_lifetime, lifetime_disabled) =
             self.store
                 .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &subject);
@@ -2026,7 +2113,7 @@ impl PacketProcessor {
         raw: &[u8],
         src: SocketAddr,
     ) -> ConnectDecision {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return ConnectDecision::Reject(self.encode_auth_challenge(msg, src));
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2157,7 +2244,7 @@ impl PacketProcessor {
         raw: &[u8],
         src: SocketAddr,
     ) -> ConnBindDecision {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return ConnBindDecision::Reject(self.encode_auth_challenge(msg, src));
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2222,7 +2309,7 @@ impl PacketProcessor {
     }
 
     fn handle_refresh(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2242,6 +2329,7 @@ impl PacketProcessor {
         let token_max_lifetime = resolution.max_lifetime_secs;
         let realm = resolution.realm;
         let tenant_id = resolution.tenant_id;
+        let subject = resolution.subject;
 
         let mut lifetime = msg
             .get_lifetime()
@@ -2263,7 +2351,10 @@ impl PacketProcessor {
             lifetime = lifetime.min(max);
         }
         if lifetime > 0 {
-            let username = msg.get_username().unwrap_or("");
+            // The raw USERNAME, as before. A USERHASH request has none; for it
+            // the resolved name stands in, which for a long-term user — the only
+            // kind a USERHASH can resolve to — is the same string.
+            let username = msg.get_username().unwrap_or(subject.as_str());
             let (dynamic_max, lifetime_disabled) =
                 self.store
                     .lifetime_policy_for_user(&realm, tenant_id.as_deref(), username);
@@ -2425,7 +2516,7 @@ impl PacketProcessor {
         raw: &[u8],
         src: SocketAddr,
     ) -> Vec<Action> {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2516,7 +2607,7 @@ impl PacketProcessor {
     }
 
     fn handle_channel_bind(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2990,7 +3081,16 @@ mod a3_f4_dont_fragment_tests {
         // Regression guard for the family split: IPPROTO_IP on an AF_INET6 socket
         // does not set DF, so a v6 allocation with DONT-FRAGMENT would silently
         // fragment.
-        let sock = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let sock = match std::net::UdpSocket::bind("[::1]:0") {
+            Ok(s) => s,
+            // A host with IPv6 disabled (EAFNOSUPPORT) cannot exercise this;
+            // skip rather than report a failure that is about the environment,
+            // as `session::v6only_tests` does.
+            Err(e) => {
+                eprintln!("skipping: no IPv6 on this host ({e})");
+                return;
+            }
+        };
         set_dont_fragment(sock.as_raw_fd(), turna_session::RelayFamily::V6)
             .expect("setsockopt IPV6_MTU_DISCOVER should succeed");
 
@@ -3127,5 +3227,225 @@ mod udp_replay_tests {
             [Action::None]
         ));
         assert_eq!(p.metrics.total_allocations.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod userhash_tests {
+    //! RFC 8489 USERHASH through the processor: a request that names its user
+    //! by hash is authenticated like one that names it by USERNAME, and is
+    //! accounted to the same subject.
+    use super::*;
+    use turna_proto_stun::attribute::ATTR_USERHASH;
+
+    const REALM: &str = "hash-test";
+
+    fn password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD
+            .get_or_init(|| {
+                turna_crypto::random_key_32()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .as_str()
+    }
+
+    fn long_term_processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(25000, 25999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                REALM,
+                [("alice", password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    /// A request naming `user` by USERHASH only, signed with
+    /// MESSAGE-INTEGRITY-SHA256 under `pass`.
+    fn hashed_request(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        method: Method,
+        user: &str,
+        pass: &str,
+        extra: Vec<Attribute>,
+    ) -> Bytes {
+        let mut msg = StunMessage::new(method, MessageClass::Request);
+        for a in extra {
+            msg.add(a);
+        }
+        msg.add(Attribute::UserHash(turna_crypto::userhash(user, REALM)));
+        msg.add(Attribute::Realm(REALM.into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key_sha256(user, REALM, pass);
+        let mut buf = [0; 1024];
+        let n = msg.encode_with_integrity_sha256(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn reply(actions: &[Action]) -> StunMessage {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
+    fn error_code(msg: &StunMessage) -> Option<u16> {
+        msg.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    /// The 420 this replaces: USERHASH (0x001E) is comprehension-required, and
+    /// before it had a typed variant every request carrying it was refused as
+    /// an unknown attribute.
+    #[test]
+    fn userhash_allocate_refresh_permission_succeed() {
+        let p = long_term_processor();
+        let src: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+        let alloc = hashed_request(
+            &p,
+            src,
+            Method::Allocate,
+            "alice",
+            password(),
+            vec![Attribute::RequestedTransport(17), Attribute::Lifetime(600)],
+        );
+        let actions = p.process(alloc, src);
+        let resp = reply(&actions);
+        assert!(
+            matches!(resp.class, MessageClass::SuccessResponse),
+            "USERHASH Allocate must succeed, got {:?}",
+            error_code(&resp)
+        );
+        // Signed with the SHA-256 key the client used (RFC 8489 §9.2.4).
+        assert!(resp.get_message_integrity_sha256().is_some());
+        // Accounted to the resolved user, not to an empty USERNAME.
+        assert_eq!(p.store.get(&src).unwrap().username, "alice");
+
+        let perm = hashed_request(
+            &p,
+            src,
+            Method::CreatePermission,
+            "alice",
+            password(),
+            vec![Attribute::XorPeerAddress("8.8.8.8:9".parse().unwrap())],
+        );
+        assert!(matches!(
+            reply(&p.process(perm, src)).class,
+            MessageClass::SuccessResponse
+        ));
+
+        let refresh = hashed_request(
+            &p,
+            src,
+            Method::Refresh,
+            "alice",
+            password(),
+            vec![Attribute::Lifetime(0)],
+        );
+        let actions = p.process(refresh, src);
+        assert!(matches!(
+            reply(&actions).class,
+            MessageClass::SuccessResponse
+        ));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CloseRelay { .. })));
+    }
+
+    #[test]
+    fn unknown_userhash_is_challenged_not_420() {
+        let p = long_term_processor();
+        let src: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let req = hashed_request(
+            &p,
+            src,
+            Method::Allocate,
+            "mallory",
+            "whatever",
+            vec![Attribute::RequestedTransport(17)],
+        );
+        let resp = reply(&p.process(req, src));
+        // RFC 8489 §9.2.4: an invalid USERHASH is answered 401.
+        assert_eq!(error_code(&resp), Some(401));
+        assert!(!resp
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::UnknownAttributes(v) if v.contains(&ATTR_USERHASH))));
+    }
+
+    /// TURN REST cannot resolve a hash; the answer is 401, never a crash, a
+    /// 420 or an allocation keyed to an empty name.
+    #[test]
+    fn shared_secret_realm_answers_userhash_with_401() {
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(26000, 26999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::SharedSecret {
+                realm: REALM.into(),
+                secret: b"rest-secret".to_vec(),
+                previous: None,
+            })),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        );
+        let src: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let req = hashed_request(
+            &p,
+            src,
+            Method::Allocate,
+            "4102444800:alice",
+            "irrelevant",
+            vec![Attribute::RequestedTransport(17)],
+        );
+        assert_eq!(error_code(&reply(&p.process(req, src))), Some(401));
+        assert!(p.store.get(&src).is_none());
+    }
+
+    #[test]
+    fn nonce_cookie_round_trips_and_marks_username_anonymity() {
+        let mgr = NonceManager::with_cookie(Some(USERHASH_NONCE_COOKIE));
+        let src: SocketAddr = "127.0.0.1:41004".parse().unwrap();
+        let nonce = mgr.issue(src);
+        // RFC 8489 §9.2: "obMatJos2" + base64 of the 24 feature bits. Bit 1
+        // (Username anonymity) set, bit 0 (Password algorithms) clear.
+        // "QAAA" is base64 of 0x40 0x00 0x00: 010000|000000|000000|000000.
+        assert!(nonce.starts_with("obMatJos2QAAA"), "{nonce}");
+        assert!(matches!(mgr.validate(src, &nonce), NonceStatus::Valid));
+
+        // A cookie-less nonce (issued before the cookie was turned on) is stale.
+        let plain = NonceManager::with_cookie(None);
+        let old = plain.issue(src);
+        assert!(!old.starts_with("obMatJos2"));
+        assert!(matches!(mgr.validate(src, &old), NonceStatus::Stale));
+    }
+
+    #[test]
+    fn cookie_is_withheld_unless_every_realm_resolves_userhash() {
+        let lt = AuthRegistry::new(turna_auth::AuthMode::long_term(REALM, [("a", "b")]));
+        assert_eq!(PacketProcessor::nonce_cookie_for(&lt, false), None);
+        assert_eq!(
+            PacketProcessor::nonce_cookie_for(&lt, true),
+            Some(USERHASH_NONCE_COOKIE)
+        );
+        let mixed = AuthRegistry::new(turna_auth::AuthMode::long_term(REALM, [("a", "b")]))
+            .with_tenant(
+                "t",
+                turna_auth::AuthMode::SharedSecret {
+                    realm: "other".into(),
+                    secret: b"s".to_vec(),
+                    previous: None,
+                },
+            );
+        assert_eq!(PacketProcessor::nonce_cookie_for(&mixed, true), None);
     }
 }
