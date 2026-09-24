@@ -68,7 +68,7 @@ impl CryptoCbc {
         payload.extend_from_slice(&mac);
 
         let mut iv: Vec<u8> = vec![0; Self::BLOCK_SIZE];
-        rand::thread_rng().fill(iv.as_mut_slice());
+        rand::rng().fill_bytes(iv.as_mut_slice());
 
         // cipher 0.5 has its own InvalidLength; report it as the same Error::Aes the
         // other suites (cipher 0.4) produce.
