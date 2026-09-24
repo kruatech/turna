@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — benchmark and migration docs
+
+- `bench/matrix.sh` compares turna with a pinned coturn on allocation rate, ChannelData
+  relay pps/Mbit/s/loss, resident memory per allocation and server CPU, writing
+  CSV/JSON/Markdown with host and version metadata. No numbers are published yet;
+  they must come from dedicated hardware.
+- `turna-load-test`: `--server-pid`, `hold` mode, `allocate --fresh`,
+  `binding --sockets-per-task`, wider `--source-ips`; the measured window now
+  excludes teardown.
+- `docs/migrating-from-coturn.md` maps all 125 options of coturn's reference
+  `turnserver.conf`; `check-doc-claims.sh` verifies the mapped keys exist.
+
+### Fixed — docs and benchmark
+
+- Migration/compliance docs no longer say RFC 6062 is refused in production, that
+  `relay-ip` has no equivalent, or that OAuth and runtime user management are
+  unimplemented.
+- `bench/turna.toml` failed validation; the relay scenario called a non-existent
+  subcommand; `coturn.conf` used an option coturn does not have.
+
 ### Changed
 
 - Tooling: the workspace declares `rust-version = "1.95"` (the toolchain the
