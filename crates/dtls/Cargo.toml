@@ -21,6 +21,7 @@
 name = "turna-dtls"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "DTLS 1.2 for the turna TURN datapath, derived from webrtc-dtls"
 publish = false

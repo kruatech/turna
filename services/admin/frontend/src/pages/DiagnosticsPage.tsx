@@ -33,7 +33,6 @@ export function DiagnosticsPage({ status, metrics, frozen }: PanelProps) {
   const hasPool    = poolSlots.length > 0
 
   // QUIC/DTLS
-  const quicBytesRx = metricOr(metrics, 'turna_quic_bytes_rx_total', 0)  // note: may not exist
   const quicActive  = metricOr(metrics, 'turna_quic_active_sessions', 0)
   const dtlsActive  = metricOr(metrics, 'turna_dtls_active_sessions', 0)
   const dtlsBytesRx = metricOr(metrics, 'turna_dtls_bytes_rx_total', 0)
