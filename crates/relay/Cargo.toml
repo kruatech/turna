@@ -23,7 +23,6 @@ parking_lot.workspace = true
 turna-common.workspace = true
 turna-proto-stun.workspace = true
 turna-proto-turn.workspace = true
-turna-proto-rtp.workspace = true
 turna-transport.workspace = true
 turna-cluster.workspace = true
 turna-session.workspace = true

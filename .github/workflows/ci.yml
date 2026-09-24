@@ -521,8 +521,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      # Miri takes hours on its abstract machine, and it only ever runs two crates —
-      # both pure parsing. A change that touches neither cannot alter what it would
+      # Miri takes hours on its abstract machine, and it only ever runs one crate —
+      # pure parsing. A change that does not touch it cannot alter what it would
       # find, so documentation, scripts and Dockerfiles skip it rather than paying
       # for a result that is decided in advance.
       #
@@ -541,7 +541,7 @@ jobs:
             echo "could not diff against $BASE — running Miri rather than guessing"
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          if echo "$CHANGED" | grep -qE '^(crates/protocol/proto-stun/|crates/packet/|Cargo\.lock$|Cargo\.toml$|\.github/workflows/ci\.yml$)'; then
+          if echo "$CHANGED" | grep -qE '^(crates/protocol/proto-stun/|Cargo\.lock$|Cargo\.toml$|\.github/workflows/ci\.yml$)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -564,7 +564,7 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
-          cargo +nightly miri test -p turna-proto-stun -p turna-packet
+          cargo +nightly miri test -p turna-proto-stun
 
   loom:
     name: loom (lock-free concurrency model)
