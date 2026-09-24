@@ -12,6 +12,8 @@ pub mod buffer;
 pub mod hugepages;
 pub mod migration;
 pub mod probe;
+/// HAProxy PROXY protocol v1/v2 (receiving side) for the TCP listeners.
+pub mod proxy_protocol;
 pub mod quic;
 pub mod ratelimit;
 pub mod select;
