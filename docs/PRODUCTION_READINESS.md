@@ -82,7 +82,7 @@ Production checklist:
 | TURN-over-SCTP | **Supported on Linux/tokio** | Opt-in native SCTP, allowed in production; requires kernel support and IP protocol 132 reachability. Plaintext, UDP peer-side relay. [Evidence](verification/sctp-supported-2026-09-18.md). |
 | Third-party auth (RFC 7635 OAuth) | **Refused in production** | Same gate on `[turn.auth.oauth].enabled`. |
 | IPv6 relayed transport | Opt-in, verified | Set `[turn] external_ip6` to a routable IPv6 address. Unset (default) keeps the old behaviour: IPv6 Allocate → `440`. Relayed media verified between two **routable** global v6 addresses with the peer filter in its `lan` profile and no loopback concession (`docs/interop/relayed-media-2026-08-19.md`), plus interop against coturn's client (`docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. |
-| DTLS | Beta, optional feature | Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics, bounded accept (`accept_timeout_secs`). On the **default** path pre-handshake rate limiting is still missing — do not expose to an untrusted internet without upstream rate limiting. `[turn.dtls] demux = true` adds it, plus concurrent handshakes and certificate hot-reload, but is itself unverified. |
+| DTLS | **Supported**, optional feature | Verified on the shipped stack (`crates/dtls`): interop with OpenSSL and coturn's client, a 300 000-packet spoofed-source flood that allocates no state, and 24 h under load with zero packet loss (`docs/interop/dtls-stack-2026-09-16.md`, `docs/soak/soak-24h-dtls-2026-09-15.md`). The default path is `[turn.dtls] demux = true` (since 0.5.0): concurrent handshakes, pre-handshake admission, per-IP handshake rate limit, certificate hot-reload. `demux = false` selects the stock listener, which has neither the rate limit nor hot reload. Session and per-IP caps, idle reaper, bounded egress, MTU enforcement, metrics. |
 | QUIC / WebTransport | Optional features; supported on Linux/macOS with tokio | Project-specific TURN mappings. Functional, lifecycle/limits, 20-minute load and WAN checks recorded; WebTransport also has Chrome browser evidence. DATAGRAM delivery is unreliable. No multi-day endurance or independent raw-QUIC TURN interoperability claim. See [support record](verification/quic-webtransport-supported-2026-09-18.md). |
 | io_uring | Supported on Linux, opt-in | Explicit `transport = "io_uring"`, built with `io-uring`. Tested kernels 6.8.0-87 and 6.14.0-33; 134 MiB and 1073 MiB RSS respectively in different worker/host configurations, not a kernel-only comparison. [Evidence and deployment scope](verification/io-uring-supported-2026-09-19.md). |
 | AF_XDP | Supported within verified Linux IPv4 UDP copy-mode scope | Opt-in; SKB/native copy on Linux 6.8.0-87 / `virtio_net`, two queues. Zero-copy unverified; prior WAN churn timeouts unexplained. [Evidence](verification/af-xdp-supported-2026-09-22.md). |
@@ -162,8 +162,8 @@ Known residual gaps, per transport:
   the UDP demultiplexer so handshakes run concurrently instead of serially inside
   `accept()` — implemented as `[turn.dtls] demux = true`, which is the default
   and brings pre-handshake admission, a per-IP handshake rate limit, certificate
-  hot-reload and observable handshake failures. (This paragraph said "off by
-  default" until 0.5.0; it had been on since 0.4.1.) DTLS 1.2 only.
+  hot-reload and observable handshake failures. (Earlier revisions of this
+  paragraph said "off by default"; demux is the default since 0.5.0.) DTLS 1.2 only.
 
   **Re-verified against the shipped stack on 2026-09-16** —
   `docs/interop/dtls-stack-2026-09-16.md`. A spoofed flood of 300 000 valid
@@ -209,9 +209,10 @@ Known residual gaps, per transport:
   - **TURNS — supported.** Browser interop across three engines, a Let's Encrypt
     chain validated by a verifying client, coturn interop, and 24 h under load
     with zero relayed-frame loss.
-  - **DTLS — beta with interop.** Allocation and media on both listener paths,
-    20 min under load, and agreement with coturn's client
-    (`docs/interop/coturn-2026-08-23.md`) — an implementation nobody here wrote.
+  - **DTLS — supported.** Allocation and media on both listener paths, interop
+    with OpenSSL and coturn's client (`docs/interop/coturn-2026-08-23.md`,
+    `docs/interop/dtls-stack-2026-09-16.md`), and 24 h under load on the shipped
+    stack (`docs/soak/soak-24h-dtls-2026-09-15.md`).
   - **WebTransport — supported.** Browser and transport verification within the
     scope in [the support record](verification/quic-webtransport-supported-2026-09-18.md).
   - **QUIC — supported.** Maintained project-specific TURN mapping. Independent
@@ -476,9 +477,9 @@ feature before enabling it in front of users.
 - `max_bytes_per_sec_per_allocation` is bytes/second. `TopTalker.bandwidth_bps` and load metrics
   are telemetry in bits/second and are intentionally separate.
 
-## Still experimental / partial — the short list
+## Opt-in transports and datapaths — the short list
 
-Everything below is opt-in and none of it is on the supported path. The
+Everything below is opt-in; each row states its own support scope. The
 authoritative per-feature register is `docs/protocol-gap.md`.
 
 | Area | State |
@@ -488,8 +489,8 @@ authoritative per-feature register is `docs/protocol-gap.md`.
 | QUIC (`quic`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
 | WebTransport (`web-transport`) | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See `docs/verification/quic-webtransport-supported-2026-09-18.md`. |
 | TURNS | **Supported** — three-engine interop, public certificate chain, coturn interop, 24 h under load (R4) |
-| DTLS | Beta — allocation and media on both listener paths, 20 min under load, **and interop against coturn's client** (R4) |
-| DTLS demux (`demux = true`) | Opt-in, no evidence yet — concurrent handshakes, pre-handshake admission, rate limit, cert reload |
+| DTLS | **Supported** — interop with OpenSSL and coturn's client, spoofed-source flood resistance, 24 h under load on the shipped stack (R4) |
+| DTLS demux (`demux = true`) | Default since 0.5.0 — concurrent handshakes, pre-handshake admission, rate limit, cert reload; `scripts/verify/dtls-demux.sh` 9/9 and a 24 h soak (`docs/soak/soak-24h-dtls-2026-09-01.md`) |
 | mTLS for TURNS clients | Opt-in (`[tls] client_ca`), verified incl. the refusal case; no CRL/OCSP by design |
 | SCTP | Supported on Linux/tokio; plaintext, native SCTP (R9) |
 | OAuth | Refused in production (R9) |
