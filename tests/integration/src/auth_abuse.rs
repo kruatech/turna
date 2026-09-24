@@ -315,3 +315,181 @@ fn binding_stays_anonymous_by_default() {
     assert!(is_success(&resp));
     assert!(extract_xor_mapped_address(&resp).is_some());
 }
+
+/// A minimal credential endpoint for `[turn.auth.webhook]`: `hookuser` is
+/// found (by password), every other name is 404. Counts the requests it served.
+fn webhook_stub(password: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let url = format!("http://{}/turn/credentials", l.local_addr().unwrap());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_out = hits.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read headers, then the declared body.
+            loop {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let cl = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= h + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let req = String::from_utf8_lossy(&buf);
+            let (status, body) = if req.contains("\"username\":\"hookuser\"") {
+                ("200 OK", format!("{{\"password\":\"{password}\"}}"))
+            } else {
+                ("404 Not Found", "{}".to_string())
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    (url, hits_out)
+}
+
+/// Send `req` the way a STUN client does over UDP — retransmitting until an
+/// answer arrives — and return the answer.
+async fn with_retransmission(
+    socket: &UdpSocket,
+    target: SocketAddr,
+    req: &[u8],
+) -> Option<Vec<u8>> {
+    for _ in 0..6 {
+        if let Some((resp, _)) = send_recv(socket, target, req, 500).await {
+            return Some(resp);
+        }
+    }
+    None
+}
+
+/// `[turn.auth.webhook]` end to end: a user the node has never heard of is
+/// looked up on the endpoint and allocates; an unknown one gets a 401; the
+/// endpoint is asked once per user thanks to the cache.
+#[test]
+fn auth_webhook_resolves_unknown_users_through_the_endpoint() {
+    let password = std::env::var("TURNA_TEST_PW_V1").expect("source .env.test");
+    let (url, hits) = webhook_stub(password.clone());
+    let Some(node) = boot_with_users(
+        &format!("[turn.auth.webhook]\nenabled = true\nurl = \"{url}\"\ntimeout_ms = 1000\n"),
+        "",
+        "",
+        false,
+    ) else {
+        return;
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (ok, ghost, again) = rt.block_on(async {
+        let s = bind_socket().await;
+        let (realm, nonce) = challenge(&s, node.turn).await.expect("challenge");
+        let build = |user: &str, pass: &str| {
+            let key = long_term_key(user, &realm, pass);
+            let mut m = TurnMsg::request(0x0003);
+            m.add_requested_transport();
+            m.add_lifetime(600);
+            m.add_username(user);
+            m.add_realm(&realm);
+            m.add_nonce(&nonce);
+            m.encode_with_integrity(&key)
+        };
+        let ok = with_retransmission(&s, node.turn, &build("hookuser", &password)).await;
+        let ghost_sock = bind_socket().await;
+        let (realm2, nonce2) = challenge(&ghost_sock, node.turn).await.expect("challenge");
+        let key = long_term_key("ghost", &realm2, &password);
+        let mut g = TurnMsg::request(0x0003);
+        g.add_requested_transport();
+        g.add_username("ghost");
+        g.add_realm(&realm2);
+        g.add_nonce(&nonce2);
+        let ghost =
+            with_retransmission(&ghost_sock, node.turn, &g.encode_with_integrity(&key)).await;
+        // A second allocation for the same user from another socket is served
+        // from the cache: no new request to the endpoint.
+        let other = bind_socket().await;
+        let (realm3, nonce3) = challenge(&other, node.turn).await.expect("challenge");
+        let key = long_term_key("hookuser", &realm3, &password);
+        let mut a = TurnMsg::request(0x0003);
+        a.add_requested_transport();
+        a.add_username("hookuser");
+        a.add_realm(&realm3);
+        a.add_nonce(&nonce3);
+        let again = send_recv(&other, node.turn, &a.encode_with_integrity(&key), 2000)
+            .await
+            .map(|(r, _)| r);
+        (ok, ghost, again)
+    });
+    let ok = ok.expect("the webhook user must be answered after at most a retransmission");
+    assert!(is_success(&ok), "allocation for a webhook-resolved user");
+    let ghost = ghost.expect("an unknown user is answered");
+    assert_eq!(extract_error_code(&ghost).map(|(c, _)| c), Some(401));
+    let again = again.expect("the cached user is answered on the first try");
+    assert!(is_success(&again));
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one endpoint request per user: hookuser and ghost"
+    );
+    std::thread::sleep(Duration::from_millis(5_500)); // cache counters mirror every 5 s
+    assert!(metric_value(&node.health, "turna_auth_webhook_requests_total") >= 2.0);
+    assert!(metric_value(&node.health, "turna_auth_webhook_cache_hits_total") >= 1.0);
+    assert!(metric_value(&node.health, "turna_auth_webhook_not_found_total") >= 1.0);
+}
+
+/// Fail closed: an endpoint that is down refuses the user (500), it does not
+/// let them in and it does not pretend they are unknown.
+#[test]
+fn auth_webhook_fails_closed_when_the_endpoint_is_down() {
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let Some(node) = boot_with_users(
+        &format!(
+            "[turn.auth.webhook]\nenabled = true\nurl = \"http://127.0.0.1:{dead}/x\"\n\
+             timeout_ms = 300\nerror_ttl_secs = 30\n"
+        ),
+        "",
+        "",
+        false,
+    ) else {
+        return;
+    };
+    let password = std::env::var("TURNA_TEST_PW_V1").expect("source .env.test");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let resp = rt.block_on(async {
+        let s = bind_socket().await;
+        let (realm, nonce) = challenge(&s, node.turn).await.expect("challenge");
+        let key = long_term_key("hookuser", &realm, &password);
+        let mut m = TurnMsg::request(0x0003);
+        m.add_requested_transport();
+        m.add_username("hookuser");
+        m.add_realm(&realm);
+        m.add_nonce(&nonce);
+        with_retransmission(&s, node.turn, &m.encode_with_integrity(&key)).await
+    });
+    let resp = resp.expect("a refusal, not silence");
+    assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(500));
+    assert!(metric_value(&node.health, "turna_auth_webhook_unavailable_total") >= 1.0);
+}

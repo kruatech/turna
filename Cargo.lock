@@ -4452,6 +4452,7 @@ dependencies = [
  "hostname",
  "libc",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "sysinfo",
