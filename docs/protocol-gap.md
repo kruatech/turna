@@ -509,7 +509,10 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   both families. PADDING (0x0026) and RESPONSE-PORT (0x0027) are deliberately **not**
   implemented: both are optional for a server (§7.5, §7.6) and both are the
   amplification tools §10 discusses, so they stay comprehension-required unknowns and
-  are answered 420.
+  are answered 420. A **malformed** CHANGE-REQUEST, RESPONSE-ORIGIN, OTHER-ADDRESS or
+  USERHASH decodes as `Attribute::Unknown`, exactly as before the attributes were
+  typed, so it never fails the whole message: the two comprehension-optional ones are
+  ignored and the two comprehension-required ones still get 420.
 - **Service**: `relay::nat_discovery` binds A1:P1, A1:P2, A2:P1, A2:P2 (§6) and
   answers Binding only, choosing the reply socket from Table 1 (§6.1) —
   `PacketProcessor::handle_nat_discovery`. Responses carry XOR-MAPPED-ADDRESS **and**

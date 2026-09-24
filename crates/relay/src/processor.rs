@@ -4242,3 +4242,82 @@ mod tcp_relay_peer_permission_tests {
         assert!(!p.peer_connection_permitted(client, "8.8.8.8:1".parse().unwrap()));
     }
 }
+
+#[cfg(test)]
+mod malformed_typed_attribute_tests {
+    //! Typing RESPONSE-ORIGIN, OTHER-ADDRESS, CHANGE-REQUEST and USERHASH must
+    //! not change what the TURN listener does with a malformed one: the two
+    //! optional ones are still ignored, the two required ones still get 420.
+    use super::*;
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(31000, 31099, 8)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "m",
+                [("u", "p")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    fn reply(p: &PacketProcessor, method: Method, typ: u16, value: Vec<u8>) -> StunMessage {
+        let mut m = StunMessage::new(method, MessageClass::Request);
+        m.add(Attribute::Unknown {
+            attr_type: typ,
+            value,
+        });
+        let mut buf = [0u8; 256];
+        let n = m.encode(&mut buf).unwrap();
+        let src: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        p.process(Bytes::copy_from_slice(&buf[..n]), src)
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("the request must be answered, not dropped as undecodable")
+    }
+
+    #[test]
+    fn malformed_optional_address_in_binding_is_ignored() {
+        let p = processor();
+        for typ in [
+            turna_proto_stun::attribute::ATTR_RESPONSE_ORIGIN,
+            turna_proto_stun::attribute::ATTR_OTHER_ADDRESS,
+        ] {
+            // Family 0x07 does not exist.
+            let r = reply(&p, Method::Binding, typ, vec![0, 0x07, 0, 1, 1, 2, 3, 4]);
+            assert!(
+                matches!(r.class, MessageClass::SuccessResponse),
+                "{typ:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_required_attributes_still_get_420() {
+        let p = processor();
+        for (method, typ, value) in [
+            (
+                Method::Binding,
+                turna_proto_stun::attribute::ATTR_CHANGE_REQUEST,
+                vec![0u8; 8],
+            ),
+            (
+                Method::Allocate,
+                turna_proto_stun::attribute::ATTR_USERHASH,
+                vec![0u8; 20],
+            ),
+        ] {
+            let r = reply(&p, method, typ, value);
+            assert!(
+                r.attributes
+                    .iter()
+                    .any(|a| matches!(a, Attribute::UnknownAttributes(v) if v == &vec![typ])),
+                "{typ:#06x}: expected 420 listing it"
+            );
+        }
+    }
+}

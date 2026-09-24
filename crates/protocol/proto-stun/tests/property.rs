@@ -276,6 +276,23 @@ proptest! {
     }
 }
 
+proptest! {
+    /// RESPONSE-ORIGIN / OTHER-ADDRESS are comprehension-optional: any value,
+    /// however malformed, decodes (as the typed variant or as Unknown) and never
+    /// fails the message — they were ignored as Unknown before they were typed.
+    #[test]
+    fn prop_optional_address_attrs_never_fail_decode(
+        typ in prop_oneof![Just(0x802Bu16), Just(0x802Cu16)],
+        value in proptest::collection::vec(any::<u8>(), 0..40),
+    ) {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        msg.add(Attribute::Unknown { attr_type: typ, value });
+        let mut buf = [0u8; 256];
+        let len = msg.encode(&mut buf).unwrap();
+        prop_assert!(StunMessage::decode(&buf[..len]).is_ok());
+    }
+}
+
 // ── Property: encode length == HEADER + attr_bytes (4-aligned) ───────────────
 
 proptest! {
