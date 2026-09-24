@@ -81,7 +81,7 @@ These are the areas we want to harden, in rough priority order:
 6. **Supply-chain hardening for releases.** The release workflow already
    produces SBOMs, artifact checksums, cosign-signed images and SLSA
    provenance. Every workflow's actions are pinned by commit SHA. Remaining:
-   container image scanning and a declared MSRV.
+   container image scanning.
 7. **Operability.** Clustering ergonomics, runbooks, and dashboards.
 
 ## Contributing to the roadmap
