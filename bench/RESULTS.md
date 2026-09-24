@@ -1,26 +1,22 @@
 # Benchmark results
 
-Template only: fill this in after running `bench/run.sh` on your hardware.
-Do not use placeholder rows as a performance claim.
+Template only: fill this in after running `bench/matrix.sh` on dedicated,
+prepared hardware (bench/PLAN.md). Do not use placeholder rows as a performance
+claim, and never paste a `SMOKE=1` run.
 
 ## Run YYYY-MM-DD
 
 **Hardware:** _e.g. AMD Ryzen 9 5950X, 32GB DDR4-3600, Linux 6.5,
 network: loopback_
 
-**Settings:**
-- `CONCURRENCY=200`
-- `DURATION=30s`
-- turna commit: `<git-sha>`
-- coturn version: `<output of turnserver -V>`
+**Settings:** the `params` block of `meta.json` (or: "defaults except …")
+- turna commit: `<git-sha>` (from `meta.json`; must not be a dirty tree)
+- coturn: `<image digest or package version, from meta.json>`
+- host tuning applied: `<per bench/PLAN.md, or what differed>`
 
-**Results:**
-
-| Run | RPS | p50 (µs) | p95 (µs) | p99 (µs) | Errors |
-|---|---:|---:|---:|---:|---:|
-| turna-bpf-on  | <fill-in> | <fill-in> | <fill-in> | <fill-in> | <fill-in> |
-| turna-bpf-off | <fill-in> | <fill-in> | <fill-in> | <fill-in> | <fill-in> |
-| coturn      | <fill-in> | <fill-in> | <fill-in> | <fill-in> | <fill-in> |
+**Results:** paste `summary.md` from `bench/results/matrix-<timestamp>/`
+(memory per allocation, binding, allocate, relay per payload — each with server
+CPU %), and attach or link `results.csv` / `results.json`.
 
 **Observations / notes:**
 

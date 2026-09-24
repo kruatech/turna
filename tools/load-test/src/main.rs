@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand};
 use tokio::net::UdpSocket;
 use tokio::sync::Barrier;
 
+mod hold;
+mod procfs;
 #[cfg(all(feature = "sctp", target_os = "linux"))]
 mod sctp_client;
 mod turn_client;
@@ -51,6 +53,7 @@ mod tls_client;
 mod transport_probe;
 #[cfg(feature = "web-transport")]
 mod wt_client;
+use hold::{run_hold, HoldParams};
 use turn_client::{Creds, FAMILY_V4, FAMILY_V6};
 
 const STUN_MAGIC: u32 = 0x2112A442;
@@ -104,12 +107,15 @@ struct Cli {
     #[arg(long)]
     bind_ip: Option<String>,
 
-    /// Spread client control sockets over N addresses in 127.0.0.0/8.
+    /// Spread client control sockets over N addresses in 127.0.0.0/8
+    /// (127.0.0.1 upwards, at most 65 534 — see `turn_client::SPREAD_MAX`).
     ///
     /// Defaults to 1 — every client from 127.0.0.1, as before. Raise it when a
-    /// run is meant to measure the server rather than the per-source-IP allocate
-    /// limiter, which is 32/s with a burst of 16: 38 channels from one address
-    /// produced 122 refusals against 59 allocations.
+    /// run is meant to measure the server rather than turna's per-source-IP
+    /// limits: the Allocate limiter (burst 32, 16/s by default — 38 channels from
+    /// one address produced 122 refusals against 59 allocations) and the
+    /// unauthenticated-reply budget (burst 64, 8/s, not configurable), which
+    /// every Binding response and every 401 challenge draws on.
     ///
     /// Linux only. The whole of 127.0.0.0/8 is local there; macOS needs
     /// `ifconfig lo0 alias 127.0.0.2` for each address and will otherwise bind
@@ -118,6 +124,23 @@ struct Cli {
     /// Ignored when --bind-ip is given, and for IPv6 servers.
     #[arg(long, default_value_t = 1)]
     source_ips: u32,
+
+    /// PID of the server under test, for server-side resource figures.
+    ///
+    /// When set (Linux, same host), every load mode samples `/proc/<pid>` at the
+    /// start and end of the *measured* window — after allocation setup and
+    /// `--warmup` — and the JSON gains `server_cpu_pct`, `server_rss_kb_start` and
+    /// `server_rss_kb_end`; the `hold` mode needs it for its per-allocation memory
+    /// figure. Sampled here rather than by the calling script because only this
+    /// process knows where the window starts. See `procfs.rs` for exactly what the
+    /// numbers include.
+    #[arg(long)]
+    server_pid: Option<u32>,
+
+    /// Clock ticks per second for `/proc/<pid>/stat` (USER_HZ). 100 on every
+    /// mainstream Linux ABI; pass `$(getconf CLK_TCK)` to be exact.
+    #[arg(long, default_value_t = 100)]
+    clk_tck: u64,
 }
 
 #[derive(Subcommand, Clone)]
@@ -173,10 +196,52 @@ enum Mode {
     Binding {
         #[arg(short, long, default_value = "10")]
         concurrency: usize,
+        /// Sockets each task rotates through, one request per socket in turn.
+        ///
+        /// With `--source-ips`, each socket is bound on the next spread address,
+        /// so the load arrives from `concurrency × sockets-per-task` sources.
+        /// That is what a Binding benchmark against turna needs: the node
+        /// answers at most 8 unauthenticated replies per second per source
+        /// address (burst 64), so a few sources measure that budget, not the
+        /// server. 1 (the default) keeps one socket per task, as before.
+        #[arg(long, default_value_t = 1)]
+        sockets_per_task: usize,
     },
     Allocate {
         #[arg(short, long, default_value = "100")]
         concurrency: usize,
+        /// Run every cycle as a brand-new client: fresh socket (new 5-tuple),
+        /// unauthenticated Allocate → 401 challenge → authenticated Allocate →
+        /// Refresh(lifetime=0) confirmed. Without it each worker takes the 401
+        /// once and then reuses its socket and nonce, which measures allocation
+        /// bookkeeping but not the challenge round-trip every real client pays.
+        #[arg(long)]
+        fresh: bool,
+    },
+    /// Establish N allocations, hold them, release them — and report the
+    /// server's resident memory before, while held and after release.
+    ///
+    /// This is the per-allocation memory figure: `(rss_held - rss_before) / N`.
+    /// Needs `--server-pid` for the memory fields (they are `null` without it).
+    /// One JSON object on stdout with `--json`, a short report otherwise.
+    Hold {
+        /// Allocations to establish.
+        #[arg(short = 'n', long, default_value_t = 1000)]
+        allocations: usize,
+        /// Allocations set up concurrently. Bounded so the setup does not become
+        /// a flood the server's own rate limiter answers instead of its allocator.
+        #[arg(long, default_value_t = 32)]
+        parallel: usize,
+        /// Seconds to wait after the last allocation before sampling, and again
+        /// after release. Must stay well inside the 300 s permission lifetime:
+        /// nothing is refreshed while held.
+        #[arg(long, default_value_t = 3)]
+        settle: u64,
+        /// Also install one permission and one channel per allocation, which is
+        /// what an allocation carrying a call looks like. Without it the figure
+        /// is for the bare allocation.
+        #[arg(long)]
+        channel: bool,
     },
     ChannelData {
         #[arg(short = 'n', long, default_value = "100")]
@@ -274,8 +339,9 @@ enum Mode {
     /// RFC 6062 TCP relay: Allocate(TCP) → CreatePermission → Connect →
     /// ConnectionBind, then data in both directions.
     ///
-    /// Requires `[turn.tcp_relay] enabled = true` and `production = false` — the
-    /// feature is refused in production precisely for want of this evidence.
+    /// Requires `[turn.tcp_relay] enabled = true` and `[tls]` enabled. (It was
+    /// also refused under `production = true` until 2026-08-25, for want of the
+    /// interop evidence this check and coturn's client then provided.)
     #[cfg(feature = "tls")]
     TcpRelayCheck {
         /// SNI presented in the TURNS handshake. RFC 6062 runs over TURNS here —
@@ -401,6 +467,7 @@ impl Mode {
             Mode::Sctp { .. } => "sctp",
             Mode::Binding { .. } => "binding",
             Mode::Allocate { .. } => "allocate",
+            Mode::Hold { .. } => "hold",
             Mode::ReconnectStorm { .. } => "reconnect-storm",
             Mode::ChannelData { .. } => "channeldata",
             Mode::Conformance { .. } => "conformance",
@@ -445,6 +512,11 @@ struct Stats {
     measure_start_ns: AtomicU64,
     start: Instant,
     running: AtomicBool,
+    /// Server process samples bracketing the measured window (`--server-pid`).
+    /// `srv_start` is re-taken when the warm-up is discarded; `srv_end` when the
+    /// run stops.
+    srv_start: std::sync::Mutex<Option<procfs::ProcSample>>,
+    srv_end: std::sync::Mutex<Option<procfs::ProcSample>>,
 }
 
 impl Stats {
@@ -462,6 +534,8 @@ impl Stats {
             lat_max: 0.into(),
             start: Instant::now(),
             running: true.into(),
+            srv_start: std::sync::Mutex::new(procfs::sample()),
+            srv_end: std::sync::Mutex::new(None),
         }
     }
 
@@ -526,13 +600,43 @@ impl Stats {
         }
         self.measure_start_ns
             .store(self.start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        *self
+            .srv_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = procfs::sample();
     }
 
     fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
     fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
+        // Close the server-side window at the first stop only; a second call
+        // (none today) must not stretch it over teardown.
+        if self.running.swap(false, Ordering::Relaxed) {
+            *self
+                .srv_end
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = procfs::sample();
+        }
+    }
+
+    /// `(cpu %, rss start KiB, rss end KiB)` over the measured window, each
+    /// `None` without `--server-pid` or off Linux.
+    fn server_window(&self) -> (Option<f64>, Option<u64>, Option<u64>) {
+        let start = *self
+            .srv_start
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let end = *self
+            .srv_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let clk = procfs::TARGET.get().map_or(100, |t| t.clk_tck);
+        let cpu = match (&start, &end) {
+            (Some(a), Some(b)) => procfs::cpu_percent(a, b, clk),
+            _ => None,
+        };
+        (cpu, start.map(|s| s.rss_kb), end.map(|s| s.rss_kb))
     }
 
     /// Compute approximate percentile from the bucket histogram.
@@ -587,6 +691,7 @@ impl Stats {
         let sent = self.sent.load(Ordering::Relaxed);
         let recv = self.recv.load(Ordering::Relaxed);
         let errs = self.errs.load(Ordering::Relaxed);
+        let (server_cpu_pct, server_rss_kb_start, server_rss_kb_end) = self.server_window();
         Snapshot {
             label: label.into(),
             mode: mode.into(),
@@ -624,6 +729,9 @@ impl Stats {
                 .iter()
                 .map(|b| b.load(Ordering::Relaxed))
                 .collect(),
+            server_cpu_pct,
+            server_rss_kb_start,
+            server_rss_kb_end,
         }
     }
 }
@@ -649,6 +757,11 @@ struct Snapshot {
     lat_p95_us: u64,
     lat_p99_us: u64,
     lat_buckets: Vec<u64>,
+    /// Server CPU over the measured window, percent of one core (`--server-pid`).
+    server_cpu_pct: Option<f64>,
+    /// Server `VmRSS` at the start / end of the measured window, KiB.
+    server_rss_kb_start: Option<u64>,
+    server_rss_kb_end: Option<u64>,
 }
 
 impl Snapshot {
@@ -704,6 +817,12 @@ impl Snapshot {
             });
             println!("    {l:>8} │ {c:>8} │ {bar}");
         }
+        if let Some(cpu) = self.server_cpu_pct {
+            println!("  Server CPU:  {cpu:.1} % of one core (measured window)");
+        }
+        if let (Some(a), Some(b)) = (self.server_rss_kb_start, self.server_rss_kb_end) {
+            println!("  Server RSS:  {a} KiB → {b} KiB");
+        }
         println!("═══════════════════════════════════════════");
     }
 
@@ -711,6 +830,12 @@ impl Snapshot {
     /// this — hand-rolled format is sufficient and avoids a build-time
     /// cost. Field names are stable; treat as machine contract.
     fn print_json(&self) {
+        println!("{}", self.to_json());
+    }
+
+    /// The JSON line [`print_json`](Self::print_json) prints. Separate so the
+    /// contract can be tested without capturing stdout.
+    fn to_json(&self) -> String {
         // Helper to format the bucket vector as a JSON array.
         let buckets = self
             .lat_buckets
@@ -718,7 +843,7 @@ impl Snapshot {
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        println!(
+        format!(
             "{{\
 \"label\":\"{label}\",\
 \"mode\":\"{mode}\",\
@@ -737,7 +862,10 @@ impl Snapshot {
 \"lat_p99_us\":{lat_p99},\
 \"lat_max_us\":{lat_max},\
 \"lat_buckets_us\":[100,500,1000,5000,10000,50000,100000,500000,1000000,-1],\
-\"lat_bucket_counts\":[{buckets}]\
+\"lat_bucket_counts\":[{buckets}],\
+\"server_cpu_pct\":{cpu},\
+\"server_rss_kb_start\":{rss0},\
+\"server_rss_kb_end\":{rss1}\
 }}",
             label = json_escape(&self.label),
             mode = self.mode,
@@ -755,7 +883,10 @@ impl Snapshot {
             lat_p95 = self.lat_p95_us,
             lat_p99 = self.lat_p99_us,
             lat_max = self.lat_max_us,
-        );
+            cpu = procfs::json_opt_f(self.server_cpu_pct, 1),
+            rss0 = procfs::json_opt(self.server_rss_kb_start),
+            rss1 = procfs::json_opt(self.server_rss_kb_end),
+        )
     }
 }
 
@@ -807,6 +938,7 @@ fn binding_request() -> [u8; 20] {
 async fn run_binding(
     server: SocketAddr,
     concurrency: usize,
+    sockets_per_task: usize,
     duration: Duration,
     warmup: Duration,
     json: bool,
@@ -819,11 +951,27 @@ async fn run_binding(
         let stats = stats.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            let sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-            sock.connect(server).await.unwrap();
+            // Without a spread or --bind-ip, keep the historical wildcard bind:
+            // it is what lets this mode reach a server that is not on loopback.
+            let spread = turn_client::SOURCE_SPREAD.get().copied().unwrap_or(1) > 1
+                || turn_client::BIND_IP.get().is_some();
+            let mut socks = Vec::with_capacity(sockets_per_task.max(1));
+            for _ in 0..sockets_per_task.max(1) {
+                let local = if spread {
+                    turn_client::control_bind_addr(server)
+                } else {
+                    "0.0.0.0:0".to_string()
+                };
+                let sock = UdpSocket::bind(local).await.unwrap();
+                sock.connect(server).await.unwrap();
+                socks.push(sock);
+            }
             let mut buf = [0u8; 1500];
+            let mut next = 0usize;
             barrier.wait().await;
             while stats.is_running() {
+                let sock = &socks[next % socks.len()];
+                next = next.wrapping_add(1);
                 let pkt = binding_request();
                 let t = Instant::now();
                 if sock.send(&pkt).await.is_ok() {
@@ -831,13 +979,24 @@ async fn run_binding(
                     stats
                         .bytes_out
                         .fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                    match tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await {
-                        Ok(Ok(n)) => {
+                    // Match the transaction id: with rotation, a late answer to an
+                    // earlier (timed-out) request can be waiting on this socket,
+                    // and counting it would pair a response with the wrong request.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    let got = loop {
+                        match tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await {
+                            Ok(Ok(n)) if n >= 20 && buf[8..20] == pkt[8..20] => break Some(n),
+                            Ok(Ok(_)) => continue,
+                            _ => break None,
+                        }
+                    };
+                    match got {
+                        Some(n) => {
                             stats.recv.fetch_add(1, Ordering::Relaxed);
                             stats.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                             stats.record_latency(t.elapsed());
                         }
-                        _ => {
+                        None => {
                             stats.errs.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -891,9 +1050,12 @@ async fn run_binding(
 /// Closed-loop authenticated Allocate benchmark.
 ///
 /// Each worker obtains a challenge once, retains its UDP socket and repeats
-/// authenticated Allocate -> confirmed Refresh(0). `recv` counts complete
+/// authenticated Allocate -> confirmed Refresh(0). With `fresh`, every cycle is a
+/// new client instead: new socket, 401 challenge, authenticated Allocate,
+/// confirmed Refresh(0). `recv` counts complete
 /// create/delete cycles; latency includes both operations. Nonce expiry retries
 /// are bounded. Warmup failures remain visible in the final error count.
+#[allow(clippy::too_many_arguments)]
 async fn run_allocate(
     server: SocketAddr,
     concurrency: usize,
@@ -902,6 +1064,7 @@ async fn run_allocate(
     json: bool,
     creds: Creds,
     rtt_ms: u64,
+    fresh: bool,
 ) -> Arc<Stats> {
     let stats = Arc::new(Stats::new());
     let barrier = Arc::new(Barrier::new(concurrency + 1));
@@ -921,7 +1084,7 @@ async fn run_allocate(
                 let measured = measuring.load(Ordering::Acquire);
                 let t = Instant::now();
                 let result = async {
-                    if let Some(current) = session.as_mut() {
+                    if let Some(current) = session.as_mut().filter(|_| !fresh) {
                         current.churn_request(true).await?;
                     } else {
                         session =
@@ -931,6 +1094,10 @@ async fn run_allocate(
                     session.as_mut().unwrap().churn_request(false).await
                 }
                 .await;
+                if fresh && result.is_ok() {
+                    // Deleted and confirmed; the next cycle is a new client.
+                    session = None;
+                }
                 if measured {
                     stats.sent.fetch_add(1, Ordering::Relaxed);
                     match &result {
@@ -1058,7 +1225,11 @@ async fn run_channeldata(
                     return;
                 }
             };
-            let ch: u16 = 0x4000 + (i as u16 & 0x3FFF);
+            // Inside RFC 8656 §12's 0x4000-0x4FFF. The old mask (0x3FFF) reached
+            // 0x7FFF, which RFC 8656 reserves and current coturn refuses unless
+            // `rfc5766-channel-numbers` is set; numbers are per allocation, so
+            // wrapping at 4096 costs nothing.
+            let ch: u16 = 0x4000 + (i as u16 & 0x0FFF);
             if sess.create_permission(peer_addr).await.is_err()
                 || sess.channel_bind(ch, peer_addr).await.is_err()
             {
@@ -1377,9 +1548,9 @@ async fn main() {
     if cli.source_ips > 1 {
         let _ = turn_client::SOURCE_SPREAD.set(cli.source_ips);
         eprintln!(
-            "source spread: clients bound across 127.0.0.1-127.0.0.{} \
+            "source spread: clients bound across 127.0.0.1-{} \
              (Linux only; on macOS these need lo0 aliases)",
-            cli.source_ips.min(250)
+            turn_client::spread_addr(cli.source_ips.min(turn_client::SPREAD_MAX))
         );
     }
 
@@ -1393,6 +1564,18 @@ async fn main() {
                 eprintln!("--bind-ip {ip:?} is not an IP address: {e}");
                 std::process::exit(2);
             }
+        }
+    }
+    if let Some(pid) = cli.server_pid {
+        let _ = procfs::TARGET.set(procfs::Target {
+            pid,
+            clk_tck: cli.clk_tck,
+        });
+        if procfs::sample().is_none() {
+            eprintln!(
+                "--server-pid {pid}: /proc/{pid} is not readable here (not Linux, wrong PID, \
+                 or another PID namespace); server CPU/RSS fields will be null"
+            );
         }
     }
     let dur = Duration::from_secs(cli.duration);
@@ -1667,12 +1850,44 @@ async fn main() {
         std::process::exit(rc);
     }
 
+    if let Mode::Hold {
+        allocations,
+        parallel,
+        settle,
+        channel,
+    } = cli.mode
+    {
+        let report = run_hold(
+            cli.server,
+            &creds,
+            HoldParams {
+                allocations,
+                parallel,
+                settle: Duration::from_secs(settle.min(200)),
+                channel,
+                rtt_ms: cli.rtt_timeout_ms,
+            },
+        )
+        .await;
+        if cli.json {
+            println!("{}", report.to_json(&cli.label));
+        } else {
+            report.print_report();
+        }
+        std::process::exit(if report.established == 0 { 1 } else { 0 });
+    }
+
     let stats = match cli.mode {
-        Mode::Binding { concurrency } => {
+        Mode::Binding {
+            concurrency,
+            sockets_per_task,
+        } => {
             if !cli.json {
-                eprintln!("Mode: STUN Binding (c={concurrency})");
+                eprintln!(
+                    "Mode: STUN Binding (c={concurrency}, {sockets_per_task} socket(s)/task)"
+                );
             }
-            run_binding(cli.server, concurrency, dur, wu, cli.json).await
+            run_binding(cli.server, concurrency, sockets_per_task, dur, wu, cli.json).await
         }
         Mode::ReconnectStorm {
             clients,
@@ -1705,9 +1920,16 @@ async fn main() {
             // worse than no report.
             std::process::exit(0);
         }
-        Mode::Allocate { concurrency } => {
+        Mode::Allocate { concurrency, fresh } => {
             if !cli.json {
-                eprintln!("Mode: Allocate (c={concurrency}, authed full handshake)");
+                eprintln!(
+                    "Mode: Allocate (c={concurrency}, {})",
+                    if fresh {
+                        "fresh client per cycle: 401 → Allocate → Refresh(0)"
+                    } else {
+                        "challenge once per worker, then Allocate → Refresh(0)"
+                    }
+                );
             }
             run_allocate(
                 cli.server,
@@ -1717,9 +1939,11 @@ async fn main() {
                 cli.json,
                 creds,
                 cli.rtt_timeout_ms,
+                fresh,
             )
             .await
         }
+        Mode::Hold { .. } => unreachable!("handled above"),
         #[cfg(any(
             feature = "quic",
             feature = "web-transport",
