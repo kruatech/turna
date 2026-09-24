@@ -278,6 +278,29 @@ it during an incident. Design and rationale: `docs/design/capacity-api.md`.
 | `turna_tls_cert_reload_failures_total` | counter | Failed reloads; the previous certificate stays in service. |
 | `turna_tls_rejected_rate_limit_total` | counter | Handshakes refused by `max_handshakes_per_sec_per_ip`, before `accept()` does any TLS work. Distinct from `rejected_per_ip`, which caps *concurrent* connections: a source that connects and drops in a loop trips this one and never that one. |
 | `turna_tls_alpn_rejected_total` | counter | Connections closed after the handshake because `alpn_required` was set and the client negotiated no ALPN. Non-zero here means either a probe or a real client that does not offer ALPN — check before assuming the former. |
+| `turna_tls_proxy_rejected_total` | counter | Connections refused by the PROXY protocol: a source outside `proxy_protocol_trusted_cidrs`, or a missing, malformed, unsupported or late header. Always 0 unless `[tls] proxy_protocol = true`. Non-zero with a load balancer in front usually means a balancer address missing from the allowlist, or a client reaching the listener around the balancer. |
+
+#### Plain TURN over TCP (`[turn.tcp]`)
+
+The same listener code as TURNS without the handshake, so the same counters
+minus the TLS-only ones (handshake failures/timeouts, certificate reloads,
+ALPN). All read 0 while the listener is disabled, which is the default. There is
+no separate readiness gauge: a listener task that dies marks the node Degraded
+through `turna_backend_readiness`.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_tcp_active_connections` | gauge | Established plain TCP connections. |
+| `turna_tcp_connections_total` | counter | Connections admitted since start. |
+| `turna_tcp_closed_total` | counter | Connections closed. |
+| `turna_tcp_rejected_over_cap_total` | counter | Refused at `max_connections`. |
+| `turna_tcp_rejected_per_ip_total` | counter | Refused at `max_connections_per_ip` (keyed on the PROXY header's address when `proxy_protocol` is on). |
+| `turna_tcp_rejected_rate_limit_total` | counter | Refused by `max_connections_per_sec_per_ip`. |
+| `turna_tcp_idle_timeouts_total` | counter | Closed by `read_timeout_secs`. |
+| `turna_tcp_framing_errors_total` | counter | Invalid or over-sized TURN-over-TCP framing. |
+| `turna_tcp_accept_errors_total` | counter | `accept()` errors survived without stopping the listener. |
+| `turna_tcp_bytes_rx_total` / `turna_tcp_bytes_tx_total` | counter | Bytes in / out. |
+| `turna_tcp_proxy_rejected_total` | counter | Refused by the PROXY protocol, as for `turna_tls_proxy_rejected_total`. 0 unless `[turn.tcp] proxy_protocol = true`. |
 
 #### TURN-over-SCTP (`[turn.sctp]`)
 

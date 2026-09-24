@@ -20,7 +20,8 @@ constraints below are taken from `crates/config/src/lib.rs`.
 | key | type | default | notes |
 |-----|------|---------|-------|
 | `listen` | socket addr | `0.0.0.0:3478` | UDP listen address (IANA STUN/TURN port). |
-| `external_ip` | string | `""` | Public IP advertised to clients. **Required in production** and must parse as a valid IPv4/IPv6 address. |
+| `listen_extra` | array of socket addr | `[]` | Further UDP listen addresses (coturn's repeated `listening-ip`). See [Multiple UDP listeners](#multiple-udp-listeners-listen_extra). |
+| `external_ip` | string | `""` | Public IP advertised to clients. **Required in production** and must parse as a valid IPv4/IPv6 address, or as coturn's `PUBLIC/PRIVATE` mapping — see [1:1 NAT](#11-nat-external_ip--publicprivate). |
 | `realm` | string | `"turna"` | Authentication realm. |
 | `transport` | enum | `tokio` | Datapath backend: `tokio` \| `io_uring` \| `af_xdp` \| `auto` (see below). |
 
@@ -33,6 +34,64 @@ constraints below are taken from `crates/config/src/lib.rs`.
   privileges to bind XSK sockets and load/attach the embedded selective XDP
   program. Never auto-selected. See [the runbook](runbooks/af-xdp.md).
 - `auto` — io_uring when available at runtime, else tokio. Opt-in (dev/bench).
+
+### Multiple UDP listeners (`listen_extra`)
+
+```toml
+[turn]
+listen       = "198.51.100.20:3478"
+listen_extra = ["10.0.0.5:3478", "198.51.100.21:3478"]
+```
+
+Every address is served by the same processor, allocation store, rate limiters
+and peer filter; each gets its own `SO_REUSEPORT` recv workers. STUN/TURN
+responses leave from the socket the request arrived on, and so does relayed
+peer→client data for an allocation made through that listener — a client (or its
+NAT) that only accepts packets from the address it sent to keeps working.
+
+Rules, all checked at startup:
+
+- **tokio only.** `transport = "io_uring"`, `"af_xdp"` and `"auto"` are refused
+  with `listen_extra` set: those backends own a single socket and would leave the
+  extra addresses silently unserved.
+- No duplicates, and no wildcard address (`0.0.0.0` / `[::]`) on the same port
+  as another listener. With `SO_REUSEPORT` the kernel would accept both binds and
+  split one address's traffic between them.
+- A port may not equal `[health]`'s or `[management]`'s, the same rule `listen`
+  has. An address that cannot be bound aborts startup.
+- The addresses join `listen` in the peer filter's unconditional self-deny.
+
+Limitations: an allocation's return path is fixed to the listener it was created
+on, so an RFC 8016 mobility re-key that moves a client to a *different*
+listener keeps sending from the original one. Allocations are keyed by client
+address, as before, so one client source address using two listeners at once is
+one allocation, not two.
+
+There is **one relay address per family**: `[turn.relay] bind_ip` / `bind_ip6`
+(coturn's `relay-ip`) do not take lists. The relayed address is built from a
+single advertised `external_ip` throughout the relay path; per-allocation relay
+addresses are a larger change than this key. Run one node per relay address if
+you need several.
+
+### 1:1 NAT (`external_ip = "PUBLIC/PRIVATE"`)
+
+For a host that only owns a private address which the provider maps 1:1 onto a
+public one (AWS elastic IP, GCP external IP):
+
+```toml
+[turn]
+listen      = "0.0.0.0:3478"
+external_ip = "203.0.113.10/10.0.0.5"   # advertise PUBLIC, relay sockets bind PRIVATE
+```
+
+This is shorthand for `external_ip = "203.0.113.10"` plus `[turn.relay] bind_ip
+= "10.0.0.5"`, which already expressed the same thing and still works. Checked at
+startup: both halves IP literals of the same family, neither unspecified; in
+`external_ip` both must be IPv4 (the private half binds the IPv4 relay sockets —
+put an IPv6 pair in `external_ip6`, whose private half pins `bind_ip6`); and a
+`bind_ip` / `bind_ip6` that names a *different* address than the private half is
+an error rather than a silent choice. The private address joins the peer
+filter's self-deny, as `bind_ip` does.
 
 ---
 
@@ -193,6 +252,11 @@ Requires `--features tls`. Maturity: **beta**.
 | `handshake_burst_per_ip` | u32 | `0` | Burst allowance for the rate limit. `0` = twice the rate. |
 | `alpn_required` | bool | `false` | RFC 7443 strict mode: refuse a client that negotiates no ALPN (`turna_tls_alpn_rejected_total`). Requires `enable_alpn = true` — the combination `alpn_required = true` with `enable_alpn = false` is a startup error. Default `false` = compatible. |
 | `client_ca` | path | `""` | PEM bundle of CAs allowed to sign a TURNS **client** certificate. Empty = no client-certificate verification, which is what a public TURN server wants. Enables mTLS on the TURNS listener only — the management plane keeps its own `[grpc] tls_ca`. |
+| `min_version` | string | `"1.2"` | Lowest TLS version offered: `"1.2"` (TLS 1.2 and 1.3 — the behaviour before this key existed) or `"1.3"`. Nothing older exists in rustls, so coturn's `no-tlsv1` / `no-tlsv1_1` have no counterpart to set. |
+| `cipher_suites` | array of string | `[]` | Allowlist, by rustls name, in preference order. Empty = the rustls defaults (unchanged behaviour). Valid names: `TLS13_AES_256_GCM_SHA384`, `TLS13_AES_128_GCM_SHA256`, `TLS13_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`, `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256`. An unknown or duplicated name is a startup error, as is a list of only TLS 1.2 suites with `min_version = "1.3"`. TLS 1.2 suites also need a key of the matching type (ECDSA vs RSA). Applies to TURNS only: QUIC is TLS 1.3 by definition (RFC 9001) and builds its own rustls config, which these keys do not touch. |
+| `proxy_protocol` | bool | `false` | Expect a HAProxy PROXY protocol header (v1 or v2) on every connection and use its source address as the client's. See [PROXY protocol](#proxy-protocol-tls-and-turntcp). |
+| `proxy_protocol_trusted_cidrs` | array of CIDR | `[]` | Load balancers allowed to send the header. Required, non-empty, when `proxy_protocol = true`. |
+| `proxy_protocol_timeout_secs` | u64 | `5` | Deadline for the header, before the TLS handshake starts. Must be positive when `proxy_protocol = true`. |
 | `require_client_cert` | bool | `false` | Refuse a client that presents no certificate. Requires `client_ca`; the combination `require_client_cert = true` with an empty `client_ca` is a startup error. `false` lets an unauthenticated client through TLS and leaves it to the long-term credential check, which is what makes a staged rollout across an existing fleet possible. **No CRL/OCSP** — same deliberate position as the management plane (`docs/MTLS.md` → Revocation); revoke by rotating the CA. |
 
 Lifecycle notes: the listener drains cooperatively on SIGTERM (it stops
@@ -203,14 +267,74 @@ listener. When a control connection closes, its allocation is released
 immediately — the connection *is* the allocation's 5-tuple — instead of pinning
 a relay port until the lifetime expires.
 
+### PROXY protocol (`[tls]` and `[turn.tcp]`)
+
+Behind a TCP load balancer every connection comes from the balancer, so the
+per-IP caps, handshake and TURN rate limits, peer filter decisions, the
+allocation's 5-tuple, XOR-MAPPED-ADDRESS and every log line would see one
+client. With `proxy_protocol = true` the listener reads a
+[PROXY protocol](https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt)
+header first and uses its source address for all of those. Configured per
+listener: `[tls]` and `[turn.tcp]` each have their own three keys.
+
+- **Trusted sources only.** A connection whose socket address is outside
+  `proxy_protocol_trusted_cidrs` is closed before anything is read. A trusted
+  source that sends no header, a malformed one, an unsupported one, or sends it
+  late is closed too — there is no fallback to the socket address, which would
+  let a client that reaches the listener directly skip the balancer.
+- **Accepted:** v1 `TCP4`/`TCP6`, v2 `PROXY` over TCP/IPv4 or TCP/IPv6 (TLVs
+  skipped). v1 `UNKNOWN`, v2 `LOCAL` and v2 `UNSPEC` — the balancer's own health
+  checks — are served with the socket address, as the specification requires.
+  v2 over UDP or UNIX sockets is refused.
+- Refusals are counted in `turna_tls_proxy_rejected_total` /
+  `turna_tcp_proxy_rejected_total`.
+- Configure the balancer to send the header (HAProxy `send-proxy` /
+  `send-proxy-v2`, AWS NLB target-group attribute `proxy_protocol_v2.enabled`).
+  With TURNS the balancer must pass TLS through (TCP mode), not terminate it.
+
+---
+
+## `[turn.tcp]` — plain TURN over TCP (opt-in)
+
+`turn:host:3478?transport=tcp`, without TLS. **Disabled by default.** TURNS is the
+better TCP fallback — it gets through firewalls that inspect or block other TCP
+ports, and it keeps the TURN control traffic off the wire in the clear — and the
+default ICE configuration in the README does not use this listener. It exists
+for deployments whose clients are already configured with the plain-TCP URL.
+
+It is the TURNS listener without the handshake: framing, caps, idle timeout,
+cooperative drain, release-on-close and PROXY protocol behave identically, and
+RFC 6062 TCP relay works over it (§4.1 allows a TCP control connection). Needs
+the `tls` build feature (a default one; a build without it refuses to start with
+`[turn.tcp]` enabled) and `transport = "tokio"`. Counters are the
+`turna_tcp_*` family in [OBSERVABILITY.md](OBSERVABILITY.md).
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Enable the listener. |
+| `listen` | socket addr | `0.0.0.0:3478` | TCP. Same number as the UDP listener, which does not conflict (different protocol). Must not equal `[tls] listen`'s port, `[health]`'s or `[management]`'s. |
+| `max_frame_size` | usize | `65536` | Max framed STUN/ChannelData message, `20..=65555`. |
+| `read_timeout_secs` | u64 | `300` | Per-connection idle read timeout. Must be > 0. |
+| `max_connections` | usize | `10000` | Global connection cap. Must be > 0. |
+| `max_connections_per_ip` | usize | `64` | Per-source-IP cap (`0` = unlimited). |
+| `max_connections_per_sec_per_ip` | u32 | `0` | Per-source-IP new-connection rate (`0` = unlimited). |
+| `connection_burst_per_ip` | u32 | `0` | Burst allowance. `0` = twice the rate. |
+| `proxy_protocol` | bool | `false` | As in `[tls]`. |
+| `proxy_protocol_trusted_cidrs` | array of CIDR | `[]` | As in `[tls]`. |
+| `proxy_protocol_timeout_secs` | u64 | `5` | As in `[tls]`. |
+
+Publish `3478/tcp` (firewall, container, Helm chart) yourself when you enable it;
+the shipped deployment files only publish what is on by default.
+
 ---
 
 ## `[turn.tcp_relay]` — RFC 6062 TCP relay allocations
 
 Lets a client relay **TCP** to peers (`CONNECT` / `CONNECTION-BIND`) instead of
-UDP. Disabled by default. **Requires `[tls]` enabled:** RFC 6062 §4.1 mandates a
-TCP/TLS control connection, and an Allocate with `REQUESTED-TRANSPORT = 6`
-arriving over UDP, DTLS or QUIC is refused with `400 Bad Request`.
+UDP. Disabled by default. **Requires `[tls]` or `[turn.tcp]` enabled:** RFC 6062
+§4.1 mandates a TCP/TLS control connection, and an Allocate with
+`REQUESTED-TRANSPORT = 6` arriving over UDP, DTLS or QUIC is refused with
+`400 Bad Request`.
 
 > **Refused in production.** With `production = true`, config validation rejects
 > `enabled = true` and the node does not start. The feature is implemented and
