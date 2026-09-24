@@ -47,7 +47,7 @@ members = [
     "tests/integration",
     "tests/soak",
     "services/admin",]
-# fuzz — изолированный workspace для cargo-fuzz (как и было)
+# fuzz — isolated workspace for cargo-fuzz (as before)
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -59,21 +59,21 @@ homepage = "https://github.com/kruatech/turna"
 readme = "README.md"
 keywords = ["turn", "stun", "webrtc", "relay", "rfc8656"]
 categories = ["network-programming"]
-# publish = false убран: крейты должны быть доступны как git-зависимость
-# (для crates.io потребуется дополнительно description у каждого крейта)
+# publish = false removed: crates must be usable as a git dependency
+# (crates.io would additionally require a description on each crate)
 
 [workspace.dependencies]
-# async runtime / основа
+# async runtime / foundation
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 thiserror = "2"
 
-# сериализация / конфиг
+# serialization / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
 
-# криптография STUN/TURN (RFC 5389/5766: long-term credentials)
+# STUN/TURN cryptography (RFC 5389/5766: long-term credentials)
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -98,7 +98,7 @@ zeroize = "1"
 # through the old rand, until the rand 0.10 update. If any of these ever comes
 # back, it comes back with those two conditions.
 
-# наблюдаемость
+# observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.32"
@@ -107,7 +107,7 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.33"
 hostname = "0.3"
 
-# структуры данных
+# data structures
 dashmap = "6"
 # Hot-path locks: parking_lot has no poison state, so a panic while holding a
 # lock can't cascade into worker-wide crashes via downstream .unwrap().
@@ -118,7 +118,7 @@ parking_lot = "0.12"
 arc-swap = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
-# workspace-крейты
+# workspace crates
 turna-common        = { path = "crates/common" }
 turna-dtls          = { path = "crates/dtls" }
 turna-proto-stun    = { path = "crates/protocol/proto-stun" }
@@ -140,10 +140,10 @@ turna-observability = { path = "crates/observability" }
 turna-control       = { path = "crates/control" }
 turna-management    = { path = "crates/management" }
 
-# ВЫРЕЗАНО из исходного workspace (использовалось только SFU/сиротами):
-#   aes, openssl, tokio-tungstenite, futures-util — проверить, что сборка
-#   проходит без них; если какой-то крейт их всё же тянет напрямую через
-#   .workspace = true, вернуть соответствующую строку.
+# REMOVED from the original workspace (used only by the SFU/orphans):
+#   aes, openssl, tokio-tungstenite, futures-util — verify that the build
+#   passes without them; if some crate still pulls them directly via
+#   .workspace = true, restore the corresponding line.
 
 [profile.release]
 lto = "thin"
