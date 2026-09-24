@@ -80,7 +80,7 @@ export const en: Record<string, string> = {
   'bp.warn': 'Drops rising — send-queue backpressure',
   'panel.transports': 'Experimental transports',
 
-  'panel.rtp': 'RTP / SFU',
+  'panel.rtp': 'RTP media quality',
   'rtp.streams': 'Active RTP streams',
   'rtp.avgLoss': 'Average loss',
   'rtp.none': 'No active RTP streams',
@@ -304,4 +304,12 @@ export const en: Record<string, string> = {
   'users.usernameRequired': 'Username is required for user scope',
   'users.patchRequired': 'Select at least one limit field',
   'users.versionInvalid': 'Expected version must be a non-negative integer',
+  'rtp.lossNow': 'Loss (last interval)',
+  'rtp.lossNowSub': 'lost / expected since the previous poll',
+  'rtp.jitterP95': 'Jitter p95',
+  'rtp.lossP95': 'Stream loss p95',
+  'rtp.outOfOrder': 'Out of order',
+  'rtp.lostOf': 'lost of',
+  'rtp.lossChart': 'RTP loss per poll interval',
+  'rtp.note': 'Measured from RTP headers on relayed media (SRTP headers are in the clear). Loss and ordering are exact per stream; jitter uses a guessed clock rate (48 kHz for PT 0/8/111, 90 kHz otherwise), so read it as a trend. p95 values cover 5-second samples since the node started.',
 }

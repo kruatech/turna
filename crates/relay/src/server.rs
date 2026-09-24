@@ -534,7 +534,6 @@ impl RelayServer {
         let cleanup_handle = {
             let store = self.processor.store().clone();
             let metrics = self.processor.metrics().clone();
-            let rtp = self.processor.rtp_analyzer().clone();
             let processor_cl = self.processor.clone();
             let relay_sockets_cl = self.relay_sockets.clone();
             let relay_tasks_cl = relay_tasks.clone();
@@ -566,31 +565,10 @@ impl RelayServer {
                             h.abort();
                         }
                     }
-                    let agg = rtp.aggregate();
-                    metrics
-                        .rtp_streams
-                        .store(agg.total_streams, std::sync::atomic::Ordering::Relaxed);
-                    metrics.rtp_avg_loss_pct_x100.store(
-                        (agg.avg_loss_percent * 100.0) as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    metrics.rtp_max_loss_pct_x100.store(
-                        (agg.max_loss_percent * 100.0) as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    metrics.rtp_avg_jitter_us.store(
-                        (agg.avg_jitter_ms * 1000.0) as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    metrics.rtp_max_jitter_us.store(
-                        (agg.max_jitter_ms * 1000.0) as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    metrics.rtp_total_bitrate_kbps.store(
-                        agg.total_bitrate_bps / 1000,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    rtp.cleanup_stale();
+                    // RTP quality is published by the node's sampler
+                    // (`turna_relay::rtp_metrics::publish`), which covers every
+                    // datapath. Sampling here as well would count each interval
+                    // twice.
                 }
             })
         };

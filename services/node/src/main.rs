@@ -1546,6 +1546,23 @@ fn run_tokio(
         let mut failover_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut command_log_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // ── RTP quality sampler ───────────────────────────────────────────────
+        // Every datapath's processors feed one process-wide analyzer; this is
+        // the one task that reads it, whichever backend runs. It used to live
+        // in the tokio server's maintenance loop only, so io_uring and AF_XDP
+        // nodes reported no RTP figures at all.
+        {
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    turna_relay::rtp_metrics::publish_global(&metrics);
+                }
+            });
+        }
+
         // ── Usage accounting ([turn.accounting]) ──────────────────────────────
         // Off by default. Started before the datapath so no allocation can end
         // unrecorded, and refused outright when a configured sink cannot be

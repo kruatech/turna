@@ -764,7 +764,10 @@ impl PacketProcessor {
             external_ip6: None,
             nonce_mgr: NonceManager::new(),
             metrics,
-            rtp_analyzer: Arc::new(RtpAnalyzer::new()),
+            // One analyzer per process, shared by every processor: see
+            // `RtpAnalyzer::global` for why per-processor instances left the
+            // RTP metrics at zero on io_uring and AF_XDP.
+            rtp_analyzer: RtpAnalyzer::global(),
             mtu,
             cluster,
             migration: None,

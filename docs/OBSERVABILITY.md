@@ -80,14 +80,68 @@ scrape_configs:
 
 ### RTP/QoS metrics
 
+Measured by `crates/rtp-analyzer` from the RTP header of every relayed
+ChannelData / Send / Data payload that parses as RTP (version 2, payload type
+outside the RTCP range 64–95). SRTP leaves that header in the clear, so this
+works on encrypted media. All processors in the node — every io_uring worker,
+the QUIC/DTLS processor, the tokio path — feed one process-wide analyzer, and one
+node task publishes it every 5 s whichever datapath runs. (Until this release the
+gauges were published only by the tokio datapath, so io_uring and AF_XDP nodes
+read zero while relaying media.)
+
+What the analyzer computes, per stream (SSRC):
+
+- **loss** — sequence numbers skipped (RFC 3550 A.1 style, a jump of 3000 or more
+  is a resync, not loss). A late packet that fills a gap is credited back.
+- **out of order** — a sequence number below the highest seen. Duplicates of the
+  latest packet count as neither.
+- **jitter** — RFC 3550 §6.4.1 interarrival jitter. The analyzer cannot see SDP,
+  so it *guesses* the clock rate from the payload type: 48 kHz for PT 0/8/111,
+  90 kHz otherwise. PCMU/PCMA really run at 8 kHz, so their jitter reads 6x low.
+  Treat jitter as a trend on this node, not an absolute to compare with a
+  client's `getStats()`.
+
+Loss seen here is loss **upstream of the relay** (sender → relay), for both
+directions of the call; loss between the relay and the receiver is not visible
+to it. Cardinality is constant: nothing is labelled by stream, user or tenant.
+
 | Metric | Type | Meaning |
 |---|---|---|
-| `turna_rtp_streams` | gauge | Active RTP streams tracked by QoS. |
-| `turna_rtp_avg_loss_percent` | gauge | Average packet loss. |
-| `turna_rtp_max_loss_percent` | gauge | Max packet loss. |
-| `turna_rtp_avg_jitter_ms` | gauge | Average jitter. |
-| `turna_rtp_max_jitter_ms` | gauge | Max jitter. |
+| `turna_rtp_streams` | gauge | Active RTP streams (SSRCs seen in the last 30 s). |
+| `turna_rtp_avg_loss_percent` | gauge | Mean over live streams of each stream's loss since it began. |
+| `turna_rtp_max_loss_percent` | gauge | Worst live stream's loss since it began. |
+| `turna_rtp_avg_jitter_ms` | gauge | Mean current jitter over live streams. |
+| `turna_rtp_max_jitter_ms` | gauge | Worst current jitter. |
 | `turna_rtp_total_bitrate_kbps` | gauge | Aggregate RTP bitrate. |
+| `turna_rtp_packets_total` | counter | RTP packets analysed (both directions). |
+| `turna_rtp_packets_expected_total` | counter | Sequence numbers spanned by analysed streams. |
+| `turna_rtp_packets_lost_total` | counter | Sequence numbers missing. `rate(lost) / rate(expected)` is the node's current RTP loss rate — better than the `avg_loss` gauge, which averages whole-stream lifetimes. A late packet that arrives after the 5 s sample which counted its gap stays counted. |
+| `turna_rtp_packets_out_of_order_total` | counter | Packets that arrived below the highest sequence seen. |
+| `turna_rtp_stream_jitter_seconds` | histogram | One observation per stream that received packets in the 5 s interval: its current jitter. Buckets 1 ms – 500 ms. |
+| `turna_rtp_stream_loss_ratio` | histogram | One observation per stream per 5 s interval in which it spanned at least 10 sequence numbers: lost / expected over that interval. Buckets 0 – 1 (the `le="0.000000"` bucket counts loss-free intervals). |
+
+```promql
+# Current RTP loss rate per node
+sum by (instance) (rate(turna_rtp_packets_lost_total[5m]))
+  / sum by (instance) (rate(turna_rtp_packets_expected_total[5m]))
+# Share of stream-intervals worse than 2% loss
+1 - sum(rate(turna_rtp_stream_loss_ratio_bucket{le="0.020000"}[5m]))
+      / sum(rate(turna_rtp_stream_loss_ratio_count[5m]))
+```
+
+`/status` carries the counters as `rtp_packets_total`,
+`rtp_packets_expected_total`, `rtp_packets_lost_total`,
+`rtp_packets_out_of_order_total`, plus `rtp_jitter_p95_ms` and
+`rtp_loss_p95_percent` (p95 of the two histograms since the node started). The
+admin UI's Traffic page shows them in the **RTP media quality** panel, with the
+loss rate over each polling interval computed from the counters.
+
+Analyzer fixes that came with these metrics, because the new counters made them
+visible: a reordered packet used to be counted as lost and then, because the
+tracked sequence number moved backwards, the next in-order packet was counted as
+a second gap; its earlier RTP timestamp wrapped an unsigned subtraction and spiked
+the jitter estimate by hours; and multiplexed RTCP was analysed as RTP streams
+with nonsense SSRCs.
 
 ### Tarantool and persistence metrics
 
@@ -125,6 +179,8 @@ scrape_configs:
 | `turna_relay_forward_duration_seconds` | ChannelData relay forwarding latency. |
 | `turna_auth_duration_seconds` | Authentication processing latency. |
 | `turna_allocation_lifetime_seconds` | Allocation lifetime distribution. |
+| `turna_rtp_stream_jitter_seconds` | Per-stream RTP jitter, sampled every 5 s (see RTP/QoS metrics). |
+| `turna_rtp_stream_loss_ratio` | Per-stream 5 s RTP loss ratio; a ratio, not seconds — `_sum` is in ratio units. |
 
 Use `histogram_quantile` in Prometheus:
 

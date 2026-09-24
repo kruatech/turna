@@ -25,6 +25,14 @@ export interface NodeStatus {
   rtp_avg_jitter_ms: number
   rtp_max_jitter_ms: number
   rtp_total_bitrate_kbps: number
+  // Cumulative RTP counters and per-stream histogram p95s. Optional: a node
+  // older than the media-quality metrics does not send them.
+  rtp_packets_total?: number
+  rtp_packets_expected_total?: number
+  rtp_packets_lost_total?: number
+  rtp_packets_out_of_order_total?: number
+  rtp_jitter_p95_ms?: number
+  rtp_loss_p95_percent?: number
   [key: string]: unknown
 }
 

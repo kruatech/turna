@@ -202,6 +202,13 @@ pub struct Metrics {
     pub rtp_avg_jitter_us: AtomicU64, // jitter in microseconds
     pub rtp_max_jitter_us: AtomicU64,
     pub rtp_total_bitrate_kbps: AtomicU64,
+    /// Cumulative RTP counters, summed from the analyzer's interval deltas by
+    /// the node's RTP sampler. Monotonic, unlike the per-stream figures the
+    /// gauges above are averaged from, which vanish with their stream.
+    pub rtp_packets: AtomicU64,
+    pub rtp_packets_expected: AtomicU64,
+    pub rtp_packets_lost: AtomicU64,
+    pub rtp_packets_out_of_order: AtomicU64,
     pub start_time: std::time::Instant,
 
     // ── Tarantool reconnect metrics ───────────────────────────────────────────
@@ -514,6 +521,10 @@ impl Metrics {
             rtp_avg_jitter_us: AtomicU64::new(0),
             rtp_max_jitter_us: AtomicU64::new(0),
             rtp_total_bitrate_kbps: AtomicU64::new(0),
+            rtp_packets: AtomicU64::new(0),
+            rtp_packets_expected: AtomicU64::new(0),
+            rtp_packets_lost: AtomicU64::new(0),
+            rtp_packets_out_of_order: AtomicU64::new(0),
             start_time: std::time::Instant::now(),
             tarantool_reconnect_attempts: AtomicU64::new(0),
             tarantool_reconnect_successes: AtomicU64::new(0),
@@ -763,6 +774,30 @@ impl Metrics {
             l(&self.log_file_write_errors),
             l(&self.log_syslog_sent),
             l(&self.log_syslog_dropped),
+        )
+    }
+
+    /// Cumulative RTP counters (see the field docs). Unlabelled: per-stream or
+    /// per-user series would be unbounded.
+    fn render_rtp_counter_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_rtp_packets_total RTP packets analysed on the relay path (both directions)\n\
+             # TYPE turna_rtp_packets_total counter\n\
+             turna_rtp_packets_total {}\n\
+             # HELP turna_rtp_packets_expected_total RTP sequence numbers spanned by analysed streams\n\
+             # TYPE turna_rtp_packets_expected_total counter\n\
+             turna_rtp_packets_expected_total {}\n\
+             # HELP turna_rtp_packets_lost_total RTP packets missing from sequence (upstream of this relay or on the path to it)\n\
+             # TYPE turna_rtp_packets_lost_total counter\n\
+             turna_rtp_packets_lost_total {}\n\
+             # HELP turna_rtp_packets_out_of_order_total RTP packets that arrived with a sequence number below the highest seen\n\
+             # TYPE turna_rtp_packets_out_of_order_total counter\n\
+             turna_rtp_packets_out_of_order_total {}\n",
+            l(&self.rtp_packets),
+            l(&self.rtp_packets_expected),
+            l(&self.rtp_packets_lost),
+            l(&self.rtp_packets_out_of_order),
         )
     }
 
@@ -1787,6 +1822,14 @@ struct StatusResponse {
     rtp_avg_jitter_ms: f64,
     rtp_max_jitter_ms: f64,
     rtp_total_bitrate_kbps: u64,
+    rtp_packets_total: u64,
+    rtp_packets_expected_total: u64,
+    rtp_packets_lost_total: u64,
+    rtp_packets_out_of_order_total: u64,
+    /// p95 of the per-stream interval jitter / loss histograms since start.
+    /// 0 until a stream has been sampled.
+    rtp_jitter_p95_ms: f64,
+    rtp_loss_p95_percent: f64,
 }
 
 /// Snapshot of the io_uring relay-route forwarding counters (RFC 8016 sharded
@@ -2193,6 +2236,24 @@ pub async fn serve_on(
                         rtp_total_bitrate_kbps: metrics
                             .rtp_total_bitrate_kbps
                             .load(Ordering::Relaxed),
+                        rtp_packets_total: metrics.rtp_packets.load(Ordering::Relaxed),
+                        rtp_packets_expected_total: metrics
+                            .rtp_packets_expected
+                            .load(Ordering::Relaxed),
+                        rtp_packets_lost_total: metrics.rtp_packets_lost.load(Ordering::Relaxed),
+                        rtp_packets_out_of_order_total: metrics
+                            .rtp_packets_out_of_order
+                            .load(Ordering::Relaxed),
+                        rtp_jitter_p95_ms: metrics
+                            .histograms
+                            .get("turna_rtp_stream_jitter_seconds")
+                            .map(|h| h.percentile(0.95) * 1000.0)
+                            .unwrap_or(0.0),
+                        rtp_loss_p95_percent: metrics
+                            .histograms
+                            .get("turna_rtp_stream_loss_ratio")
+                            .map(|h| h.percentile(0.95) * 100.0)
+                            .unwrap_or(0.0),
                     };
                     (
                         "200 OK",
@@ -2392,6 +2453,7 @@ pub async fn serve_on(
                     body.push_str(&m.render_auth_reason_metrics());
                     body.push_str(&m.render_log_sink_metrics());
                     body.push_str(&m.render_accounting_metrics());
+                    body.push_str(&m.render_rtp_counter_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());

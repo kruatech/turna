@@ -6,6 +6,8 @@
 
 pub mod peer_filter;
 pub mod processor;
+/// RTP quality → metrics, called periodically by the node.
+pub mod rtp_metrics;
 pub mod server;
 pub mod tcp_relay;
 mod udp_transactions;

@@ -2859,26 +2859,34 @@ fn metric_value(health: &SocketAddr, name: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Usage accounting through the real binary: an Allocate followed by a
-/// Refresh(lifetime = 0) produces one `stop` record with reason `released` in
-/// the JSON-lines file, and the metric counts it.
+/// Accounting and RTP metrics through the real binary.
 #[cfg(test)]
-mod accounting_it {
+mod ops_it {
     use super::*;
 
-    #[tokio::test]
-    async fn released_allocation_writes_a_stop_record() {
+    struct Node {
+        child: std::process::Child,
+        turn: SocketAddr,
+        health: SocketAddr,
+    }
+
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Start a node with `extra` appended to a minimal config (static user
+    /// testuser/testpass, relay ports `ports`), and wait for /ready.
+    async fn spawn_node(dir: &std::path::Path, ports: (u16, u16), extra: &str) -> Option<Node> {
         let bin = node_binary();
         if !bin.exists() {
             eprintln!("skipping: {bin:?} not built — run `cargo build -p turna-node`");
-            return;
+            return None;
         }
         let turn_port = free_port(true);
         let health_port = free_port(false);
-        let dir = std::env::temp_dir().join(format!("turna-acct-it-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let usage = dir.join("usage.jsonl");
         let cfg_path = dir.join("turn.toml");
         std::fs::write(
             &cfg_path,
@@ -2893,55 +2901,59 @@ mod accounting_it {
                  username = \"testuser\"\n\
                  password = \"testpass\"\n\
                  [turn.relay]\n\
-                 min_port = 24800\n\
-                 max_port = 24900\n\
+                 min_port = {}\n\
+                 max_port = {}\n\
                  max_allocations = 32\n\
-                 [turn.accounting]\n\
-                 enabled = true\n\
-                 [turn.accounting.file]\n\
-                 path = \"{}\"\n\
                  [health]\n\
-                 listen = \"127.0.0.1:{health_port}\"\n",
-                usage.display()
+                 listen = \"127.0.0.1:{health_port}\"\n\
+                 {extra}\n",
+                ports.0, ports.1
             ),
         )
         .expect("write config");
-
-        let mut child = std::process::Command::new(&bin)
+        let child = std::process::Command::new(&bin)
             .arg(&cfg_path)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn node");
-        let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+        let mut node = Node {
+            child,
+            turn: format!("127.0.0.1:{turn_port}").parse().unwrap(),
+            health: format!("127.0.0.1:{health_port}").parse().unwrap(),
+        };
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while !http_ready(&health) {
+        while !http_ready(&node.health) {
             assert!(
                 std::time::Instant::now() < deadline
-                    && child.try_wait().expect("try_wait").is_none(),
-                "node with [turn.accounting] did not become ready"
+                    && node.child.try_wait().expect("try_wait").is_none(),
+                "node did not become ready with:\n{extra}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let target: SocketAddr = format!("127.0.0.1:{turn_port}").parse().unwrap();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Some(node)
+    }
 
+    /// Allocate as testuser; returns (key, realm, latest nonce, relay address).
+    async fn allocate(
+        socket: &UdpSocket,
+        target: SocketAddr,
+    ) -> (Vec<u8>, String, String, SocketAddr) {
         let mut probe = TurnMsg::request(0x0003);
         probe.add_requested_transport();
-        let (resp, _) = send_recv(&socket, target, &probe.encode(), 2000)
+        let (resp, _) = send_recv(socket, target, &probe.encode(), 2000)
             .await
             .expect("probe answered");
         let realm = extract_realm(&resp).expect("realm");
         let nonce = extract_nonce(&resp).expect("nonce");
         let key = long_term_key("testuser", &realm, "testpass");
-
         let mut alloc = TurnMsg::request(0x0003);
         alloc.add_requested_transport();
         alloc.add_lifetime(600);
         alloc.add_username("testuser");
         alloc.add_realm(&realm);
         alloc.add_nonce(&nonce);
-        let (resp, _) = send_recv(&socket, target, &alloc.encode_with_integrity(&key), 2000)
+        let (resp, _) = send_recv(socket, target, &alloc.encode_with_integrity(&key), 2000)
             .await
             .expect("allocate answered");
         assert!(
@@ -2949,16 +2961,78 @@ mod accounting_it {
             "Allocate: {:?}",
             extract_error_code(&resp)
         );
-        let nonce2 = extract_nonce(&resp).unwrap_or(nonce);
+        let relay = extract_xor_relayed_address(&resp).expect("relayed address");
+        let nonce = extract_nonce(&resp).unwrap_or(nonce);
+        (key, realm, nonce, relay)
+    }
 
-        let mut del = TurnMsg::request(0x0004);
-        del.add_lifetime(0);
-        del.add_username("testuser");
-        del.add_realm(&realm);
-        del.add_nonce(&nonce2);
-        let (resp, _) = send_recv(&socket, target, &del.encode_with_integrity(&key), 2000)
+    /// An authenticated request built by `build`; returns the response.
+    async fn request(
+        socket: &UdpSocket,
+        target: SocketAddr,
+        key: &[u8],
+        realm: &str,
+        nonce: &str,
+        build: impl FnOnce(&mut TurnMsg),
+        method: u16,
+    ) -> Vec<u8> {
+        let mut m = TurnMsg::request(method);
+        build(&mut m);
+        m.add_username("testuser");
+        m.add_realm(realm);
+        m.add_nonce(nonce);
+        send_recv(socket, target, &m.encode_with_integrity(key), 2000)
             .await
-            .expect("refresh answered");
+            .expect("request answered")
+            .0
+    }
+
+    async fn wait_metric(health: &SocketAddr, name: &str, at_least: f64, secs: u64) -> f64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        let mut v = 0.0;
+        while std::time::Instant::now() < deadline {
+            v = metric_value(health, name);
+            if v >= at_least {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        v
+    }
+
+    /// An Allocate followed by a Refresh(lifetime = 0) produces one `stop`
+    /// record with reason `released` in the JSON-lines file, and the metric
+    /// counts it.
+    #[tokio::test]
+    async fn released_allocation_writes_a_stop_record() {
+        let dir = std::env::temp_dir().join(format!("turna-acct-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let usage = dir.join("usage.jsonl");
+        let Some(node) = spawn_node(
+            &dir,
+            (24800, 24900),
+            &format!(
+                "[turn.accounting]\nenabled = true\n[turn.accounting.file]\npath = \"{}\"\n",
+                usage.display()
+            ),
+        )
+        .await
+        else {
+            return;
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (key, realm, nonce, _) = allocate(&socket, node.turn).await;
+        let resp = request(
+            &socket,
+            node.turn,
+            &key,
+            &realm,
+            &nonce,
+            |m| m.add_lifetime(0),
+            0x0004,
+        )
+        .await;
         assert!(
             is_success(&resp),
             "Refresh(0): {:?}",
@@ -2975,17 +3049,14 @@ mod accounting_it {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // Metrics are mirrored on a 5 s tick.
-        let deadline = std::time::Instant::now() + Duration::from_secs(12);
-        let mut stops = 0.0;
-        while std::time::Instant::now() < deadline {
-            stops = metric_value(&health, "turna_accounting_records_total{type=\"stop\"}");
-            if stops >= 1.0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        let stops = wait_metric(
+            &node.health,
+            "turna_accounting_records_total{type=\"stop\"}",
+            1.0,
+            12,
+        )
+        .await;
+        drop(node);
         let _ = std::fs::remove_dir_all(&dir);
 
         let line = text
@@ -3002,6 +3073,113 @@ mod accounting_it {
         assert!(
             stops >= 1.0,
             "turna_accounting_records_total{{type=\"stop\"}} = {stops}"
+        );
+    }
+
+    /// RTP relayed through the node shows up in the new counters and
+    /// histograms — the node-level sampler is wired, not just the analyzer.
+    /// Needs a non-loopback local address for the peer (loopback peers are
+    /// always refused by the peer filter).
+    #[tokio::test]
+    async fn relayed_rtp_reaches_the_quality_metrics() {
+        // The interface address used to reach the outside; no packet is sent.
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        if probe.connect("192.0.2.1:9").is_err() {
+            eprintln!("skipping: no non-loopback route");
+            return;
+        }
+        let peer_ip = probe.local_addr().unwrap().ip();
+        if peer_ip.is_loopback() || peer_ip.is_unspecified() {
+            eprintln!("skipping: no non-loopback address");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("turna-rtp-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let Some(node) = spawn_node(
+            &dir,
+            (24910, 24990),
+            "[turn.peer_filter]\nprofile = \"lan\"\n",
+        )
+        .await
+        else {
+            return;
+        };
+        let peer = UdpSocket::bind(SocketAddr::new(peer_ip, 0)).await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (key, realm, nonce, _) = allocate(&client, node.turn).await;
+        let resp = request(
+            &client,
+            node.turn,
+            &key,
+            &realm,
+            &nonce,
+            |m| m.add_xor_peer_address(peer_addr),
+            0x0008,
+        )
+        .await;
+        assert!(
+            is_success(&resp),
+            "CreatePermission: {:?}",
+            extract_error_code(&resp)
+        );
+        let nonce = extract_nonce(&resp).unwrap_or(nonce);
+        let channel = 0x4002u16;
+        let resp = request(
+            &client,
+            node.turn,
+            &key,
+            &realm,
+            &nonce,
+            |m| {
+                m.add_channel_number(channel);
+                m.add_xor_peer_address(peer_addr);
+            },
+            0x0009,
+        )
+        .await;
+        assert!(
+            is_success(&resp),
+            "ChannelBind: {:?}",
+            extract_error_code(&resp)
+        );
+
+        // 40 sequence numbers, 3 never sent (loss), one pair swapped (reorder).
+        let mut seqs: Vec<u16> = (1..=40).filter(|s| ![10, 20, 30].contains(s)).collect();
+        let i = seqs.iter().position(|&s| s == 15).unwrap();
+        seqs.swap(i, i + 1);
+        let mut buf = [0u8; 256];
+        for s in &seqs {
+            let mut rtp = vec![0u8; 60];
+            rtp[0] = 0x80;
+            rtp[1] = 96; // dynamic video PT
+            rtp[2..4].copy_from_slice(&s.to_be_bytes());
+            rtp[4..8].copy_from_slice(&(*s as u32 * 3000).to_be_bytes());
+            rtp[8..12].copy_from_slice(&0x5eed_0001u32.to_be_bytes());
+            client
+                .send_to(&build_channel_data(channel, &rtp), node.turn)
+                .await
+                .unwrap();
+            // Relayed to the peer: proves the packet crossed the node.
+            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .expect("peer receives relayed RTP")
+                .unwrap();
+        }
+
+        let packets = wait_metric(&node.health, "turna_rtp_packets_total", 37.0, 15).await;
+        let lost = metric_value(&node.health, "turna_rtp_packets_lost_total");
+        let ooo = metric_value(&node.health, "turna_rtp_packets_out_of_order_total");
+        let jitter_count = metric_value(&node.health, "turna_rtp_stream_jitter_seconds_count");
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(packets, 37.0, "turna_rtp_packets_total");
+        assert_eq!(lost, 3.0, "turna_rtp_packets_lost_total");
+        assert_eq!(ooo, 1.0, "turna_rtp_packets_out_of_order_total");
+        assert!(
+            jitter_count >= 1.0,
+            "turna_rtp_stream_jitter_seconds_count = {jitter_count}"
         );
     }
 }

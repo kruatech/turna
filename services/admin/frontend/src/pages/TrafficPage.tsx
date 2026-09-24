@@ -4,8 +4,10 @@ import { useI18n } from '../i18n'
 import { formatBytes, formatBytesRate, formatCount, formatRate } from '../format/format'
 import { rateSeries, lastRate } from '../lib/series'
 import type { PanelProps } from '../panels/types'
+import { RtpPanel } from '../panels/RtpPanel'
 
-export function TrafficPage({ status, history, frozen }: PanelProps) {
+export function TrafficPage(props: PanelProps) {
+  const { status, history, frozen } = props
   const { t, lang } = useI18n()
   if (!status) return <div className="flex items-center justify-center h-48 text-[--muted]">{t('ov.waiting')}</div>
   const bpsIn  = rateSeries(history, s => s.bytes_received)
@@ -41,6 +43,7 @@ export function TrafficPage({ status, history, frozen }: PanelProps) {
           <SC label={t('tr.queueDropped')} value={formatCount(status.send_queue_dropped, lang)} color={status.send_queue_dropped > 0 ? 'text-amber-400' : 'text-[--ink]'} />
         </div>
       </Card>
+      <RtpPanel {...props} />
     </div>
   )
 }

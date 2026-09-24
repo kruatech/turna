@@ -288,6 +288,28 @@ groups:
             Average relayed RTP jitter is above 50ms for 10m. Watch alongside
             loss; sustained high jitter degrades real-time media.
 
+      - alert: TurnaRtpLossRate
+        # Counter-based, so it reflects the last 5m rather than whole-stream
+        # lifetimes like the avg gauge above. The second clause keeps a node
+        # relaying a handful of packets from alerting on one lost frame.
+        expr: >-
+          (
+            sum by (instance) (rate(turna_rtp_packets_lost_total[5m]))
+              / sum by (instance) (rate(turna_rtp_packets_expected_total[5m]))
+          ) > 0.05
+          and sum by (instance) (rate(turna_rtp_packets_expected_total[5m])) > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna relayed RTP loss above 5% on {{ $labels.instance }}"
+          description: >-
+            More than 5% of RTP sequence numbers relayed in the last 5m never
+            arrived at the relay. This is loss between senders and this node
+            (both call directions), not loss the relay caused — check
+            turna_send_queue_dropped_total and the host's UDP receive errors
+            before blaming the network.
+
   # ── Optional sinks: log file, full-log syslog, usage accounting ─────────────
   # All three families read 0 when the feature is off, so these never fire on a
   # node that does not use them.
