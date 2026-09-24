@@ -1,11 +1,11 @@
 //! Property tests: decode(encode(x)) == x
 //!
-//! Проверяет что encode и decode являются взаимно обратными функциями
-//! для всех валидных входных данных. Находит баги типа:
-//! - потеря поля при roundtrip
-//! - truncation строк
-//! - неверная XOR-маска адресов
-//! - padding ошибки
+//! Checks that encode and decode are mutual inverses for all valid
+//! inputs. Finds bugs such as:
+//! - a field lost during roundtrip
+//! - string truncation
+//! - a wrong XOR mask for addresses
+//! - padding errors
 
 use proptest::prelude::*;
 use turna_proto_stun::attribute::Attribute;
@@ -13,7 +13,7 @@ use turna_proto_stun::header::MessageClass;
 use turna_proto_stun::message::StunMessage;
 use turna_proto_stun::method::Method;
 
-// ── Стратегии генерации ───────────────────────────────────────────────────────
+// ── Generation strategies ─────────────────────────────────────────────────────
 
 fn arb_method() -> impl Strategy<Value = Method> {
     prop_oneof![
@@ -38,7 +38,7 @@ fn arb_tid() -> impl Strategy<Value = [u8; 12]> {
     any::<[u8; 12]>()
 }
 
-/// Генерирует ASCII строку длиной 1..=200 (валидный USERNAME/REALM/NONCE).
+/// Generates an ASCII string of length 1..=200 (a valid USERNAME/REALM/NONCE).
 fn arb_short_string() -> impl Strategy<Value = String> {
     "[a-zA-Z0-9_.@:-]{1,200}".prop_map(|s| s)
 }
@@ -49,7 +49,7 @@ fn arb_ipv4_addr() -> impl Strategy<Value = std::net::SocketAddr> {
 }
 
 fn arb_lifetime() -> impl Strategy<Value = u32> {
-    // Реалистичные значения + граничные
+    // Realistic values + boundary values
     prop_oneof![
         Just(0u32),
         Just(1u32),
@@ -62,7 +62,7 @@ fn arb_lifetime() -> impl Strategy<Value = u32> {
 
 fn arb_channel() -> impl Strategy<Value = u16> {
     prop_oneof![
-        0x4000u16..=0x7FFEu16, // валидные
+        0x4000u16..=0x7FFEu16, // valid
         Just(0x4000u16),
         Just(0x7FFEu16),
     ]
@@ -71,7 +71,7 @@ fn arb_channel() -> impl Strategy<Value = u16> {
 // ── Property: header roundtrip ────────────────────────────────────────────────
 
 proptest! {
-    /// Method + Class + TransactionID сохраняются при encode → decode.
+    /// Method + Class + TransactionID are preserved across encode → decode.
     #[test]
     fn prop_header_roundtrip(
         method in arb_method(),
@@ -182,8 +182,8 @@ proptest! {
 // ── Property: XOR address roundtrip ──────────────────────────────────────────
 
 proptest! {
-    /// XOR-MAPPED-ADDRESS: encode → decode должен вернуть точно тот же SocketAddr.
-    /// Это проверяет правильность XOR-маски (MAGIC_COOKIE + TID).
+    /// XOR-MAPPED-ADDRESS: encode → decode must return exactly the same SocketAddr.
+    /// This checks that the XOR mask (MAGIC_COOKIE + TID) is correct.
     #[test]
     fn prop_xor_mapped_address_roundtrip(addr in arb_ipv4_addr()) {
         let mut msg = StunMessage::new(Method::Binding, MessageClass::SuccessResponse);
@@ -232,11 +232,11 @@ proptest! {
         let mut buf = vec![0u8; 8192];
         let len = msg.encode(&mut buf).unwrap();
 
-        // Длина должна быть кратна 4 (после header)
+        // Length must be a multiple of 4 (after the header)
         let attr_len = len - 20; // HEADER_SIZE = 20
         prop_assert_eq!(attr_len % 4, 0, "attribute section must be 4-byte aligned");
 
-        // Задекодированный заголовок должен совпадать с фактической длиной
+        // The decoded header must match the actual length
         let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         prop_assert_eq!(declared, attr_len);
     }
@@ -259,11 +259,11 @@ proptest! {
 
         let decoded = StunMessage::decode(&buf[..len]).unwrap();
 
-        // Верификация с правильным ключом
+        // Verification with the correct key
         prop_assert!(decoded.verify_integrity(&buf[..len], &key),
             "integrity must verify with correct key");
 
-        // Верификация с неправильным ключом должна падать
+        // Verification with a wrong key must fail
         let bad_key = b"wrong_key_xxxxx";
         prop_assert!(!decoded.verify_integrity(&buf[..len], bad_key),
             "integrity must NOT verify with wrong key");
@@ -272,9 +272,9 @@ proptest! {
 
 // ── Property: raw ChannelData frame codec ────────────────────────────────────
 //
-// Взаимная обратимость encode_channel_data / decode_channel_data, корректность
-// 4-байтового паддинга и согласованность классификатора is_channel_data с
-// диапазоном номеров каналов 0x4000..=0x7FFE.
+// encode_channel_data / decode_channel_data are mutual inverses, 4-byte padding is
+// correct, and the is_channel_data classifier agrees with the channel number range
+// 0x4000..=0x7FFE.
 
 use turna_proto_stun::message::{decode_channel_data, encode_channel_data, is_channel_data};
 
@@ -283,7 +283,7 @@ fn arb_channel_data_payload() -> impl Strategy<Value = Vec<u8>> {
 }
 
 proptest! {
-    /// decode(encode(channel, data)) == (channel, data) для валидного канала.
+    /// decode(encode(channel, data)) == (channel, data) for a valid channel.
     #[test]
     fn prop_channel_data_roundtrip(
         channel in arb_channel(),
@@ -293,28 +293,28 @@ proptest! {
         let len = encode_channel_data(&mut buf, channel, &data)
             .expect("buffer is large enough for the padded frame");
 
-        // Кадр кратен 4 и покрывает заголовок + данные, паддинг < 4 байт.
+        // Frame is a multiple of 4 and covers header + data, padding < 4 bytes.
         prop_assert_eq!(len % 4, 0, "channel-data frame must be 4-byte aligned");
         prop_assert!(len >= 4 + data.len());
         prop_assert!(len - (4 + data.len()) < 4, "padding must be < 4 bytes");
 
-        // Встроенная длина == длине данных (без паддинга).
+        // Embedded length == data length (without padding).
         let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         prop_assert_eq!(declared, data.len());
 
-        // Паддинг-байты нулевые.
+        // Padding bytes are zero.
         for &b in &buf[4 + data.len()..len] {
             prop_assert_eq!(b, 0u8, "padding bytes must be zero");
         }
 
-        // Roundtrip: канал и данные восстанавливаются точно.
+        // Roundtrip: channel and data are restored exactly.
         let (got_channel, got_data) =
             decode_channel_data(&buf[..len]).expect("encoded frame must decode");
         prop_assert_eq!(got_channel, channel);
         prop_assert_eq!(got_data, &data[..]);
     }
 
-    /// Классификатор принимает ровно валидный диапазон каналов 0x4000..=0x7FFE.
+    /// The classifier accepts exactly the valid channel range 0x4000..=0x7FFE.
     #[test]
     fn prop_is_channel_data_matches_range(
         channel in any::<u16>(),
@@ -327,7 +327,7 @@ proptest! {
         prop_assert_eq!(is_channel_data(&buf[..len]), in_range);
     }
 
-    /// encode возвращает ошибку, если буфер меньше паддированного кадра.
+    /// encode returns an error if the buffer is smaller than the padded frame.
     #[test]
     fn prop_channel_data_buffer_too_short(
         channel in arb_channel(),

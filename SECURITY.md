@@ -8,8 +8,8 @@ version receives security fixes.
 
 | Version         | Supported                |
 |-----------------|--------------------------|
-| `0.4.0`         | ✅ current                |
-| `< 0.4.0`       | ❌ superseded            |
+| `0.5.0`         | ✅ current                |
+| `< 0.5.0`       | ❌ superseded            |
 
 Only the newest release is supported: there is no LTS line, and adding one is a
 commitment rather than a table entry — the options are priced in

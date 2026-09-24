@@ -1,8 +1,8 @@
-//! OpenTelemetry интеграция
+//! OpenTelemetry integration
 //!
-//! - TurnaSampler: 1% base + 100% ошибок + 100% Allocate/Refresh + rate limit
-//! - OTLP export (gRPC) в Jaeger/Tempo/Grafana Cloud
-//! - TURN-специфичные histogram buckets
+//! - TurnaSampler: 1% base + 100% errors + 100% Allocate/Refresh + rate limit
+//! - OTLP export (gRPC) to Jaeger/Tempo/Grafana Cloud
+//! - TURN-specific histogram buckets
 //!
 //! # Cargo.toml additions required in crates/observability/Cargo.toml:
 //!
@@ -457,7 +457,7 @@ where
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }
 
-/// Span macro для обработки STUN-запроса.
+/// Span macro for handling a STUN request.
 #[macro_export]
 macro_rules! stun_span {
     ($method:expr, $class:expr, $client:expr) => {
@@ -471,7 +471,7 @@ macro_rules! stun_span {
     };
 }
 
-/// Span macro для relay (ChannelData).
+/// Span macro for relay (ChannelData).
 #[macro_export]
 macro_rules! relay_span {
     ($channel:expr, $dir:expr) => {
