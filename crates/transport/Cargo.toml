@@ -61,6 +61,11 @@ webrtc-util = { version = "0.9", optional = true }
 # crate transitively — declaring it makes the macro reachable here.
 async-trait = { version = "0.1", optional = true }
 
+[dev-dependencies]
+# Throwaway certificates for the TLS-policy handshake tests in tcp_tls.rs.
+# Already in the lock at this version (turna-dtls uses it), so no new crate.
+rcgen = "0.13"
+
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
 
