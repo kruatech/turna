@@ -1207,6 +1207,9 @@ fn run_tokio(
                 metrics
                     .log_file_write_errors
                     .store(sinks.file_write_errors, Relaxed);
+                metrics
+                    .log_file_rotation_errors
+                    .store(sinks.file_rotation_errors, Relaxed);
                 metrics.log_syslog_sent.store(sinks.syslog_sent, Relaxed);
                 metrics
                     .log_syslog_dropped

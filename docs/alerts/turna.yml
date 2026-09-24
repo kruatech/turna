@@ -330,16 +330,17 @@ groups:
             ran out; file_error: the accounting file could not be written.
 
       - alert: TurnaLogFileWriteErrors
-        expr: increase(turna_log_file_write_errors_total[10m]) > 0
+        expr: increase(turna_log_file_write_errors_total[10m]) > 0 or increase(turna_log_file_rotation_errors_total[10m]) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
           summary: "turna log file writes failing on {{ $labels.instance }}"
           description: >-
-            The [turn.observability.log_file] sink lost log lines — usually a
-            full disk or a directory the service may not write. The lines are
-            gone and nothing else records that they existed.
+            The [turn.observability.log_file] sink lost log lines, or could not
+            rotate — usually a full disk or a directory the service may not
+            write. Lost lines are gone and nothing else records them; a failed
+            rotation lets the active file grow past its limit.
 
       - alert: TurnaLogSyslogDrops
         expr: increase(turna_log_syslog_dropped_total[10m]) > 100

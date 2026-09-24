@@ -154,6 +154,7 @@ pub struct Metrics {
     /// sink is not configured.
     pub log_file_rotations: AtomicU64,
     pub log_file_write_errors: AtomicU64,
+    pub log_file_rotation_errors: AtomicU64,
     pub log_syslog_sent: AtomicU64,
     pub log_syslog_dropped: AtomicU64,
 
@@ -489,6 +490,7 @@ impl Metrics {
             syslog_dropped: AtomicU64::new(0),
             log_file_rotations: AtomicU64::new(0),
             log_file_write_errors: AtomicU64::new(0),
+            log_file_rotation_errors: AtomicU64::new(0),
             log_syslog_sent: AtomicU64::new(0),
             log_syslog_dropped: AtomicU64::new(0),
             accounting_stop_records: AtomicU64::new(0),
@@ -764,6 +766,9 @@ impl Metrics {
              # HELP turna_log_file_write_errors_total Log lines lost to a file write or rotation error\n\
              # TYPE turna_log_file_write_errors_total counter\n\
              turna_log_file_write_errors_total {}\n\
+             # HELP turna_log_file_rotation_errors_total Log file rotations or prunes that failed; lines keep going to the active file and the retry backs off 60 s\n\
+             # TYPE turna_log_file_rotation_errors_total counter\n\
+             turna_log_file_rotation_errors_total {}\n\
              # HELP turna_log_syslog_sent_total Log lines written to the full-log syslog sink ([turn.observability.log_syslog])\n\
              # TYPE turna_log_syslog_sent_total counter\n\
              turna_log_syslog_sent_total {}\n\
@@ -772,6 +777,7 @@ impl Metrics {
              turna_log_syslog_dropped_total {}\n",
             l(&self.log_file_rotations),
             l(&self.log_file_write_errors),
+            l(&self.log_file_rotation_errors),
             l(&self.log_syslog_sent),
             l(&self.log_syslog_dropped),
         )

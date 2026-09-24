@@ -269,7 +269,8 @@ are emitted unconditionally and read `0` when the sink is off.
 | metric | type | meaning |
 |---|---|---|
 | `turna_log_file_rotations_total` | counter | Rotations performed by the file sink (size or time). Stays `0` with `rotation = "external"`, where logrotate rotates and SIGHUP reopens. |
-| `turna_log_file_write_errors_total` | counter | Log lines lost to a write or rotation error — usually a full disk or a directory the service may not write. **Alert on any increase**: the lines are gone and nothing else says so. |
+| `turna_log_file_write_errors_total` | counter | Log lines lost to a write error — usually a full disk or a directory the service may not write. **Alert on any increase**: the lines are gone and nothing else says so. |
+| `turna_log_file_rotation_errors_total` | counter | Rotations (renames) or prunes of old files that failed. No line is lost: the active file is reopened and keeps growing, and the rotation is retried no sooner than 60 s later. A rising value means the file will grow past `max_size_mb` or keep old periods — check the directory. |
 | `turna_log_syslog_sent_total` | counter | Lines written to the full-log syslog sink. |
 | `turna_log_syslog_dropped_total` | counter | Lines lost by the full-log syslog sink: its queue (`queue_capacity`) was full, or the transport failed. Lines are formatted on the logging thread and sent by one background thread, so a slow collector drops lines rather than stalling the relay. |
 
