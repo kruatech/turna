@@ -706,6 +706,32 @@ impl TurnaConfig {
             self.tls.proxy_protocol_timeout_secs,
         ));
 
+        // A relay socket bound inside a PROXY-trusted range sends relayed
+        // traffic from a trusted source. The node denies trusted ranges as
+        // peers, which covers every listener inside them; a listener of
+        // another node reachable at an address *outside* them would still
+        // accept a header from this relay. Warned, not refused: listing the
+        // node's own subnet is a common shortcut, and the remedy (list only
+        // the balancers) is the operator's call.
+        {
+            let trusted = self.proxy_trusted_cidrs_in_use();
+            let binds = [
+                self.turn.effective_relay_bind_ip().map(IpAddr::V4),
+                self.turn.effective_relay_bind_ip6().map(IpAddr::V6),
+            ];
+            for bind in binds.into_iter().flatten() {
+                if let Some(c) = trusted.iter().find(|c| cidr_contains(c, bind)) {
+                    warn!(
+                        relay_bind = %bind,
+                        trusted = %c,
+                        "the relay bind address is inside proxy_protocol_trusted_cidrs: relayed \
+                         traffic leaves from an address PROXY-protocol listeners trust. List only \
+                         the load balancers' addresses there, not a subnet the TURN nodes share"
+                    );
+                }
+            }
+        }
+
         // Plain TURN over TCP.
         errors.extend(validate_proxy_protocol(
             "turn.tcp",
@@ -1044,20 +1070,53 @@ impl TurnaConfig {
                 }
             }
         }
+        // The other UDP listeners. Health and management are TCP and cannot
+        // collide with a UDP bind; SCTP is its own IP protocol (132) and does
+        // not either. DTLS and QUIC are UDP, and a bind on the same address
+        // and port — or a wildcard on the same port — would either fail at
+        // startup or, with SO_REUSEPORT on our side, share the traffic.
+        let udp_listeners = [
+            ("turn.dtls", self.turn.dtls.enabled, self.turn.dtls.listen),
+            ("turn.quic", self.turn.quic.enabled, self.turn.quic.listen),
+        ];
         for addr in extra {
-            for (name, other) in [
-                ("health", self.health.listen),
-                ("management", self.management.listen),
-            ] {
-                if addr.port() == other.port() {
+            for (name, enabled, other) in udp_listeners {
+                let overlaps = addr.port() == other.port()
+                    && (addr.ip() == other.ip()
+                        || addr.ip().is_unspecified()
+                        || other.ip().is_unspecified());
+                if enabled && overlaps {
                     errors.push(format!(
-                        "turn.listen_extra: {addr} uses the {name} listener's port {}",
-                        other.port()
+                        "turn.listen_extra: {addr} overlaps the UDP listener {name}.listen = \
+                         {other}; give it another port or a distinct specific address"
                     ));
                 }
             }
         }
+        // RFC 8016 mobility re-keys an allocation onto a new client address,
+        // but the socket its relayed data leaves from is fixed when the
+        // allocation is created. With one listener that is always right; with
+        // several, a client that moves to another listener would get Data
+        // indications from an address it no longer talks to. Refused rather
+        // than half-working (docs/CONFIGURATION.md, listen_extra).
+        if self.turn.migration.enabled {
+            errors.push(
+                "turn.listen_extra cannot be combined with turn.migration.enabled: a \
+                 mobility re-key moves an allocation to a new client address but not to \
+                 the listener that address uses, so relayed data could leave from an \
+                 address the client never sent to. Use one of the two"
+                    .into(),
+            );
+        }
         errors
+    }
+
+    /// `proxy_protocol_trusted_cidrs` of every *enabled* listener that has the
+    /// PROXY protocol on. The node denies these as relay peers
+    /// unconditionally: a relayed connection into a trusted range could reach
+    /// a PROXY-trusting listener from a trusted source and forge the header.
+    pub fn proxy_trusted_cidrs_in_use(&self) -> Vec<String> {
+        proxy_trusted_cidrs_in_use(&self.turn, &self.tls)
     }
 
     /// Returns true if production mode is active.
@@ -1523,6 +1582,41 @@ fn default_software_attribute() -> String {
 /// serde cannot express a non-zero integer default inline.
 fn default_credential_clock_skew() -> u64 {
     300
+}
+
+/// Free-function form of [`TurnaConfig::proxy_trusted_cidrs_in_use`], for
+/// callers (the node) that hold `[turn]` and `[tls]` separately.
+pub fn proxy_trusted_cidrs_in_use(turn: &TurnConfig, tls: &TlsConfig) -> Vec<String> {
+    let mut v = Vec::new();
+    if tls.enabled && tls.proxy_protocol {
+        v.extend(tls.proxy_protocol_trusted_cidrs.iter().cloned());
+    }
+    if turn.tcp.enabled && turn.tcp.proxy_protocol {
+        v.extend(turn.tcp.proxy_protocol_trusted_cidrs.iter().cloned());
+    }
+    v
+}
+
+/// Whether `ip` is inside `cidr` (`a.b.c.d/n` or `v6/n`). False for anything
+/// unparseable — validation reports those separately.
+fn cidr_contains(cidr: &str, ip: IpAddr) -> bool {
+    let Some((net, pfx)) = cidr.trim().split_once('/') else {
+        return false;
+    };
+    let (Ok(net), Ok(pfx)) = (net.trim().parse::<IpAddr>(), pfx.trim().parse::<u32>()) else {
+        return false;
+    };
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(a)) if pfx <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - pfx).unwrap_or(0);
+            u32::from(n) & mask == u32::from(a) & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(a)) if pfx <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - pfx).unwrap_or(0);
+            u128::from(n) & mask == u128::from(a) & mask
+        }
+        _ => false,
+    }
 }
 
 /// Lightweight CIDR syntax check (the relay does the authoritative parse).
@@ -5226,13 +5320,82 @@ mod network_deployment_tests {
     }
 
     #[test]
-    fn listen_extra_health_port_clash_refused() {
+    fn listen_extra_is_checked_against_udp_listeners_only() {
+        // TCP health/management on the same port number do not conflict.
         let mut c = base();
         c.turn.listen = "10.0.0.5:3478".parse().unwrap();
         c.turn.listen_extra = vec![format!("192.0.2.7:{}", c.health.listen.port())
             .parse()
             .unwrap()];
-        err_contains(&c, "health listener's port");
+        check(&c).unwrap();
+
+        // DTLS (UDP) on the same wildcard port does, once enabled.
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["192.0.2.7:5349".parse().unwrap()];
+        check(&c).unwrap();
+        c.turn.dtls.enabled = true; // default listen 0.0.0.0:5349
+        c.turn.dtls.max_handshakes_per_sec_per_ip = 0;
+        err_contains(&c, "overlaps the UDP listener turn.dtls.listen");
+        // A distinct specific address on the same port is fine.
+        c.turn.dtls.listen = "192.0.2.8:5349".parse().unwrap();
+        check(&c).unwrap();
+
+        // QUIC likewise.
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["192.0.2.7:5350".parse().unwrap()];
+        c.turn.quic.enabled = true;
+        c.turn.quic.listen = "192.0.2.7:5350".parse().unwrap();
+        err_contains(&c, "overlaps the UDP listener turn.quic.listen");
+    }
+
+    #[test]
+    fn listen_extra_refuses_mobility() {
+        let mut c = base();
+        c.turn.listen = "10.0.0.5:3478".parse().unwrap();
+        c.turn.listen_extra = vec!["192.0.2.7:3478".parse().unwrap()];
+        c.turn.migration.enabled = true;
+        c.turn.migration.ticket_secret = "a".repeat(64);
+        err_contains(&c, "cannot be combined with turn.migration.enabled");
+        c.turn.listen_extra.clear();
+        check(&c).unwrap();
+    }
+
+    #[test]
+    fn proxy_trusted_ranges_in_use_follow_enabled_listeners() {
+        let mut c = base();
+        c.tls.proxy_protocol = true;
+        c.tls.proxy_protocol_trusted_cidrs = vec!["10.1.0.0/24".into()];
+        c.turn.tcp.proxy_protocol = true;
+        c.turn.tcp.proxy_protocol_trusted_cidrs = vec!["10.2.0.0/24".into()];
+        assert!(
+            c.proxy_trusted_cidrs_in_use().is_empty(),
+            "both listeners off"
+        );
+        c.turn.tcp.enabled = true;
+        assert_eq!(
+            c.proxy_trusted_cidrs_in_use(),
+            vec!["10.2.0.0/24".to_string()]
+        );
+        c.tls.enabled = true;
+        assert_eq!(c.proxy_trusted_cidrs_in_use().len(), 2);
+        c.tls.proxy_protocol = false;
+        assert_eq!(
+            c.proxy_trusted_cidrs_in_use(),
+            vec!["10.2.0.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn cidr_contains_matches() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(cidr_contains("10.0.0.0/8", ip("10.9.9.9")));
+        assert!(!cidr_contains("10.0.0.0/8", ip("11.0.0.1")));
+        assert!(cidr_contains("0.0.0.0/0", ip("1.2.3.4")));
+        assert!(cidr_contains("2001:db8::/32", ip("2001:db8:1::1")));
+        assert!(!cidr_contains("2001:db8::/32", ip("10.0.0.1")));
+        assert!(!cidr_contains("bogus", ip("10.0.0.1")));
     }
 
     // ── external_ip PUBLIC/PRIVATE ───────────────────────────────────────────
