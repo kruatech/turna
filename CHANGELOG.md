@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — RFC 6062
+
+- A peer-initiated TCP connection to a relayed address is closed, with no
+  ConnectionAttempt, unless the allocation holds a permission for the peer and the
+  peer filter allows it (RFC 6062 §5.3). Previously every connection to a relayed
+  TCP port was announced to the client. The check is tied to the accepting
+  listener's port, and relayed TCP listeners now stop when their allocation expires.
+  New `turna_tcp_relay_peer_refused_total`.
+
+### Added — protocol
+
+- RFC 8489 USERHASH for long-term users (previously 420); REST/OAuth realms answer
+  401. `[turn.auth] advertise_userhash` (off) sets the nonce-cookie anonymity bit.
+- RFC 5780 NAT behaviour discovery, opt-in: `[turn.nat_discovery]` (off). Rate
+  limited like Binding and sharing one unauthenticated-reply budget with the TURN
+  listener; authenticated discovery Bindings are nonce-checked and signed.
+- RFC 6062 TCP relay over IPv6, opt-in: `[turn.tcp_relay] allow_ipv6` (off,
+  requires `external_ip6`).
+
+### Changed / Fixed — protocol
+
+- Outbound RFC 6062 CONNECT binds to the relay bind address (`bind_ip`/`bind_ip6`);
+  the relayed port itself is still kernel-chosen (documented as open).
+- SIGHUP reload refuses to switch a realm between static users and a shared secret.
+- ADDITIONAL-ADDRESS-FAMILY is still not implemented; its design doc is corrected
+  against RFC 8656 (partial success, per-family lifetimes) and the decision reopened.
+
 ### Changed
 
 - Document AF_XDP as **supported within the verified Linux IPv4 UDP copy-mode scope**
