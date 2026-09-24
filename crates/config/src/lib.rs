@@ -389,6 +389,14 @@ impl TurnaConfig {
                                 .into(),
                         );
                     }
+                    if w.max_retries > 20 {
+                        errors.push(format!(
+                            "[turn.accounting.webhook] max_retries = {} must be at most 20: \
+                             with the 60 s backoff cap that is already ~17 minutes per \
+                             batch, and a batch being retried holds up every batch behind it",
+                            w.max_retries
+                        ));
+                    }
                     if w.max_pending_batches == 0 {
                         errors.push(
                             "[turn.accounting.webhook] max_pending_batches must be > 0".into(),
@@ -2063,7 +2071,7 @@ pub struct AccountingWebhookConfig {
     pub flush_interval_secs: u64,
     /// Attempts after the first failure, with exponential backoff (1 s, 2 s,
     /// 4 s … capped at 60 s). A batch that still fails is dropped and counted.
-    /// Default 5.
+    /// Default 5, at most 20.
     pub max_retries: u32,
     /// Per-request timeout in seconds. Default 10.
     pub timeout_secs: u64,
@@ -5097,7 +5105,9 @@ mod ops_config_tests {
         bad.turn.accounting.interim_interval_secs = 10;
         bad.turn.accounting.webhook.url = "ftp://x".into();
         bad.turn.accounting.webhook.batch_size = 0;
+        bad.turn.accounting.webhook.max_retries = 21;
         let msg = validate_dev(&bad).unwrap_err().to_string();
+        assert!(msg.contains("max_retries"), "{msg}");
         assert!(msg.contains("interim_interval_secs"), "{msg}");
         assert!(msg.contains("http://"), "{msg}");
         assert!(msg.contains("batch_size"), "{msg}");

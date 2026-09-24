@@ -538,8 +538,12 @@ describe, and syslog puts them where a compromised node cannot reach them.
 Off by default. When enabled, every allocation that ends produces a `stop`
 record, and — with `interim_interval_secs` — every live allocation produces an
 `interim` record on that interval. On a clean shutdown each still-live
-allocation gets a final `interim` record, because no `stop` will follow on this
-node.
+allocation gets a final `interim` record, because no `stop` will follow in this
+process. That snapshot is handed to the sinks with backpressure (not dropped
+when a queue is full), and the node waits up to 10 s for the file thread and the
+webhook to finish; records the webhook still holds after that are counted as
+`webhook_failed` and logged at WARN. The shutdown budget the node logs at start
+includes those 10 s when accounting is enabled.
 
 ```toml
 [turn.accounting]
@@ -556,7 +560,7 @@ url = "https://billing.example/v1/turn-usage"
 authorization = "Bearer ${TURNA_ACCOUNTING_TOKEN}"
 batch_size = 100
 flush_interval_secs = 5
-max_retries = 5                 # backoff 1, 2, 4 … 60 s
+max_retries = 5                 # backoff 1, 2, 4 … 60 s; at most 20
 timeout_secs = 10
 max_pending_batches = 64
 ```
@@ -568,11 +572,11 @@ max_pending_batches = 64
 | `include_addresses` | `false` | Off because an address is personal data with its own retention rules, and billing needs the user and the bytes. |
 | `queue_capacity` | `10000` | Datapath→dispatcher queue. Full = record dropped and counted, never a stalled teardown. |
 | `file.path` | `""` | Created `0640`. The node refuses to start if it cannot be opened. |
-| `webhook.url` | `""` | `http://` or `https://` (system trust store). Plain `http://` warns under `production = true`. |
+| `webhook.url` | `""` | `http://` or `https://` (system trust store). Plain `http://` warns under `production = true`. Logged and shown by `--dump-config` with userinfo and query string masked. |
 | `webhook.authorization` | `""` | Sent as the `Authorization` header. `${VAR}`/`file:///` substitution applies; `--dump-config` masks it. |
 | `webhook.batch_size` | `100` | 1..=10000 records per POST. |
 | `webhook.flush_interval_secs` | `5` | Longest a record waits for its batch. |
-| `webhook.max_retries` | `5` | Retries on transport errors, 5xx, 408, 429. Any other 4xx drops the batch immediately. |
+| `webhook.max_retries` | `5` | Retries on transport errors, 5xx, 408, 429, at most 20 (with the 60 s backoff cap that is already ~17 minutes, and a batch being retried holds up the ones behind it). Any other 4xx drops the batch immediately. |
 | `webhook.timeout_secs` | `10` | Per request. |
 | `webhook.max_pending_batches` | `64` | Webhook backlog before records are dropped. |
 
@@ -583,10 +587,11 @@ One JSON object per line in the file; a JSON array of them per POST.
 | field | meaning |
 |-------|---------|
 | `v` | Schema version, `1`. |
-| `record_id` | `<node>:<allocation_id>:<type>:<event_ms>` — deterministic; **deduplicate on it**, delivery is at least once. |
+| `record_id` | `<node>:<boot_id>:<allocation_id>:<type>:<event_ms>` — deterministic; **deduplicate on it**, delivery is at least once. |
 | `type` | `stop` or `interim`. |
 | `end_reason` | `stop` only: `expired`, `released` (Refresh lifetime 0), `admin_deleted` (management API), `migration_lost`. |
 | `node` | `[cluster] node_id` of the node that relayed the bytes. |
+| `boot_id` | Random per process start (16 hex). Separates segments across a restart of the same node. |
 | `allocation_id` | Stable across RFC 8016 migration and failover. |
 | `username`, `realm` | As authenticated. |
 | `tenant` | `[[tenants]] id`, or `null` for the base realm. |
@@ -605,10 +610,14 @@ direction's payload crosses both legs, so `bytes_from_client` is both "in on the
 client leg" and "out on the peer leg". Packets dropped by the bandwidth quota or
 a missing permission are not counted.
 
-**Segments.** Counters live on the node. An allocation that fails over to
-another node restarts at 0 there and its records carry that node's `node`, so
-sum per `(allocation_id, node)`. `interim` records are cumulative for their
-segment — take the latest, do not add them up.
+**Segments.** Counters live in the process. A segment is
+`(allocation_id, node, boot_id)`: an allocation that survives a restart of the
+same node (rehydrated from the state backend with the same `allocation_id` and
+`start_ms`) or fails over to another node restarts at 0 in a new segment.
+Per segment, take the `stop` record — or, if there is none, the latest `interim`
+(the process ended while the allocation lived; its shutdown snapshot is that
+interim). Then sum the segments. Never add `interim` records within a segment:
+they are cumulative.
 
 **Cost.** Nothing new on the ChannelData hot path except the peer→client
 direction share (two relaxed atomic increments on the peer→client path; the

@@ -655,6 +655,10 @@ const PERSISTENCE_FLUSH_TIMEOUT_SECS: u64 = 10;
 /// other than the persistence writer (heartbeat, failover). They only need to
 /// observe the shutdown signal and stop; the writer gets the larger flush budget.
 const TASK_JOIN_TIMEOUT_SECS: u64 = 5;
+/// Budget for `[turn.accounting]` at shutdown: the final snapshot (sent with
+/// backpressure) and draining the file thread and the webhook. Undelivered
+/// webhook records past it are counted as `webhook_failed` and logged.
+const ACCOUNTING_FLUSH_TIMEOUT_SECS: u64 = 10;
 /// P0.2: how long a claimed command's lease is held before another claim may
 /// reclaim it (the claimant is expected to complete well within this window).
 const COMMAND_LEASE_MS: u64 = 30_000;
@@ -1572,8 +1576,11 @@ fn run_tokio(
         // opened: billing that silently records nothing is found at the end of
         // the month.
         let accounting_handle: Option<tokio::task::JoinHandle<()>> =
-            match accounting::AccountingSettings::from_config(&config.accounting, &cluster.node_id)
-            {
+            match accounting::AccountingSettings::from_config(
+                &config.accounting,
+                &cluster.node_id,
+                Duration::from_secs(ACCOUNTING_FLUSH_TIMEOUT_SECS),
+            ) {
                 Some(settings) => {
                     let acct = accounting::start(settings, store.clone(), shutdown_rx.clone())
                         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -2377,6 +2384,11 @@ fn run_tokio(
         let shutdown_budget_secs =
             cluster.drain_grace_secs + PERSISTENCE_FLUSH_TIMEOUT_SECS
                 + 2 * TASK_JOIN_TIMEOUT_SECS
+                + if config.accounting.enabled {
+                    ACCOUNTING_FLUSH_TIMEOUT_SECS + 1
+                } else {
+                    0
+                }
                 + 2;
         info!(
             drain_grace_secs = cluster.drain_grace_secs,
@@ -2837,13 +2849,13 @@ fn run_tokio(
             Duration::from_secs(PERSISTENCE_FLUSH_TIMEOUT_SECS),
         )
         .await;
-        // Accounting writes its shutdown snapshot and drains its queue; the
-        // webhook sender may still be retrying after that and is not waited for
-        // beyond this budget.
+        // Accounting bounds its own drain by ACCOUNTING_FLUSH_TIMEOUT_SECS (the
+        // snapshot, the file thread, the webhook); the extra second is for the
+        // task to return after it.
         join_within_budget(
             "accounting",
             accounting_handle,
-            Duration::from_secs(TASK_JOIN_TIMEOUT_SECS),
+            Duration::from_secs(ACCOUNTING_FLUSH_TIMEOUT_SECS + 1),
         )
         .await;
         join_within_budget(
@@ -3177,7 +3189,13 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     println!("include_addresses     = {}", ac.include_addresses);
     println!("queue_capacity        = {}", ac.queue_capacity);
     println!("file.path             = \"{}\"", ac.file.path);
-    println!("webhook.url           = \"{}\"", ac.webhook.url);
+    println!(
+        "webhook.url           = \"{}\"",
+        match mode {
+            DumpMode::Raw => ac.webhook.url.clone(),
+            DumpMode::Masked => accounting::mask_url(&ac.webhook.url),
+        }
+    );
     println!(
         "webhook.authorization = \"{}\"",
         mask(&ac.webhook.authorization)

@@ -1740,7 +1740,18 @@ impl AllocationStore {
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.usage_dropped.fetch_add(1, Ordering::Relaxed);
+                // The dispatcher has shut down (node stopping) — this
+                // allocation's usage is not recorded anywhere. Said at WARN,
+                // throttled like the full-queue case, not only counted.
+                let prev = self.usage_dropped.fetch_add(1, Ordering::Relaxed);
+                if prev == 0 || (prev + 1).is_power_of_two() {
+                    tracing::warn!(
+                        dropped_total = prev + 1,
+                        allocation_id = %alloc.allocation_id,
+                        "usage record for an allocation that ended after accounting \
+                         shut down — not recorded"
+                    );
+                }
             }
         }
     }

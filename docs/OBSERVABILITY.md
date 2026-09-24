@@ -283,7 +283,7 @@ fixed sets — record type and drop reason — never a user or tenant.
 | metric | type | meaning |
 |---|---|---|
 | `turna_accounting_records_total{type="stop"\|"interim"}` | counter | Records handed to the sinks. `stop` grows by one per allocation that ended; compare with the allocation churn to see that none are missing. |
-| `turna_accounting_records_dropped_total{reason=…}` | counter | Records lost. `queue_full`: the datapath→dispatcher queue (`queue_capacity`) was full; `webhook_queue_full`: the webhook sender was behind by more than `max_pending_batches`; `webhook_failed`: a batch was rejected (4xx) or retries ran out; `file_error`: the append failed. **Alert on any increase** — a lost record is unbilled usage. |
+| `turna_accounting_records_dropped_total{reason=…}` | counter | Records lost. `queue_full`: the datapath→dispatcher queue (`queue_capacity`) was full; `webhook_queue_full`: the webhook sender was behind by more than `max_pending_batches`; `webhook_failed`: a batch was rejected (4xx), retries ran out, or the webhook still held it when the 10 s shutdown budget ended; `queue_full` also counts records from allocations that ended after accounting shut down (logged at WARN); `file_error`: the append failed. **Alert on any increase** — a lost record is unbilled usage. |
 | `turna_accounting_webhook_batches_total` | counter | Batches the webhook accepted (2xx). |
 | `turna_accounting_webhook_retries_total` | counter | Retries after a transient failure (transport error, 5xx, 408, 429). A steady rate with no `webhook_failed` drops means the endpoint is flaky but the backoff is absorbing it. |
 
