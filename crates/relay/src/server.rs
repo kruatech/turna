@@ -45,8 +45,8 @@ pub type ClientSinks = Arc<DashMap<SocketAddr, ClientSink>>;
 /// Outbound message ready for the send task.
 ///
 /// All data fields are `Bytes` — sending to the channel is an AtomicAdd,
-/// not a memcpy. STUN-ответы сюда больше не попадают — каждый recv-воркер
-/// отвечает send_to со своего SO_REUSEPORT-сокета.
+/// not a memcpy. STUN responses no longer go through here: each recv worker
+/// replies via send_to from its own SO_REUSEPORT socket.
 pub(crate) enum OutMsg {
     Relay {
         port: u16,
@@ -62,8 +62,8 @@ pub(crate) enum OutMsg {
     },
 }
 
-/// Число SO_REUSEPORT recv-воркеров: TURNA_RECV_WORKERS,
-/// иначе число доступных ядер (taskset учитывается), максимум 16.
+/// Number of SO_REUSEPORT recv workers: TURNA_RECV_WORKERS,
+/// otherwise the number of available cores (respects taskset), at most 16.
 pub fn recv_workers() -> usize {
     let default = if cfg!(target_os = "linux") {
         std::thread::available_parallelism()
@@ -696,9 +696,9 @@ impl RelayServer {
         }
 
         // ── Recv workers (hot path) ──────────────────────────────────────
-        // N сокетов SO_REUSEPORT на одном порту, по recv-задаче на сокет.
-        // STUN-ответы (Action::Send) уходят send_to прямо из воркера, без mpsc.
-        // В бенче с одного IP отключай TURNA_RATE_LIMIT_* и TURNA_PREFIX_*.
+        // N SO_REUSEPORT sockets on one port, one recv task per socket.
+        // STUN responses (Action::Send) go out via send_to from the worker, no mpsc.
+        // When benchmarking from one IP, disable TURNA_RATE_LIMIT_* and TURNA_PREFIX_*.
         let n_workers = recv_workers();
         let listen_addr = self.transport.local_addr()?;
         let mut workers = Vec::with_capacity(n_workers);
@@ -720,17 +720,17 @@ impl RelayServer {
             let send_tx = send_tx.clone();
 
             workers.push(tokio::spawn(async move {
-                // До BATCH датаграмм на один recvmmsg; ответы — одним sendmmsg.
+                // Up to BATCH datagrams per recvmmsg; replies in a single sendmmsg.
                 const BATCH: usize = 32;
                 let zero: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 0));
                 let mut metas = [(0usize, zero); BATCH];
                 loop {
-                    // Одна арена на батч: 1 malloc на 32 пакета; каждый пакет —
-                    // Bytes-слайс арены без копирования (zero-copy Forward жив).
+                    // One arena per batch: 1 malloc per 32 packets; each packet is a
+                    // Bytes slice of the arena, no copying (zero-copy Forward preserved).
                     let mut arena = bytes::BytesMut::with_capacity(BATCH * MAX_UDP_PACKET);
-                    // SAFETY: capacity == BATCH*MAX_UDP_PACKET; recvmmsg пишет
-                    // первые len байт каждого слота, slice(..len) ниже не даёт
-                    // прочитать неинициализированный хвост.
+                    // SAFETY: capacity == BATCH*MAX_UDP_PACKET; recvmmsg writes
+                    // the first len bytes of each slot; slice(..len) below prevents
+                    // reading the uninitialized tail.
                     unsafe {
                         arena.set_len(BATCH * MAX_UDP_PACKET);
                     }
@@ -797,7 +797,7 @@ impl RelayServer {
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 }
-                                // Control-plane: не дропаем при полной очереди.
+                                // Control-plane: do not drop when the queue is full.
                                 Action::RegisterRelay { port, socket, .. } => {
                                     if send_tx
                                         .send(OutMsg::RegisterRelay { port, socket })

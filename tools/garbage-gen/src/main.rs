@@ -50,7 +50,7 @@ fn main() {
             sent += 1;
             next += Duration::from_nanos(interval_ns);
         } else {
-            // Spin-wait для точного timing (не sleep — слишком грубо)
+            // Spin-wait for precise timing (not sleep, which is too coarse)
             std::hint::spin_loop();
         }
     }
