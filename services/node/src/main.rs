@@ -1554,8 +1554,9 @@ fn run_tokio(
         let mut command_log_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // ── RTP quality sampler ───────────────────────────────────────────────
-        // Every datapath's processors feed one process-wide analyzer; this is
-        // the one task that reads it, whichever backend runs. It used to live
+        // Every processor (each io_uring worker too) has its own registered
+        // analyzer; this is the one task that samples them all, whichever
+        // backend runs. It used to live
         // in the tokio server's maintenance loop only, so io_uring and AF_XDP
         // nodes reported no RTP figures at all.
         {
