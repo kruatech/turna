@@ -141,6 +141,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Admin console: send the `X-Admin-Token` on every `/api` request, not only on
+  `POST /api/manage`. Since 0.5.0 the backend requires the token on reads too, so
+  with a token configured every status/metrics/health poll failed with 401 (and
+  health/ready rendered as "down"). A rejected read now shows an "admin token
+  required" banner with a prompt, and polling pauses until a token is entered.
+- Config: the RBAC doc comment and the "enabled with no bindings" error named the
+  section `[management.rbac]`; the section actually parsed is `[grpc.rbac]`
+  (`[management]` has `deny_unknown_fields`, so the documented form was rejected).
+
 - **Key material was freed without being overwritten.** The shared secret is
   resident for the whole run, and a SIGHUP rotation made that worse rather than
   better: the new `AuthMode` and `TurnaConfig` were swapped in and the old

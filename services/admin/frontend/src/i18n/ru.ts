@@ -99,6 +99,8 @@ export const ru: Record<string, string> = {
   'nav.collapse': 'Свернуть',
   'topbar.paused': 'пауза',
   'topbar.nodata': 'нет данных',
+  'topbar.authRequired': 'Нужен токен администратора — без него бэкенд отклоняет чтение. Опрос приостановлен.',
+  'topbar.enterToken': 'Ввести токен',
   'topbar.unreachable': 'Нода недоступна — показаны последние известные значения. Продолжаю опрашивать…',
   'ov.activeAlloc': 'Активные аллокации',
   'ov.bandwidth': 'Полоса (relay)',
