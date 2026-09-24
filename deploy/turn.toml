@@ -158,6 +158,26 @@ trace_sample_rate    = 0.01
 json_logs            = false
 # Hard cap on spans/second to protect against runaway tracing.
 max_spans_per_second = 1000
+# Write the log to stdout (default true). Set false only together with a
+# log_file or log_syslog sink below; validation refuses logging nowhere.
+# log_to_stdout = true
+
+# Optional: also write the log to a rotating file. Same lines and redaction as
+# stdout. The directory must exist and be writable by the service user (the
+# systemd unit's LogsDirectory= line creates /var/log/turna).
+# [turn.observability.log_file]
+# path        = "/var/log/turna/turna.log"
+# rotation    = "size"     # size | daily | hourly | external (logrotate + SIGHUP)
+# max_size_mb = 100
+# max_files   = 7
+# level       = "trace"    # narrows only; RUST_LOG still applies first
+
+# Optional: send EVERY log line at or above `level` to syslog (the security-only
+# export is syslog_endpoint; this is separate and uses MSGID LOG).
+# [turn.observability.log_syslog]
+# endpoint       = "unix:///dev/log"   # or udp://host:514, tcp://host:601
+# level          = "info"
+# queue_capacity = 8192
 
 # =============================================================================
 # [turn.rate_limit] — tiered rate limiting

@@ -60,6 +60,11 @@ ReadOnlyPaths=/etc/turna
 # Uncomment when [turn.observability] node_audit_path is set — that is the one
 # thing the node writes.
 # ReadWritePaths=/var/lib/turna
+# Uncomment when [turn.observability.log_file] path is under /var/log/turna.
+# systemd creates the directory owned by User= and makes it writable despite
+# ProtectSystem=strict. deploy/logrotate/turna-node pairs with
+# rotation = "external".
+# LogsDirectory=turna
 
 # Ports 3478 and 5349 are both above 1024, so no capability is needed. If you
 # move the TURNS listener to 443 (worth doing where filters only pass

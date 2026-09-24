@@ -295,6 +295,119 @@ fn assert_refused_transport(what: &str, body: &str, transport: &str, expect_in_m
     );
 }
 
+/// `log_to_stdout = false` with no other sink would leave a node nobody can
+/// debug. Refused at load, with the reason.
+#[test]
+fn refuses_to_log_nowhere() {
+    assert_refused(
+        "log_to_stdout = false with no sink",
+        "[turn.observability]\nlog_to_stdout = false\n",
+        "log nowhere",
+    );
+}
+
+/// The file sink through the real binary: the node writes its startup lines to
+/// the file (and not to stdout, which is switched off), and SIGHUP after an
+/// external move makes it write a fresh file at the configured path — the
+/// logrotate contract for `rotation = "external"`.
+#[cfg(target_os = "linux")]
+#[test]
+fn node_logs_to_file_and_reopens_on_sighup() {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: {bin:?} not built — run `cargo build -p turna-node`");
+        return;
+    }
+    let turn_port = free_port(true);
+    let health_port = free_port(false);
+    let dir = std::env::temp_dir().join(format!("turna-logfile-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let log = dir.join("turna.log");
+    let cfg_path = dir.join("turn.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{turn_port}\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [turn.relay]\n\
+             min_port = 24710\n\
+             max_port = 24790\n\
+             max_allocations = 32\n\
+             [turn.observability]\n\
+             log_to_stdout = false\n\
+             [turn.observability.log_file]\n\
+             path = \"{}\"\n\
+             rotation = \"external\"\n\
+             [health]\n\
+             listen = \"127.0.0.1:{health_port}\"\n",
+            log.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .env("RUST_LOG", "info")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn node");
+    let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !http_ready(&health) {
+        if std::time::Instant::now() >= deadline || child.try_wait().expect("try_wait").is_some() {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("output");
+            panic!(
+                "node did not become ready with a log file configured:\n{}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let first = std::fs::read_to_string(&log).unwrap_or_default();
+    let moved = dir.join("turna.log.1");
+    std::fs::rename(&log, &moved).expect("move log like logrotate");
+    // SAFETY: kill(2) with a pid we spawned and still own.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGHUP);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut reopened = String::new();
+    while std::time::Instant::now() < deadline {
+        reopened = std::fs::read_to_string(&log).unwrap_or_default();
+        if reopened.contains("log file reopened") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("output");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        first.contains("starting turna"),
+        "startup lines must reach the file:\n{first}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("starting turna"),
+        "log_to_stdout = false, yet stdout carried the log"
+    );
+    assert!(
+        reopened.contains("log file reopened"),
+        "after SIGHUP the node must write a fresh file at the path; got:\n{reopened}"
+    );
+}
+
 /// Production policy must not hide invalid transport configuration. RFC 6062
 /// and Linux/tokio SCTP are allowed; OAuth retains its separate refusal below.
 #[test]

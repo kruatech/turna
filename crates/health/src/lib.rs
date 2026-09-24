@@ -149,6 +149,14 @@ pub struct Metrics {
     pub syslog_sent: AtomicU64,
     pub syslog_dropped: AtomicU64,
 
+    /// Optional log sinks (`[turn.observability.log_file]` / `log_syslog`),
+    /// mirrored from turna-observability by the node. All read 0 when the
+    /// sink is not configured.
+    pub log_file_rotations: AtomicU64,
+    pub log_file_write_errors: AtomicU64,
+    pub log_syslog_sent: AtomicU64,
+    pub log_syslog_dropped: AtomicU64,
+
     pub host_cpu_percent: AtomicU64,
     pub host_memory_percent: AtomicU64,
 
@@ -461,6 +469,10 @@ impl Metrics {
             capacity_rate_hard_percent: AtomicU64::new(80),
             syslog_sent: AtomicU64::new(0),
             syslog_dropped: AtomicU64::new(0),
+            log_file_rotations: AtomicU64::new(0),
+            log_file_write_errors: AtomicU64::new(0),
+            log_syslog_sent: AtomicU64::new(0),
+            log_syslog_dropped: AtomicU64::new(0),
             host_cpu_percent: AtomicU64::new(u64::MAX),
             host_memory_percent: AtomicU64::new(u64::MAX),
             relay_ports_in_use: AtomicU64::new(0),
@@ -708,6 +720,31 @@ impl Metrics {
             Readiness::Ready
         };
         self.readiness.store(r as u8, Ordering::SeqCst);
+    }
+
+    /// Optional log-sink counters. Emitted unconditionally, at 0 when the sink
+    /// is off, so a dashboard does not have to cope with series that appear
+    /// only on some nodes.
+    fn render_log_sink_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_log_file_rotations_total Log file rotations performed ([turn.observability.log_file]; 0 when off)\n\
+             # TYPE turna_log_file_rotations_total counter\n\
+             turna_log_file_rotations_total {}\n\
+             # HELP turna_log_file_write_errors_total Log lines lost to a file write or rotation error\n\
+             # TYPE turna_log_file_write_errors_total counter\n\
+             turna_log_file_write_errors_total {}\n\
+             # HELP turna_log_syslog_sent_total Log lines written to the full-log syslog sink ([turn.observability.log_syslog])\n\
+             # TYPE turna_log_syslog_sent_total counter\n\
+             turna_log_syslog_sent_total {}\n\
+             # HELP turna_log_syslog_dropped_total Log lines lost by the full-log syslog sink: queue full or transport error\n\
+             # TYPE turna_log_syslog_dropped_total counter\n\
+             turna_log_syslog_dropped_total {}\n",
+            l(&self.log_file_rotations),
+            l(&self.log_file_write_errors),
+            l(&self.log_syslog_sent),
+            l(&self.log_syslog_dropped),
+        )
     }
 
     /// Record one allocation for a tenant (multi-tenancy observability).
@@ -2302,6 +2339,7 @@ pub async fn serve_on(
                         m.processor_panics.load(Ordering::Relaxed)
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
+                    body.push_str(&m.render_log_sink_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());

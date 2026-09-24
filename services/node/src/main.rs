@@ -132,8 +132,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             latency_threshold_us: 10_000,
             always_sample_methods: vec!["Allocate".into(), "Refresh".into()],
         },
+        log_to_stdout: obs.log_to_stdout,
+        log_file: log_file_sink(&obs.log_file),
+        log_syslog: log_syslog_sink(&obs.log_syslog),
         ..Default::default()
     };
+    // Kept to report below, once a subscriber exists to report it with.
+    let log_sinks_requested = (
+        !obs.log_file.path.is_empty(),
+        !obs.log_syslog.endpoint.is_empty(),
+    );
 
     // Installed now, armed later. A tracing layer can only join the chain while
     // the subscriber is being built, and the audit log it writes to is opened
@@ -161,6 +169,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if used_defaults {
         info!("no config file, using defaults");
+    }
+    // The fallback above installs stdout only. A configured file or syslog sink
+    // that could not be opened is then absent, and the eprintln above is easy to
+    // miss in a unit's journal, so it is said again at WARN on the channel that
+    // did come up.
+    {
+        let active_file = turna_observability::log_file::active().is_some();
+        let active_syslog = turna_observability::syslog_log::stats().is_some();
+        if log_sinks_requested.0 && !active_file {
+            warn!(
+                path = %config.observability.log_file.path,
+                "[turn.observability.log_file] is configured but the file could not be opened; \
+                 logging to stdout only"
+            );
+        }
+        if log_sinks_requested.1 && !active_syslog {
+            warn!(
+                endpoint = %config.observability.log_syslog.endpoint,
+                "[turn.observability.log_syslog] is configured but could not be set up; \
+                 log lines are not going to syslog"
+            );
+        }
+        if active_file {
+            info!(path = %config.observability.log_file.path,
+                  rotation = %config.observability.log_file.rotation, "logging to file");
+        }
+        if active_syslog {
+            info!(endpoint = %config.observability.log_syslog.endpoint,
+                  level = %config.observability.log_syslog.level, "logging to syslog");
+        }
     }
     info!(listen = %config.listen, realm = %config.realm, "starting turna");
 
@@ -1109,6 +1147,30 @@ fn run_tokio(
     #[cfg(not(unix))]
     let _ = &reload_path;
 
+    // SIGHUP also reopens the log file, which is what logrotate expects of a
+    // daemon after moving its file (`rotation = "external"`). A second listener
+    // rather than a line in the rotation handler above: that one exists only
+    // when the node was started with a config path, and it `continue`s on a
+    // config that fails to load — neither of which should stop a reopen.
+    #[cfg(unix)]
+    if turna_observability::log_file::active().is_some() {
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%e, "cannot install SIGHUP handler; the log file will not be reopened");
+                    return;
+                }
+            };
+            loop {
+                sighup.recv().await;
+                turna_observability::log_file::reopen();
+                info!(event = "log_file_reopened", "SIGHUP: log file reopened");
+            }
+        });
+    }
+
     let _syslog = Arc::new(turna_observability::syslog::SyslogExporter::new(
         turna_observability::syslog::SyslogConfig {
             endpoint: config.observability.syslog_endpoint.clone(),
@@ -1135,6 +1197,19 @@ fn run_tokio(
                 metrics
                     .syslog_dropped
                     .store(syslog.dropped.load(Relaxed), Relaxed);
+                // Optional log sinks. Zero when not configured, which the
+                // metric descriptions say.
+                let sinks = turna_observability::log_sink_stats();
+                metrics
+                    .log_file_rotations
+                    .store(sinks.file_rotations, Relaxed);
+                metrics
+                    .log_file_write_errors
+                    .store(sinks.file_write_errors, Relaxed);
+                metrics.log_syslog_sent.store(sinks.syslog_sent, Relaxed);
+                metrics
+                    .log_syslog_dropped
+                    .store(sinks.syslog_dropped, Relaxed);
                 // Requests that validated against previous_shared_secret. Lives in
                 // a static inside turna-auth because the check happens inside
                 // validate(), which has no Metrics handle — same reason the syslog
@@ -2896,6 +2971,41 @@ fn mask_uri_credentials(uri: &str) -> String {
     }
 }
 
+/// `[turn.observability.log_file]` → the telemetry sink, or `None` when off.
+///
+/// The strings were checked by config validation; an unparseable one here can
+/// only mean a config that skipped validation, and it maps to "off" rather than
+/// to a guess.
+fn log_file_sink(s: &turna_config::LogFileSection) -> Option<turna_observability::FileSink> {
+    if s.path.is_empty() {
+        return None;
+    }
+    let rotation = turna_observability::log_file::Rotation::parse(
+        &s.rotation,
+        s.max_size_mb.saturating_mul(1024 * 1024),
+    )?;
+    Some(turna_observability::FileSink {
+        file: turna_observability::log_file::LogFileConfig {
+            path: s.path.clone().into(),
+            rotation,
+            max_files: s.max_files.max(1),
+        },
+        level: s.level.parse().ok()?,
+    })
+}
+
+/// `[turn.observability.log_syslog]` → the telemetry sink, or `None` when off.
+fn log_syslog_sink(s: &turna_config::LogSyslogSection) -> Option<turna_observability::SyslogSink> {
+    if s.endpoint.is_empty() {
+        return None;
+    }
+    Some(turna_observability::SyslogSink {
+        endpoint: s.endpoint.clone(),
+        level: s.level.parse().ok()?,
+        queue_capacity: s.queue_capacity,
+    })
+}
+
 fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
     let mask = |s: &str| -> String {
         match mode {
@@ -2976,6 +3086,21 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
         "max_spans_per_second = {}",
         t.observability.max_spans_per_second
     );
+    println!("log_to_stdout        = {}", t.observability.log_to_stdout);
+    println!();
+    let lf = &t.observability.log_file;
+    println!("[turn.observability.log_file]");
+    println!("path        = \"{}\"", lf.path);
+    println!("rotation    = \"{}\"", lf.rotation);
+    println!("max_size_mb = {}", lf.max_size_mb);
+    println!("max_files   = {}", lf.max_files);
+    println!("level       = \"{}\"", lf.level);
+    println!();
+    let ls = &t.observability.log_syslog;
+    println!("[turn.observability.log_syslog]");
+    println!("endpoint       = \"{}\"", ls.endpoint);
+    println!("level          = \"{}\"", ls.level);
+    println!("queue_capacity = {}", ls.queue_capacity);
     println!();
 
     println!("[health]");

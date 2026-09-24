@@ -53,6 +53,23 @@ pub enum Severity {
     Warning = 4,
     Notice = 5,
     Informational = 6,
+    /// Only the full-log sink (`[turn.observability.log_syslog]`) uses this:
+    /// DEBUG and TRACE lines, when the operator asked for them. No security
+    /// event is ever Debug.
+    Debug = 7,
+}
+
+impl Severity {
+    /// The severity a `tracing` level maps to. TRACE has no syslog counterpart
+    /// and shares Debug, which is what every syslog bridge does.
+    pub fn from_level(level: &tracing::Level) -> Self {
+        match *level {
+            tracing::Level::ERROR => Severity::Error,
+            tracing::Level::WARN => Severity::Warning,
+            tracing::Level::INFO => Severity::Informational,
+            _ => Severity::Debug,
+        }
+    }
 }
 
 /// What kind of event this is. Becomes the `MSGID` field, which is what a SIEM
@@ -129,7 +146,13 @@ impl EventKind {
 /// Where to send, and how.
 #[derive(Debug, Clone)]
 pub struct SyslogConfig {
-    /// `udp://host:port`, `tcp://host:port`, or empty to disable.
+    /// `udp://host:port`, `tcp://host:port`, `unix:///dev/log`, or empty to
+    /// disable.
+    ///
+    /// The unix form is the local syslog socket — journald or rsyslog on the same
+    /// host. Lines sent there use the RFC 3164 shape that glibc's `syslog(3)`
+    /// writes (`<PRI>Mmm dd hh:mm:ss TAG[PID]: MSG`), because that is the one
+    /// format every local daemon parses; the network forms keep RFC 5424.
     pub endpoint: String,
     /// APP-NAME in the syslog header. Defaults to `turna`.
     pub app_name: String,
@@ -166,6 +189,10 @@ enum Sink {
     /// threads writing interleave into garbage. UDP needs no lock: each datagram
     /// is whole.
     Tcp(Mutex<Option<TcpStream>>, SocketAddr),
+    /// The local syslog socket. A datagram socket like UDP, so no lock: each
+    /// line is one datagram and cannot interleave with another.
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixDatagram, std::path::PathBuf),
     Disabled,
 }
 
@@ -203,6 +230,8 @@ impl SyslogExporter {
 
         let sink = if config.endpoint.is_empty() {
             Sink::Disabled
+        } else if let Some(path) = config.endpoint.strip_prefix("unix://") {
+            open_unix_sink(path, config.non_blocking)
         } else {
             match parse_endpoint(&config.endpoint) {
                 Some(("udp", addr)) => match UdpSocket::bind("0.0.0.0:0") {
@@ -225,7 +254,7 @@ impl SyslogExporter {
                 _ => {
                     tracing::error!(
                         endpoint = %config.endpoint,
-                        "syslog: endpoint must be udp://host:port or tcp://host:port; export disabled"
+                        "syslog: endpoint must be udp://host:port, tcp://host:port or unix:///path; export disabled"
                     );
                     Sink::Disabled
                 }
@@ -265,10 +294,31 @@ impl SyslogExporter {
         if matches!(self.sink, Sink::Disabled) {
             return;
         }
+        let sd = self.structured_data(fields);
+        let line = self.format_line(severity, kind.msgid(), &sd, "");
+        self.write(&line);
+    }
 
-        let pri = FACILITY_LOCAL0 as u16 * 8 + severity as u16;
-        let ts = rfc3339_now();
+    /// Emit one ordinary log line — the full-log sink's path, not a security
+    /// event.
+    ///
+    /// `module` is the `tracing` target and goes into structured data so a
+    /// collector can filter on it; `message` is the already-formatted (and
+    /// already-redacted) text of the event. MSGID is `LOG`, distinct from every
+    /// security MSGID, so a SIEM rule written against those keeps matching
+    /// exactly what it matched before this sink existed.
+    pub fn emit_log(&self, severity: Severity, module: &str, message: &str) {
+        if matches!(self.sink, Sink::Disabled) {
+            return;
+        }
+        let sd = self.structured_data(&[("module", module)]);
+        let line = self.format_line(severity, "LOG", &sd, message);
+        self.write(&line);
+    }
 
+    /// RFC 5424 structured data: `[turna@0 k="v" ...]`, values escaped and
+    /// address-named ones hashed when redaction is on.
+    fn structured_data(&self, fields: &[(&str, &str)]) -> String {
         let mut sd = String::from("[turna@0");
         for (k, v) in fields {
             let value = if self.config.redact_addresses && looks_like_address(k) {
@@ -287,21 +337,57 @@ impl SyslogExporter {
             sd.push_str(&format!(" {k}=\"{escaped}\""));
         }
         sd.push(']');
+        sd
+    }
 
-        let line = format!(
-            "<{pri}>1 {ts} {host} {app} {pid} {msgid} {sd}",
+    /// One wire line. RFC 5424 for the network sinks; the RFC 3164 shape glibc
+    /// writes for the local socket, which is what journald and rsyslog's
+    /// `imuxsock` parse without configuration.
+    fn format_line(&self, severity: Severity, msgid: &str, sd: &str, msg: &str) -> String {
+        let pri = FACILITY_LOCAL0 as u16 * 8 + severity as u16;
+        let sep = if msg.is_empty() { "" } else { " " };
+        if self.is_local() {
+            // No hostname: a local daemon adds its own, and the 3164 parser in
+            // journald would otherwise read our hostname as the tag.
+            return format!(
+                "<{pri}>{ts} {app}[{pid}]: {msgid} {sd}{sep}{msg}",
+                ts = rfc3164_now(),
+                app = self.config.app_name,
+                pid = std::process::id(),
+            );
+        }
+        format!(
+            "<{pri}>1 {ts} {host} {app} {pid} {msgid} {sd}{sep}{msg}",
+            ts = rfc3339_now(),
             host = self.hostname,
             app = self.config.app_name,
             pid = std::process::id(),
-            msgid = kind.msgid(),
-        );
+        )
+    }
 
-        self.write(&line);
+    fn is_local(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self.sink, Sink::Unix(..))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     fn write(&self, line: &str) {
         match &self.sink {
             Sink::Disabled => {}
+            #[cfg(unix)]
+            Sink::Unix(sock, path) => match sock.send_to(line.as_bytes(), path) {
+                Ok(_) => {
+                    self.sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            },
             Sink::Udp(sock, addr) => match sock.send_to(line.as_bytes(), addr) {
                 Ok(_) => {
                     self.sent.fetch_add(1, Ordering::Relaxed);
@@ -353,6 +439,36 @@ impl SyslogExporter {
             }
         }
     }
+}
+
+/// The local syslog socket. Not connected: `send_to` per line means a daemon
+/// restart (which recreates `/dev/log`) is picked up by the next line instead of
+/// leaving a socket connected to an unlinked inode.
+#[cfg(unix)]
+fn open_unix_sink(path: &str, non_blocking: bool) -> Sink {
+    if path.is_empty() || !path.starts_with('/') {
+        tracing::error!(
+            path,
+            "syslog: unix endpoint must be an absolute path (unix:///dev/log); export disabled"
+        );
+        return Sink::Disabled;
+    }
+    match std::os::unix::net::UnixDatagram::unbound() {
+        Ok(s) => {
+            let _ = s.set_nonblocking(non_blocking);
+            Sink::Unix(s, std::path::PathBuf::from(path))
+        }
+        Err(e) => {
+            tracing::error!(%e, "syslog: could not open a unix datagram socket; export disabled");
+            Sink::Disabled
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn open_unix_sink(_path: &str, _non_blocking: bool) -> Sink {
+    tracing::error!("syslog: unix:// endpoints exist only on unix; export disabled");
+    Sink::Disabled
 }
 
 fn parse_endpoint(s: &str) -> Option<(&str, SocketAddr)> {
@@ -469,8 +585,33 @@ fn rfc3339_now() -> String {
     )
 }
 
+/// RFC 3164 TIMESTAMP, `Mmm dd hh:mm:ss` — the one glibc writes to `/dev/log`.
+///
+/// UTC, because this crate has no timezone database. The local daemons this goes
+/// to (journald, rsyslog `imuxsock`) stamp lines with their own receive time by
+/// default and ignore this field, so the offset is not what anyone reads.
+fn rfc3164_now() -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (_, m, d) = civil_from_days((secs / 86_400) as i64);
+    let sod = secs % 86_400;
+    // Day is space-padded, not zero-padded: `Sep  4`, per RFC 3164 §4.1.2.
+    format!(
+        "{} {d:>2} {:02}:{:02}:{:02}",
+        MONTHS[(m - 1) as usize],
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
 /// Howard Hinnant's algorithm. Days since the Unix epoch to a civil date.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;

@@ -198,6 +198,25 @@ is eight bytes from `/dev/urandom`, and if that read fails the node logs why and
 writes addresses verbatim rather than substituting something that looks like a
 hash and protects nothing.
 
+#### Log sinks (`[turn.observability.log_file]`, `[turn.observability.log_syslog]`)
+
+Optional, off by default. The file sink writes the same lines as stdout to a
+rotating file; the full-log syslog sink sends every line at or above its level to
+`unix:///dev/log` or a remote collector with MSGID `LOG` (distinct from every
+security MSGID above, so SIEM rules keep matching exactly what they matched).
+Both render fields through the same redacting formatter as stdout, so
+`log_allocation_addresses = false` hashes addresses on them too, and fields named
+like a credential (`password`, `secret`, `shared_secret`, `token`,
+`authorization`, …) are written as `[redacted]` on every sink. All four series
+are emitted unconditionally and read `0` when the sink is off.
+
+| metric | type | meaning |
+|---|---|---|
+| `turna_log_file_rotations_total` | counter | Rotations performed by the file sink (size or time). Stays `0` with `rotation = "external"`, where logrotate rotates and SIGHUP reopens. |
+| `turna_log_file_write_errors_total` | counter | Log lines lost to a write or rotation error — usually a full disk or a directory the service may not write. **Alert on any increase**: the lines are gone and nothing else says so. |
+| `turna_log_syslog_sent_total` | counter | Lines written to the full-log syslog sink. |
+| `turna_log_syslog_dropped_total` | counter | Lines lost by the full-log syslog sink: its queue (`queue_capacity`) was full, or the transport failed. Lines are formatted on the logging thread and sent by one background thread, so a slow collector drops lines rather than stalling the relay. |
+
 #### Dashboard
 
 `deploy/grafana/turna-overview.json`. Schema 39, which loads on Grafana 10 and 11.
@@ -552,7 +571,43 @@ Do not promote high-cardinality values such as `client_addr`, `relay_addr`, or
 query time.
 
 Secrets (`shared_secret`, passwords, HMAC keys) must never appear in logs. Treat
-logs as network metadata and apply retention controls.
+logs as network metadata and apply retention controls. As a backstop, a field
+whose *name* is a credential name (`password`, `secret`, `shared_secret`,
+`previous_shared_secret`, `token`, `auth_token`, `api_key`, `authorization`,
+`auth_header`) is replaced with `[redacted]` by the formatter every sink shares.
+No line in the tree logs such a field today; the list exists so that one added
+later does not reach a file or a remote collector.
+
+### Writing the log to a file
+
+```toml
+[turn.observability.log_file]
+path = "/var/log/turna/turna.log"
+rotation = "size"      # size | daily | hourly | external
+max_size_mb = 100
+max_files = 7
+```
+
+Same format as stdout (`json_logs` applies), no ANSI colour, file mode `0640`.
+`size` rotates to `turna.log.1 … .N`; `daily`/`hourly` rename to
+`turna.log.YYYY-MM-DD[THH]` (UTC) at the first line of a new period; `external`
+never rotates and relies on logrotate plus SIGHUP (`deploy/logrotate/turna-node`).
+SIGHUP reopens the file in every mode. `log_to_stdout = false` stops the stdout
+copy once a file or syslog sink carries the log.
+
+### Sending the whole log to syslog
+
+```toml
+[turn.observability.log_syslog]
+endpoint = "unix:///dev/log"   # or udp://host:514, tcp://host:601
+level = "info"
+```
+
+`unix://` sends the RFC 3164 shape glibc's `syslog(3)` writes, which journald and
+rsyslog parse without configuration; the network forms send RFC 5424, framed with
+octet counting over TCP. The facility is `local0`, as for security events.
+`level` narrows what is sent; it cannot add lines the global filter (`RUST_LOG`)
+already removed.
 
 ## OpenTelemetry traces
 

@@ -272,19 +272,79 @@ impl TurnaConfig {
         // nowhere.
         if !self.turn.observability.syslog_endpoint.is_empty() {
             let e = &self.turn.observability.syslog_endpoint;
-            let ok = e.starts_with("udp://") || e.starts_with("tcp://");
-            let has_port = e
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse::<u16>().ok())
-                .is_some();
-            if !ok || !has_port {
+            if !syslog_endpoint_ok(e) {
                 errors.push(format!(
-                    "[observability] syslog_endpoint = {e:?} must be udp://host:port \
-                     or tcp://host:port. Refused here rather than at runtime: an \
+                    "[observability] syslog_endpoint = {e:?} must be udp://host:port, \
+                     tcp://host:port or unix:///path. Refused here rather than at runtime: an \
                      endpoint that silently fails to parse means security events go \
                      nowhere and nothing says so."
                 ));
+            }
+        }
+
+        // Optional log sinks. Everything here is refused at load rather than
+        // discovered at runtime, for the same reason as syslog_endpoint above.
+        {
+            let o = &self.turn.observability;
+            let f = &o.log_file;
+            if !f.path.is_empty() {
+                if !matches!(
+                    f.rotation.as_str(),
+                    "size" | "daily" | "hourly" | "external"
+                ) {
+                    errors.push(format!(
+                        "[turn.observability.log_file] rotation = {:?} must be size, daily, \
+                         hourly or external",
+                        f.rotation
+                    ));
+                }
+                if f.rotation == "size" && f.max_size_mb == 0 {
+                    errors.push(
+                        "[turn.observability.log_file] max_size_mb must be > 0 with \
+                         rotation = \"size\" (0 would rotate on every line)"
+                            .into(),
+                    );
+                }
+                if f.max_files == 0 || f.max_files > 1000 {
+                    errors.push(format!(
+                        "[turn.observability.log_file] max_files = {} must be 1..=1000",
+                        f.max_files
+                    ));
+                }
+                if !LOG_LEVELS.contains(&f.level.as_str()) {
+                    errors.push(format!(
+                        "[turn.observability.log_file] level = {:?} must be one of {LOG_LEVELS:?}",
+                        f.level
+                    ));
+                }
+            }
+            let l = &o.log_syslog;
+            if !l.endpoint.is_empty() {
+                if !syslog_endpoint_ok(&l.endpoint) {
+                    errors.push(format!(
+                        "[turn.observability.log_syslog] endpoint = {:?} must be \
+                         unix:///path, udp://host:port or tcp://host:port",
+                        l.endpoint
+                    ));
+                }
+                if !LOG_LEVELS.contains(&l.level.as_str()) {
+                    errors.push(format!(
+                        "[turn.observability.log_syslog] level = {:?} must be one of {LOG_LEVELS:?}",
+                        l.level
+                    ));
+                }
+                if l.queue_capacity == 0 {
+                    errors
+                        .push("[turn.observability.log_syslog] queue_capacity must be > 0".into());
+                }
+            }
+            if !o.log_to_stdout && f.path.is_empty() && l.endpoint.is_empty() {
+                errors.push(
+                    "[turn.observability] log_to_stdout = false with no log_file path and no \
+                     log_syslog endpoint: the node would log nowhere. Configure a sink or \
+                     leave stdout on."
+                        .into(),
+                );
             }
         }
 
@@ -1780,6 +1840,109 @@ pub struct ObservabilityConfig {
     pub json_logs: bool,
     /// Maximum number of spans per second (rate limiter in TurnaSampler).
     pub max_spans_per_second: u32,
+    /// Write the log to stdout. `true` by default, as in every release before
+    /// this key existed.
+    ///
+    /// `false` only makes sense when `[turn.observability.log_file]` or
+    /// `[turn.observability.log_syslog]` is configured; validation refuses it
+    /// otherwise, because a node that logs nowhere is one nobody can debug.
+    #[serde(default = "default_true")]
+    pub log_to_stdout: bool,
+    /// Log file with rotation. Off unless `path` is set.
+    #[serde(default)]
+    pub log_file: LogFileSection,
+    /// Send the whole log (not only security events) to syslog. Off unless
+    /// `endpoint` is set.
+    #[serde(default)]
+    pub log_syslog: LogSyslogSection,
+}
+
+/// `[turn.observability.log_file]` — write the log to a file as well as (or
+/// instead of) stdout.
+///
+/// The same lines stdout carries, in the same format (`json_logs` applies), with
+/// the same redaction (`log_allocation_addresses`, credential-named fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogFileSection {
+    /// File to append to. Empty (the default) disables the file sink. The
+    /// directory must exist and be writable by the node's user; under the
+    /// shipped systemd unit that means adding it to `ReadWritePaths` (the unit
+    /// has `LogsDirectory=turna` commented in for `/var/log/turna`).
+    pub path: String,
+    /// `"size"` (default), `"daily"`, `"hourly"` or `"external"`.
+    ///
+    /// `external` never rotates here: logrotate moves the file and sends SIGHUP,
+    /// and the node reopens the path. SIGHUP also reloads shared secrets, which is
+    /// idempotent — a reload with an unchanged file changes nothing.
+    pub rotation: String,
+    /// Size limit for `rotation = "size"`, in MiB. Default 100.
+    pub max_size_mb: u64,
+    /// Rotated files kept (the active file is not counted). Default 7.
+    pub max_files: usize,
+    /// Narrows what reaches the file: `error`, `warn`, `info`, `debug` or
+    /// `trace` (the default, meaning "everything the global filter passes").
+    /// Cannot widen past `RUST_LOG`.
+    pub level: String,
+}
+
+impl Default for LogFileSection {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            rotation: "size".into(),
+            max_size_mb: 100,
+            max_files: 7,
+            level: "trace".into(),
+        }
+    }
+}
+
+/// `[turn.observability.log_syslog]` — send every log line at or above `level`
+/// to syslog.
+///
+/// Separate from `syslog_endpoint`, which carries curated security events to a
+/// SIEM and stays exactly as it was. These lines use MSGID `LOG`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogSyslogSection {
+    /// `unix:///dev/log` (local journald/rsyslog), `udp://host:514` or
+    /// `tcp://host:601`. Empty (the default) disables the sink.
+    pub endpoint: String,
+    /// `error`, `warn`, `info` (default), `debug` or `trace`. Applied on top of
+    /// the global filter, so it can narrow but not widen.
+    pub level: String,
+    /// Lines buffered for the sender thread. Beyond this they are dropped and
+    /// counted in `turna_log_syslog_dropped_total` rather than stalling the
+    /// thread that logged. Default 8192.
+    pub queue_capacity: usize,
+}
+
+impl Default for LogSyslogSection {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            level: "info".into(),
+            queue_capacity: 8192,
+        }
+    }
+}
+
+/// The level names the log sinks accept.
+const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
+
+/// `udp://host:port`, `tcp://host:port` or `unix:///absolute/path`.
+fn syslog_endpoint_ok(e: &str) -> bool {
+    if let Some(path) = e.strip_prefix("unix://") {
+        return path.starts_with('/') && path.len() > 1;
+    }
+    let ok = e.starts_with("udp://") || e.starts_with("tcp://");
+    let has_port = e
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .is_some();
+    ok && has_port
 }
 
 impl Default for ObservabilityConfig {
@@ -1794,6 +1957,9 @@ impl Default for ObservabilityConfig {
             trace_sample_rate: 0.01,        // 1%
             json_logs: false,
             max_spans_per_second: 1000,
+            log_to_stdout: true,
+            log_file: LogFileSection::default(),
+            log_syslog: LogSyslogSection::default(),
         }
     }
 }
@@ -3553,12 +3719,12 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
-    fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
-    fn restore_turna_production(value: Option<OsString>) {
+    pub(super) fn restore_turna_production(value: Option<OsString>) {
         if let Some(value) = value {
             std::env::set_var("TURNA_PRODUCTION", value);
         } else {
@@ -4628,5 +4794,111 @@ shared_secret = \"a-real-secret-not-the-placeholder\"
             !err.contains("removed in 0.5.0"),
             "a typo must not be reported as a removed section: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod log_sink_tests {
+    // The env lock is the one `tests` uses: TURNA_PRODUCTION is process-global,
+    // and a second lock would let a test there flip production mode under a
+    // validation running here.
+    use super::tests::{production_env_lock, restore_turna_production};
+    use super::*;
+
+    // ── optional log sinks ────────────────────────────────────────────────
+
+    fn validate_dev(cfg: &TurnaConfig) -> Result<()> {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let r = cfg.validate();
+        restore_turna_production(saved);
+        r
+    }
+
+    #[test]
+    fn log_sinks_are_off_by_default_and_stdout_stays_on() {
+        let o = ObservabilityConfig::default();
+        assert!(o.log_to_stdout);
+        assert!(o.log_file.path.is_empty());
+        assert!(o.log_syslog.endpoint.is_empty());
+        // Parsing an old config with no new keys gives the same.
+        let cfg: TurnaConfig = toml::from_str("[turn.observability]\njson_logs = true\n").unwrap();
+        assert!(cfg.turn.observability.log_to_stdout);
+        assert!(cfg.turn.observability.log_file.path.is_empty());
+    }
+
+    #[test]
+    fn log_file_section_parses_and_validates() {
+        let cfg: TurnaConfig = toml::from_str(
+            "[turn.observability.log_file]\npath = \"/var/log/turna/turna.log\"\n\
+             rotation = \"daily\"\nmax_files = 14\nlevel = \"info\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.turn.observability.log_file.rotation, "daily");
+        validate_dev(&cfg).unwrap();
+
+        let mut bad = cfg.clone();
+        bad.turn.observability.log_file.rotation = "weekly".into();
+        bad.turn.observability.log_file.max_files = 0;
+        bad.turn.observability.log_file.level = "loud".into();
+        let msg = validate_dev(&bad).unwrap_err().to_string();
+        assert!(msg.contains("rotation"), "{msg}");
+        assert!(msg.contains("max_files"), "{msg}");
+        assert!(msg.contains("level"), "{msg}");
+
+        let mut zero = cfg;
+        zero.turn.observability.log_file.rotation = "size".into();
+        zero.turn.observability.log_file.max_size_mb = 0;
+        assert!(validate_dev(&zero)
+            .unwrap_err()
+            .to_string()
+            .contains("max_size_mb"));
+    }
+
+    #[test]
+    fn log_file_rejects_unknown_keys() {
+        let r: std::result::Result<TurnaConfig, _> =
+            toml::from_str("[turn.observability.log_file]\npaht = \"/tmp/x\"\n");
+        assert!(r.is_err(), "deny_unknown_fields must cover the new section");
+    }
+
+    #[test]
+    fn log_syslog_endpoint_forms() {
+        for ok in ["unix:///dev/log", "udp://10.0.0.1:514", "tcp://syslog:601"] {
+            let mut cfg = TurnaConfig::default();
+            cfg.turn.observability.log_syslog.endpoint = ok.into();
+            validate_dev(&cfg).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in ["unix://dev/log", "unix://", "http://x:1", "udp://host"] {
+            let mut cfg = TurnaConfig::default();
+            cfg.turn.observability.log_syslog.endpoint = bad.into();
+            assert!(validate_dev(&cfg).is_err(), "{bad} must be refused");
+        }
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.observability.log_syslog.endpoint = "unix:///dev/log".into();
+        cfg.turn.observability.log_syslog.level = "verbose".into();
+        assert!(validate_dev(&cfg).is_err());
+    }
+
+    /// The security exporter gained the unix sink too, so its validation
+    /// accepts it; the network forms are unchanged.
+    #[test]
+    fn security_syslog_endpoint_accepts_unix() {
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.observability.syslog_endpoint = "unix:///dev/log".into();
+        validate_dev(&cfg).unwrap();
+        cfg.turn.observability.syslog_endpoint = "udp://collector".into();
+        assert!(validate_dev(&cfg).is_err());
+    }
+
+    #[test]
+    fn stdout_off_needs_another_sink() {
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.observability.log_to_stdout = false;
+        let msg = validate_dev(&cfg).unwrap_err().to_string();
+        assert!(msg.contains("log nowhere"), "{msg}");
+        cfg.turn.observability.log_file.path = "/var/log/turna/turna.log".into();
+        validate_dev(&cfg).unwrap();
     }
 }

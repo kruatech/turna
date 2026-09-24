@@ -464,6 +464,31 @@ and the revoked certificate would then work.
 | `log_allocation_addresses` | bool | `true` | Log client IP addresses on the three per-allocation INFO lines. |
 | `node_audit_path` | string | `""` | Where the node writes its audit chain. Empty keeps it in memory only. |
 | `node_audit_entries` | usize | `256` | Entries kept in the in-memory ring. |
+| `log_to_stdout` | bool | `true` | Write the log to stdout. `false` is refused unless a file or syslog log sink is configured. |
+| `log_file.path` | string | `""` | Also write the log to this file. Empty disables. The directory must exist and be writable by the service user. |
+| `log_file.rotation` | string | `"size"` | `size`, `daily`, `hourly` (UTC) or `external` (never rotate; logrotate + SIGHUP). |
+| `log_file.max_size_mb` | u64 | `100` | Size limit for `rotation = "size"`. Must be > 0. |
+| `log_file.max_files` | usize | `7` | Rotated files kept, 1..=1000. The active file is not counted. |
+| `log_file.level` | string | `"trace"` | Narrows the file: `error`/`warn`/`info`/`debug`/`trace`. Applied after `RUST_LOG`, so it cannot widen it. |
+| `log_syslog.endpoint` | string | `""` | Send **every** log line (not only security events) to `unix:///dev/log`, `udp://host:514` or `tcp://host:601`. Empty disables. |
+| `log_syslog.level` | string | `"info"` | Lowest level sent. Applied after `RUST_LOG`. |
+| `log_syslog.queue_capacity` | usize | `8192` | Lines buffered for the sender thread; beyond it they are dropped and counted in `turna_log_syslog_dropped_total`. |
+
+`syslog_endpoint` also accepts `unix:///dev/log` since the log-sink work: the
+exporter gained the local socket, and the security events can use it too.
+
+**Log file and full-log syslog are opt-in and change nothing when unset.** They
+carry the same lines as stdout, rendered by the same redacting formatter: the
+`log_allocation_addresses` switch applies to them, and credential-named fields are
+replaced with `[redacted]`. `log_syslog` is not the security export —
+`syslog_endpoint` keeps sending only the curated security events, and the full
+log carries MSGID `LOG` so SIEM rules on the security MSGIDs are unaffected.
+
+SIGHUP reopens the log file (for logrotate with `rotation = "external"`) and also
+reloads shared secrets, which is idempotent: a reload with an unchanged file
+changes nothing. A log file or syslog sink that cannot be opened at startup is
+reported on stderr and again at WARN once stdout logging is up; the node keeps
+serving with stdout only rather than refusing to start over a log destination.
 
 **`syslog_endpoint` carries security events only** — authentication failures,
 authorisation denials, peer refusals, rate-limit trips, audit entries, readiness
