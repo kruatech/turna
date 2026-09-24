@@ -837,7 +837,41 @@ fn rate_limit_settings(cfg: &turna_config::RateLimitConfig) -> turna_relay::Rate
         default: tier(&cfg.default),
         trusted: tier(&cfg.trusted),
         trusted_prefixes: cfg.trusted_prefixes.clone(),
+        auto_ban: None,
     }
+}
+
+/// `[turn.auto_ban]` → the shared ban table, or `None` when it is off.
+fn auto_ban_table(config: &TurnConfig) -> Option<Arc<turna_relay::AutoBan>> {
+    let a = &config.auto_ban;
+    if !a.enabled {
+        return None;
+    }
+    let mut allowlist = a.allowlist.clone();
+    if a.exempt_trusted_prefixes {
+        allowlist.extend(config.rate_limit.trusted_prefixes.iter().cloned());
+    }
+    info!(
+        auth_failures = a.auth_failures,
+        rate_limit_violations = a.rate_limit_violations,
+        window_secs = a.window_secs,
+        ban_secs = a.ban_secs,
+        scope = %a.scope,
+        allowlisted_ranges = allowlist.len(),
+        "auto-ban enabled"
+    );
+    Some(Arc::new(turna_relay::AutoBan::new(
+        turna_relay::AutoBanSettings {
+            auth_failures: a.auth_failures,
+            rate_limit_violations: a.rate_limit_violations,
+            window: Duration::from_secs(a.window_secs),
+            ban: Duration::from_secs(a.ban_secs),
+            prefix_scope: a.scope == "prefix",
+            allowlist,
+            max_tracked: a.max_tracked,
+            max_bans: a.max_bans,
+        },
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -871,7 +905,11 @@ fn run_tokio(
     // the QUIC/DTLS processor): each builds its own limiter from these tiers, so
     // a source's budget is per-datapath, exactly as it was when the tiers came
     // from the environment.
-    let rate_limits = rate_limit_settings(&config.rate_limit);
+    let mut rate_limits = rate_limit_settings(&config.rate_limit);
+    // `[turn.auto_ban]`: one table shared by every datapath, so a source banned
+    // on UDP is banned on TURNS, DTLS and QUIC as well. Its sweeper is spawned
+    // inside the runtime below.
+    rate_limits.auto_ban = auto_ban_table(&config);
 
     let node_audit = {
         let path = &config.observability.node_audit_path;
@@ -944,6 +982,26 @@ fn run_tokio(
         .build()?;
 
     let result = rt.block_on(async {
+    // `[turn.auto_ban]` sweeper: expires bans (logging the unban security
+    // event) and publishes the active-ban gauge.
+    if let Some(ban) = rate_limits.auto_ban.clone() {
+        let ban_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let active = turna_relay::abuse::sweep_and_log(&ban);
+                ban_metrics
+                    .autoban_active
+                    .store(active as u64, std::sync::atomic::Ordering::Relaxed);
+                ban_metrics.autoban_refused_full.store(
+                    ban.bans_refused_full
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        });
+    }
     // MOVED HERE FROM `main`'s SYNCHRONOUS PROLOGUE. `tokio::spawn` needs a
     // runtime, and there is none until `run_tokio` builds one a few lines above
     // this — so spawning during config setup panicked with "there is no reactor

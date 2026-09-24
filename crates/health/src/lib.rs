@@ -303,6 +303,17 @@ pub struct Metrics {
     pub auth_fail_integrity: AtomicU64,
     pub auth_fail_bad_request: AtomicU64,
 
+    // ── Auto-ban (`[turn.auto_ban]`) ───────────────────────────────────────────
+    // All zero while the feature is off.
+    /// Bans imposed since start.
+    pub autoban_bans: AtomicU64,
+    /// Packets dropped because their source was banned.
+    pub autoban_dropped: AtomicU64,
+    /// Bans currently in the table (gauge, set by the node's sweep).
+    pub autoban_active: AtomicU64,
+    /// Bans refused because `max_bans` live bans were already in force.
+    pub autoban_refused_full: AtomicU64,
+
     // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
     // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
     // task in the node listeners (the transport crate is leaf-level and cannot
@@ -537,6 +548,10 @@ impl Metrics {
             auth_fail_expired: AtomicU64::new(0),
             auth_fail_integrity: AtomicU64::new(0),
             auth_fail_bad_request: AtomicU64::new(0),
+            autoban_bans: AtomicU64::new(0),
+            autoban_dropped: AtomicU64::new(0),
+            autoban_active: AtomicU64::new(0),
+            autoban_refused_full: AtomicU64::new(0),
             quic_active: AtomicU64::new(0),
             quic_sessions_total: AtomicU64::new(0),
             quic_closed_total: AtomicU64::new(0),
@@ -764,6 +779,30 @@ impl Metrics {
             self.auth_fail_expired.load(Ordering::Relaxed),
             self.auth_fail_integrity.load(Ordering::Relaxed),
             self.auth_fail_bad_request.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Abuse controls: `[turn.auto_ban]`. Emitted unconditionally (zero while
+    /// the feature is off) so scrapes have a stable series set.
+    fn render_abuse_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_autoban_bans_total Sources banned by [turn.auto_ban] since start\n\
+             # TYPE turna_autoban_bans_total counter\n\
+             turna_autoban_bans_total {}\n\
+             # HELP turna_autoban_active Bans currently in force (or expired and not yet swept)\n\
+             # TYPE turna_autoban_active gauge\n\
+             turna_autoban_active {}\n\
+             # HELP turna_autoban_dropped_total Packets dropped because their source was banned\n\
+             # TYPE turna_autoban_dropped_total counter\n\
+             turna_autoban_dropped_total {}\n\
+             # HELP turna_autoban_refused_full_total Bans not imposed because max_bans live bans were already in force\n\
+             # TYPE turna_autoban_refused_full_total counter\n\
+             turna_autoban_refused_full_total {}\n",
+            l(&self.autoban_bans),
+            l(&self.autoban_active),
+            l(&self.autoban_dropped),
+            l(&self.autoban_refused_full),
         )
     }
 
@@ -2302,6 +2341,7 @@ pub async fn serve_on(
                         m.processor_panics.load(Ordering::Relaxed)
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
+                    body.push_str(&m.render_abuse_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());
@@ -2365,6 +2405,7 @@ mod metrics_format_regression {
             m.peer_rejected.load(Ordering::Relaxed),
         );
         body.push_str(&m.render_auth_reason_metrics());
+        body.push_str(&m.render_abuse_metrics());
         body.push_str(&m.render_transport_metrics());
         body
     }

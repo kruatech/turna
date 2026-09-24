@@ -205,6 +205,30 @@ max_spans_per_second = 1000
 # how an operator ends up looking for a ceiling that is not written down.
 
 # =============================================================================
+# [turn.auto_ban] — temporary bans after repeated failures (fail2ban built in)
+# =============================================================================
+# Off by default. A source that fails authentication `auth_failures` times in
+# `window_secs` has every packet dropped for `ban_secs`, before any other work.
+# Only failures behind a valid NONCE count, so a spoofed source cannot get a
+# victim banned that way.
+#
+# rate_limit_violations (0 = off) also bans on rate-limiter refusals. Those are
+# raw packets and CAN carry a forged source address: enable only where spoofing
+# is filtered upstream. [turn.rate_limit] trusted_prefixes are exempt by default.
+#
+# [turn.auto_ban]
+# enabled = true
+# auth_failures = 10
+# rate_limit_violations = 0
+# window_secs = 60
+# ban_secs = 600
+# scope = "ip"                    # or "prefix": count and ban per /24 or /48
+# allowlist = ["198.51.100.0/24"]
+# exempt_trusted_prefixes = true
+# max_tracked = 65536
+# max_bans = 16384
+
+# =============================================================================
 # [health] — Prometheus metrics + /health endpoint
 # =============================================================================
 [health]

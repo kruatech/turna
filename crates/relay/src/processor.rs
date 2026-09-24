@@ -302,7 +302,7 @@ fn hash_ip(ip: &std::net::IpAddr) -> String {
 /// carries one label across every line about it — a permission denial and the
 /// allocation it belongs to correlate, which is the whole reason the hash is
 /// stable within a process.
-fn loggable_ip(ip: &std::net::IpAddr) -> String {
+pub(crate) fn loggable_ip(ip: &std::net::IpAddr) -> String {
     if LOG_ALLOCATION_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
         return ip.to_string();
     }
@@ -552,6 +552,8 @@ pub struct PacketProcessor {
     trusted_limiter: Option<TieredRateLimiter>,
     /// Ranges whose sources use `trusted_limiter`. Empty unless configured.
     trusted_prefixes: Vec<crate::peer_filter::Cidr>,
+    /// `[turn.auto_ban]`. `None` unless configured; see [`crate::abuse`].
+    auto_ban: Option<Arc<crate::abuse::AutoBan>>,
     /// Budget for replies sent to an address that has not authenticated:
     /// Binding responses and 401 challenges.
     ///
@@ -602,6 +604,14 @@ pub struct RateLimitSettings {
     /// CIDR ranges whose sources get the `trusted` tier: the offices and VPN
     /// pools where hundreds of users share one NAT address.
     pub trusted_prefixes: Vec<String>,
+    /// `[turn.auto_ban]`: temporary bans fed by auth failures and rate-limit
+    /// refusals. `None` (the default) leaves the datapath exactly as before.
+    ///
+    /// Here rather than in a builder of its own because this struct is the one
+    /// thing every processor the node builds is already handed — the UDP server,
+    /// the AF_XDP loop and the QUIC/DTLS processor beside io_uring — and the
+    /// table is shared (`Arc`) so a ban on one path is a ban on all of them.
+    pub auto_ban: Option<Arc<crate::abuse::AutoBan>>,
 }
 
 impl RateLimitSettings {
@@ -684,7 +694,49 @@ impl PacketProcessor {
             );
             Some(TieredRateLimiter::new(settings.trusted))
         };
+        self.auto_ban = settings.auto_ban.clone();
         self
+    }
+
+    /// Count one offence against `src` for `[turn.auto_ban]`, and announce the
+    /// ban if this one tipped it.
+    #[inline]
+    fn note_offence(&self, src: SocketAddr, offence: crate::abuse::Offence) {
+        if let Some(ban) = &self.auto_ban {
+            if let Some(ev) = ban.record(src.ip(), offence) {
+                self.metrics.autoban_bans.fetch_add(1, Ordering::Relaxed);
+                crate::abuse::log_ban(&ev);
+            }
+        }
+    }
+
+    /// A rate limiter refused `src`: the existing counter, plus auto-ban evidence.
+    #[inline]
+    fn note_rate_limited(&self, src: SocketAddr) {
+        self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+        self.note_offence(src, crate::abuse::Offence::RateLimited);
+    }
+
+    /// A request that carried a valid NONCE failed authentication. Only these
+    /// feed auto-ban: the client-bound nonce proves a round trip from `src`, so
+    /// the evidence cannot be forged with a spoofed source address.
+    #[inline]
+    fn note_auth_failure(&self, src: SocketAddr) {
+        self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        self.note_offence(src, crate::abuse::Offence::AuthFailure);
+    }
+
+    /// `[turn.auto_ban]` gate: drop everything from a banned source. One relaxed
+    /// load when nothing is banned (or the feature is off).
+    #[inline]
+    fn banned(&self, src: SocketAddr) -> bool {
+        match &self.auto_ban {
+            Some(ban) if ban.is_banned(src.ip()) => {
+                self.metrics.autoban_dropped.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Which limiter governs this source.
@@ -748,6 +800,7 @@ impl PacketProcessor {
             )),
             trusted_limiter: None,
             trusted_prefixes: Vec::new(),
+            auto_ban: None,
             // (64, 8): a legitimate client needs single digits of these, ever.
             // Only `per_ip` is consulted; the other tiers are set to the same
             // values rather than left at their generous defaults so that a
@@ -940,6 +993,12 @@ impl PacketProcessor {
             .bytes_received
             .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
+        // `[turn.auto_ban]`: before classification, limiting, parsing or auth —
+        // a banned source costs one map read and nothing else.
+        if self.banned(src) {
+            return vec![Action::None];
+        }
+
         // Cheap stateless protocol classification BEFORE rate limiting.
         //
         // Garbage traffic must not touch the limiter/state/auth path: under
@@ -967,7 +1026,7 @@ impl PacketProcessor {
             // the per-allocation bandwidth quota — so a cheaper per-IP-only
             // gate (single shard lock) is sufficient here.
             if !self.limiter_for(src.ip()).check_ingress_ip(src.ip()) {
-                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                self.note_rate_limited(src);
                 return vec![Action::None];
             }
             // P2: only read the clock / update the histogram on sampled packets.
@@ -984,7 +1043,7 @@ impl PacketProcessor {
 
         // STUN is pre-auth: keep the full per-IP + per-prefix ingress gate.
         if !self.limiter_for(src.ip()).check_ingress(src.ip()) {
-            self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            self.note_rate_limited(src);
             return vec![Action::None];
         }
         if should_sample() {
@@ -1017,9 +1076,13 @@ impl PacketProcessor {
                 .bytes_received
                 .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
+            if self.banned(src) {
+                return vec![Action::None];
+            }
+
             // ChannelData uses the per-IP-only ingress gate (see P5 in process()).
             if !self.limiter_for(src.ip()).check_ingress_ip(src.ip()) {
-                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                self.note_rate_limited(src);
                 return vec![Action::None];
             }
 
@@ -1338,7 +1401,7 @@ impl PacketProcessor {
             (MessageClass::Request, Method::Binding) => self.handle_binding(msg, raw, src),
             (MessageClass::Request, Method::Allocate) => {
                 if !self.limiter_for(src.ip()).check_allocate(src.ip()) {
-                    self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.note_rate_limited(src);
                     return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_allocate(msg, raw, src, ingress_tcp)
@@ -1346,14 +1409,14 @@ impl PacketProcessor {
             (MessageClass::Request, Method::Refresh) => self.handle_refresh(msg, raw, src),
             (MessageClass::Request, Method::CreatePermission) => {
                 if !self.limiter_for(src.ip()).check_create_permission(src.ip()) {
-                    self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.note_rate_limited(src);
                     return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_create_permission(msg, raw, src)
             }
             (MessageClass::Request, Method::ChannelBind) => {
                 if !self.limiter_for(src.ip()).check_channel_bind(src.ip()) {
-                    self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.note_rate_limited(src);
                     return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_channel_bind(msg, raw, src)
@@ -1571,7 +1634,7 @@ impl PacketProcessor {
                 if let Some(occurrences) = AUTH_FAILED_LOG.should_log() {
                     warn!(src = %loggable_addr(&src), %e, occurrences, "auth failed");
                 }
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2035,7 +2098,7 @@ impl PacketProcessor {
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return ConnectDecision::Reject(self.encode_error(
                         msg,
@@ -2166,7 +2229,7 @@ impl PacketProcessor {
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return ConnBindDecision::Reject(self.encode_error(
                         msg,
@@ -2231,7 +2294,7 @@ impl PacketProcessor {
         let resolution = match self.auth_validate(msg, raw) {
             Ok(r) => r,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2434,7 +2497,7 @@ impl PacketProcessor {
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2525,7 +2588,7 @@ impl PacketProcessor {
         let key = match self.auth_validate(msg, raw) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -3127,5 +3190,153 @@ mod udp_replay_tests {
             [Action::None]
         ));
         assert_eq!(p.metrics.total_allocations.load(Ordering::Relaxed), 1);
+    }
+}
+
+/// `[turn.auto_ban]` through the real request path: bad credentials behind a
+/// valid nonce ban the source, the ban drops everything from it (Binding and
+/// ChannelData included), and neighbours and forged Binding failures do not
+/// count.
+#[cfg(test)]
+mod auto_ban_tests {
+    use super::*;
+    use crate::abuse::{AutoBan, AutoBanSettings};
+
+    fn wrong_password() -> String {
+        // Random per run, and not the one the user was created with.
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn processor_with_ban(threshold: u32, rl_threshold: u32) -> PacketProcessor {
+        let ban = Arc::new(AutoBan::new(AutoBanSettings {
+            auth_failures: threshold,
+            rate_limit_violations: rl_threshold,
+            window: Duration::from_secs(60),
+            ban: Duration::from_secs(600),
+            prefix_scope: false,
+            allowlist: vec!["192.0.2.0/24".into()],
+            max_tracked: 1024,
+            max_bans: 1024,
+        }));
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(25000, 25999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "ban-test",
+                [("alice", wrong_password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        );
+        p.with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: Some(ban),
+        })
+    }
+
+    /// An Allocate with a valid nonce and the wrong key.
+    fn bad_allocate(p: &PacketProcessor, src: SocketAddr) -> Bytes {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.add(Attribute::RequestedTransport(17));
+        msg.add(Attribute::Username("alice".into()));
+        msg.add(Attribute::Realm("ban-test".into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key("alice", "ban-test", &wrong_password());
+        let mut buf = [0; 512];
+        let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn binding() -> Bytes {
+        let msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        let mut buf = [0; 64];
+        let n = msg.encode(&mut buf).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn answered(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::Send { .. }))
+    }
+
+    #[test]
+    fn repeated_auth_failures_ban_the_source_and_nothing_else() {
+        let p = processor_with_ban(3, 0);
+        let bad: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let good: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+
+        assert!(answered(&p.process(binding(), bad)), "not banned yet");
+        for _ in 0..3 {
+            // Each failure is still answered with a 401 challenge.
+            assert!(answered(&p.process(bad_allocate(&p, bad), bad)));
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 1);
+
+        // Everything from the banned address is dropped silently — including a
+        // Binding, which needs no credentials, and ChannelData.
+        assert!(!answered(&p.process(binding(), bad)));
+        assert!(!answered(&p.process(bad_allocate(&p, bad), bad)));
+        let cd = Bytes::from_static(&[0x40, 0x00, 0x00, 0x04, 1, 2, 3, 4]);
+        assert!(!answered(&p.process(cd.clone(), bad)));
+        assert!(matches!(p.process_slice(&cd, bad)[..], [Action::None]));
+        assert!(p.metrics.autoban_dropped.load(Ordering::Relaxed) >= 4);
+
+        // Another port on the same host is the same host.
+        let same_host: SocketAddr = "203.0.113.9:40001".parse().unwrap();
+        assert!(!answered(&p.process(binding(), same_host)));
+
+        // The neighbour is untouched.
+        assert!(answered(&p.process(binding(), good)));
+    }
+
+    #[test]
+    fn allowlisted_sources_are_never_banned() {
+        let p = processor_with_ban(2, 0);
+        let src: SocketAddr = "192.0.2.50:40000".parse().unwrap();
+        for _ in 0..10 {
+            p.process(bad_allocate(&p, src), src);
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+        assert!(answered(&p.process(binding(), src)));
+    }
+
+    /// A Binding with bad MESSAGE-INTEGRITY skips the nonce, so its source may
+    /// be forged. It must not count, or anyone could get a victim banned.
+    #[test]
+    fn forged_binding_failures_do_not_count() {
+        let p = processor_with_ban(2, 0);
+        let victim: SocketAddr = "198.51.100.77:3478".parse().unwrap();
+        let key = turna_crypto::long_term_key("alice", "ban-test", &wrong_password());
+        for _ in 0..10 {
+            let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+            msg.add(Attribute::Username("alice".into()));
+            msg.add(Attribute::Realm("ban-test".into()));
+            let mut buf = [0; 256];
+            let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+            p.process(Bytes::copy_from_slice(&buf[..n]), victim);
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn off_by_default() {
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(26000, 26999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "ban-test",
+                [("alice", wrong_password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        );
+        let src: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        for _ in 0..50 {
+            p.process(bad_allocate(&p, src), src);
+        }
+        assert!(answered(&p.process(binding(), src)));
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
     }
 }

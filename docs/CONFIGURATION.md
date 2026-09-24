@@ -603,6 +603,65 @@ deprecated: a limit set there appears in no config file and in no
 `--dump-config` output, which is how an operator ends up hunting for a ceiling
 that is written down nowhere.
 
+## Auto-ban (`[turn.auto_ban]`)
+
+fail2ban built into the datapath, **off by default**. A source that fails
+authentication `auth_failures` times — or, if enabled, is refused by a rate
+limiter `rate_limit_violations` times — within `window_secs` has **every packet**
+dropped for `ban_secs`: STUN, ChannelData, all transports. The check is the first
+thing the processor does with a packet, before classification, rate limiting,
+parsing or authentication, and costs one atomic load while nothing is banned.
+Bans expire on their own; there is no unban command to forget.
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Turn the feature on. |
+| `auth_failures` | u32 | `10` | Auth failures in the window that trigger a ban. `0` disables this trigger. |
+| `rate_limit_violations` | u32 | `0` | Rate-limiter refusals in the window that trigger a ban. `0` (default) disables this trigger — see below. |
+| `window_secs` | u64 | `60` | Counting window. Must be > 0 when enabled. |
+| `ban_secs` | u64 | `600` | Ban duration. Must be > 0 when enabled. |
+| `scope` | string | `"ip"` | `"ip"` counts and bans the address; `"prefix"` counts and bans the /24 (IPv4) or /48 (IPv6), for attackers rotating through a block. |
+| `allowlist` | array of CIDR | `[]` | Never counted, never banned. |
+| `exempt_trusted_prefixes` | bool | `true` | Also exempt `[turn.rate_limit] trusted_prefixes` — the NAT addresses many users share. |
+| `max_tracked` | usize | `65536` | Cap on sources with a running offence count. The idlest of a small sample is evicted beyond it. |
+| `max_bans` | usize | `16384` | Cap on simultaneous bans. A ban beyond it is **refused** (`turna_autoban_refused_full_total`), never evicting another. |
+
+```toml
+[turn.auto_ban]
+enabled = true
+auth_failures = 10
+window_secs = 60
+ban_secs = 600
+allowlist = ["198.51.100.0/24"]   # your office egress
+```
+
+**What counts as an auth failure.** Only requests that carried a valid NONCE and
+then failed credential validation: Allocate, Refresh, CreatePermission,
+ChannelBind, CONNECT and ConnectionBind. The nonce is bound to the client address
+and has to be fetched with a round trip, so this evidence cannot be forged with a
+spoofed source. A Binding with bad MESSAGE-INTEGRITY is deliberately **not**
+counted: it needs no nonce, and counting it would let anyone get a victim banned.
+A credential lookup that is merely pending or unavailable (the auth webhook) is
+not a failure either.
+
+**Why `rate_limit_violations` is off by default.** It counts refused packets, and
+a UDP packet can carry any source address. An attacker who can spoof can make the
+node ban an address of their choosing — a customer, a partner's NAT, a monitoring
+probe. Turn it on only where spoofing is filtered upstream (BCP 38), and keep your
+own ranges in `allowlist`. `docs/security/accepted-risks.md` records this.
+
+**Events.** Each ban writes `auto-ban: source banned` (WARN) and each expiry
+`auto-ban: ban expired, source unbanned` (INFO) from `turna_relay::abuse`. Both
+reach syslog as `SOURCE_BANNED` with `src_ip`, `reason` and `detail`. The address
+follows `[observability] log_allocation_addresses` like every other client address.
+Metrics: `turna_autoban_bans_total`, `turna_autoban_active`,
+`turna_autoban_dropped_total`, `turna_autoban_refused_full_total`.
+
+**One table for the node.** Every datapath (UDP, TURNS, DTLS, QUIC, SCTP, the
+io_uring/AF_XDP processors) shares it, so a ban applies everywhere at once. It is
+per node, not per cluster: a source banned on one node can still reach another
+until it fails there too.
+
 ## Bandwidth quota: what it is and is not
 
 `[turn.relay.quota] max_bytes_per_sec_per_allocation` is **abuse protection, not

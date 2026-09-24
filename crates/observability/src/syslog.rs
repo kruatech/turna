@@ -79,6 +79,12 @@ pub enum EventKind {
     /// The moment something meant to protect the deployment did not engage.
     /// Distinct from a crash: the process is fine, one of its defences is not.
     ControlFailed,
+    /// `[turn.auto_ban]` banned a source, or a ban expired (`state="expired"`).
+    ///
+    /// Its own kind rather than `RateLimited`: a ban is a decision the node took
+    /// about an address for minutes, not one refused packet, and a SIEM
+    /// correlating attackers across nodes wants exactly these lines.
+    SourceBanned,
 }
 
 impl EventKind {
@@ -95,6 +101,7 @@ impl EventKind {
             EventKind::TlsHandshakeFailed => "TLS_HANDSHAKE_FAILED",
             EventKind::MalformedInput => "MALFORMED_INPUT",
             EventKind::ControlFailed => "CONTROL_FAILED",
+            EventKind::SourceBanned => "SOURCE_BANNED",
         }
     }
 
@@ -122,6 +129,8 @@ impl EventKind {
             // Error: a defence that did not engage is not routine, and unlike the
             // refusals above it will not resolve on its own.
             EventKind::ControlFailed => Severity::Error,
+            // Warning: the node has started refusing an address outright.
+            EventKind::SourceBanned => Severity::Warning,
         }
     }
 }
@@ -565,6 +574,9 @@ mod tests {
             EventKind::ReadinessChanged,
             EventKind::ConfigChanged,
             EventKind::TlsHandshakeFailed,
+            EventKind::MalformedInput,
+            EventKind::ControlFailed,
+            EventKind::SourceBanned,
         ];
         let ids: Vec<&str> = kinds.iter().map(|k| k.msgid()).collect();
         let unique: std::collections::HashSet<&&str> = ids.iter().collect();
@@ -572,6 +584,7 @@ mod tests {
         // These are a contract: a SIEM rule matches on them.
         assert_eq!(EventKind::AuthFailure.msgid(), "AUTH_FAILURE");
         assert_eq!(EventKind::RbacDenied.msgid(), "RBAC_DENIED");
+        assert_eq!(EventKind::SourceBanned.msgid(), "SOURCE_BANNED");
     }
 
     /// A rate limiter doing its job is not a warning. If it were, a SIEM would

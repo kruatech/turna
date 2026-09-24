@@ -78,6 +78,17 @@ scrape_configs:
 | `turna_quota_exceeded_total` | counter | Packets dropped due to quota. |
 | `turna_peer_rejected_total` | counter | Permission/ChannelBind/Send requests rejected by peer filter. |
 
+#### Auto-ban (`[turn.auto_ban]`)
+
+All four read 0 while the feature is off, which is the default.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `turna_autoban_bans_total` | counter | Sources (or prefixes, under `scope = "prefix"`) banned since start. Each one also produced a `SOURCE_BANNED` syslog event. A burst is an attack being absorbed; a steady trickle from the same ranges is worth an upstream block. |
+| `turna_autoban_active` | gauge | Bans currently in the table, updated every 5 s by the sweeper (expired-but-unswept bans are included until the next sweep; they no longer apply). |
+| `turna_autoban_dropped_total` | counter | Packets dropped because their source was banned, before any other processing. The cost the bans are saving. |
+| `turna_autoban_refused_full_total` | counter | Bans **not** imposed because `max_bans` live bans were already in force. Non-zero means the table is too small for the attack, or the attack is distributed enough that per-source bans are the wrong tool. |
+
 ### RTP/QoS metrics
 
 | Metric | Type | Meaning |

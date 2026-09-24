@@ -143,6 +143,18 @@ OBSERVABILITY
 - **Controls:** auth before mutation, allocation/session indexes, permission TTL,
   channel binding validation.
 
+### 5.2a Repeated authentication failures and floods from one source
+
+- **Vector:** credential guessing against long-term users, or one address
+  flooding the rate limiters.
+- **Risk:** online password guessing; sustained cost from a source the limiters
+  already refuse.
+- **Controls:** per-IP/prefix and per-method token buckets; optional
+  `[turn.auto_ban]`, which drops everything from a source after N nonce-bound
+  auth failures (unforgeable by spoofing) and, if explicitly enabled, N
+  rate-limit refusals (forgeable — RISK-007 in `accepted-risks.md`). Bans are
+  per node, bounded in memory, and expire on their own.
+
 ### 5.3 Peer filtering
 
 - **Vector:** authenticated requests targeting denied IP ranges.

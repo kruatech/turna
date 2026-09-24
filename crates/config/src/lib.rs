@@ -865,6 +865,14 @@ impl TurnaConfig {
                 errors.push(format!("turn.rate_limit.trusted_prefixes: {e}"));
             }
         }
+        errors.extend(self.turn.auto_ban.validate());
+        if self.turn.auto_ban.enabled && self.turn.auto_ban.rate_limit_violations > 0 {
+            warn!(
+                "turn.auto_ban.rate_limit_violations is set: a UDP flood can carry any \
+                 source address, so an attacker who can spoof can get a victim's address \
+                 banned. auth_failures cannot be forged this way."
+            );
+        }
         // A trusted tier stricter than the default one is almost certainly a
         // copy-paste or a swapped block: the point of the trusted set is a
         // higher ceiling for sources that share a NAT address.
@@ -1063,6 +1071,10 @@ pub struct TurnConfig {
     /// force appeared in no config file and no config dump.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Temporary source bans after repeated auth failures or rate-limit
+    /// refusals (`[turn.auto_ban]`). Off by default.
+    #[serde(default)]
+    pub auto_ban: AutoBanConfig,
     /// Peer-address filtering policy (M1). Defaults to `internet-facing`
     /// (denies RFC 1918 / ULA peers). Set `profile = "lan"` to allow private
     /// relaying. See `docs/security/peer-filter.md`.
@@ -1093,6 +1105,7 @@ impl Default for TurnConfig {
             sctp: SctpSection::default(),
             tcp_relay: TcpRelaySection::default(),
             rate_limit: RateLimitConfig::default(),
+            auto_ban: AutoBanConfig::default(),
             peer_filter: PeerFilterConfig::default(),
         }
     }
@@ -1531,6 +1544,106 @@ impl Default for RateLimitConfig {
             // ceiling to whatever private range happened to reach the node.
             trusted_prefixes: Vec::new(),
         }
+    }
+}
+
+/// `[turn.auto_ban]` — fail2ban built into the datapath.
+///
+/// A source that fails authentication `auth_failures` times, or is refused by a
+/// rate limiter `rate_limit_violations` times, within `window_secs` has every
+/// packet dropped for `ban_secs`. The check runs before classification, rate
+/// limiting and authentication, and costs one atomic load while nothing is
+/// banned. Bans expire on their own; nothing has to unban.
+///
+/// **Off by default**, and the two triggers are not equally safe:
+///
+/// - `auth_failures` counts only requests that carried a valid, client-bound
+///   NONCE, i.e. the source completed a round trip. It cannot be pointed at a
+///   victim with a spoofed source address.
+/// - `rate_limit_violations` counts refused packets, and a UDP packet can carry
+///   any source address. Someone who can spoof can get an address banned. It is
+///   therefore 0 (off) by default — see `docs/security/accepted-risks.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoBanConfig {
+    pub enabled: bool,
+    /// Authentication failures within the window that trigger a ban. 0 turns
+    /// this trigger off.
+    pub auth_failures: u32,
+    /// Rate-limit refusals within the window that trigger a ban. 0 (default)
+    /// turns this trigger off.
+    pub rate_limit_violations: u32,
+    /// Counting window, seconds.
+    pub window_secs: u64,
+    /// Ban duration, seconds.
+    pub ban_secs: u64,
+    /// `"ip"` (default) bans the address; `"prefix"` counts and bans per /24
+    /// (IPv4) or /48 (IPv6), for attackers that rotate through a block.
+    pub scope: String,
+    /// CIDR ranges that are never counted and never banned.
+    pub allowlist: Vec<String>,
+    /// Also exempt `[turn.rate_limit] trusted_prefixes`. True by default: those
+    /// are the NAT addresses hundreds of users share, where one person's typo is
+    /// everyone's outage.
+    pub exempt_trusted_prefixes: bool,
+    /// Cap on sources with a running offence count (memory bound).
+    pub max_tracked: usize,
+    /// Cap on simultaneous bans (memory bound). A ban beyond it is refused and
+    /// counted in `turna_autoban_refused_full_total`, never evicting another.
+    pub max_bans: usize,
+}
+
+impl Default for AutoBanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_failures: 10,
+            rate_limit_violations: 0,
+            window_secs: 60,
+            ban_secs: 600,
+            scope: "ip".into(),
+            allowlist: Vec::new(),
+            exempt_trusted_prefixes: true,
+            max_tracked: 65_536,
+            max_bans: 16_384,
+        }
+    }
+}
+
+impl AutoBanConfig {
+    pub(crate) fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for r in &self.allowlist {
+            if let Err(why) = validate_cidr(r) {
+                errors.push(format!("turn.auto_ban.allowlist: {why}"));
+            }
+        }
+        if !matches!(self.scope.as_str(), "ip" | "prefix") {
+            errors.push(format!(
+                "turn.auto_ban.scope = {:?} is invalid; use \"ip\" or \"prefix\"",
+                self.scope
+            ));
+        }
+        if !self.enabled {
+            return errors;
+        }
+        if self.auth_failures == 0 && self.rate_limit_violations == 0 {
+            errors.push(
+                "turn.auto_ban.enabled = true but both triggers are 0 \
+                 (auth_failures, rate_limit_violations), so nothing could ever be banned"
+                    .into(),
+            );
+        }
+        if self.window_secs == 0 {
+            errors.push("turn.auto_ban.window_secs must be > 0".into());
+        }
+        if self.ban_secs == 0 {
+            errors.push("turn.auto_ban.ban_secs must be > 0".into());
+        }
+        if self.max_tracked == 0 || self.max_bans == 0 {
+            errors.push("turn.auto_ban.max_tracked and max_bans must be > 0".into());
+        }
+        errors
     }
 }
 
@@ -3553,7 +3666,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
-    fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
@@ -4628,5 +4741,68 @@ shared_secret = \"a-real-secret-not-the-placeholder\"
             !err.contains("removed in 0.5.0"),
             "a typo must not be reported as a removed section: {err}"
         );
+    }
+}
+
+/// `[turn.auto_ban]`, `[turn.auth.webhook]`, `max_total_bytes_per_sec` and
+/// `require_binding_auth`: every one is off by default and validated when on.
+#[cfg(test)]
+mod abuse_controls_tests {
+    use super::*;
+
+    /// Parse with `TURNA_PRODUCTION` cleared, under the lock the other
+    /// production-sensitive tests hold.
+    fn parse_dev(toml: &str) -> Result<TurnaConfig> {
+        let _guard = super::tests::production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let r = TurnaConfig::from_str(toml);
+        match saved {
+            Some(v) => std::env::set_var("TURNA_PRODUCTION", v),
+            None => std::env::remove_var("TURNA_PRODUCTION"),
+        }
+        r
+    }
+
+    #[test]
+    fn auto_ban_is_off_by_default_and_its_spoofable_trigger_too() {
+        let a = AutoBanConfig::default();
+        assert!(!a.enabled);
+        assert_eq!(a.rate_limit_violations, 0);
+        assert!(a.exempt_trusted_prefixes);
+        let cfg = parse_dev("").expect("empty config loads");
+        assert!(!cfg.turn.auto_ban.enabled);
+    }
+
+    #[test]
+    fn auto_ban_validates_when_enabled() {
+        let ok = parse_dev(
+            "[turn.auto_ban]\nenabled = true\nauth_failures = 5\nscope = \"prefix\"\n\
+             allowlist = [\"192.0.2.0/24\"]\n",
+        )
+        .expect("a sane auto_ban section loads");
+        assert_eq!(ok.turn.auto_ban.auth_failures, 5);
+
+        let err = parse_dev(
+            "[turn.auto_ban]\nenabled = true\nauth_failures = 0\nrate_limit_violations = 0\n",
+        )
+        .expect_err("no trigger must be refused")
+        .to_string();
+        assert!(err.contains("both triggers are 0"), "{err}");
+
+        let err = parse_dev("[turn.auto_ban]\nenabled = true\nban_secs = 0\n")
+            .expect_err("zero ban must be refused")
+            .to_string();
+        assert!(err.contains("ban_secs"), "{err}");
+
+        let err = parse_dev("[turn.auto_ban]\nscope = \"subnet\"\n")
+            .expect_err("unknown scope must be refused even while disabled")
+            .to_string();
+        assert!(err.contains("turn.auto_ban.scope"), "{err}");
+
+        let err = parse_dev("[turn.auto_ban]\nallowlist = [\"not-a-cidr\"]\n")
+            .expect_err("bad CIDR must be refused")
+            .to_string();
+        assert!(err.contains("turn.auto_ban.allowlist"), "{err}");
     }
 }
