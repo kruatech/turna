@@ -4367,6 +4367,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turna-common",
+ "turna-oauth-verify",
  "turna-proto-stun",
  "webrtc-dtls",
  "webrtc-util",
@@ -4434,6 +4435,17 @@ dependencies = [
  "turna-state-backend",
  "turna-transport",
  "zeroize",
+]
+
+[[package]]
+name = "turna-oauth-verify"
+version = "0.5.0"
+dependencies = [
+ "base64 0.23.1",
+ "clap",
+ "turna-auth",
+ "turna-crypto",
+ "turna-proto-stun",
 ]
 
 [[package]]

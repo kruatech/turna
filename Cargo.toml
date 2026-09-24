@@ -42,6 +42,7 @@ members = [
     "tools/load-test",
     "tools/diff-test",
     "tools/garbage-gen",
+    "tools/oauth-verify",
 
     # tests
     "tests/integration",

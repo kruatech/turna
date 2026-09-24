@@ -31,6 +31,7 @@
 // audited surface, which is confined to turna-transport and turna-relay.
 #![forbid(unsafe_code)]
 
+pub mod oauth_token;
 pub mod tenant;
 pub mod webhook;
 
@@ -820,6 +821,43 @@ fn decrypt_access_token(
     as_rs_keys: &[Vec<u8>],
     server_name: &str,
 ) -> Result<(Vec<u8>, u32), AuthError> {
+    let opened = open_access_token(token, as_rs_keys, server_name)?;
+    let (mac_key, ts, lifetime) = (opened.mac_key, opened.timestamp, opened.lifetime);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // RFC 7635 §6.1: reject unless within the (symmetric, skew-tolerant) window.
+    if !token_time_valid(ts, lifetime, now, OAUTH_CLOCK_SKEW_SECS) {
+        return Err(AuthError::Expired);
+    }
+    // Remaining validity (seconds) = token end − now, clamped to u32. The caller
+    // caps the allocation lifetime by this so it never outlives the token.
+    let ts_secs = ts >> 16;
+    let remaining = ts_secs
+        .saturating_add(lifetime as u64)
+        .saturating_sub(now)
+        .min(u32::MAX as u64) as u32;
+    Ok((mac_key, remaining))
+}
+
+/// The fields of a decrypted ACCESS-TOKEN, before any freshness check.
+pub(crate) struct OpenedToken {
+    pub(crate) mac_key: Vec<u8>,
+    /// Raw 64-bit fixed-point timestamp (seconds in the top 48 bits).
+    pub(crate) timestamp: u64,
+    pub(crate) lifetime: u32,
+}
+
+/// AEAD-open an RFC 7635 §6.2 token and parse its block. No time check: the
+/// validator applies one, and the verification kit wants to show an expired
+/// token's fields rather than only say "expired".
+pub(crate) fn open_access_token(
+    token: &[u8],
+    as_rs_keys: &[Vec<u8>],
+    server_name: &str,
+) -> Result<OpenedToken, AuthError> {
     if token.len() < 2 {
         return Err(AuthError::InvalidCredentials);
     }
@@ -847,29 +885,17 @@ fn decrypt_access_token(
         return Err(AuthError::InvalidCredentials);
     }
     let mac_key = plaintext[2..2 + key_len].to_vec();
-    let ts = u64::from_be_bytes(plaintext[2 + key_len..2 + key_len + 8].try_into().unwrap());
+    let timestamp = u64::from_be_bytes(plaintext[2 + key_len..2 + key_len + 8].try_into().unwrap());
     let lifetime = u32::from_be_bytes(
         plaintext[2 + key_len + 8..2 + key_len + 12]
             .try_into()
             .unwrap(),
     );
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // RFC 7635 §6.1: reject unless within the (symmetric, skew-tolerant) window.
-    if !token_time_valid(ts, lifetime, now, OAUTH_CLOCK_SKEW_SECS) {
-        return Err(AuthError::Expired);
-    }
-    // Remaining validity (seconds) = token end − now, clamped to u32. The caller
-    // caps the allocation lifetime by this so it never outlives the token.
-    let ts_secs = ts >> 16;
-    let remaining = ts_secs
-        .saturating_add(lifetime as u64)
-        .saturating_sub(now)
-        .min(u32::MAX as u64) as u32;
-    Ok((mac_key, remaining))
+    Ok(OpenedToken {
+        mac_key,
+        timestamp,
+        lifetime,
+    })
 }
 
 /// AES-GCM AEAD decrypt (RFC 5116). Key length selects AES-128 (16 B) or

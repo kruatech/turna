@@ -20,6 +20,9 @@ procedures live beside it:
   `init.lua`; it is idempotent, and what that does **not** cover), the stored
   functions the CAS semantics live in, and the command-log backfill that gates
   the management plane on startup.
+- `docs/runbooks/oauth-verification.md` — verifying RFC 7635 OAuth against your
+  own authorization server with `turna-oauth-verify`, and what evidence lifts
+  the production refusal.
 - `docs/runbooks/disaster-recovery.md`, `docs/runbooks/incidents.md`,
   `docs/runbooks/af-xdp.md`, `docs/runbooks/encrypted-transports.md`.
 

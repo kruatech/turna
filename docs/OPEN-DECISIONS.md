@@ -292,6 +292,13 @@ itself, which is not interop.
 
 Deliberately deferred. The gate stays.
 
+What changed since: the evidence can now be collected by whoever has an AS.
+`turna-oauth-verify` inspects a token from a real AS with turna's own decoder and
+runs the full client flow against a node with it; its `mint`/`selftest` modes
+exist for plumbing only and are labelled as not being interop.
+[runbooks/oauth-verification.md](runbooks/oauth-verification.md) is the
+procedure and says what record justifies lifting the gate.
+
 ---
 
 ### A failed health bind is not fatal

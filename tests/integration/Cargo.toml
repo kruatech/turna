@@ -21,6 +21,9 @@ base64 = "0.23"
 # F-5 #2 hermetic harness: PR_SET_PDEATHSIG so a spawned node never orphans.
 libc = "0.2"
 turna-common = { path = "../../crates/common" }
+# RFC 7635 verification kit: the OAuth end-to-end test drives its library, so
+# the operator's tool and the test exercise the node with the same code.
+turna-oauth-verify = { path = "../../tools/oauth-verify" }
 # DTL-5: optional DTLS client for the TURN-over-DTLS e2e test (feature `dtls`).
 # Pinned to the same versions the transport crate uses for the server side.
 webrtc-dtls = { version = "0.10", optional = true }
