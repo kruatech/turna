@@ -1,94 +1,94 @@
 # Threat Model — turna
 
-**Дата:** 2026-06-11  
-**Версия:** 1.1  
-**Статус:** актуально для текущего TURN-only workspace
+**Date:** 2026-06-11  
+**Version:** 1.1  
+**Status:** current for the present TURN-only workspace
 
-## 1. Область применения
+## 1. Scope
 
-Этот threat model описывает текущий workspace Turna: TURN/STUN relay,
-optional encrypted transports, gRPC management/control plane, cluster gossip и
+This threat model describes the current Turna workspace: TURN/STUN relay,
+optional encrypted transports, gRPC management/control plane, cluster gossip and
 Tarantool-backed allocation persistence.
 
-В текущем репозитории нет standalone `turna-signaling`, bundled browser demo или
-SFU-сервиса. Платформенные JWT/user-store компоненты существуют как crate-level
-примитивы, но не являются публичным HTTP auth service в этом workspace.
+The current repository has no standalone `turna-signaling`, bundled browser demo or
+SFU service. Platform JWT/user-store components exist as crate-level
+primitives, but are not a public HTTP auth service in this workspace.
 
-## 2. Защищаемые активы
+## 2. Protected assets
 
-| Актив | Описание | Критичность |
+| Asset | Description | Criticality |
 |---|---|---|
-| TURN credentials | Shared-secret, static long-term users, derived HMAC keys | Критическая |
-| TURN allocations | Relay-порты, permissions, channel bindings, allocation TTL | Высокая |
-| Relay traffic metadata | Client/peer/relay addresses, username/realm, counters | Высокая |
-| Management API | gRPC управляющий интерфейс и `turnactl` operations | Высокая |
-| Cluster gossip | Node membership, redirect ownership, drain/leaving messages | Высокая |
-| Persistence backend | Tarantool allocation/node state | Высокая |
-| TLS/DTLS/QUIC key material | Certificate/private-key files for optional transports | Критическая |
-| Observability data | Metrics/logs/traces with network metadata | Средняя/Высокая |
+| TURN credentials | Shared-secret, static long-term users, derived HMAC keys | Critical |
+| TURN allocations | Relay ports, permissions, channel bindings, allocation TTL | High |
+| Relay traffic metadata | Client/peer/relay addresses, username/realm, counters | High |
+| Management API | gRPC management interface and `turnactl` operations | High |
+| Cluster gossip | Node membership, redirect ownership, drain/leaving messages | High |
+| Persistence backend | Tarantool allocation/node state | High |
+| TLS/DTLS/QUIC key material | Certificate/private-key files for optional transports | Critical |
+| Observability data | Metrics/logs/traces with network metadata | Medium/High |
 
-## 3. Классы атакующих
+## 3. Attacker classes
 
 ### 3.1 Unauthenticated Internet client
 
-- **Возможности:** отправляет произвольные UDP/TCP пакеты на публичный TURN edge.
-- **Цели:** получить relay без credentials, вызвать parser panic, исчерпать CPU.
-- **Меры:** STUN parser limits, MESSAGE-INTEGRITY before state mutation,
+- **Capabilities:** sends arbitrary UDP/TCP packets to the public TURN edge.
+- **Goals:** obtain a relay without credentials, trigger a parser panic, exhaust CPU.
+- **Mitigations:** STUN parser limits, MESSAGE-INTEGRITY before state mutation,
   auth challenge path, malformed packet counters, optional Linux BPF pre-filter.
 
 ### 3.2 Malicious authenticated TURN client
 
-- **Возможности:** имеет валидные credentials.
-- **Цели:** исчерпать allocations/relay ports/bandwidth, сканировать private
-  network через TURN permissions, попытаться читать чужой трафик.
-- **Меры:** per-allocation isolation, permission/channel enforcement,
+- **Capabilities:** has valid credentials.
+- **Goals:** exhaust allocations/relay ports/bandwidth, scan the private
+  network via TURN permissions, attempt to read other clients' traffic.
+- **Mitigations:** per-allocation isolation, permission/channel enforcement,
   `[turn.relay].max_allocations`, `[turn.relay.quota]`, peer filter default
   `internet-facing`.
 
 ### 3.3 Replay attacker
 
-- **Возможности:** перехват и повтор TURN/STUN requests или mobility ticket.
-- **Цели:** переиспользовать устаревшие credentials/tickets.
-- **Меры:** credential expiry in username for shared-secret mode, nonce handling,
+- **Capabilities:** interception and replay of TURN/STUN requests or a mobility ticket.
+- **Goals:** reuse stale credentials/tickets.
+- **Mitigations:** credential expiry in username for shared-secret mode, nonce handling,
   MESSAGE-INTEGRITY, migration ticket TTL and HMAC key.
 
 ### 3.4 Peer-address abuse / SSRF attacker
 
-- **Возможности:** authenticated client пытается создать permission/channel/send
+- **Capabilities:** an authenticated client tries to create a permission/channel/send
   toward loopback, link-local, cloud metadata, RFC1918/ULA, multicast, etc.
-- **Цели:** использовать TURN как port scanner или SSRF relay.
-- **Меры:** peer filter normalizes addresses before decision, denies special-use
+- **Goals:** use TURN as a port scanner or SSRF relay.
+- **Mitigations:** peer filter normalizes addresses before decision, denies special-use
   ranges, and defaults to `internet-facing`.
 
 ### 3.5 Malformed packet sender
 
-- **Возможности:** отправка намеренно сломанных STUN/ChannelData/RTP/RTCP packets.
-- **Цели:** OOB read/write, panic, infinite loop, high parser CPU.
-- **Меры:** parser limits, fuzzing, property tests, counters
+- **Capabilities:** sends deliberately malformed STUN/ChannelData/RTP/RTCP packets.
+- **Goals:** OOB read/write, panic, infinite loop, high parser CPU.
+- **Mitigations:** parser limits, fuzzing, property tests, counters
   `turna_parser_rejections_total` and `turna_malformed_packets_total`.
 
 ### 3.6 Management-plane attacker
 
-- **Возможности:** достигает gRPC management port.
-- **Цели:** drain node, kill allocation, read operational state, call future admin
+- **Capabilities:** reaches the gRPC management port.
+- **Goals:** drain node, kill allocation, read operational state, call future admin
   RPCs.
-- **Меры:** loopback bind by default in `deploy/turn.toml`, production validation
+- **Mitigations:** loopback bind by default in `deploy/turn.toml`, production validation
   requiring mTLS for non-loopback exposure, firewall/VPN requirement.
 
 ### 3.7 Cluster-network attacker
 
-- **Возможности:** достигает UDP gossip port or Tarantool port on private network.
-- **Цели:** inject node membership, redirect clients, corrupt persisted
+- **Capabilities:** reaches the UDP gossip port or Tarantool port on the private network.
+- **Goals:** inject node membership, redirect clients, corrupt persisted
   allocation state.
-- **Меры:** `cluster_secret` for gossip HMAC, private firewall rules, Tarantool
+- **Mitigations:** `cluster_secret` for gossip HMAC, private firewall rules, Tarantool
   dedicated user/password, least-privilege schema grants.
 
 ### 3.8 Compromised node
 
-- **Возможности:** full shell on one Turna host.
-- **Цели:** read local secrets, alter config, publish bad cluster state, observe
+- **Capabilities:** full shell on one Turna host.
+- **Goals:** read local secrets, alter config, publish bad cluster state, observe
   metadata.
-- **Меры:** OS hardening, non-root service user, least-privilege secret files,
+- **Mitigations:** OS hardening, non-root service user, least-privilege secret files,
   mTLS/control-plane cert rotation, cluster credential rotation, backend audit.
 
 ## 4. Trust boundaries
