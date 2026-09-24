@@ -206,7 +206,13 @@ pub(crate) async fn run_sctp_bridge(
                                 .await;
                         }
                         Action::RegisterRelay { port, socket, .. } => {
-                            let _ = relay_tx.send(OutMsg::RegisterRelay { port, socket }).await;
+                            let _ = relay_tx
+                                .send(OutMsg::RegisterRelay {
+                                    port,
+                                    socket,
+                                    reply_via: None,
+                                })
+                                .await;
                         }
                         Action::CloseRelay { port } => {
                             let _ = relay_tx.send(OutMsg::CloseRelay { port }).await;
