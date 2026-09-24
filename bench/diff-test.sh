@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # bench/diff-test.sh — differential protocol testing: turna vs coturn
 #
-# Запускает оба сервера и прогоняет diff-test против них.
-# Требования (Linux): coturn установлен, repo собран в release.
+# Starts both servers and runs diff-test against them.
+# Requirements (Linux): coturn installed, repo built in release.
 #
 # Usage:
 #   bash bench/diff-test.sh
