@@ -18,24 +18,73 @@
 //! therefore a trend to watch, not an absolute to compare with a client's
 //! `getStats()`. Loss and ordering do not depend on the clock rate.
 //!
-//! Streams are keyed by SSRC. RTCP multiplexed on the same port (RFC 5761) is
-//! skipped: its packet types land in RTP PT 64..=95, which RTP must not use.
+//! Streams are keyed by `(SSRC, direction)`. RTCP multiplexed on the same port
+//! (RFC 5761) is skipped: its packet types land in RTP PT 64..=95, which RTP
+//! must not use.
+//!
+//! # Hairpinned media
+//!
+//! When both endpoints of a call are clients of this server, each packet
+//! crosses it twice: client→peer on the sender's allocation, then peer→client on
+//! the receiver's. Keying by direction makes those two observations two streams,
+//! one per leg, each measured correctly. Keyed by SSRC alone they were one
+//! stream fed every packet twice, 0 µs apart — which read as a duplicate per
+//! packet and pulled jitter toward zero. The cost is that hairpinned media is
+//! *counted* once per leg in the packet counters. That is the same thing the
+//! relay's own byte counters do (it relays those bytes twice) and is the
+//! documented behaviour, not an accident; the per-leg loss figures are exact.
+//!
+//! # Sequence handling (RFC 3550 A.1)
+//!
+//! A jump of `MAX_DROPOUT` or more ahead, or more than `MAX_MISORDER` behind,
+//! is not believed on its own: the packet is set aside and the stream resyncs
+//! only if the *next* packet follows it in sequence (a sender restart or SSRC
+//! reuse). A late packet within `MAX_MISORDER` credits back loss only if it was
+//! really missing — a bitmap of the last 128 sequence numbers tells a late
+//! arrival from a duplicate of an old packet.
+//!
+//! # One analyzer per worker
+//!
+//! Every `PacketProcessor` gets its own analyzer through [`RtpAnalyzer::registered`]
+//! (per io_uring worker, per datapath), so the per-packet map update never
+//! contends across workers. The node's periodic publisher samples all of them
+//! through [`RtpAnalyzer::for_each_registered`]. A stream's packets stay on one
+//! worker: a client's 5-tuple hashes to one SO_REUSEPORT worker, and a relay
+//! socket belongs to one worker.
 
 use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 use turna_proto_rtp::RtpHeader;
 
-/// Per-stream (SSRC) quality state.
+/// Which leg of the relay a packet was observed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    /// From a TURN client, towards its peer.
+    ClientToPeer,
+    /// From a peer, towards the TURN client.
+    PeerToClient,
+}
+
+/// RFC 3550 A.1 `MAX_MISORDER`: how far behind the highest sequence a packet
+/// may be and still be a late arrival rather than a restart.
+const MAX_MISORDER: u16 = 100;
+
+/// Per-stream (SSRC, direction) quality state.
 struct StreamState {
     ssrc: u32,
     /// Owner (client address).
     client: SocketAddr,
     /// Whether this is audio or video.
     is_audio: bool,
-    /// Last seen sequence number.
+    /// Highest sequence number seen (RFC 3550 `max_seq`).
     last_seq: u16,
+    /// Bit k set = sequence `last_seq - k` has been received (k < 128).
+    seen: u128,
+    /// RFC 3550 `bad_seq`: after an unbelievable jump, the sequence number the
+    /// next packet must carry for the stream to resync onto it.
+    bad_seq: Option<u16>,
     /// Total packets received.
     packets_received: u64,
     /// Total packets expected (based on seq gaps).
@@ -77,6 +126,8 @@ impl StreamState {
             client,
             is_audio,
             last_seq: 0,
+            seen: 0,
+            bad_seq: None,
             packets_received: 0,
             packets_expected: 0,
             packets_lost: 0,
@@ -103,7 +154,7 @@ impl StreamState {
         self.window_bytes += packet_size as u64;
 
         if self.first_packet {
-            self.last_seq = header.sequence_number;
+            self.init_seq(header.sequence_number);
             self.last_rtp_ts = header.timestamp;
             self.last_arrival = now;
             self.first_packet = false;
@@ -111,35 +162,61 @@ impl StreamState {
             return;
         }
 
-        // Packet loss detection
-        let expected_seq = self.last_seq.wrapping_add(1);
-        let seq_diff = header.sequence_number.wrapping_sub(expected_seq);
-
-        if seq_diff == 0 {
-            // In order
-            self.packets_expected += 1;
-            self.last_seq = header.sequence_number;
-        } else if seq_diff < MAX_DROPOUT {
-            // Forward gap: seq_diff packets missing (for now — a late arrival
-            // below credits one back).
-            let lost = seq_diff as u64;
+        // RFC 3550 A.1 update_seq, with a seen-bitmap for late arrivals.
+        let seq = header.sequence_number;
+        let udelta = seq.wrapping_sub(self.last_seq);
+        if udelta == 0 {
+            // Duplicate of the latest packet: neither loss nor reordering, and
+            // no new jitter sample.
+            return;
+        } else if udelta < MAX_DROPOUT {
+            // Ahead, with a permissible gap: udelta - 1 packets missing for now
+            // (a late arrival below credits one back).
+            let lost = (udelta - 1) as u64;
             self.packets_lost += lost;
-            self.packets_expected += 1 + lost;
-            self.last_seq = header.sequence_number;
-        } else if seq_diff < 0x8000 {
-            // A jump this large is a sender restart or a new sequence space,
-            // not thousands of lost packets (RFC 3550 A.1, MAX_DROPOUT).
-            // Resynchronise without counting loss.
-            self.packets_expected += 1;
-            self.last_seq = header.sequence_number;
-        } else if header.sequence_number == self.last_seq {
-            // Duplicate of the latest packet: neither loss nor reordering.
+            self.packets_expected += udelta as u64;
+            self.seen = if udelta >= 128 {
+                0
+            } else {
+                self.seen << udelta
+            };
+            self.seen |= 1;
+            self.last_seq = seq;
+            self.bad_seq = None;
+        } else if udelta <= u16::MAX - MAX_MISORDER {
+            // A jump too large to believe from one packet: a restart, SSRC
+            // reuse, or garbage. Resync only when the next packet follows it.
+            if self.bad_seq == Some(seq) {
+                // Two in sequence on the new numbering: accept it. Both
+                // packets are received, none is lost.
+                self.init_seq(seq);
+                self.packets_expected += 2;
+                // New timestamp space too: re-anchor jitter rather than feed
+                // it the difference between two unrelated clocks.
+                self.last_rtp_ts = header.timestamp;
+                self.last_arrival = now;
+                return;
+            } else {
+                self.bad_seq = Some(seq.wrapping_add(1));
+                return;
+            }
         } else {
-            // Arrived late. It was counted lost when the gap it belongs to was
-            // seen, so credit it back. `last_seq` stays at the highest sequence
-            // seen: moving it backwards would make the next in-order packet look
-            // like a fresh gap and count the same loss twice.
+            // Up to MAX_MISORDER behind the highest: late, or a duplicate of
+            // an old packet.
+            let back = self.last_seq.wrapping_sub(seq) as u32;
+            let bit = 1u128 << back.min(127);
+            if back < 128 && self.seen & bit != 0 {
+                // Already received: a duplicate. No loss credit, no reorder.
+                return;
+            }
+            if back < 128 {
+                self.seen |= bit;
+            }
             self.packets_out_of_order += 1;
+            // It was counted lost when the gap it belongs to was seen, so
+            // credit it back. `last_seq` stays at the highest sequence seen:
+            // moving it backwards would make the next in-order packet look like
+            // a fresh gap and count the same loss twice.
             self.packets_lost = self.packets_lost.saturating_sub(1);
         }
 
@@ -167,6 +244,13 @@ impl StreamState {
             self.window_bytes = 0;
             self.window_start = now;
         }
+    }
+
+    /// Start counting sequence numbers from `seq` (first packet, or resync).
+    fn init_seq(&mut self, seq: u16) {
+        self.last_seq = seq;
+        self.seen = 1;
+        self.bad_seq = None;
     }
 
     fn loss_percent(&self) -> f64 {
@@ -235,7 +319,15 @@ pub struct StreamQuality {
 
 /// RTP quality analyzer — thread-safe, one per relay server.
 pub struct RtpAnalyzer {
-    streams: DashMap<u32, StreamState>,
+    streams: DashMap<(u32, Direction), StreamState>,
+}
+
+/// Analyzers handed out by [`RtpAnalyzer::registered`]. Weak, so a dropped
+/// processor's analyzer goes away with it; dead entries are pruned when the
+/// registry is walked.
+fn registry() -> &'static Mutex<Vec<Weak<RtpAnalyzer>>> {
+    static REG: OnceLock<Mutex<Vec<Weak<RtpAnalyzer>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 impl RtpAnalyzer {
@@ -245,16 +337,26 @@ impl RtpAnalyzer {
         }
     }
 
-    /// The process-wide analyzer.
+    /// A new analyzer, registered for [`Self::for_each_registered`].
     ///
-    /// Every `PacketProcessor` feeds this one. A node runs several processors —
-    /// one per io_uring worker, one for QUIC/DTLS beside them — and with one
-    /// analyzer each, only the tokio path's was ever read, so on io_uring and
-    /// AF_XDP the RTP metrics stayed at zero while media flowed. One shared map
-    /// also sees both directions of a stream whichever worker handled them.
-    pub fn global() -> Arc<RtpAnalyzer> {
-        static GLOBAL: OnceLock<Arc<RtpAnalyzer>> = OnceLock::new();
-        GLOBAL.get_or_init(|| Arc::new(RtpAnalyzer::new())).clone()
+    /// One per `PacketProcessor`, so each io_uring worker updates its own map
+    /// and the per-packet shard lock never contends across workers. (A single
+    /// process-wide map did: every packet on every worker took a write lock in
+    /// one shared DashMap.)
+    pub fn registered() -> Arc<RtpAnalyzer> {
+        let a = Arc::new(RtpAnalyzer::new());
+        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        reg.retain(|w| w.strong_count() > 0);
+        reg.push(Arc::downgrade(&a));
+        a
+    }
+
+    /// Every live registered analyzer. The registry lock is held only to copy
+    /// the list; sampling happens after, one analyzer at a time.
+    pub fn all_registered() -> Vec<Arc<RtpAnalyzer>> {
+        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        reg.retain(|w| w.strong_count() > 0);
+        reg.iter().filter_map(Weak::upgrade).collect()
     }
 
     /// Per-stream interval figures and totals since the previous call, and
@@ -287,7 +389,7 @@ impl RtpAnalyzer {
 
     /// Analyze an RTP packet payload. Call on every forwarded packet.
     /// Returns true if analysis succeeded (valid RTP).
-    pub fn analyze(&self, data: &[u8], client: SocketAddr) -> bool {
+    pub fn analyze(&self, data: &[u8], client: SocketAddr, dir: Direction) -> bool {
         let header = match RtpHeader::parse(data) {
             Ok(h) => h,
             Err(_) => return false,
@@ -300,7 +402,7 @@ impl RtpAnalyzer {
         let packet_size = data.len();
 
         self.streams
-            .entry(header.ssrc)
+            .entry((header.ssrc, dir))
             .or_insert_with(|| StreamState::new(header.ssrc, client, is_audio))
             .update(&header, packet_size);
 
@@ -330,7 +432,33 @@ impl RtpAnalyzer {
 
     /// Get aggregate quality stats.
     pub fn aggregate(&self) -> AggregateQuality {
-        let streams = self.get_all_quality();
+        AggregateQuality::from_streams(&self.get_all_quality())
+    }
+
+    /// Remove stale streams (no packets for > 30s).
+    pub fn cleanup_stale(&self) -> usize {
+        let cutoff = Instant::now() - std::time::Duration::from_secs(30);
+        let stale: Vec<(u32, Direction)> = self
+            .streams
+            .iter()
+            .filter(|e| e.value().last_arrival < cutoff)
+            .map(|e| *e.key())
+            .collect();
+        let count = stale.len();
+        for key in stale {
+            self.streams.remove(&key);
+        }
+        count
+    }
+
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+}
+
+impl AggregateQuality {
+    /// Aggregate over streams from any number of analyzers.
+    pub fn from_streams(streams: &[StreamQuality]) -> Self {
         if streams.is_empty() {
             return AggregateQuality::default();
         }
@@ -358,26 +486,6 @@ impl RtpAnalyzer {
             max_jitter_ms: max_jitter,
             total_bitrate_bps: total_bitrate,
         }
-    }
-
-    /// Remove stale streams (no packets for > 30s).
-    pub fn cleanup_stale(&self) -> usize {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(30);
-        let stale: Vec<u32> = self
-            .streams
-            .iter()
-            .filter(|e| e.value().last_arrival < cutoff)
-            .map(|e| *e.key())
-            .collect();
-        let count = stale.len();
-        for ssrc in stale {
-            self.streams.remove(&ssrc);
-        }
-        count
-    }
-
-    pub fn stream_count(&self) -> usize {
-        self.streams.len()
     }
 }
 
@@ -423,7 +531,11 @@ mod tests {
 
     fn feed(a: &RtpAnalyzer, seqs: &[u16], ssrc: u32) {
         for &s in seqs {
-            assert!(a.analyze(&pkt(PT_OPUS, s, s as u32 * 960, ssrc), client()));
+            assert!(a.analyze(
+                &pkt(PT_OPUS, s, s as u32 * 960, ssrc),
+                client(),
+                Direction::ClientToPeer
+            ));
         }
     }
 
@@ -491,7 +603,7 @@ mod tests {
         // RTCP SR: byte 1 = 200 → PT field 72.
         let mut sr = pkt(0, 0, 0, 7);
         sr[1] = 200;
-        assert!(!a.analyze(&sr, client()));
+        assert!(!a.analyze(&sr, client(), Direction::ClientToPeer));
         assert_eq!(a.stream_count(), 0);
     }
 
@@ -502,7 +614,11 @@ mod tests {
     fn reordering_does_not_explode_jitter() {
         let a = RtpAnalyzer::new();
         for s in [1u16, 2, 4, 3, 5] {
-            a.analyze(&pkt(PT_VP8, s, s as u32 * 3000, 8), client());
+            a.analyze(
+                &pkt(PT_VP8, s, s as u32 * 3000, 8),
+                client(),
+                Direction::ClientToPeer,
+            );
         }
         let j = a.get_all_quality()[0].jitter_ms;
         assert!(j < 1_000.0, "jitter {j} ms after one reordered packet");
@@ -539,7 +655,68 @@ mod tests {
     }
 
     #[test]
-    fn global_is_one_instance() {
-        assert!(Arc::ptr_eq(&RtpAnalyzer::global(), &RtpAnalyzer::global()));
+    fn registered_analyzers_are_listed_until_dropped() {
+        let a = RtpAnalyzer::registered();
+        let b = RtpAnalyzer::registered();
+        let all = RtpAnalyzer::all_registered();
+        assert!(all.iter().any(|x| Arc::ptr_eq(x, &a)));
+        assert!(all.iter().any(|x| Arc::ptr_eq(x, &b)));
+        drop(all);
+        let b_ptr = Arc::as_ptr(&b);
+        drop(b);
+        assert!(!RtpAnalyzer::all_registered()
+            .iter()
+            .any(|x| Arc::as_ptr(x) == b_ptr));
+    }
+
+    /// RFC 3550 A.1: a sender restart that jumps *backwards* resyncs after two
+    /// packets in sequence, with no loss and no reordering counted.
+    #[test]
+    fn backward_restart_resyncs_after_two_in_sequence() {
+        let a = RtpAnalyzer::new();
+        feed(&a, &[1000, 1001, 1002, 5, 6, 7, 8], 11);
+        let q = &a.get_all_quality()[0];
+        assert_eq!(q.packets_lost, 0);
+        assert_eq!(q.packets_out_of_order, 0);
+        // And the new numbering is tracked: a gap after resync is loss.
+        feed(&a, &[10], 11);
+        assert_eq!(a.get_all_quality()[0].packets_lost, 1);
+    }
+
+    /// One stray packet far away is not believed: the stream carries on.
+    #[test]
+    fn a_single_stray_jump_is_ignored() {
+        let a = RtpAnalyzer::new();
+        feed(&a, &[1, 2, 3, 40_000, 4, 5], 12);
+        let q = &a.get_all_quality()[0];
+        assert_eq!(q.packets_lost, 0);
+        assert_eq!(q.packets_out_of_order, 0);
+    }
+
+    /// A duplicate of an old (already received) packet must not credit loss
+    /// back: only a packet that was really missing does.
+    #[test]
+    fn duplicate_of_an_old_packet_does_not_credit_loss() {
+        let a = RtpAnalyzer::new();
+        feed(&a, &[1, 2, 5, 3, 3, 2, 6], 13); // 3,4 missing; 3 late; then dups
+        let q = &a.get_all_quality()[0];
+        assert_eq!(q.packets_lost, 1, "only 4 is still missing");
+        assert_eq!(q.packets_out_of_order, 1, "one late packet, the rest dups");
+    }
+
+    /// The two legs of a hairpinned call are separate streams.
+    #[test]
+    fn directions_are_separate_streams() {
+        let a = RtpAnalyzer::new();
+        for s in 1..=5u16 {
+            let p = pkt(PT_OPUS, s, s as u32 * 960, 14);
+            a.analyze(&p, client(), Direction::ClientToPeer);
+            a.analyze(&p, client(), Direction::PeerToClient);
+        }
+        let qs = a.get_all_quality();
+        assert_eq!(qs.len(), 2);
+        assert!(qs
+            .iter()
+            .all(|q| q.packets_received == 5 && q.packets_lost == 0));
     }
 }

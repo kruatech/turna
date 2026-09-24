@@ -83,18 +83,25 @@ scrape_configs:
 Measured by `crates/rtp-analyzer` from the RTP header of every relayed
 ChannelData / Send / Data payload that parses as RTP (version 2, payload type
 outside the RTCP range 64–95). SRTP leaves that header in the clear, so this
-works on encrypted media. All processors in the node — every io_uring worker,
-the QUIC/DTLS processor, the tokio path — feed one process-wide analyzer, and one
-node task publishes it every 5 s whichever datapath runs. (Until this release the
-gauges were published only by the tokio datapath, so io_uring and AF_XDP nodes
-read zero while relaying media.)
+works on encrypted media. Each packet processor — each io_uring worker, the
+QUIC/DTLS processor, the tokio path — has its own analyzer, so the per-packet
+update never contends across workers; one node task samples all of them every
+5 s whichever datapath runs. (Until this release the gauges were published only
+by the tokio datapath, so io_uring and AF_XDP nodes read zero while relaying
+media.)
 
-What the analyzer computes, per stream (SSRC):
+What the analyzer computes, per stream — keyed by **(SSRC, direction)**, so the
+client→peer and peer→client legs are separate streams:
 
-- **loss** — sequence numbers skipped (RFC 3550 A.1 style, a jump of 3000 or more
-  is a resync, not loss). A late packet that fills a gap is credited back.
-- **out of order** — a sequence number below the highest seen. Duplicates of the
-  latest packet count as neither.
+- **loss** — sequence numbers skipped. A late packet that fills a gap is
+  credited back; a duplicate of a packet already received is not (a bitmap of
+  the last 128 sequence numbers tells them apart).
+- **resync** (RFC 3550 A.1) — a jump of 3000 or more ahead, or more than 100
+  behind, is set aside; the stream restarts on the new numbering only when the
+  next packet follows it (a sender restart). A single stray packet is ignored.
+  Neither counts as loss.
+- **out of order** — a sequence number below the highest seen that had not been
+  received yet. Duplicates count as neither.
 - **jitter** — RFC 3550 §6.4.1 interarrival jitter. The analyzer cannot see SDP,
   so it *guesses* the clock rate from the payload type: 48 kHz for PT 0/8/111,
   90 kHz otherwise. PCMU/PCMA really run at 8 kHz, so their jitter reads 6x low.
@@ -104,6 +111,11 @@ What the analyzer computes, per stream (SSRC):
 Loss seen here is loss **upstream of the relay** (sender → relay), for both
 directions of the call; loss between the relay and the receiver is not visible
 to it. Cardinality is constant: nothing is labelled by stream, user or tenant.
+
+**Hairpinned media** — both endpoints are clients of this server — crosses it
+twice, and is measured once per leg: two streams, and twice in the packet
+counters, as in the relay's own byte counters. Each leg's loss is exact; it is
+not double-counted *within* a stream.
 
 | Metric | Type | Meaning |
 |---|---|---|
