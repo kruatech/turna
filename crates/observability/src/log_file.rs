@@ -110,6 +110,10 @@ struct State {
     /// file's mtime, so a node restarted the next morning rotates yesterday's
     /// file on its first line rather than appending today to it.
     period: Option<u64>,
+    /// After a failed rotation, no new attempt before this. Without it a
+    /// rotation that cannot succeed (a directory in the way, a read-only
+    /// directory) would be retried — and fail — on every single line.
+    retry_after: Option<std::time::Instant>,
 }
 
 /// An open, rotating log file. Shared by the `fmt` layer (through
@@ -120,10 +124,19 @@ pub struct LogFile {
     reopen_requested: AtomicBool,
     /// Rotations performed. Exported as `turna_log_file_rotations_total`.
     pub rotations: AtomicU64,
-    /// Lines lost to a write or rotation error. Exported as
+    /// Lines lost to a write error. Exported as
     /// `turna_log_file_write_errors_total`.
     pub write_errors: AtomicU64,
+    /// Rotations (or pruning of old files) that failed. The line that
+    /// triggered it is still written, to the active file. Exported as
+    /// `turna_log_file_rotation_errors_total`.
+    pub rotation_errors: AtomicU64,
+    /// Wait after a failed rotation before trying again.
+    retry_backoff: std::time::Duration,
 }
+
+/// How long a failed rotation waits before it is tried again.
+const ROTATION_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl LogFile {
     /// Open (or create) the file. Fails if it cannot be opened, so that a
@@ -143,11 +156,14 @@ impl LogFile {
                 file: Some(file),
                 size: meta.len(),
                 period,
+                retry_after: None,
             }),
             config,
             reopen_requested: AtomicBool::new(false),
             rotations: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
+            rotation_errors: AtomicU64::new(0),
+            retry_backoff: ROTATION_RETRY_BACKOFF,
         }))
     }
 
@@ -189,9 +205,13 @@ impl LogFile {
             Rotation::Daily | Rotation::Hourly => now_period != st.period,
             Rotation::External => false,
         };
-        if due {
-            self.rotate(&mut st)?;
-            st.period = now_period;
+        let backing_off = st
+            .retry_after
+            .is_some_and(|t| std::time::Instant::now() < t);
+        if due && !backing_off {
+            if self.rotate(&mut st) {
+                st.period = now_period;
+            }
         }
 
         if st.file.is_none() {
@@ -207,16 +227,49 @@ impl LogFile {
         Ok(())
     }
 
-    fn rotate(&self, st: &mut State) -> io::Result<()> {
+    /// Rotate, then always reopen the configured path, whatever happened.
+    ///
+    /// Returns whether the active file was moved aside. On failure the line
+    /// that triggered it still goes to the active file (reopened at the same
+    /// path, so it is the old file if the rename never happened), the failure is
+    /// counted, and the next attempt waits `retry_backoff` — a rotation that
+    /// cannot succeed must not cost a failed rename per line, nor drop lines.
+    fn rotate(&self, st: &mut State) -> bool {
         // Close before renaming. Not required on Linux, but it keeps the handle
         // from outliving the name it was opened under.
         st.file = None;
+        let moved = self.move_active_aside(st);
+        let moved_ok = moved.is_ok();
+        if moved_ok {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+            st.retry_after = None;
+            // Pruning is housekeeping: the rotation itself has happened, so a
+            // failure here is counted but does not make the rotation retry.
+            if matches!(self.config.rotation, Rotation::Daily | Rotation::Hourly)
+                && prune_dated(&self.config.path, self.config.max_files).is_err()
+            {
+                self.rotation_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            self.rotation_errors.fetch_add(1, Ordering::Relaxed);
+            st.retry_after = Some(std::time::Instant::now() + self.retry_backoff);
+        }
+        // Reopen here rather than leaving it to the caller: the handle must
+        // never stay closed because a rename failed.
+        if let Ok(f) = open_append(&self.config.path) {
+            st.size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            st.file = Some(f);
+        }
+        moved_ok
+    }
+
+    /// The renames. Size: shift .N-1 → .N … .1 → .2, then active → .1 (the file
+    /// that would become .max_files+1 is overwritten, which is the retention).
+    /// Time: active → `<file>.<period>`.
+    fn move_active_aside(&self, st: &State) -> io::Result<()> {
         let path = &self.config.path;
         match self.config.rotation {
             Rotation::Size(_) => {
-                // Shift .N-1 → .N, …, .1 → .2, then the active file → .1. The
-                // file that would become .max_files+1 is overwritten by the
-                // shift, which is the retention.
                 for i in (1..self.config.max_files).rev() {
                     let from = numbered(path, i);
                     if from.exists() {
@@ -236,14 +289,9 @@ impl LogFile {
                 if path.exists() {
                     std::fs::rename(path, target)?;
                 }
-                prune_dated(path, self.config.max_files)?;
             }
             Rotation::External => {}
         }
-        self.rotations.fetch_add(1, Ordering::Relaxed);
-        let f = open_append(path)?;
-        st.size = 0;
-        st.file = Some(f);
         Ok(())
     }
 }
@@ -520,6 +568,42 @@ mod tests {
         std::fs::write(d.join("turna.log.2026-01-01"), b"first").unwrap();
         let next = free_name(&path, "2026-01-01");
         assert_eq!(next, d.join("turna.log.2026-01-01.1"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A rename that cannot succeed — a directory where `.1` should go — must
+    /// not drop lines and must not be retried on every line.
+    #[test]
+    fn failed_rotation_keeps_writing_and_backs_off() {
+        let d = tmpdir("rotfail");
+        let path = d.join("turna.log");
+        let blocker = numbered(&path, 1);
+        std::fs::create_dir_all(blocker.join("occupied")).unwrap();
+        let f = LogFile::open(LogFileConfig {
+            path: path.clone(),
+            rotation: Rotation::Size(10),
+            max_files: 1,
+        })
+        .unwrap();
+        for _ in 0..20 {
+            f.write_line(b"0123456789\n");
+        }
+        assert_eq!(f.write_errors.load(Ordering::Relaxed), 0, "no line lost");
+        assert_eq!(f.rotations.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            f.rotation_errors.load(Ordering::Relaxed),
+            1,
+            "one failed attempt, then back off instead of retrying per line"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 20 * 11);
+
+        // Once the obstacle is gone and the backoff has passed, rotation works.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        f.state.lock().unwrap().retry_after = Some(std::time::Instant::now());
+        f.write_line(b"after\n");
+        assert_eq!(f.rotations.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert_eq!(std::fs::metadata(&blocker).unwrap().len(), 20 * 11);
         let _ = std::fs::remove_dir_all(&d);
     }
 

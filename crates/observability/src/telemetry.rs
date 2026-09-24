@@ -535,6 +535,7 @@ fn mark_sinks_active(
 pub struct LogSinkStats {
     pub file_rotations: u64,
     pub file_write_errors: u64,
+    pub file_rotation_errors: u64,
     pub syslog_sent: u64,
     pub syslog_dropped: u64,
 }
@@ -542,13 +543,20 @@ pub struct LogSinkStats {
 /// Current [`LogSinkStats`]. All zero when no optional sink is configured.
 pub fn log_sink_stats() -> LogSinkStats {
     use std::sync::atomic::Ordering::Relaxed;
-    let (file_rotations, file_write_errors) = crate::log_file::active()
-        .map(|f| (f.rotations.load(Relaxed), f.write_errors.load(Relaxed)))
-        .unwrap_or((0, 0));
+    let (file_rotations, file_write_errors, file_rotation_errors) = crate::log_file::active()
+        .map(|f| {
+            (
+                f.rotations.load(Relaxed),
+                f.write_errors.load(Relaxed),
+                f.rotation_errors.load(Relaxed),
+            )
+        })
+        .unwrap_or((0, 0, 0));
     let (syslog_sent, syslog_dropped) = crate::syslog_log::stats().unwrap_or((0, 0));
     LogSinkStats {
         file_rotations,
         file_write_errors,
+        file_rotation_errors,
         syslog_sent,
         syslog_dropped,
     }
