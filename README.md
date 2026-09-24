@@ -12,7 +12,7 @@ High-performance TURN/STUN server written in Rust (RFC 5389, RFC 5766, RFC 8656)
 
 ## Status
 
-**Production GA (`0.4.0`).** The default **Tokio datapath** is the primary supported path:
+**Production GA (`0.5.0`).** The default **Tokio datapath** is the primary supported path:
 STUN binding, the TURN allocation lifecycle, long-term-credential and TURN REST
 (coturn-compatible) auth, Prometheus/OpenTelemetry, config validation, durable runtime configuration,
 per-subject limits, and graceful drain.
@@ -131,7 +131,7 @@ live in [bench/README.md](bench/README.md).
 | Allocation released when its TCP/DTLS/QUIC connection closes | Supported (not left to TTL)     |
 | mTLS for TURNS clients                         | Opt-in (`[tls] client_ca`); no CRL/OCSP by design |
 | IPv6 relayed transport                         | Opt-in via `[turn] external_ip6`; 440 when unset. Relayed media and coturn interop verified on routable addresses |
-| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS on the demux path, which is the default since 0.4.1 (`demux = false` gives the stock listener and no hot reload). Verified under load, and again on 2026-09-16 for the current DTLS stack: a new pair reaches the next client, an unusable one leaves the previous certificate in service and is counted as a failure rather than reported as success |
+| Certificate rotation without restart           | TURNS and QUIC (both paths); DTLS on the demux path, which is the default since 0.5.0 (`demux = false` gives the stock listener and no hot reload). Verified under load, and again on 2026-09-16 for the current DTLS stack: a new pair reaches the next client, an unusable one leaves the previous certificate in service and is counted as a failure rather than reported as success |
 | Shared-secret rotation without restart         | Supported via `SIGHUP`. The handler re-reads the same config file and republishes `shared_secret` / `previous_shared_secret` without dropping calls; a changed realm is refused. `UpdateConfig` still carries allocation limits only, not the secret. Overlap window: set the new secret, keep the old one in `previous_shared_secret`, `SIGHUP`, wait for `turna_auth_previous_secret_total` to flatten, drop the old one, `SIGHUP` again |
 | Multi-node ownership/state failover            | Experimental / limited scope                  |
 | Transparent active-session (media) failover    | Out of GA scope                               |
@@ -331,6 +331,11 @@ Workspace crates can be consumed via a git dependency:
 [dependencies]
 turna-relay = { git = "https://github.com/kruatech/turna", tag = "v0.5.0" }
 ```
+
+## Documentation
+
+[docs/README.md](docs/README.md) indexes the documentation by task: install,
+configure, operate, secure, and the evidence records behind each support claim.
 
 ## Development
 

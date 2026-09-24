@@ -1,8 +1,8 @@
-//! TCP Relay для TURN (RFC 6062)
+//! TCP Relay for TURN (RFC 6062)
 //!
 //! Connect → WaitingForBind → ConnectionBind → Bound (bidirectional proxy) → Close
 //!
-//! Нужен клиентам за firewall, блокирующим UDP relay.
+//! Needed by clients behind firewalls that block UDP relay.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -161,18 +161,18 @@ impl TcpRelayManager {
         )
     }
 
-    /// Connect (RFC 6062 §4.3): устанавливает TCP к peer, возвращает CONNECTION-ID.
+    /// Connect (RFC 6062 §4.3): establishes TCP to the peer, returns CONNECTION-ID.
     pub async fn handle_connect(
         &self,
         alloc: AllocationId,
         peer: SocketAddr,
         owner: Vec<u8>,
     ) -> Result<TcpConnectionId> {
-        // Проверяем лимит
+        // Check the limit
         if self.conns.read().await.len() >= self.config.max_total {
             return Err(TcpRelayError::MaxConnections(self.config.max_total));
         }
-        // Проверяем дубликат
+        // Check for a duplicate
         if let Some(&id) = self.alloc_peers.read().await.get(&(alloc, peer)) {
             return Err(TcpRelayError::AlreadyExists {
                 addr: peer,
@@ -358,7 +358,7 @@ impl TcpRelayManager {
         Ok(())
     }
 
-    /// Чистим все соединения аллокации при её удалении.
+    /// Clean up all of an allocation's connections when it is removed.
     pub async fn cleanup_allocation(&self, alloc: AllocationId) {
         let ids: Vec<TcpConnectionId> = {
             let c = self.conns.read().await;
