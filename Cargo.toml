@@ -53,6 +53,9 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.5.0"
 edition = "2021"
+# Minimum supported Rust version. CI builds and tests on exactly this toolchain
+# (the `msrv` job; rust-toolchain.toml pins the same channel).
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/kruatech/turna"
 homepage = "https://github.com/kruatech/turna"
