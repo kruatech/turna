@@ -48,17 +48,17 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | coturn | turna | kind | note |
 |---|---|---|---|
 | `listening-device` | — | no equivalent | no `SO_BINDTODEVICE`; bind by address with `[turn] listen` |
-| `listening-port` | `[turn] listen` | key | address and port are one value, e.g. `"0.0.0.0:3478"`. UDP only — see `no-tcp` |
+| `listening-port` | `[turn] listen` | key | address and port are one value, e.g. `"0.0.0.0:3478"`. UDP; plain TCP on the same port is the opt-in `[turn.tcp] listen` — see `no-tcp` |
 | `tls-listening-port` | `[tls] listen` | key | plus `[tls] enabled = true`. `tls` is a default feature of `turna-node`, so a standard build has it |
 | `alt-listening-port` | — | no equivalent | the alternate port exists for RFC 5780, which turna does not implement <!-- parity-pr --> |
 | `alt-tls-listening-port` | — | no equivalent | as `alt-listening-port` <!-- parity-pr --> |
-| `tcp-proxy-port` | — | no equivalent | no PROXY protocol support on any listener <!-- parity-pr --> |
-| `listening-ip` | `[turn] listen` | key | one address per process. Several `listening-ip` lines have no equivalent: run one process per address <!-- parity-pr --> |
+| `tcp-proxy-port` | `[turn.tcp] proxy_protocol`, `[tls] proxy_protocol` | key | not a separate port: PROXY protocol v1/v2 is switched on per listener and honoured only from `[turn.tcp] proxy_protocol_trusted_cidrs` / `[tls] proxy_protocol_trusted_cidrs`; any other source is closed |
+| `listening-ip` | `[turn] listen`, `[turn] listen_extra` | key | the first address is `[turn] listen`; further `listening-ip` lines go in `[turn] listen_extra` (UDP, tokio datapath only, refused together with `[turn.migration] enabled`). Relayed data leaves from the listener the client used |
 | `aux-server` | — | no equivalent | one UDP listener per process |
 | `udp-self-balance` | — | by design | load spreading across nodes is cluster mode's redirect (`[cluster]`), not auxiliary listeners |
-| `external-ip` | `[turn] external_ip`, `[turn] external_ip6` | key | required under `production = true`. The `PUBLIC/PRIVATE` form has no direct equivalent: set `listen` to the private address and `external_ip` to the public one. IPv6 relaying is enabled by setting `external_ip6` |
+| `external-ip` | `[turn] external_ip`, `[turn] external_ip6` | key | required under `production = true`. The `PUBLIC/PRIVATE` form is accepted as is: PUBLIC is advertised, relay sockets bind PRIVATE (same family; must agree with `[turn.relay] bind_ip` / `[turn.relay] bind_ip6` when set). One mapping per family; a repeated `-X` has no equivalent. IPv6 relaying is enabled by setting `[turn] external_ip6` |
 | `no-udp` | — | no equivalent | the UDP listener (`[turn] listen`) is always on |
-| `no-tcp` | — | by design | there is no plain TURN-over-TCP listener at all, so this is always in force; TCP clients use TURNS <!-- parity-pr --> |
+| `no-tcp` | `[turn.tcp] enabled` | key | inverse default: coturn listens on TCP unless `no-tcp`; turna serves plain TURN over TCP only with `[turn.tcp] enabled = true` (needs the `tls` build feature and the tokio datapath). `false` is the default |
 | `no-tls` | `[tls] enabled` | key | `false` is the default |
 | `dtls` | `[turn.dtls] enabled` | key | also needs a `--features dtls` build and its own `cert_path` / `key_path`; the default `listen` is `0.0.0.0:5349` |
 | `no-dtls` | `[turn.dtls] enabled` | key | `false` is the default |
@@ -81,7 +81,7 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `multiplex-peer-port` | — | no equivalent | as `multiplex-peer` |
 | `multiplex-peer-max-peers` | — | no equivalent | as `multiplex-peer` |
 | `no-udp-relay` | — | no equivalent | UDP relaying is always available |
-| `no-tcp-relay` | `[turn.tcp_relay] enabled` | key | `false` (no TCP relay) is the default. RFC 6062 is beta, needs `[tls]`, IPv4 only — see [below](#things-that-are-not-a-translation) |
+| `no-tcp-relay` | `[turn.tcp_relay] enabled` | key | `false` (no TCP relay) is the default. RFC 6062 is beta, needs `[tls]` or `[turn.tcp]` as the control listener, IPv4 only — see [below](#things-that-are-not-a-translation) |
 | `server-relay` | — | no equivalent | the permission check on relayed packets cannot be switched off |
 | `ne` | — | by design | coturn ignores it too |
 | `keep-address-family` | — | by design | the relayed family follows REQUESTED-ADDRESS-FAMILY (RFC 6156), never the client's transport family |
@@ -150,15 +150,15 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `pkey` | `[tls] key_path` | key | PKCS#8 / PKCS#1 / SEC1. DTLS (`[turn.dtls] key_path`) needs an ECDSA P-256 key |
 | `pkey-pwd` | — | no equivalent | encrypted private keys are not supported |
 | `raw-public-keys` | — | no equivalent | no RFC 7250 |
-| `cipher-list` | — | no equivalent | rustls' safe defaults; not configurable <!-- parity-pr --> |
+| `cipher-list` | `[tls] cipher_suites` | key | rustls suite names, not OpenSSL names; unknown names refuse to start, and a list the certificate's key type cannot use stops the TURNS listener |
 | `CA-file` | `[tls] client_ca` | key | mTLS on the TURNS listener; add `require_client_cert = true` to refuse clients without one |
 | `ec-curve-name` | — | no equivalent | rustls chooses |
 | `dh566` | — | by design | no finite-field DH: TLS 1.2+ with ECDHE only |
 | `dh1066` | — | by design | as `dh566` |
 | `dh-file` | — | by design | as `dh566` |
-| `tlsv1` | — | by design | TLS 1.0 is never offered (rustls: 1.2 and 1.3) <!-- parity-pr --> |
-| `tlsv1_1` | — | by design | TLS 1.1 is never offered <!-- parity-pr --> |
-| `no-tlsv1_2` | — | no equivalent | 1.2 and 1.3 are both always offered; there is no minimum-version key <!-- parity-pr --> |
+| `tlsv1` | — | by design | TLS 1.0 is never offered (rustls: 1.2 and 1.3) |
+| `tlsv1_1` | — | by design | TLS 1.1 is never offered |
+| `no-tlsv1_2` | `[tls] min_version` | key | `"1.3"`; the default `"1.2"` offers 1.2 and 1.3. TURNS only — QUIC is TLS 1.3 regardless |
 | `acme-redirect` | — | no equivalent | certificates are provisioned outside turna and picked up by the reload above |
 
 Related turna keys with no coturn counterpart: `[tls] enable_alpn` / `alpn_required`
@@ -274,10 +274,10 @@ setup. Do not treat cluster mode as a prerequisite for migrating.
 actually relay TCP — enable `[turn.tcp_relay]`. It is beta and off by default.
 It was refused under `production = true` until 2026-08-25, when interop with
 coturn's own client put the missing evidence on record
-(`docs/interop/coturn-2026-08-23.md`); it is allowed now. Two conditions: `[tls]`
-must be enabled, because turna has no plain-TCP listener and RFC 6062's control
-connection therefore runs over TURNS (validation refuses the combination under
-`production = true`); and it is IPv4 only. Size for it first — a listener and a
+(`docs/interop/coturn-2026-08-23.md`); it is allowed now. Two conditions: a TCP control
+listener must be enabled — `[tls]` (TURNS) or the opt-in plain `[turn.tcp]` —
+because RFC 6062's control connection runs over it (validation refuses
+`[turn.tcp_relay]` without one under `production = true`); and it is IPv4 only. Size for it first — a listener and a
 connection per relayed peer is a different profile from UDP relaying.
 
 **io_uring / AF_XDP.** Migrate on `transport = "tokio"` first and evaluate
