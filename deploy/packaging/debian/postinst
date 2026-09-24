@@ -1,0 +1,17 @@
+#!/bin/sh
+# turna-node postinst. cargo-deb replaces the token below with the
+# systemd-sysusers call (creates the `turna` user) and the systemd unit
+# handling (daemon-reload; the unit is NOT enabled or started — see below).
+set -e
+
+#DEBHELPER#
+
+# The shipped config may end up holding the shared secret. On first install make
+# it readable by the service and root only. Upgrades leave whatever the admin
+# set alone.
+if [ "$1" = "configure" ] && [ -z "$2" ] && [ -f /etc/turna/turn.toml ]; then
+    chgrp turna /etc/turna/turn.toml
+    chmod 0640 /etc/turna/turn.toml
+fi
+
+exit 0
