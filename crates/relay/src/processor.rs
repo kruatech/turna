@@ -244,6 +244,27 @@ fn software_attribute() -> Option<&'static str> {
     }
 }
 
+/// `[turn.auth] advertise_userhash`: prefix every nonce with the RFC 8489
+/// "nonce cookie" that sets Security Feature bit 1, "Username anonymity", so a
+/// conforming client sends USERHASH instead of USERNAME (§9.2.5).
+///
+/// Accepting USERHASH needs no switch — a request carrying it used to be
+/// answered 420 and is now authenticated, which no working client can have
+/// depended on. *Advertising* it is a switch, because it changes every nonce on
+/// the wire and obliges clients to change what they send. Off by default.
+///
+/// Process-wide, like `SOFTWARE_MODE`: set once at startup, before any
+/// processor is built, and read by each processor's nonce issuer when it is
+/// constructed. The node builds up to three processors (main, QUIC/DTLS,
+/// AF_XDP); a builder on each would be three places to forget.
+static ADVERTISE_USERHASH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the node before any processor is constructed.
+pub fn set_advertise_userhash(on: bool) {
+    ADVERTISE_USERHASH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static DECODE_ERROR_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
 static UNAUTH_BUDGET_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
 static AUTH_FAILED_LOG: turna_common::LogThrottle = turna_common::LogThrottle::new();
@@ -423,15 +444,35 @@ struct NonceManager {
     /// How long an issued nonce stays valid, including a grace window for the
     /// client's in-flight retry.
     max_age: Duration,
+    /// RFC 8489 §9.2 "nonce cookie" prepended to every issued nonce, or `None`
+    /// (the default) for the historical cookie-less nonce.
+    cookie: Option<&'static str>,
 }
 
+/// RFC 8489 §9.2 nonce cookie with only Security Feature bit 1, "Username
+/// anonymity", set (§18.1): `"obMatJos2"` followed by the base64 of the
+/// 24-bit feature set `0x40 0x00 0x00`, which is `"QAAA"`.
+///
+/// Bit 0, "Password algorithms", is deliberately clear. Setting it obliges the
+/// server to send PASSWORD-ALGORITHMS in every 401 and 438 (§9.2.4), and a
+/// client that sees the bit without the attribute must give up (§9.2.5) —
+/// turna does not send PASSWORD-ALGORITHMS, so setting that bit would lock out
+/// every RFC 8489 client.
+const USERHASH_NONCE_COOKIE: &str = "obMatJos2QAAA";
+
 impl NonceManager {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_cookie(None)
+    }
+
+    fn with_cookie(cookie: Option<&'static str>) -> Self {
         Self {
             server_key: turna_crypto::random_key_32(),
             start: Instant::now(),
             // 600s lifetime + 30s grace, matching the previous rotation policy.
             max_age: Duration::from_secs(630),
+            cookie,
         }
     }
 
@@ -442,13 +483,28 @@ impl NonceManager {
 
     /// Issue a fresh nonce bound to `client`.
     fn issue(&self, client: SocketAddr) -> String {
-        turna_crypto::issue_client_nonce(&self.server_key, &client.to_string(), self.now_ms())
+        let nonce =
+            turna_crypto::issue_client_nonce(&self.server_key, &client.to_string(), self.now_ms());
+        match self.cookie {
+            Some(cookie) => format!("{cookie}{nonce}"),
+            None => nonce,
+        }
     }
 
     /// Validate `nonce` for `client`: the MAC must match (same client + key) and
     /// the nonce must not be older than `max_age`.
     fn validate(&self, client: SocketAddr, nonce: &str) -> NonceStatus {
         let max_age_ms = self.max_age.as_millis() as u64;
+        // With a cookie configured, a nonce without it was not issued by this
+        // process (or was issued before a restart that turned the cookie on):
+        // stale, so the client is handed a fresh one carrying the feature bits.
+        let nonce = match self.cookie {
+            Some(cookie) => match nonce.strip_prefix(cookie) {
+                Some(rest) => rest,
+                None => return NonceStatus::Stale,
+            },
+            None => nonce,
+        };
         match turna_crypto::verify_client_nonce(&self.server_key, &client.to_string(), nonce) {
             Some(issued_ms) if self.now_ms().saturating_sub(issued_ms) <= max_age_ms => {
                 NonceStatus::Valid
@@ -565,7 +621,7 @@ pub struct PacketProcessor {
     /// The distinction matters under spoofing, where the source address is the
     /// victim: a 48-byte response to a 20-byte request, up to the per-IP ingress
     /// refill of 50 000/second, is 2.4 MB/s aimed at whoever the attacker named.
-    unauth_reply_limiter: TieredRateLimiter,
+    unauth_reply_limiter: Arc<TieredRateLimiter>,
     external_ip: std::net::IpAddr,
     /// RFC 6156 IPv6 relayed transport. `None` (the default) keeps the historical
     /// IPv4-only behaviour: an explicit `REQUESTED-ADDRESS-FAMILY = IPv6` is
@@ -586,6 +642,42 @@ pub struct PacketProcessor {
     /// RFC 6062 TCP relay engine. `None` = TCP allocations disabled (Allocate
     /// with REQUESTED-TRANSPORT=TCP → 442).
     tcp_relay: Option<Arc<TcpRelayManager>>,
+}
+
+/// The budget for replies to addresses that have not authenticated (Binding
+/// responses, 401 challenges, RFC 5780 discovery replies), as a value that
+/// several processors can share.
+///
+/// Each processor has its own by default, which is the historical behaviour.
+/// The node shares one across every processor only when RFC 5780 discovery is
+/// enabled: the discovery responder is a separate processor, and with separate
+/// buckets a spoofed victim would receive a full budget of Binding replies from
+/// the TURN listener *and* another from the discovery sockets. One budget per
+/// source across both is the point.
+#[derive(Clone)]
+pub struct UnauthReplyBudget(Arc<TieredRateLimiter>);
+
+impl UnauthReplyBudget {
+    pub fn new() -> Self {
+        // (64, 8): a legitimate client needs single digits of these, ever.
+        // Only `per_ip` is consulted; the other tiers are set to the same
+        // values rather than left at their generous defaults so that a
+        // future caller reaching for one does not get an accidental
+        // free pass.
+        Self(Arc::new(TieredRateLimiter::new(TieredLimits {
+            per_ip: (64, 8),
+            per_prefix: (512, 64),
+            allocate: (64, 8),
+            create_permission: (64, 8),
+            channel_bind: (64, 8),
+        })))
+    }
+}
+
+impl Default for UnauthReplyBudget {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Rate-limit tiers handed to a [`PacketProcessor`].
@@ -739,6 +831,10 @@ impl PacketProcessor {
         mtu: u16,
         cluster: Option<ClusterRouting>,
     ) -> Self {
+        let nonce_mgr = NonceManager::with_cookie(Self::nonce_cookie_for(
+            &auth,
+            ADVERTISE_USERHASH.load(Ordering::Relaxed),
+        ));
         Self {
             udp_transactions: crate::udp_transactions::UdpTransactions::new(),
             store,
@@ -748,21 +844,10 @@ impl PacketProcessor {
             )),
             trusted_limiter: None,
             trusted_prefixes: Vec::new(),
-            // (64, 8): a legitimate client needs single digits of these, ever.
-            // Only `per_ip` is consulted; the other tiers are set to the same
-            // values rather than left at their generous defaults so that a
-            // future caller reaching for one does not get an accidental
-            // free pass.
-            unauth_reply_limiter: TieredRateLimiter::new(TieredLimits {
-                per_ip: (64, 8),
-                per_prefix: (512, 64),
-                allocate: (64, 8),
-                create_permission: (64, 8),
-                channel_bind: (64, 8),
-            }),
+            unauth_reply_limiter: UnauthReplyBudget::new().0,
             external_ip,
             external_ip6: None,
-            nonce_mgr: NonceManager::new(),
+            nonce_mgr,
             metrics,
             rtp_analyzer: Arc::new(RtpAnalyzer::new()),
             mtu,
@@ -774,6 +859,48 @@ impl PacketProcessor {
 
     pub fn store(&self) -> &Arc<AllocationStore> {
         &self.store
+    }
+
+    /// Draw unauthenticated replies from `budget` instead of this processor's
+    /// own (see [`UnauthReplyBudget`]).
+    pub fn with_unauth_reply_budget(mut self, budget: &UnauthReplyBudget) -> Self {
+        self.set_unauth_reply_budget(budget);
+        self
+    }
+
+    /// [`with_unauth_reply_budget`](Self::with_unauth_reply_budget) when a
+    /// budget is given; unchanged otherwise.
+    pub fn maybe_unauth_reply_budget(self, budget: Option<&UnauthReplyBudget>) -> Self {
+        match budget {
+            Some(b) => self.with_unauth_reply_budget(b),
+            None => self,
+        }
+    }
+
+    /// In-place form of [`with_unauth_reply_budget`](Self::with_unauth_reply_budget).
+    pub fn set_unauth_reply_budget(&mut self, budget: &UnauthReplyBudget) {
+        self.unauth_reply_limiter = budget.0.clone();
+    }
+
+    /// The nonce cookie this processor issues, per [`set_advertise_userhash`].
+    ///
+    /// Withheld (with a warning) unless every realm can resolve a USERHASH:
+    /// advertising the bit to a TURN REST client would make it send a hash
+    /// that cannot be inverted, and it would never authenticate again. Config
+    /// validation refuses that combination first; this is the second line, for
+    /// embedders that call the setter without going through the config.
+    fn nonce_cookie_for(auth: &AuthRegistry, advertise: bool) -> Option<&'static str> {
+        if !advertise {
+            return None;
+        }
+        if !auth.all_realms_support_userhash() {
+            warn!(
+                "advertise_userhash ignored: a realm on this node uses TURN REST or \
+                 OAuth credentials, which cannot resolve a USERHASH"
+            );
+            return None;
+        }
+        Some(USERHASH_NONCE_COOKIE)
     }
 
     /// Attach an RFC 8016 migration ticket signer/verifier. Builder-style so
@@ -1278,7 +1405,7 @@ impl PacketProcessor {
         let cacheable = !ingress_tcp
             && raw.len() <= 4096
             && matches!(msg.class, MessageClass::Request)
-            && msg.get_username().is_some()
+            && msg.has_user_identity()
             && (matches!(msg.method, Method::Refresh)
                 || (matches!(msg.method, Method::Allocate)
                     && msg.get_requested_transport() == Some(17)));
@@ -1326,7 +1453,9 @@ impl PacketProcessor {
         if matches!(msg.class, MessageClass::Request) {
             // I3: reject unknown comprehension-required attributes with 420 before
             // routing/auth — a request we can't parse must not be redirected.
-            if let Some(actions) = self.reject_unknown_comprehension_required(msg, src) {
+            // `false`: this is the TURN listener, which has no alternate
+            // address, so CHANGE-REQUEST is refused here too (RFC 5780 §6).
+            if let Some(actions) = self.reject_unknown_comprehension_required(msg, src, false) {
                 return actions;
             }
             if let Some(actions) = self.maybe_redirect_new_client(msg, src) {
@@ -1367,10 +1496,18 @@ impl PacketProcessor {
     /// required (type < 0x8000) attributes we didn't understand. 0x001C
     /// (MESSAGE-INTEGRITY-SHA256) and 0x001D (PASSWORD-ALGORITHM) are understood
     /// despite being parsed generically, so they never trigger 420.
+    ///
+    /// CHANGE-REQUEST decodes to a typed attribute, but RFC 5780 §6 requires a
+    /// server that cannot answer from an alternate address to refuse it with
+    /// 420 — which is every socket except the NAT-discovery ones. Only the
+    /// discovery responder passes `change_request_ok = true`. PADDING and
+    /// RESPONSE-PORT stay untyped and are refused everywhere (see
+    /// `handle_nat_discovery`).
     fn reject_unknown_comprehension_required(
         &self,
         msg: &StunMessage,
         src: SocketAddr,
+        change_request_ok: bool,
     ) -> Option<Vec<Action>> {
         let unknown: Vec<u16> = msg
             .attributes
@@ -1383,6 +1520,9 @@ impl PacketProcessor {
                         && *attr_type != turna_proto_stun::attribute::ATTR_PASSWORD_ALGORITHM =>
                 {
                     Some(*attr_type)
+                }
+                Attribute::ChangeRequest { .. } if !change_request_ok => {
+                    Some(turna_proto_stun::attribute::ATTR_CHANGE_REQUEST)
                 }
                 _ => None,
             })
@@ -1547,6 +1687,178 @@ impl PacketProcessor {
         }]
     }
 
+    /// RFC 5780 NAT behaviour discovery: answer a Binding request that arrived
+    /// on one of the four discovery sockets (`local` is that socket's address).
+    ///
+    /// Returns the response and the address it must be **sent from**, which is
+    /// the point of the exercise — the caller owns the four sockets and picks
+    /// the one bound to that address. `None` means drop silently.
+    ///
+    /// Everything that guards the TURN listener's Binding path guards this one:
+    /// the configured ingress tiers, then the unauthenticated-reply budget,
+    /// because a discovery response is an unauthenticated reply like any other
+    /// and a slightly larger one (MAPPED-ADDRESS, RESPONSE-ORIGIN and
+    /// OTHER-ADDRESS on top of XOR-MAPPED-ADDRESS). Two reflection vectors the
+    /// RFC itself names are closed by not implementing their attributes:
+    /// PADDING (§7.6, "divide the message into IP fragments") and RESPONSE-PORT
+    /// (§7.5, send somewhere other than the source) are comprehension-required
+    /// and answered 420, so a response always goes to the request's source
+    /// address and is never padded. Both are optional for a server.
+    ///
+    /// Only Binding is served. A TURN method here is dropped, not answered:
+    /// these sockets are not a TURN listener, and replying would advertise
+    /// one.
+    pub fn handle_nat_discovery(
+        &self,
+        raw: &[u8],
+        src: SocketAddr,
+        local: SocketAddr,
+        topology: &crate::nat_discovery::NatDiscoveryTopology,
+    ) -> Option<(Bytes, SocketAddr)> {
+        self.metrics
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_received
+            .fetch_add(raw.len() as u64, Ordering::Relaxed);
+        if !message::is_stun_message(raw) {
+            self.metrics
+                .malformed_packets
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if !self.limiter_for(src.ip()).check_ingress(src.ip()) {
+            self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let msg = match StunMessage::decode(raw) {
+            Ok(m) => m,
+            Err(_) => {
+                // Silent, as on the TURN listener: an error answer to garbage
+                // is a reflection vector.
+                self.metrics
+                    .parser_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        if !matches!(
+            (&msg.class, &msg.method),
+            (MessageClass::Request, Method::Binding)
+        ) {
+            return None;
+        }
+        // Every reply from here on — 420, 401 or success — is unauthenticated
+        // (or not yet authenticated), so the budget is charged first.
+        if !self.allow_unauth_reply(src) {
+            return None;
+        }
+        if let Some(actions) = self.reject_unknown_comprehension_required(&msg, src, true) {
+            // 420 goes out from the socket the request arrived on (Da:Dp).
+            return actions.into_iter().find_map(|a| match a {
+                Action::Send { data, .. } => Some((data, local)),
+                _ => None,
+            });
+        }
+        // A Binding that carries MESSAGE-INTEGRITY is handled as the RFC 8489
+        // §9.2.4 long-term mechanism prescribes, and its success response is
+        // signed (RFC 5780 §6.1: "If authentication is being required, the
+        // server MUST include a MESSAGE-INTEGRITY and associated attributes").
+        // The checks, in the RFC's order: USERNAME/USERHASH, REALM and NONCE
+        // present (else 400), the nonce issued by this responder to this
+        // source and still fresh (else 438 — a replayed request is refused
+        // here), the integrity valid (else 401). Every error goes out from
+        // Da:Dp; the budget was charged above, once, for whichever reply this
+        // turns out to be. An unauthenticated Binding (no MESSAGE-INTEGRITY) is
+        // answered unsigned, which is what discovery clients send.
+        let has_integrity =
+            msg.get_message_integrity().is_some() || msg.get_message_integrity_sha256().is_some();
+        let mut signing_key: Option<Vec<u8>> = None;
+        if has_integrity {
+            let error = |code: u16, reason: &str, with_nonce: bool| {
+                let mut resp =
+                    turn::build_error_response(msg.method, msg.transaction_id, code, reason);
+                if with_nonce {
+                    resp.add(Attribute::Realm(self.auth.default_realm().to_string()));
+                    resp.add(Attribute::Nonce(self.nonce_mgr.issue(src)));
+                }
+                let mut buf = [0u8; 512];
+                let len = resp.encode(&mut buf).ok()?;
+                self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .bytes_sent
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                Some((Bytes::copy_from_slice(&buf[..len]), local))
+            };
+            let Some(nonce) = msg.get_nonce() else {
+                return error(400, "Bad Request", false);
+            };
+            if !msg.has_user_identity() || msg.get_realm().is_none() {
+                return error(400, "Bad Request", false);
+            }
+            if matches!(self.nonce_mgr.validate(src, nonce), NonceStatus::Stale) {
+                return error(438, "Stale Nonce", true);
+            }
+            match self.auth_validate(&msg, raw) {
+                Ok(r) => signing_key = Some(r.key),
+                Err(turna_auth::AuthError::BadRequest) => {
+                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    return error(400, "Bad Request", false);
+                }
+                Err(_) => {
+                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    let resp = turn::build_auth_challenge(
+                        msg.method,
+                        msg.transaction_id,
+                        self.auth.default_realm(),
+                        &self.nonce_mgr.issue(src),
+                    );
+                    let mut buf = [0u8; 512];
+                    let len = resp.encode(&mut buf).ok()?;
+                    self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .bytes_sent
+                        .fetch_add(len as u64, Ordering::Relaxed);
+                    return Some((Bytes::copy_from_slice(&buf[..len]), local));
+                }
+            }
+        }
+
+        // RFC 5780 §6.1, Table 1: the source of the response follows the
+        // CHANGE-REQUEST flags; OTHER-ADDRESS is Ca:Cp whatever they say.
+        let (change_ip, change_port) = msg.get_change_request().unwrap_or((false, false));
+        let from = topology.response_source(local, change_ip, change_port)?;
+        let other = topology.other_address(local)?;
+
+        let mut resp = StunMessage::with_transaction_id(
+            Method::Binding,
+            MessageClass::SuccessResponse,
+            msg.transaction_id,
+        );
+        // §6.1: "The server MUST include both MAPPED-ADDRESS and
+        // XOR-MAPPED-ADDRESS in its Response."
+        resp.add(Attribute::XorMappedAddress(src));
+        resp.add(Attribute::MappedAddress(src));
+        // §6.1: RESPONSE-ORIGIN is the address actually sent from; OTHER-ADDRESS
+        // is included because this server has an alternate address and port.
+        resp.add(Attribute::ResponseOrigin(from));
+        resp.add(Attribute::OtherAddress(other));
+        if let Some(sw) = software_attribute() {
+            resp.add(Attribute::Software(sw.into()));
+        }
+        let mut buf = [0u8; 512];
+        let len = match &signing_key {
+            // Same MESSAGE-INTEGRITY variant as the request (RFC 8489 §9.2.4).
+            Some(key) => encode_with_integrity_auto(&resp, &mut buf, key, &msg).ok()?,
+            None => resp.encode(&mut buf).ok()?,
+        };
+        self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+        Some((Bytes::copy_from_slice(&buf[..len]), from))
+    }
+
     fn handle_allocate(
         &self,
         msg: &StunMessage,
@@ -1558,7 +1870,7 @@ impl PacketProcessor {
         // before auth let an unauthenticated client probe whether an allocation
         // already exists on this 5-tuple (437 vs 401 disclosure). Challenge and
         // validate first, then do the allocation-mismatch / transport checks.
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -1735,8 +2047,11 @@ impl PacketProcessor {
         if let Some(max) = token_max_lifetime {
             lifetime = lifetime.min(max);
         }
-        // Kept for the log line below; accounting uses `subject`.
-        let credential = msg.get_username().unwrap_or("").to_string();
+        // Kept for the log line below; accounting uses `subject`. A USERHASH
+        // request has no USERNAME to log, and logging the hash would only
+        // re-identify what the client chose to hide; `subject` already names
+        // the user for the operator.
+        let credential = msg.get_username().unwrap_or("(userhash)").to_string();
         let (dynamic_lifetime, lifetime_disabled) =
             self.store
                 .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &subject);
@@ -1874,41 +2189,54 @@ impl PacketProcessor {
         if msg.get_even_port().is_some() || msg.get_reservation_token().is_some() || has_df {
             return self.encode_error(msg, src, 400, "Bad Request");
         }
-        // RFC 6062 TCP allocations stay IPv4-only even when `external_ip6` is set:
-        // the TCP relay datapath has no v6 path yet, so an IPv6 family request is
-        // refused with 440 rather than accepted and then unable to CONNECT.
+        // RFC 6156 family for an RFC 6062 TCP allocation.
         //
-        // Two ways a v6 family can arrive here, and BOTH have to be refused:
+        // IPv6 is served only when BOTH switches are on: `[turn] external_ip6`
+        // (an address to advertise) and `[turn.tcp_relay] allow_ipv6` (default
+        // off). The second exists so that a deployment already running v6 UDP
+        // relaying and TCP relaying side by side keeps answering an IPv6 TCP
+        // Allocate with 440 until it opts in — the TCP datapath is a listener
+        // and a connection per peer, a different thing to size than a UDP
+        // socket. With both on, the relayed listener binds v6 (`IPV6_V6ONLY`, on
+        // `[turn.relay] bind_ip6`) and `external_ip6` is advertised; the family
+        // rules are the UDP ones — CreatePermission refuses a cross-family peer
+        // with 443, so CONNECT (which needs a permission) cannot reach one, and
+        // the v6-only listener cannot accept one.
         //
-        //  1. the client asks for it (REQUESTED-ADDRESS-FAMILY = IPv6);
-        //  2. the operator configured `[turn] external_ip` as a v6 literal, which
-        //     `config::validate()` accepts and nothing downstream ties to
-        //     `tcp_relay`. The client sends no family attribute, so case 1 never
-        //     fires — yet `relay_addr` below is built from `self.external_ip` and
-        //     would advertise a v6 XOR-RELAYED-ADDRESS while the relayed listener
-        //     binds `0.0.0.0`. The Allocate would SUCCEED and peer-initiated
-        //     connections (RFC 6062 §4.4) could never arrive at the address the
-        //     client was just handed, with nothing logged and no error anywhere.
+        // Two ways a v6 family can arrive here, and the second is still refused
+        // whatever the switches say:
         //
-        // Case 2 is the dangerous one precisely because it looks like it worked.
-        // Refusing with the same 440 keeps the observable behaviour equal to what
-        // docs/feature-support.md already promises ("an IPv6 TCP allocation answers
-        // 440") instead of splitting it by how the family was chosen.
+        //  1. the client asks for it (REQUESTED-ADDRESS-FAMILY = IPv6) — served
+        //     when both switches are on, 440 otherwise;
+        //  2. the operator configured `[turn] external_ip` as a v6 literal. The
+        //     client sends no family attribute, which means IPv4 (RFC 8656
+        //     §7.2), so the listener binds v4 while `relay_addr` would be built
+        //     from a v6 `external_ip` — the Allocate would SUCCEED and hand the
+        //     client an address nothing serves, with nothing logged. That case
+        //     answers 440 and says why.
         let requested_v6 = matches!(
             msg.get_requested_address_family(),
             Some(turna_proto_stun::attribute::AddressFamily::Ipv6)
         );
-        if requested_v6 || self.external_ip.is_ipv6() {
-            if !requested_v6 {
-                warn!(
-                    external_ip = %self.external_ip,
-                    "RFC 6062: refusing TCP allocation because [turn] external_ip is IPv6 \
-                     and the TCP relay datapath is IPv4-only; the relayed listener would \
-                     bind 0.0.0.0 and never receive peer-initiated connections"
-                );
-            }
+        let v6_allowed = self.external_ip6.is_some()
+            && self.tcp_relay.as_ref().is_some_and(|m| m.ipv6_enabled());
+        if requested_v6 && !v6_allowed {
             return self.encode_error(msg, src, 440, "Address Family not Supported");
         }
+        if !requested_v6 && self.external_ip.is_ipv6() {
+            warn!(
+                external_ip = %self.external_ip,
+                "RFC 6062: refusing TCP allocation because [turn] external_ip is IPv6 \
+                 while the allocation is IPv4 (no REQUESTED-ADDRESS-FAMILY); the relayed \
+                 listener would bind 0.0.0.0 and never receive peer-initiated connections"
+            );
+            return self.encode_error(msg, src, 440, "Address Family not Supported");
+        }
+        let relay_family = if requested_v6 {
+            turna_session::RelayFamily::V6
+        } else {
+            turna_session::RelayFamily::V4
+        };
 
         let mut lifetime = msg
             .get_lifetime()
@@ -1917,8 +2245,11 @@ impl PacketProcessor {
         if let Some(max) = token_max_lifetime {
             lifetime = lifetime.min(max);
         }
-        // Kept for the log line below; accounting uses `subject`.
-        let credential = msg.get_username().unwrap_or("").to_string();
+        // Kept for the log line below; accounting uses `subject`. A USERHASH
+        // request has no USERNAME to log, and logging the hash would only
+        // re-identify what the client chose to hide; `subject` already names
+        // the user for the operator.
+        let credential = msg.get_username().unwrap_or("(userhash)").to_string();
         let (dynamic_lifetime, lifetime_disabled) =
             self.store
                 .lifetime_policy_for_user(&realm, tenant_id.as_deref(), &subject);
@@ -1934,7 +2265,12 @@ impl PacketProcessor {
             Ok(p) => p,
             Err(_) => return self.encode_error(msg, src, 508, "Insufficient Capacity"),
         };
-        let relay_addr = SocketAddr::new(self.external_ip, relay_port);
+        let relay_addr = match (relay_family, self.external_ip6) {
+            (turna_session::RelayFamily::V6, Some(ip6)) => {
+                SocketAddr::new(std::net::IpAddr::V6(ip6), relay_port)
+            }
+            _ => SocketAddr::new(self.external_ip, relay_port),
+        };
         let mut port_reservation = turna_session::PortReservationGuard::new(
             self.store.pool_for_port(relay_port),
             relay_port,
@@ -1944,18 +2280,17 @@ impl PacketProcessor {
         // allocation (peer-initiated connections require it). Bind it before
         // committing the allocation; on failure, release the port and reject the
         // Allocate rather than hand back a half-working allocation.
-        // Same bind address as the UDP relay sockets: a TCP allocation that
-        // listened on every interface while the UDP ones were pinned to the
-        // public address would reopen on the private side exactly the surface
-        // `[turn.relay] bind_ip` exists to close.
-        let listener =
-            match std::net::TcpListener::bind((turna_session::relay_bind_addr_v4(), relay_port)) {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
-                    return self.encode_error(msg, src, 508, "Insufficient Capacity");
-                }
-            };
+        // Same bind address as the UDP relay sockets of the same family: a TCP
+        // allocation that listened on every interface while the UDP ones were
+        // pinned to the public address would reopen on the private side exactly
+        // the surface `[turn.relay] bind_ip` / `bind_ip6` exist to close.
+        let listener = match turna_session::bind_relay_tcp_listener(relay_family, relay_port) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(%relay_addr, error = %e, "RFC 6062: relayed TCP listener bind failed");
+                return self.encode_error(msg, src, 508, "Insufficient Capacity");
+            }
+        };
 
         if let Err(e) = self.store.create_for_identity(
             src,
@@ -2026,7 +2361,7 @@ impl PacketProcessor {
         raw: &[u8],
         src: SocketAddr,
     ) -> ConnectDecision {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return ConnectDecision::Reject(self.encode_auth_challenge(msg, src));
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2081,6 +2416,77 @@ impl PacketProcessor {
             key,
             relay_port,
         }
+    }
+
+    /// RFC 6062 §5.3: may the peer that just connected to `client`'s relayed
+    /// TCP listener be announced with a ConnectionAttempt?
+    ///
+    /// "If no permission for this peer has been installed for this allocation,
+    /// the server MUST close the connection with the peer immediately after it
+    /// has been accepted." Until 2026-09-24 nothing checked this: anyone who
+    /// found a relayed port could open connections that the client was then
+    /// invited to bind, bypassing the permission model CONNECT enforces.
+    ///
+    /// Same state as CreatePermission and CONNECT — the allocation's own
+    /// permission table via `Allocation::has_permission`, which honours expiry
+    /// — plus the peer filter, which CreatePermission already applied to every
+    /// permitted address but which is re-run here because the filter policy
+    /// can be stricter than it was when the permission was installed. The
+    /// allocation must still exist, be unexpired and be a TCP allocation, and
+    /// the peer must be in its relayed family (the v6 listener is v6-only, so
+    /// that last check is belt and braces).
+    ///
+    /// `relay_port` is the port of the listener that accepted the connection,
+    /// and it must be the allocation's current relayed port. The client's
+    /// 5-tuple alone is not enough: after an allocation expires, a new one on the
+    /// same TLS connection gets a different port, and a listener left over from
+    /// the old one must not announce connections — tagged with the old port —
+    /// on the new allocation's permissions.
+    ///
+    /// A `false` is counted in `turna_tcp_relay_peer_refused_total`; the caller
+    /// drops (closes) the stream.
+    pub fn peer_connection_permitted(
+        &self,
+        client: SocketAddr,
+        relay_port: u16,
+        peer: SocketAddr,
+    ) -> bool {
+        let peer = normalize_addr(peer);
+        let permitted = !is_forbidden_peer(peer.ip())
+            && match self.store.get(&client) {
+                Some(a) => {
+                    !a.is_expired()
+                        && a.transport == TransportProto::Tcp
+                        && a.relay_addr.port() == relay_port
+                        && a.relay_addr.is_ipv6() == peer.is_ipv6()
+                        && a.has_permission(&peer)
+                }
+                None => false,
+            };
+        if !permitted {
+            self.metrics
+                .tcp_relay_peer_refused
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                client = %loggable_addr(&client),
+                peer = %loggable_addr(&peer),
+                "RFC 6062: peer-initiated connection without permission closed"
+            );
+        }
+        permitted
+    }
+
+    /// Does `client` still own a live TCP allocation on `relay_port`? The
+    /// relayed-TCP accept loop polls this and stops its listener when it turns
+    /// false, which is how a listener ends when its allocation *expires* — the
+    /// explicit paths (Refresh 0, control connection closed) emit `CloseRelay`,
+    /// but the expiry sweep only reconciles UDP relay sockets.
+    pub fn tcp_listener_live(&self, client: SocketAddr, relay_port: u16) -> bool {
+        self.store.get(&client).is_some_and(|a| {
+            !a.is_expired()
+                && a.transport == TransportProto::Tcp
+                && a.relay_addr.port() == relay_port
+        })
     }
 
     /// Build a signed RFC 6062 CONNECT success response carrying CONNECTION-ID.
@@ -2157,7 +2563,7 @@ impl PacketProcessor {
         raw: &[u8],
         src: SocketAddr,
     ) -> ConnBindDecision {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return ConnBindDecision::Reject(self.encode_auth_challenge(msg, src));
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2222,7 +2628,7 @@ impl PacketProcessor {
     }
 
     fn handle_refresh(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2242,6 +2648,7 @@ impl PacketProcessor {
         let token_max_lifetime = resolution.max_lifetime_secs;
         let realm = resolution.realm;
         let tenant_id = resolution.tenant_id;
+        let subject = resolution.subject;
 
         let mut lifetime = msg
             .get_lifetime()
@@ -2263,7 +2670,10 @@ impl PacketProcessor {
             lifetime = lifetime.min(max);
         }
         if lifetime > 0 {
-            let username = msg.get_username().unwrap_or("");
+            // The raw USERNAME, as before. A USERHASH request has none; for it
+            // the resolved name stands in, which for a long-term user — the only
+            // kind a USERHASH can resolve to — is the same string.
+            let username = msg.get_username().unwrap_or(subject.as_str());
             let (dynamic_max, lifetime_disabled) =
                 self.store
                     .lifetime_policy_for_user(&realm, tenant_id.as_deref(), username);
@@ -2425,7 +2835,7 @@ impl PacketProcessor {
         raw: &[u8],
         src: SocketAddr,
     ) -> Vec<Action> {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2516,7 +2926,7 @@ impl PacketProcessor {
     }
 
     fn handle_channel_bind(&self, msg: &StunMessage, raw: &[u8], src: SocketAddr) -> Vec<Action> {
-        if msg.get_username().is_none() {
+        if !msg.has_user_identity() {
             return self.encode_auth_challenge(msg, src);
         }
         if let Some(stale) = self.validate_nonce(msg, src) {
@@ -2990,7 +3400,16 @@ mod a3_f4_dont_fragment_tests {
         // Regression guard for the family split: IPPROTO_IP on an AF_INET6 socket
         // does not set DF, so a v6 allocation with DONT-FRAGMENT would silently
         // fragment.
-        let sock = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let sock = match std::net::UdpSocket::bind("[::1]:0") {
+            Ok(s) => s,
+            // A host with IPv6 disabled (EAFNOSUPPORT) cannot exercise this;
+            // skip rather than report a failure that is about the environment,
+            // as `session::v6only_tests` does.
+            Err(e) => {
+                eprintln!("skipping: no IPv6 on this host ({e})");
+                return;
+            }
+        };
         set_dont_fragment(sock.as_raw_fd(), turna_session::RelayFamily::V6)
             .expect("setsockopt IPV6_MTU_DISCOVER should succeed");
 
@@ -3127,5 +3546,1157 @@ mod udp_replay_tests {
             [Action::None]
         ));
         assert_eq!(p.metrics.total_allocations.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod userhash_tests {
+    //! RFC 8489 USERHASH through the processor: a request that names its user
+    //! by hash is authenticated like one that names it by USERNAME, and is
+    //! accounted to the same subject.
+    use super::*;
+    use turna_proto_stun::attribute::ATTR_USERHASH;
+
+    const REALM: &str = "hash-test";
+
+    fn password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD
+            .get_or_init(|| {
+                turna_crypto::random_key_32()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            })
+            .as_str()
+    }
+
+    fn long_term_processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(25000, 25999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                REALM,
+                [("alice", password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    /// A request naming `user` by USERHASH only, signed with
+    /// MESSAGE-INTEGRITY-SHA256 under `pass`.
+    fn hashed_request(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        method: Method,
+        user: &str,
+        pass: &str,
+        extra: Vec<Attribute>,
+    ) -> Bytes {
+        let mut msg = StunMessage::new(method, MessageClass::Request);
+        for a in extra {
+            msg.add(a);
+        }
+        msg.add(Attribute::UserHash(turna_crypto::userhash(user, REALM)));
+        msg.add(Attribute::Realm(REALM.into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key_sha256(user, REALM, pass);
+        let mut buf = [0; 1024];
+        let n = msg.encode_with_integrity_sha256(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn reply(actions: &[Action]) -> StunMessage {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
+    fn error_code(msg: &StunMessage) -> Option<u16> {
+        msg.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    /// The 420 this replaces: USERHASH (0x001E) is comprehension-required, and
+    /// before it had a typed variant every request carrying it was refused as
+    /// an unknown attribute.
+    #[test]
+    fn userhash_allocate_refresh_permission_succeed() {
+        let p = long_term_processor();
+        let src: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+
+        let alloc = hashed_request(
+            &p,
+            src,
+            Method::Allocate,
+            "alice",
+            password(),
+            vec![Attribute::RequestedTransport(17), Attribute::Lifetime(600)],
+        );
+        let actions = p.process(alloc, src);
+        let resp = reply(&actions);
+        assert!(
+            matches!(resp.class, MessageClass::SuccessResponse),
+            "USERHASH Allocate must succeed, got {:?}",
+            error_code(&resp)
+        );
+        // Signed with the SHA-256 key the client used (RFC 8489 §9.2.4).
+        assert!(resp.get_message_integrity_sha256().is_some());
+        // Accounted to the resolved user, not to an empty USERNAME.
+        assert_eq!(p.store.get(&src).unwrap().username, "alice");
+
+        let perm = hashed_request(
+            &p,
+            src,
+            Method::CreatePermission,
+            "alice",
+            password(),
+            vec![Attribute::XorPeerAddress("8.8.8.8:9".parse().unwrap())],
+        );
+        assert!(matches!(
+            reply(&p.process(perm, src)).class,
+            MessageClass::SuccessResponse
+        ));
+
+        let refresh = hashed_request(
+            &p,
+            src,
+            Method::Refresh,
+            "alice",
+            password(),
+            vec![Attribute::Lifetime(0)],
+        );
+        let actions = p.process(refresh, src);
+        assert!(matches!(
+            reply(&actions).class,
+            MessageClass::SuccessResponse
+        ));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::CloseRelay { .. })));
+    }
+
+    #[test]
+    fn unknown_userhash_is_challenged_not_420() {
+        let p = long_term_processor();
+        let src: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let req = hashed_request(
+            &p,
+            src,
+            Method::Allocate,
+            "mallory",
+            "whatever",
+            vec![Attribute::RequestedTransport(17)],
+        );
+        let resp = reply(&p.process(req, src));
+        // RFC 8489 §9.2.4: an invalid USERHASH is answered 401.
+        assert_eq!(error_code(&resp), Some(401));
+        assert!(!resp
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::UnknownAttributes(v) if v.contains(&ATTR_USERHASH))));
+    }
+
+    /// TURN REST cannot resolve a hash; the answer is 401, never a crash, a
+    /// 420 or an allocation keyed to an empty name.
+    #[test]
+    fn shared_secret_realm_answers_userhash_with_401() {
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(26000, 26999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::SharedSecret {
+                realm: REALM.into(),
+                secret: b"rest-secret".to_vec(),
+                previous: None,
+            })),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        );
+        let src: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let req = hashed_request(
+            &p,
+            src,
+            Method::Allocate,
+            "4102444800:alice",
+            "irrelevant",
+            vec![Attribute::RequestedTransport(17)],
+        );
+        assert_eq!(error_code(&reply(&p.process(req, src))), Some(401));
+        assert!(p.store.get(&src).is_none());
+    }
+
+    #[test]
+    fn nonce_cookie_round_trips_and_marks_username_anonymity() {
+        let mgr = NonceManager::with_cookie(Some(USERHASH_NONCE_COOKIE));
+        let src: SocketAddr = "127.0.0.1:41004".parse().unwrap();
+        let nonce = mgr.issue(src);
+        // RFC 8489 §9.2: "obMatJos2" + base64 of the 24 feature bits. Bit 1
+        // (Username anonymity) set, bit 0 (Password algorithms) clear.
+        // "QAAA" is base64 of 0x40 0x00 0x00: 010000|000000|000000|000000.
+        assert!(nonce.starts_with("obMatJos2QAAA"), "{nonce}");
+        assert!(matches!(mgr.validate(src, &nonce), NonceStatus::Valid));
+
+        // A cookie-less nonce (issued before the cookie was turned on) is stale.
+        let plain = NonceManager::with_cookie(None);
+        let old = plain.issue(src);
+        assert!(!old.starts_with("obMatJos2"));
+        assert!(matches!(mgr.validate(src, &old), NonceStatus::Stale));
+    }
+
+    #[test]
+    fn cookie_is_withheld_unless_every_realm_resolves_userhash() {
+        let lt = AuthRegistry::new(turna_auth::AuthMode::long_term(REALM, [("a", "b")]));
+        assert_eq!(PacketProcessor::nonce_cookie_for(&lt, false), None);
+        assert_eq!(
+            PacketProcessor::nonce_cookie_for(&lt, true),
+            Some(USERHASH_NONCE_COOKIE)
+        );
+        let mixed = AuthRegistry::new(turna_auth::AuthMode::long_term(REALM, [("a", "b")]))
+            .with_tenant(
+                "t",
+                turna_auth::AuthMode::SharedSecret {
+                    realm: "other".into(),
+                    secret: b"s".to_vec(),
+                    previous: None,
+                },
+            );
+        assert_eq!(PacketProcessor::nonce_cookie_for(&mixed, true), None);
+    }
+}
+
+#[cfg(test)]
+mod nat_discovery_tests {
+    //! RFC 5780 through the processor. The socket plumbing is tested in
+    //! `nat_discovery`; here, what each request is answered with and from where.
+    use super::*;
+    use crate::nat_discovery::NatDiscoveryTopology;
+    use turna_proto_stun::attribute::ATTR_CHANGE_REQUEST;
+
+    fn topo() -> NatDiscoveryTopology {
+        NatDiscoveryTopology::new(
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.2".parse().unwrap(),
+            3478,
+            3479,
+        )
+        .unwrap()
+    }
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(27000, 27999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "nat",
+                [("u", "p")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    fn binding(extra: Vec<Attribute>) -> Vec<u8> {
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        for a in extra {
+            m.add(a);
+        }
+        let mut buf = [0u8; 256];
+        let n = m.encode(&mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn plain_binding_carries_all_four_addresses() {
+        let p = processor();
+        let src = sa("198.51.100.7:40000");
+        let local = sa("127.0.0.1:3478");
+        let (bytes, from) = p
+            .handle_nat_discovery(&binding(vec![]), src, local, &topo())
+            .expect("a reply");
+        assert_eq!(from, local, "no CHANGE-REQUEST: answer from Da:Dp");
+        let r = StunMessage::decode(&bytes).unwrap();
+        assert!(matches!(r.class, MessageClass::SuccessResponse));
+        assert!(r
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::XorMappedAddress(x) if *x == src)));
+        assert!(r
+            .attributes
+            .iter()
+            .any(|a| matches!(a, Attribute::MappedAddress(x) if *x == src)));
+        assert_eq!(r.get_response_origin(), Some(local));
+        assert_eq!(r.get_other_address(), Some(sa("127.0.0.2:3479")));
+    }
+
+    #[test]
+    fn change_request_moves_the_source_and_response_origin_follows() {
+        let p = processor();
+        let src = sa("198.51.100.7:40001");
+        let local = sa("127.0.0.1:3478");
+        for (ip, port, want) in [
+            (true, false, "127.0.0.2:3478"),
+            (false, true, "127.0.0.1:3479"),
+            (true, true, "127.0.0.2:3479"),
+        ] {
+            let req = binding(vec![Attribute::ChangeRequest {
+                change_ip: ip,
+                change_port: port,
+            }]);
+            let (bytes, from) = p.handle_nat_discovery(&req, src, local, &topo()).unwrap();
+            assert_eq!(from, sa(want));
+            let r = StunMessage::decode(&bytes).unwrap();
+            assert_eq!(r.get_response_origin(), Some(sa(want)));
+            assert_eq!(r.get_other_address(), Some(sa("127.0.0.2:3479")));
+        }
+    }
+
+    /// PADDING (0x0026) and RESPONSE-PORT (0x0027) are the two attributes the
+    /// RFC's security section worries about; both are optional for a server
+    /// and refused here, from the socket the request arrived on.
+    #[test]
+    fn padding_and_response_port_are_refused_with_420() {
+        let p = processor();
+        let src = sa("198.51.100.7:40002");
+        let local = sa("127.0.0.2:3479");
+        for (typ, value) in [(0x0026u16, vec![0u8; 64]), (0x0027, vec![0x13, 0x88, 0, 0])] {
+            let req = binding(vec![Attribute::Unknown {
+                attr_type: typ,
+                value,
+            }]);
+            let (bytes, from) = p.handle_nat_discovery(&req, src, local, &topo()).unwrap();
+            assert_eq!(from, local);
+            let r = StunMessage::decode(&bytes).unwrap();
+            assert!(r
+                .attributes
+                .iter()
+                .any(|a| matches!(a, Attribute::UnknownAttributes(v) if v == &vec![typ])));
+        }
+    }
+
+    #[test]
+    fn turn_methods_are_not_served_on_discovery_sockets() {
+        let p = processor();
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::RequestedTransport(17));
+        let mut buf = [0u8; 128];
+        let n = m.encode(&mut buf).unwrap();
+        assert!(p
+            .handle_nat_discovery(
+                &buf[..n],
+                sa("198.51.100.7:40003"),
+                sa("127.0.0.1:3478"),
+                &topo()
+            )
+            .is_none());
+    }
+
+    /// Replies share the unauthenticated-reply budget: a flood from one
+    /// (possibly spoofed) source stops being answered.
+    #[test]
+    fn replies_are_bounded_by_the_unauthenticated_budget() {
+        let p = processor();
+        let src = sa("198.51.100.8:40004");
+        let req = binding(vec![Attribute::ChangeRequest {
+            change_ip: true,
+            change_port: true,
+        }]);
+        let answered = (0..500)
+            .filter(|_| {
+                p.handle_nat_discovery(&req, src, sa("127.0.0.1:3478"), &topo())
+                    .is_some()
+            })
+            .count();
+        assert!(answered < 500, "all 500 were answered");
+        assert!(answered >= 1);
+        assert!(p.metrics.unauth_replies_suppressed.load(Ordering::Relaxed) > 0);
+    }
+
+    /// The TURN listener has no alternate address, so RFC 5780 §6 requires it
+    /// to refuse CHANGE-REQUEST with 420 — the same answer it gave when the
+    /// attribute was not understood at all.
+    #[test]
+    fn turn_listener_still_refuses_change_request() {
+        let p = processor();
+        let src = sa("198.51.100.7:40005");
+        let req = binding(vec![Attribute::ChangeRequest {
+            change_ip: true,
+            change_port: false,
+        }]);
+        let actions = p.process(Bytes::from(req), src);
+        let r = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("a reply");
+        assert!(r.attributes.iter().any(
+            |a| matches!(a, Attribute::UnknownAttributes(v) if v == &vec![ATTR_CHANGE_REQUEST])
+        ));
+        // And a plain Binding there still has no OTHER-ADDRESS (§6: a server
+        // without an alternate address MUST NOT include it).
+        let actions = p.process(Bytes::from(binding(vec![])), src);
+        let r = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(r.get_other_address().is_none());
+        assert!(r.get_response_origin().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tcp_relay_ipv6_tests {
+    //! RFC 6062 TCP allocations in the IPv6 family. The paths that bind a v6
+    //! socket skip on a host without IPv6 and say so; the refusals run
+    //! everywhere.
+    use super::*;
+    use crate::tcp_relay::{TcpRelayConfig, TcpRelayManager};
+    use turna_proto_stun::attribute::AddressFamily;
+
+    const REALM: &str = "tcp6";
+
+    fn processor(allow_ipv6: bool, ip6: Option<&str>) -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(29000, 29999, 64)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                REALM,
+                [("u", "pw")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_tcp_relay(Some(Arc::new(TcpRelayManager::new(TcpRelayConfig {
+            allow_ipv6,
+            ..Default::default()
+        }))))
+        .with_external_ip6(ip6.map(|s| s.parse().unwrap()))
+    }
+
+    fn signed(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        method: Method,
+        extra: Vec<Attribute>,
+    ) -> Bytes {
+        let mut m = StunMessage::new(method, MessageClass::Request);
+        for a in extra {
+            m.add(a);
+        }
+        m.add(Attribute::Username("u".into()));
+        m.add(Attribute::Realm(REALM.into()));
+        m.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key("u", REALM, "pw");
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn tcp_allocate(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        family: Option<AddressFamily>,
+    ) -> Vec<Action> {
+        let mut extra = vec![Attribute::RequestedTransport(turn::TRANSPORT_TCP)];
+        if let Some(f) = family {
+            extra.push(Attribute::RequestedAddressFamily(f));
+        }
+        p.process_tcp_control(signed(p, src, Method::Allocate, extra), src)
+    }
+
+    fn reply(actions: &[Action]) -> StunMessage {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("a reply")
+    }
+
+    fn code(m: &StunMessage) -> Option<u16> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    fn relayed(m: &StunMessage) -> Option<SocketAddr> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::XorRelayedAddress(x) => Some(*x),
+            _ => None,
+        })
+    }
+
+    fn host_has_ipv6() -> bool {
+        std::net::TcpListener::bind("[::1]:0").is_ok()
+    }
+
+    /// The default: `allow_ipv6 = false` answers 440 exactly as before, even
+    /// with `external_ip6` configured for UDP.
+    #[test]
+    fn ipv6_tcp_allocation_is_refused_unless_opted_in() {
+        let p = processor(false, Some("2001:db8::10"));
+        let src: SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        let r = reply(&tcp_allocate(&p, src, Some(AddressFamily::Ipv6)));
+        assert_eq!(code(&r), Some(440));
+        assert!(p.store.get(&src).is_none());
+    }
+
+    /// Opted in but with no v6 address to advertise: still 440, rather than a
+    /// v6 allocation carrying an address nobody routes.
+    #[test]
+    fn ipv6_tcp_allocation_needs_external_ip6() {
+        let p = processor(true, None);
+        let src: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let r = reply(&tcp_allocate(&p, src, Some(AddressFamily::Ipv6)));
+        assert_eq!(code(&r), Some(440));
+    }
+
+    /// Turning v6 on changes nothing for a v4 TCP allocation.
+    #[test]
+    fn ipv4_tcp_allocation_is_unchanged_with_ipv6_enabled() {
+        let p = processor(true, Some("2001:db8::10"));
+        let src: SocketAddr = "127.0.0.1:42003".parse().unwrap();
+        let actions = tcp_allocate(&p, src, None);
+        let r = reply(&actions);
+        assert!(
+            matches!(r.class, MessageClass::SuccessResponse),
+            "{:?}",
+            code(&r)
+        );
+        assert!(relayed(&r).unwrap().is_ipv4());
+        let listener_v4 = actions.iter().any(|a| {
+            matches!(a, Action::RegisterTcpListener { listener, .. }
+                if listener.local_addr().unwrap().is_ipv4())
+        });
+        assert!(listener_v4, "v4 allocation must bind a v4 listener");
+    }
+
+    #[test]
+    fn ipv6_tcp_allocation_binds_v6_and_enforces_family() {
+        if !host_has_ipv6() {
+            eprintln!("skipping: no IPv6 on this host; the v6 TCP relay path is not exercised");
+            return;
+        }
+        let p = processor(true, Some("2001:db8::10"));
+        let src: SocketAddr = "127.0.0.1:42004".parse().unwrap();
+        let actions = tcp_allocate(&p, src, Some(AddressFamily::Ipv6));
+        let r = reply(&actions);
+        assert!(
+            matches!(r.class, MessageClass::SuccessResponse),
+            "{:?}",
+            code(&r)
+        );
+        let addr = relayed(&r).unwrap();
+        assert_eq!(
+            addr.ip(),
+            "2001:db8::10".parse::<std::net::IpAddr>().unwrap()
+        );
+        let listener_v6 = actions.iter().any(|a| {
+            matches!(a, Action::RegisterTcpListener { listener, relay_port, .. }
+                if listener.local_addr().unwrap().is_ipv6() && *relay_port == addr.port())
+        });
+        assert!(
+            listener_v6,
+            "v6 allocation must bind a v6 listener on the advertised port"
+        );
+
+        // RFC 6156: a v4 peer on a v6 allocation is a family mismatch (443),
+        // so CONNECT — which needs a permission — cannot reach one either.
+        let perm = signed(
+            &p,
+            src,
+            Method::CreatePermission,
+            vec![Attribute::XorPeerAddress("8.8.8.8:80".parse().unwrap())],
+        );
+        assert_eq!(code(&reply(&p.process_tcp_control(perm, src))), Some(443));
+        let connect = signed(
+            &p,
+            src,
+            Method::Connect,
+            vec![Attribute::XorPeerAddress("8.8.8.8:80".parse().unwrap())],
+        );
+        let msg = StunMessage::decode(&connect).unwrap();
+        match p.connect_decision(&msg, &connect, src) {
+            ConnectDecision::Reject(a) => assert_eq!(code(&reply(&a)), Some(403)),
+            ConnectDecision::Proceed { .. } => panic!("CONNECT to a v4 peer on a v6 allocation"),
+        }
+        // A v6 peer in the global range is permitted.
+        let perm6 = signed(
+            &p,
+            src,
+            Method::CreatePermission,
+            vec![Attribute::XorPeerAddress(
+                "[2001:4860:4860::8888]:80".parse().unwrap(),
+            )],
+        );
+        assert!(matches!(
+            reply(&p.process_tcp_control(perm6, src)).class,
+            MessageClass::SuccessResponse
+        ));
+        // RFC 6062 §5.3 on the v6 listener: the permitted v6 peer may be
+        // announced; a v4 peer and an unpermitted v6 peer may not.
+        assert!(p.peer_connection_permitted(
+            src,
+            addr.port(),
+            "[2001:4860:4860::8888]:5000".parse().unwrap()
+        ));
+        assert!(!p.peer_connection_permitted(src, addr.port(), "8.8.8.8:5000".parse().unwrap()));
+        assert!(!p.peer_connection_permitted(
+            src,
+            addr.port(),
+            "[2001:4860:4860::8844]:5000".parse().unwrap()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tcp_relay_peer_permission_tests {
+    //! RFC 6062 §5.3 through the shared accept handler, with real TCP streams
+    //! and a real client sink. The accepted stream is loopback; the `peer`
+    //! address handed to the handler is what the listener's `accept()` would
+    //! report, so a global address stands in for it — loopback peers are
+    //! denied by the default peer filter, which is itself one of the cases.
+    use super::*;
+    use crate::tcp_relay::{
+        handle_peer_initiated, AllocationId, PeerAcceptOutcome, TcpRelayConfig, TcpRelayManager,
+    };
+    use std::time::Duration;
+
+    const REALM: &str = "tcp-perm";
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(30000, 30999, 64)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                REALM,
+                [("u", "pw")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_tcp_relay(Some(Arc::new(TcpRelayManager::new(
+            TcpRelayConfig::default(),
+        ))))
+    }
+
+    fn signed(
+        p: &PacketProcessor,
+        src: SocketAddr,
+        method: Method,
+        extra: Vec<Attribute>,
+    ) -> Bytes {
+        let mut m = StunMessage::new(method, MessageClass::Request);
+        for a in extra {
+            m.add(a);
+        }
+        m.add(Attribute::Username("u".into()));
+        m.add(Attribute::Realm(REALM.into()));
+        m.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key("u", REALM, "pw");
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn is_success(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(a, Action::Send { data, .. }
+                if matches!(StunMessage::decode(data).unwrap().class, MessageClass::SuccessResponse))
+        })
+    }
+
+    /// A connected loopback stream pair; returns the server side (what the
+    /// relayed listener's accept() yields) and the peer's end.
+    async fn stream_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let connect =
+            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
+        let (accepted, _) = l.accept().await.unwrap();
+        (accepted, connect.await.unwrap())
+    }
+
+    /// The peer's end sees EOF promptly when the server side was closed.
+    async fn closed_by_server(mut peer_end: tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut b = [0u8; 1];
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), peer_end.read(&mut b)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    #[tokio::test]
+    async fn peer_without_permission_is_closed_and_not_announced() {
+        let p = processor();
+        let mgr = p.tcp_relay.clone().unwrap();
+        let client: SocketAddr = "127.0.0.1:43001".parse().unwrap();
+        let alloc = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::Allocate,
+                vec![Attribute::RequestedTransport(turn::TRANSPORT_TCP)],
+            ),
+            client,
+        );
+        assert!(is_success(&alloc));
+        let perm = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::CreatePermission,
+                vec![Attribute::XorPeerAddress("8.8.8.8:0".parse().unwrap())],
+            ),
+            client,
+        );
+        assert!(is_success(&perm));
+
+        let sinks = crate::server::new_client_sinks();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        sinks.insert(client, tx);
+        let port = p.store.get(&client).unwrap().relay_addr.port();
+        let id = AllocationId(port as u64);
+
+        // 1. No permission for 8.8.4.4: closed, nothing delivered, counted.
+        let (server_side, peer_end) = stream_pair().await;
+        let out = handle_peer_initiated(
+            &mgr,
+            &p,
+            &sinks,
+            id,
+            port,
+            client,
+            b"k",
+            server_side,
+            "8.8.4.4:5000".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(out, PeerAcceptOutcome::Refused);
+        assert!(
+            closed_by_server(peer_end).await,
+            "unpermitted peer must be closed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no ConnectionAttempt for an unpermitted peer"
+        );
+        assert_eq!(p.metrics.tcp_relay_peer_refused.load(Ordering::Relaxed), 1);
+
+        // 2. A peer the filter denies (loopback) is refused the same way.
+        let (server_side, peer_end) = stream_pair().await;
+        let out = handle_peer_initiated(
+            &mgr,
+            &p,
+            &sinks,
+            id,
+            port,
+            client,
+            b"k",
+            server_side,
+            "127.0.0.1:5000".parse().unwrap(),
+        )
+        .await;
+        assert_eq!(out, PeerAcceptOutcome::Refused);
+        assert!(closed_by_server(peer_end).await);
+        assert!(rx.try_recv().is_err());
+
+        // 3. The permitted peer (8.8.8.8, any port) is announced.
+        let (server_side, _peer_end) = stream_pair().await;
+        let out = handle_peer_initiated(
+            &mgr,
+            &p,
+            &sinks,
+            id,
+            port,
+            client,
+            b"k",
+            server_side,
+            "8.8.8.8:5001".parse().unwrap(),
+        )
+        .await;
+        let PeerAcceptOutcome::Announced(conn) = out else {
+            panic!("permitted peer must be announced, got {out:?}");
+        };
+        let ind = StunMessage::decode(&rx.try_recv().expect("ConnectionAttempt queued")).unwrap();
+        assert!(matches!(ind.method, Method::ConnectionAttempt));
+        assert_eq!(ind.get_connection_id(), Some(conn.value()));
+        assert_eq!(
+            ind.get_xor_peer_address(),
+            Some("8.8.8.8:5001".parse().unwrap())
+        );
+        assert_eq!(p.metrics.tcp_relay_peer_refused.load(Ordering::Relaxed), 2);
+    }
+
+    /// The listener's port must be the allocation's current port: a leftover
+    /// listener from an earlier allocation on the same control connection must
+    /// not announce peers against the new allocation's permissions.
+    #[tokio::test]
+    async fn stale_listener_port_is_refused_and_listener_stops_on_expiry() {
+        let p = Arc::new(processor());
+        let mgr = p.tcp_relay.clone().unwrap();
+        let client: SocketAddr = "127.0.0.1:43010".parse().unwrap();
+        let actions = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::Allocate,
+                vec![Attribute::RequestedTransport(turn::TRANSPORT_TCP)],
+            ),
+            client,
+        );
+        assert!(is_success(&actions));
+        let (listener, port) = actions
+            .into_iter()
+            .find_map(|a| match a {
+                Action::RegisterTcpListener {
+                    listener,
+                    relay_port,
+                    ..
+                } => Some((listener, relay_port)),
+                _ => None,
+            })
+            .expect("TCP allocation hands over its listener");
+        let perm = p.process_tcp_control(
+            signed(
+                &p,
+                client,
+                Method::CreatePermission,
+                vec![Attribute::XorPeerAddress("8.8.8.8:0".parse().unwrap())],
+            ),
+            client,
+        );
+        assert!(is_success(&perm));
+        let peer: SocketAddr = "8.8.8.8:1".parse().unwrap();
+        assert!(p.peer_connection_permitted(client, port, peer));
+        assert!(
+            !p.peer_connection_permitted(client, port.wrapping_add(1), peer),
+            "a listener on another port must not use this allocation's permissions"
+        );
+
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let task = tokio::spawn(crate::tcp_relay::run_relayed_listener(
+            mgr,
+            p.clone(),
+            crate::server::new_client_sinks(),
+            listener,
+            port,
+            client,
+            b"k".to_vec(),
+            Duration::from_millis(50),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "listener must run while the allocation lives"
+        );
+
+        // Expire it the way the sweep would: the allocation is gone, and no
+        // CloseRelay reaches the listener.
+        p.store.refresh(&client, 0).unwrap();
+        assert!(!p.tcp_listener_live(client, port));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("listener must stop once its allocation is gone")
+            .unwrap();
+        // The port is free again: the listener socket was closed.
+        assert!(std::net::TcpListener::bind(("0.0.0.0", port)).is_ok());
+    }
+
+    /// No allocation, or a UDP allocation, on that 5-tuple: refused.
+    #[tokio::test]
+    async fn peer_for_missing_or_udp_allocation_is_refused() {
+        let p = processor();
+        assert!(!p.peer_connection_permitted(
+            "127.0.0.1:43002".parse().unwrap(),
+            31000,
+            "8.8.8.8:1".parse().unwrap()
+        ));
+        let client: SocketAddr = "127.0.0.1:43003".parse().unwrap();
+        let udp = p.process(
+            signed(
+                &p,
+                client,
+                Method::Allocate,
+                vec![Attribute::RequestedTransport(turn::TRANSPORT_UDP)],
+            ),
+            client,
+        );
+        assert!(is_success(&udp));
+        let perm = p.process(
+            signed(
+                &p,
+                client,
+                Method::CreatePermission,
+                vec![Attribute::XorPeerAddress("8.8.8.8:0".parse().unwrap())],
+            ),
+            client,
+        );
+        assert!(is_success(&perm));
+        let port = p.store.get(&client).unwrap().relay_addr.port();
+        assert!(!p.peer_connection_permitted(client, port, "8.8.8.8:1".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod malformed_typed_attribute_tests {
+    //! Typing RESPONSE-ORIGIN, OTHER-ADDRESS, CHANGE-REQUEST and USERHASH must
+    //! not change what the TURN listener does with a malformed one: the two
+    //! optional ones are still ignored, the two required ones still get 420.
+    use super::*;
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(31000, 31099, 8)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "m",
+                [("u", "p")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    fn reply(p: &PacketProcessor, method: Method, typ: u16, value: Vec<u8>) -> StunMessage {
+        let mut m = StunMessage::new(method, MessageClass::Request);
+        m.add(Attribute::Unknown {
+            attr_type: typ,
+            value,
+        });
+        let mut buf = [0u8; 256];
+        let n = m.encode(&mut buf).unwrap();
+        let src: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        p.process(Bytes::copy_from_slice(&buf[..n]), src)
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(StunMessage::decode(data).unwrap()),
+                _ => None,
+            })
+            .expect("the request must be answered, not dropped as undecodable")
+    }
+
+    #[test]
+    fn malformed_optional_address_in_binding_is_ignored() {
+        let p = processor();
+        for typ in [
+            turna_proto_stun::attribute::ATTR_RESPONSE_ORIGIN,
+            turna_proto_stun::attribute::ATTR_OTHER_ADDRESS,
+        ] {
+            // Family 0x07 does not exist.
+            let r = reply(&p, Method::Binding, typ, vec![0, 0x07, 0, 1, 1, 2, 3, 4]);
+            assert!(
+                matches!(r.class, MessageClass::SuccessResponse),
+                "{typ:#06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_required_attributes_still_get_420() {
+        let p = processor();
+        for (method, typ, value) in [
+            (
+                Method::Binding,
+                turna_proto_stun::attribute::ATTR_CHANGE_REQUEST,
+                vec![0u8; 8],
+            ),
+            (
+                Method::Allocate,
+                turna_proto_stun::attribute::ATTR_USERHASH,
+                vec![0u8; 20],
+            ),
+        ] {
+            let r = reply(&p, method, typ, value);
+            assert!(
+                r.attributes
+                    .iter()
+                    .any(|a| matches!(a, Attribute::UnknownAttributes(v) if v == &vec![typ])),
+                "{typ:#06x}: expected 420 listing it"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod nat_discovery_auth_and_budget_tests {
+    use super::*;
+    use crate::nat_discovery::NatDiscoveryTopology;
+
+    fn topo() -> NatDiscoveryTopology {
+        NatDiscoveryTopology::new(
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.2".parse().unwrap(),
+            3478,
+            3479,
+        )
+        .unwrap()
+    }
+
+    fn processor() -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(32000, 32099, 8)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "nd",
+                [("u", "pw")],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+    }
+
+    fn signed_binding(nonce: Option<&str>, pass: &str) -> Vec<u8> {
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        m.add(Attribute::ChangeRequest {
+            change_ip: true,
+            change_port: true,
+        });
+        m.add(Attribute::Username("u".into()));
+        m.add(Attribute::Realm("nd".into()));
+        if let Some(n) = nonce {
+            m.add(Attribute::Nonce(n.into()));
+        }
+        let key = turna_crypto::long_term_key("u", "nd", pass);
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn code(b: &[u8]) -> Option<u16> {
+        StunMessage::decode(b)
+            .unwrap()
+            .attributes
+            .iter()
+            .find_map(|a| match a {
+                Attribute::ErrorCode { code, .. } => Some(*code),
+                _ => None,
+            })
+    }
+
+    /// RFC 5780 §6.1 + RFC 8489 §9.2.4: an authenticated discovery Binding is
+    /// nonce-checked and its success response is signed.
+    #[test]
+    fn authenticated_binding_is_nonce_checked_and_signed() {
+        let p = processor();
+        let src: SocketAddr = "198.51.100.30:40000".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:3478".parse().unwrap();
+
+        // No NONCE with MESSAGE-INTEGRITY: 400, from Da:Dp.
+        let (r, from) = p
+            .handle_nat_discovery(&signed_binding(None, "pw"), src, local, &topo())
+            .unwrap();
+        assert_eq!((code(&r), from), (Some(400), local));
+
+        // A nonce this responder never issued to this source: 438 with a
+        // fresh one, so a captured request cannot be replayed elsewhere.
+        let foreign = processor().nonce_mgr.issue(src);
+        let (r, _) = p
+            .handle_nat_discovery(&signed_binding(Some(&foreign), "pw"), src, local, &topo())
+            .unwrap();
+        assert_eq!(code(&r), Some(438));
+        let fresh = StunMessage::decode(&r)
+            .unwrap()
+            .get_nonce()
+            .unwrap()
+            .to_string();
+
+        // Wrong password with a valid nonce: 401.
+        let (r, _) = p
+            .handle_nat_discovery(&signed_binding(Some(&fresh), "WRONG"), src, local, &topo())
+            .unwrap();
+        assert_eq!(code(&r), Some(401));
+
+        // Valid: success from Ca:Cp, signed with the long-term key.
+        let raw_req = signed_binding(Some(&fresh), "pw");
+        let (r, from) = p
+            .handle_nat_discovery(&raw_req, src, local, &topo())
+            .unwrap();
+        assert_eq!(from, "127.0.0.2:3479".parse::<SocketAddr>().unwrap());
+        let resp = StunMessage::decode(&r).unwrap();
+        assert!(matches!(resp.class, MessageClass::SuccessResponse));
+        let key = turna_crypto::long_term_key("u", "nd", "pw");
+        assert!(resp.verify_integrity(&r, &key), "response must be signed");
+    }
+
+    /// One budget per source across processors that share it: replies from
+    /// one exhaust the other.
+    #[test]
+    fn shared_budget_is_one_budget_per_source() {
+        let budget = UnauthReplyBudget::new();
+        let turn = processor().with_unauth_reply_budget(&budget);
+        let disc = processor().with_unauth_reply_budget(&budget);
+        let src: SocketAddr = "198.51.100.31:40000".parse().unwrap();
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        m.add(Attribute::Software("x".into()));
+        let mut buf = [0u8; 64];
+        let n = m.encode(&mut buf).unwrap();
+        // Drain the budget through the TURN listener's processor.
+        for _ in 0..200 {
+            turn.process(Bytes::copy_from_slice(&buf[..n]), src);
+        }
+        assert!(
+            disc.handle_nat_discovery(&buf[..n], src, "127.0.0.1:3478".parse().unwrap(), &topo())
+                .is_none(),
+            "the discovery responder must see the budget the TURN listener spent"
+        );
+        // Unshared processors keep independent budgets (the default).
+        let alone = processor();
+        assert!(alone
+            .handle_nat_discovery(&buf[..n], src, "127.0.0.1:3478".parse().unwrap(), &topo())
+            .is_some());
+    }
+
+    /// The sizes docs/CONFIGURATION.md quotes for the amplification factor.
+    #[test]
+    fn discovery_reply_sizes_match_the_documentation() {
+        let p = processor();
+        let mut m = StunMessage::new(Method::Binding, MessageClass::Request);
+        m.add(Attribute::ChangeRequest {
+            change_ip: false,
+            change_port: false,
+        });
+        let mut buf = [0u8; 64];
+        let n = m.encode(&mut buf).unwrap();
+        assert_eq!(n, 28, "request: header + CHANGE-REQUEST");
+        let (v4, _) = p
+            .handle_nat_discovery(
+                &buf[..n],
+                "198.51.100.32:40000".parse().unwrap(),
+                "127.0.0.1:3478".parse().unwrap(),
+                &topo(),
+            )
+            .unwrap();
+        // header 20 + 4 x 12 (four v4 addresses) + SOFTWARE "turna" 12.
+        assert_eq!(v4.len(), 80);
+        let t6 = NatDiscoveryTopology::new(
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+            3478,
+            3479,
+        )
+        .unwrap();
+        let (v6, _) = p
+            .handle_nat_discovery(
+                &buf[..n],
+                "[2001:db8::99]:40000".parse().unwrap(),
+                "[2001:db8::1]:3478".parse().unwrap(),
+                &t6,
+            )
+            .unwrap();
+        // header 20 + 4 x 24 (four v6 addresses) + SOFTWARE 12.
+        assert_eq!(v6.len(), 128);
     }
 }

@@ -281,9 +281,10 @@ per-feature production maturity always check
 | --- | --- | --- |
 | STUN Binding | RFC 5389 | Supported (default tokio datapath) |
 | Message integrity, SHA-256 (`MESSAGE-INTEGRITY-SHA256`) | RFC 8489 | Supported |
+| Username anonymity (`USERHASH`) | RFC 8489 §14.4 | Supported for long-term (`static_users` / stored) users; TURN REST answers `401` (a hash of an ephemeral username cannot be resolved). Advertising it in the nonce is opt-in (`[turn.auth] advertise_userhash`) |
 | TURN allocation lifecycle, UDP relay | RFC 5766 / RFC 8656 | Supported (default tokio datapath) |
 | Relayed transport family | RFC 6156 / 8656 | IPv4 by default; IPv6 opt-in via `[turn] external_ip6` (unset → `440`). One family per allocation, cross-family peers get `443`. `ADDITIONAL-ADDRESS-FAMILY` not implemented |
-| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; allowed in production since 2026-08-25. Requires the `tls` listener. IPv4 only — an IPv6 TCP allocation answers 440 |
+| TURN over TCP (TCP relay allocations) | RFC 6062 | Implemented; allowed in production since 2026-08-25. Requires the `tls` listener. IPv4 by default; IPv6 opt-in with `[turn.tcp_relay] allow_ipv6` + `[turn] external_ip6` (otherwise an IPv6 TCP allocation answers 440). The v6 path has not yet run on an IPv6 host |
 | Session migration | RFC 8016 | Partial — tickets are issued and re-issued on the tokio datapath; cross-node migration is **unwired** (no allocation is transferred between nodes), treat as same-node |
 | TLS-over-TCP transport (`tls`) | — | **Supported** — three-engine browser interop, a public certificate chain validated by a verifying client, coturn interop, and 24 h under load ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md)) |
 | DTLS transport (`dtls`) | RFC 7350 | Supported — 24 h under load with zero packet loss, a 300 000-packet spoofed-source flood that allocates no state, 20/20 handshakes at 3 % path loss, and interop with OpenSSL and coturn's client ([docs/interop/dtls-stack-2026-09-16.md](docs/interop/dtls-stack-2026-09-16.md)). Not reachable from a browser: WebRTC has no DTLS transport for TURN |
@@ -291,7 +292,7 @@ per-feature production maturity always check
 | WebTransport (`web-transport`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
 | TURN-over-SCTP transport (`sctp`) | Project-specific TURN mapping | **Supported on Linux/tokio**, opt-in, allowed in production. Native SCTP without TLS; control and ChannelData, UDP relay. [Evidence](docs/verification/sctp-supported-2026-09-18.md) |
 | Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
-| NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
+| NAT behaviour discovery | RFC 5780 | Opt-in (`[turn.nat_discovery]`, off by default), UDP only; needs two addresses of one family on the host and refuses to start without them. Rate-limited like Binding; PADDING / RESPONSE-PORT refused. coturn client interop on loopback |
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
 | Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |
 | `io_uring` datapath | — | **Supported on Linux**, opt-in UDP datapath. Verified on **6.8.0-87 / 6.14.0-33**: recovery/drain, live TURN checks, 30-minute media and four-hour authenticated allocation churn on 6.8; functional checks and short churn on 6.14. [Scope and evidence](docs/verification/io-uring-supported-2026-09-19.md). |

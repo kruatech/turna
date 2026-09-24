@@ -105,12 +105,38 @@ impl AuthRegistry {
     /// it is hashed into every long-term key, so swapping it under live clients
     /// would invalidate credentials rather than rotate a secret. Returns `false`
     /// (and changes nothing) on a realm mismatch.
+    ///
+    /// Also refused (`false`, with a warning) when the replacement would change
+    /// whether the realm can resolve an RFC 8489 USERHASH — in practice, a
+    /// reloaded file that turns a `static_users` realm into a shared-secret one.
+    /// Processors decide at construction whether to advertise "Username
+    /// anonymity" in the nonce, only when every realm can resolve a hash; a
+    /// swap underneath them would keep the advertisement while the realm could
+    /// no longer honour it, and every RFC 8489 client would send USERHASH and
+    /// get 401 until restart. Changing the credential mechanism is a restart,
+    /// not a rotation.
     pub fn replace_base(&self, new: AuthMode) -> bool {
         if new.realm() != self.base_realm {
             return false;
         }
+        if !Self::same_userhash_eligibility(&self.base.load(), &new, &self.base_realm) {
+            return false;
+        }
         self.base.store(std::sync::Arc::new(new));
         true
+    }
+
+    fn same_userhash_eligibility(current: &AuthMode, new: &AuthMode, realm: &str) -> bool {
+        if current.supports_userhash() == new.supports_userhash() {
+            return true;
+        }
+        tracing::warn!(
+            realm,
+            "auth reload refused: it would change whether this realm can resolve an \
+             RFC 8489 USERHASH (static_users vs shared secret / OAuth). Changing the \
+             credential mechanism needs a restart."
+        );
+        false
     }
 
     /// Replace one tenant's auth backend, keyed by realm. Returns `false` if the
@@ -121,6 +147,10 @@ impl AuthRegistry {
         }
         match self.tenants.get(realm) {
             Some((_, slot)) => {
+                // Same rule as `replace_base`.
+                if !Self::same_userhash_eligibility(&slot.load(), &new, realm) {
+                    return false;
+                }
                 slot.store(std::sync::Arc::new(new));
                 true
             }
@@ -132,6 +162,19 @@ impl AuthRegistry {
     /// reloaded config knows which ones this registry actually holds.
     pub fn tenant_realms(&self) -> Vec<String> {
         self.tenants.keys().cloned().collect()
+    }
+
+    /// Whether every realm this registry serves can resolve an RFC 8489
+    /// USERHASH. Advertising "Username anonymity" in the nonce cookie obliges
+    /// a conforming client to send USERHASH instead of USERNAME (§9.2.5), and
+    /// the 401 challenge is issued before the realm is known, so the bit is only
+    /// safe when no realm would then be unable to authenticate that client.
+    pub fn all_realms_support_userhash(&self) -> bool {
+        self.base.load().supports_userhash()
+            && self
+                .tenants
+                .values()
+                .all(|(_, auth)| auth.load().supports_userhash())
     }
 
     /// Number of explicit tenants (0 = single-tenant).
@@ -169,24 +212,27 @@ impl AuthRegistry {
             // the current backend for this request; a concurrent rotation
             // publishes a new one for the next request without disturbing this.
             let mode = auth.load();
-            let (key, max_lifetime_secs) = mode.validate_with_lifetime(msg, raw)?;
+            let v = mode.validate_identity(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: Some(tenant_id.clone()),
                 realm: realm_ref.to_string(),
-                key,
-                subject: mode.subject_of(msg.get_username().unwrap_or("")),
-                max_lifetime_secs,
+                key: v.key,
+                // The resolved name, not `msg.get_username()`: a USERHASH
+                // request carries no USERNAME, and keying its quota on "" would
+                // pool every anonymous user into one subject.
+                subject: mode.subject_of(&v.username),
+                max_lifetime_secs: v.max_lifetime_secs,
             })
         } else if realm_ref == self.base_realm {
             // Base realm: default/single-tenant.
             let base = self.base.load();
-            let (key, max_lifetime_secs) = base.validate_with_lifetime(msg, raw)?;
+            let v = base.validate_identity(msg, raw)?;
             Ok(AuthResolution {
                 tenant_id: None,
                 realm: realm_ref.to_string(),
-                key,
-                subject: base.subject_of(msg.get_username().unwrap_or("")),
-                max_lifetime_secs,
+                key: v.key,
+                subject: base.subject_of(&v.username),
+                max_lifetime_secs: v.max_lifetime_secs,
             })
         } else {
             // Unknown realm — no backend to authenticate against. Reject; never
@@ -247,5 +293,42 @@ impl AuthRegistry {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    fn rest(realm: &str) -> AuthMode {
+        AuthMode::SharedSecret {
+            realm: realm.into(),
+            secret: b"s2".to_vec(),
+            previous: None,
+        }
+    }
+
+    /// A SIGHUP must not turn a USERHASH-capable realm into one that cannot
+    /// resolve a hash: processors keep advertising "Username anonymity".
+    #[test]
+    fn reload_refuses_a_change_of_userhash_eligibility() {
+        let reg = AuthRegistry::new(AuthMode::long_term("r", [("a", "b")]))
+            .with_tenant("t", AuthMode::long_term("tr", [("c", "d")]));
+        assert!(reg.all_realms_support_userhash());
+        assert!(!reg.replace_base(rest("r")), "long-term -> REST refused");
+        assert!(!reg.replace_tenant("tr", rest("tr")), "tenant too");
+        assert!(reg.all_realms_support_userhash(), "nothing changed");
+        // Long-term -> long-term is still allowed.
+        assert!(reg.replace_base(AuthMode::long_term("r", [("x", "y")])));
+    }
+
+    /// The rotation this path exists for is untouched.
+    #[test]
+    fn shared_secret_rotation_still_works() {
+        let reg = AuthRegistry::new(rest("r")).with_tenant("t", rest("tr"));
+        assert!(reg.replace_base(rest("r")));
+        assert!(reg.replace_tenant("tr", rest("tr")));
+        // REST -> long-term would start advertising-eligible; also refused.
+        assert!(!reg.replace_base(AuthMode::long_term("r", [("a", "b")])));
     }
 }

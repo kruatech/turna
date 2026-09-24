@@ -252,54 +252,22 @@ pub(crate) async fn run_tls_bridge(
                                 listener.set_nonblocking(true).ok();
                                 match tokio::net::TcpListener::from_std(listener) {
                                     Ok(l) => {
+                                        // Runs until the listener fails, the
+                                        // task is aborted (CloseRelay / control
+                                        // connection closed), or the allocation
+                                        // expires.
                                         let handle = tokio::spawn(async move {
-                                            let alloc = AllocationId(relay_port as u64);
-                                            loop {
-                                                match l.accept().await {
-                                                    Ok((stream, peer)) => {
-                                                        match mgr
-                                                            .register_incoming(
-                                                                alloc,
-                                                                peer,
-                                                                stream,
-                                                                owner_key.clone(),
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(id) => {
-                                                                let ind = proc
-                                                                    .build_connection_attempt_indication(
-                                                                        id.value(),
-                                                                        peer,
-                                                                    );
-                                                                let delivered = match ind {
-                                                                    Some(bytes) => sinks
-                                                                        .get(&client_addr)
-                                                                        .map(|s| {
-                                                                            s.try_send(bytes)
-                                                                                .is_ok()
-                                                                        })
-                                                                        .unwrap_or(false),
-                                                                    None => false,
-                                                                };
-                                                                if !delivered {
-                                                                    // Client gone / queue full / encode
-                                                                    // error: the pending peer conn would
-                                                                    // never be bound — drop it.
-                                                                    mgr.release(id).await;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                debug!(%peer, error = %e, "RFC 6062 peer connection rejected");
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(port = relay_port, error = %e, "relayed TCP accept failed; stopping listener");
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            crate::tcp_relay::run_relayed_listener(
+                                                mgr,
+                                                proc,
+                                                sinks,
+                                                l,
+                                                relay_port,
+                                                client_addr,
+                                                owner_key,
+                                                crate::tcp_relay::LISTENER_LIVENESS_INTERVAL,
+                                            )
+                                            .await
                                         });
                                         tcp_listeners.insert(relay_port, handle);
                                     }

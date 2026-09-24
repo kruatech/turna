@@ -2745,3 +2745,219 @@ fn metric_value(health: &SocketAddr, name: &str) -> f64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0)
 }
+
+#[cfg(test)]
+mod userhash_e2e {
+    //! RFC 8489 §14.4 USERHASH against a real node: an Allocate that names its
+    //! user by `SHA-256(username ":" realm)` and carries no USERNAME at all.
+    //! Until this landed the node answered 420, because 0x001E is
+    //! comprehension-required and was not understood.
+    use super::*;
+
+    const ATTR_USERHASH: u16 = 0x001E;
+
+    fn userhash(user: &str, realm: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("{user}:{realm}").as_bytes()).into()
+    }
+
+    #[tokio::test]
+    async fn allocate_by_userhash_succeeds_on_a_long_term_realm() {
+        let target = target_addr();
+        let sock = bind_socket().await;
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let r401 = skip_if_no_server!(
+            send_recv(&sock, target, &probe.encode(), 2000).await,
+            target
+        );
+        let (r401, _) = r401;
+        if test_secret().is_some() {
+            // A TURN REST realm cannot resolve a hash (the username embeds an
+            // expiry the server never stores); the processor tests pin the 401.
+            eprintln!("SKIP: target uses a shared secret; USERHASH needs a long-term realm");
+            return;
+        }
+        let realm = extract_realm(&r401).expect("401 carries REALM");
+        let nonce = extract_nonce(&r401).expect("401 carries NONCE");
+        let (username, password) = effective_credentials();
+
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_attr(ATTR_USERHASH, &userhash(&username, &realm));
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let key = long_term_key(&username, &realm, &password);
+        let (resp, _) = send_recv(&sock, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to USERHASH Allocate");
+        assert!(
+            is_success(&resp),
+            "USERHASH Allocate must succeed; err={:?}",
+            extract_error_code(&resp)
+        );
+
+        // A hash of a name the node does not know is a 401, not a 420.
+        let sock2 = bind_socket().await;
+        let (r401, _) = send_recv(&sock2, target, &probe.encode(), 2000)
+            .await
+            .expect("challenge");
+        let nonce = extract_nonce(&r401).expect("NONCE");
+        let mut bad = TurnMsg::request(0x0003);
+        bad.add_requested_transport();
+        bad.add_attr(ATTR_USERHASH, &userhash("nobody-by-this-name", &realm));
+        bad.add_realm(&realm);
+        bad.add_nonce(&nonce);
+        let (resp, _) = send_recv(&sock2, target, &bad.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to unknown USERHASH");
+        assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(401));
+
+        // Release the first allocation so the shared node stays clean.
+        let mut rel = TurnMsg::request(0x0004);
+        rel.add_lifetime(0);
+        rel.add_attr(ATTR_USERHASH, &userhash(&username, &realm));
+        rel.add_realm(&realm);
+        rel.add_nonce(&extract_nonce(&r401).unwrap_or_default());
+        let _ = send_recv(&sock, target, &rel.encode_with_integrity(&key), 1000).await;
+    }
+}
+
+/// RFC 5780 needs both addresses: an enabled `[turn.nat_discovery]` with one
+/// address must stop the node, not start a discovery service that can never
+/// answer CHANGE-REQUEST correctly.
+#[test]
+fn refuses_nat_discovery_without_an_alternate_address() {
+    assert_refused(
+        "RFC 5780 with one address",
+        "[turn.nat_discovery]\nenabled = true\nprimary_ip = \"127.0.0.1\"\n\
+         primary_port = 3490\nalternate_port = 3491",
+        "nat_discovery",
+    );
+}
+
+#[cfg(test)]
+mod nat_discovery_e2e {
+    //! RFC 5780 against a real node on 127.0.0.1 + 127.0.0.2 (both loopback,
+    //! so any Linux host has them).
+    use super::*;
+
+    const ATTR_CHANGE_REQUEST: u16 = 0x0003;
+    const ATTR_RESPONSE_ORIGIN: u16 = 0x802B;
+    const ATTR_OTHER_ADDRESS: u16 = 0x802C;
+
+    struct Node(std::process::Child);
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn plain_addr(v: &[u8]) -> Option<SocketAddr> {
+        (v.len() >= 8 && v[1] == 0x01)
+            .then(|| SocketAddr::from(([v[4], v[5], v[6], v[7]], u16::from_be_bytes([v[2], v[3]]))))
+    }
+
+    fn attr(data: &[u8], typ: u16) -> Option<Vec<u8>> {
+        iter_attrs(data)
+            .find(|(t, _)| *t == typ)
+            .map(|(_, v)| v.to_vec())
+    }
+
+    #[tokio::test]
+    async fn change_request_is_answered_from_the_alternate_address() {
+        let bin = node_binary();
+        if !bin.exists() {
+            eprintln!("skipping: node binary not built");
+            return;
+        }
+        if std::net::UdpSocket::bind("127.0.0.2:0").is_err() {
+            eprintln!("skipping: 127.0.0.2 is not usable on this host");
+            return;
+        }
+        let turn_port = free_port(true);
+        let health_port = free_port(false);
+        // Two ports; a collision with something else makes the node refuse to
+        // start, which the readiness wait below reports.
+        let (p1, p2) = (free_port(true), free_port(true));
+        let dir =
+            std::env::temp_dir().join(format!("turna-nat-{}-{turn_port}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("turn.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[turn]\nlisten = \"127.0.0.1:{turn_port}\"\nrealm = \"turna\"\n\
+                 transport = \"tokio\"\n\
+                 [[turn.auth.static_users]]\nusername = \"testuser\"\npassword = \"testpass\"\n\
+                 [turn.relay]\nmin_port = 49152\nmax_port = 49500\nmax_allocations = 16\n\
+                 [turn.nat_discovery]\nenabled = true\nprimary_ip = \"127.0.0.1\"\n\
+                 alternate_ip = \"127.0.0.2\"\nprimary_port = {p1}\nalternate_port = {p2}\n\
+                 [health]\nlisten = \"127.0.0.1:{health_port}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg(&cfg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let node = Node(cmd.spawn().expect("spawn node"));
+        let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !http_ready(&health) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node with [turn.nat_discovery] did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let a1p1: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+        let a2p2: SocketAddr = format!("127.0.0.2:{p2}").parse().unwrap();
+        let sock = bind_socket().await;
+        for (flags, want) in [
+            (0u8, a1p1),
+            (0x06, a2p2),
+            (0x04, format!("127.0.0.2:{p1}").parse().unwrap()),
+            (0x02, format!("127.0.0.1:{p2}").parse().unwrap()),
+        ] {
+            let mut m = TurnMsg::request(0x0001);
+            if flags != 0 {
+                m.add_attr(ATTR_CHANGE_REQUEST, &[0, 0, 0, flags]);
+            }
+            let (resp, from) = send_recv(&sock, a1p1, &m.encode(), 2000)
+                .await
+                .unwrap_or_else(|| panic!("no reply for flags {flags:#x}"));
+            assert!(is_success(&resp), "flags {flags:#x}");
+            assert_eq!(
+                from, want,
+                "flags {flags:#x}: reply came from the wrong socket"
+            );
+            assert_eq!(
+                attr(&resp, ATTR_RESPONSE_ORIGIN)
+                    .as_deref()
+                    .and_then(plain_addr),
+                Some(want)
+            );
+            assert_eq!(
+                attr(&resp, ATTR_OTHER_ADDRESS)
+                    .as_deref()
+                    .and_then(plain_addr),
+                Some(a2p2)
+            );
+        }
+
+        // The TURN listener itself still refuses CHANGE-REQUEST (RFC 5780 §6).
+        let turn: SocketAddr = format!("127.0.0.1:{turn_port}").parse().unwrap();
+        let mut m = TurnMsg::request(0x0001);
+        m.add_attr(ATTR_CHANGE_REQUEST, &[0, 0, 0, 0x06]);
+        let (resp, _) = send_recv(&sock, turn, &m.encode(), 2000)
+            .await
+            .expect("reply");
+        assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(420));
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -172,6 +172,11 @@ pub struct Metrics {
     /// Permission/ChannelBind/Send requests refused because the peer address
     /// is in a denied (special-use) range — see relay::peer_filter.
     pub peer_rejected: AtomicU64,
+    /// RFC 6062 §5.3: peer-initiated TCP connections to a relayed address that
+    /// were accepted and closed at once because the allocation holds no
+    /// permission for the peer (or the peer filter denies it). No
+    /// ConnectionAttempt is sent for these.
+    pub tcp_relay_peer_refused: AtomicU64,
     /// A3-O1: packet-processing panics caught by the worker's panic guard.
     /// A non-zero rate means a packet tripped a bug in `PacketProcessor`; the
     /// worker survived (the offending packet was dropped). Alert on rate > 0.
@@ -476,6 +481,7 @@ impl Metrics {
             malformed_packets: AtomicU64::new(0),
             quota_exceeded: AtomicU64::new(0),
             peer_rejected: AtomicU64::new(0),
+            tcp_relay_peer_refused: AtomicU64::new(0),
             processor_panics: AtomicU64::new(0),
             rtp_streams: AtomicU64::new(0),
             rtp_avg_loss_pct_x100: AtomicU64::new(0),
@@ -864,6 +870,16 @@ impl Metrics {
             l(&self.user_limits_conflicts_total),
             l(&self.user_limits_failures_total),
             l(&self.user_limits_over_limit_subjects),
+        )
+    }
+
+    /// RFC 6062 TCP relay counters. Zero unless `[turn.tcp_relay]` is enabled.
+    fn render_tcp_relay_metrics(&self) -> String {
+        format!(
+            "# HELP turna_tcp_relay_peer_refused_total Peer-initiated TCP connections to a relayed address closed because the allocation has no permission for the peer, or the peer filter denies it (RFC 6062 5.3)\n\
+             # TYPE turna_tcp_relay_peer_refused_total counter\n\
+             turna_tcp_relay_peer_refused_total {}\n",
+            self.tcp_relay_peer_refused.load(Ordering::Relaxed)
         )
     }
 
@@ -2303,6 +2319,7 @@ pub async fn serve_on(
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
                     body.push_str(&m.render_transport_metrics());
+                    body.push_str(&m.render_tcp_relay_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());
                     if let Some(provider) = &relay_routes {
@@ -2366,6 +2383,7 @@ mod metrics_format_regression {
         );
         body.push_str(&m.render_auth_reason_metrics());
         body.push_str(&m.render_transport_metrics());
+        body.push_str(&m.render_tcp_relay_metrics());
         body
     }
 
@@ -2399,6 +2417,7 @@ mod metrics_format_regression {
             "turna_malformed_packets_total",
             "turna_quota_exceeded_total",
             "turna_peer_rejected_total",
+            "turna_tcp_relay_peer_refused_total",
         ] {
             let sample = format!("{name} ");
             assert!(

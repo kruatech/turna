@@ -43,6 +43,7 @@ constraints below are taken from `crates/config/src/lib.rs`.
 | `shared_secret` | string | (built-in placeholder) | coturn-style `lt-cred-mech` (time-limited credentials). |
 | `token_ttl` | u64 | `86400` | Token lifetime, seconds. |
 | `static_users` | array of `{ username, password }` | `[]` | Long-term static credentials. |
+| `advertise_userhash` | bool | `false` | RFC 8489 username anonymity. When true every nonce carries the §9.2 nonce cookie with "Username anonymity" set, so conforming clients send `USERHASH` instead of `USERNAME`. **Refused** unless the base realm and every tenant use `static_users` (TURN REST / OAuth cannot resolve a hash). A `USERHASH` request is *accepted* on long-term realms whatever this says. A SIGHUP reload that would switch a realm between `static_users` and a shared secret (or back) is refused for that realm and logged — the mechanism, and with it USERHASH eligibility, changes only on restart. |
 
 Use **one** of: `static_users` (long-term) or `shared_secret` (time-limited).
 
@@ -94,9 +95,10 @@ Rules that hold in both modes:
 - Putting an IPv6 literal in `external_ip` does **not** enable IPv6 relaying; it
   only changes what is advertised for v4-family allocations. `external_ip6` is the
   key that matters, and validation rejects a v4 literal in it.
-- RFC 6062 **TCP** relay allocations stay IPv4-only regardless of `external_ip6`:
-  the TCP relay datapath has no v6 path, so an IPv6 family request there is still
-  `440`.
+- RFC 6062 **TCP** relay allocations are IPv4-only unless `[turn.tcp_relay]
+  allow_ipv6 = true` is also set; then an IPv6 family request binds the relayed TCP
+  listener v6 (`IPV6_V6ONLY`, on `[turn.relay] bind_ip6`) and advertises
+  `external_ip6`. Without that key an IPv6 TCP request is `440`, as before.
 - `ADDITIONAL-ADDRESS-FAMILY` (one Allocate asking for both families at once) is
   **not** implemented — see `docs/protocol-gap.md` → IPv6.
 
@@ -212,10 +214,10 @@ UDP. Disabled by default. **Requires `[tls]` enabled:** RFC 6062 §4.1 mandates 
 TCP/TLS control connection, and an Allocate with `REQUESTED-TRANSPORT = 6`
 arriving over UDP, DTLS or QUIC is refused with `400 Bad Request`.
 
-> **Refused in production.** With `production = true`, config validation rejects
-> `enabled = true` and the node does not start. The feature is implemented and
-> testable with `production = false`; the gate lifts once interop and
-> pipelined-client hardening are done (`docs/protocol-gap.md` → TCP relay).
+> **Allowed in production since 2026-08-25** (the refusal this note used to
+> describe was lifted once coturn interop was recorded — `docs/feature-support.md`).
+> With `production = true` and `[tls]` disabled, validation refuses it, because no
+> client could open the control connection.
 
 | key | type | default | notes |
 |-----|------|---------|-------|
@@ -225,11 +227,72 @@ arriving over UDP, DTLS or QUIC is refused with `400 Bad Request`.
 | `max_per_allocation` | usize | `10` | Concurrent peer connections per allocation. |
 | `max_total` | usize | `50000` | Concurrent peer connections overall (`446`/`508` beyond it). |
 | `buffer_size` | usize | `16384` | Per-direction relay buffer. |
+| `allow_ipv6` | bool | `false` | Serve `REQUESTED-ADDRESS-FAMILY = IPv6` TCP allocations: listener bound v6 (`IPV6_V6ONLY`, `[turn.relay] bind_ip6`), `[turn] external_ip6` advertised. **Requires `external_ip6`** (validation). Off → `440`, as before. Cross-family peers get `443` on CreatePermission, so CONNECT cannot reach them. |
 
 A `ConnectionBind` must be authenticated with the **same credentials** as the
 `CONNECT` (or the allocation owner, for peer-initiated connections) —
 `CONNECTION-ID` is a sequential, guessable value, so this ownership check is
 what prevents one authenticated client hijacking another's pending connection.
+
+---
+
+## `[turn.nat_discovery]` — RFC 5780 NAT behaviour discovery
+
+Answers STUN Binding on four UDP sockets — A1:P1, A1:P2, A2:P1, A2:P2 — so a client
+can ask for a reply from the other address and/or port (`CHANGE-REQUEST`) and learn
+how its NAT maps and filters. Off by default. The TURN listener is not one of the
+four and keeps answering `CHANGE-REQUEST` with `420`, as RFC 5780 §6 requires of a
+socket with no alternate address.
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Serve RFC 5780 on the four sockets. |
+| `primary_ip` | string | `""` | A1, the address clients are pointed at (e.g. through `_stun-behavior._udp`). |
+| `alternate_ip` | string | `""` | A2, a second address of the **same family**, assigned to this host. |
+| `primary_port` | u16 | `3478` | P1. Collides with a TURN listener on the same address or on the wildcard — move one of them. |
+| `alternate_port` | u16 | `3479` | P2, distinct from P1. |
+
+Validation refuses `enabled = true` unless both addresses parse, differ, share a
+family and are not a wildcard; unless the ports differ; and when a port collides
+with `turn.listen`, an enabled DTLS or QUIC listener, or any relay port range. A
+bind failure at startup stops the node: a discovery service answering from three of
+its four addresses would report the wrong NAT type.
+
+Replies are unauthenticated and `CHANGE-REQUEST` can send them from three different
+sources, so every request passes the `[turn.rate_limit]` tiers and the
+unauthenticated-reply budget before anything is sent. With discovery enabled that
+budget is **shared by every processor on the node** — the TURN listener, the
+discovery sockets, DTLS/QUIC and each io_uring worker — so a spoofed victim gets one
+budget (burst 64, 8/s per source IP) in total, not one per listener. With discovery
+off each processor keeps its own, as before. `PADDING` and `RESPONSE-PORT` are not
+implemented and are answered `420`. Only Binding is served. UDP only.
+
+**Amplification.** A discovery reply carries four addresses (XOR-MAPPED, MAPPED,
+RESPONSE-ORIGIN, OTHER-ADDRESS): **80 bytes** for IPv4 and **128 bytes** for IPv6
+with the default `software_attribute = "product"` (4 bytes more with `"full"`, 12
+fewer with `"none"`), against a 20-byte request (28 with CHANGE-REQUEST) — up to
+**4×** for IPv4 and **6.4×** for IPv6. The TURN listener's own Binding reply is 44
+bytes (2.2×). The shared budget above is what bounds it; the sizes are pinned by
+`discovery_reply_sizes_match_the_documentation`.
+
+**Authenticated Bindings.** A discovery Binding that carries MESSAGE-INTEGRITY is
+handled by the RFC 8489 long-term mechanism: NONCE, REALM and USERNAME/USERHASH are
+required (`400`), the nonce must be one this responder issued to that source and
+still fresh (`438` with a new one), the integrity must verify (`401`), and the success
+response is signed with the same MESSAGE-INTEGRITY variant (RFC 5780 §6.1).
+Discovery clients normally send no credentials and get an unsigned reply.
+
+The addresses must be the ones clients reach: `RESPONSE-ORIGIN` and `OTHER-ADDRESS`
+name them, so behind a 1:1 NAT they would name private addresses.
+
+```toml
+[turn.nat_discovery]
+enabled = true
+primary_ip = "203.0.113.10"
+alternate_ip = "203.0.113.11"
+primary_port = 3478      # TURN listener on another address, or move these ports
+alternate_port = 3479
+```
 
 ---
 

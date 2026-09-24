@@ -214,6 +214,85 @@ proptest! {
     }
 }
 
+// ── Property: USERHASH / RFC 5780 attribute roundtrip ────────────────────────
+
+fn arb_any_addr() -> impl Strategy<Value = std::net::SocketAddr> {
+    prop_oneof![
+        arb_ipv4_addr(),
+        (any::<[u8; 16]>(), any::<u16>()).prop_map(|(ip, port)| {
+            std::net::SocketAddr::new(std::net::Ipv6Addr::from(ip).into(), port)
+        }),
+    ]
+}
+
+proptest! {
+    /// RFC 8489 §14.4 USERHASH: every 32-byte value survives encode → decode,
+    /// alongside the attributes a real request carries with it.
+    #[test]
+    fn prop_userhash_roundtrip(h in any::<[u8; 32]>(), realm in arb_short_string()) {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.add(Attribute::UserHash(h));
+        msg.add(Attribute::Realm(realm.clone()));
+
+        let mut buf = [0u8; 1024];
+        let len = msg.encode(&mut buf).unwrap();
+        let decoded = StunMessage::decode(&buf[..len]).unwrap();
+
+        prop_assert_eq!(decoded.get_userhash(), Some(&h));
+        prop_assert!(decoded.has_user_identity());
+        prop_assert_eq!(decoded.get_username(), None);
+        prop_assert_eq!(decoded.get_realm(), Some(realm.as_str()));
+    }
+
+    /// RFC 5780 §7.2 CHANGE-REQUEST flags survive encode → decode.
+    #[test]
+    fn prop_change_request_roundtrip(change_ip in any::<bool>(), change_port in any::<bool>()) {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        msg.add(Attribute::ChangeRequest { change_ip, change_port });
+
+        let mut buf = [0u8; 256];
+        let len = msg.encode(&mut buf).unwrap();
+        let decoded = StunMessage::decode(&buf[..len]).unwrap();
+
+        prop_assert_eq!(decoded.get_change_request(), Some((change_ip, change_port)));
+    }
+
+    /// RFC 5780 §7.3 / §7.4: RESPONSE-ORIGIN and OTHER-ADDRESS, both families.
+    #[test]
+    fn prop_response_origin_other_address_roundtrip(
+        origin in arb_any_addr(),
+        other in arb_any_addr(),
+    ) {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::SuccessResponse);
+        msg.add(Attribute::ResponseOrigin(origin));
+        msg.add(Attribute::OtherAddress(other));
+
+        let mut buf = [0u8; 256];
+        let len = msg.encode(&mut buf).unwrap();
+        let decoded = StunMessage::decode(&buf[..len]).unwrap();
+
+        prop_assert_eq!(decoded.get_response_origin(), Some(origin));
+        prop_assert_eq!(decoded.get_other_address(), Some(other));
+    }
+}
+
+proptest! {
+    /// RESPONSE-ORIGIN / OTHER-ADDRESS are comprehension-optional: any value,
+    /// however malformed, decodes (as the typed variant or as Unknown) and never
+    /// fails the message — they were ignored as Unknown before they were typed.
+    #[test]
+    fn prop_optional_address_attrs_never_fail_decode(
+        typ in prop_oneof![Just(0x802Bu16), Just(0x802Cu16)],
+        value in proptest::collection::vec(any::<u8>(), 0..40),
+    ) {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        msg.add(Attribute::Unknown { attr_type: typ, value });
+        let mut buf = [0u8; 256];
+        let len = msg.encode(&mut buf).unwrap();
+        prop_assert!(StunMessage::decode(&buf[..len]).is_ok());
+    }
+}
+
 // ── Property: encode length == HEADER + attr_bytes (4-aligned) ───────────────
 
 proptest! {

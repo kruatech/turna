@@ -83,6 +83,31 @@ if [ "$CODEC_5780" = no ]; then
   fi
 else
   pass "RFC 5780 codec present in crates/protocol (doc claims are allowed)"
+
+  # With the codec in, the claims flip: the docs say the service exists, is
+  # wired, and is OFF by default. Each half is checked against the code.
+  if grep -qE '^pub async fn run\(' crates/relay/src/nat_discovery.rs 2>/dev/null &&
+    grep -qE 'nat_discovery::run\(' services/node/src/main.rs; then
+    pass "RFC 5780 responder exists and the node starts it"
+  else
+    fail "RFC 5780 codec present, but the responder is missing or not started by the node" \
+      "Docs describe [turn.nat_discovery] as a working service; wire it or correct them."
+  fi
+  ND_DEFAULT=$(awk '/^impl Default for NatDiscoverySection/,/^}/' crates/config/src/lib.rs)
+  if printf '%s' "$ND_DEFAULT" | grep -qE 'enabled: false'; then
+    pass "[turn.nat_discovery] defaults to enabled = false"
+  else
+    fail "[turn.nat_discovery] no longer defaults to off" \
+      "Every doc says RFC 5780 is opt-in (amplification: coturn keeps it off too). Restore the default or rewrite the docs."
+  fi
+  STALE=$(grep -nE '5780' README.md docs/feature-support.md docs/PRODUCTION_READINESS.md 2>/dev/null |
+    grep -iE 'not implemented|no codec' | grep -viE 'was wrong|earlier|previously|once claimed')
+  if [ -n "$STALE" ]; then
+    fail "a doc still says RFC 5780 is not implemented" \
+      "Lines: $(printf '%s' "$STALE" | head -3 | tr '\n' ';')"
+  else
+    pass "no doc still calls RFC 5780 unimplemented"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

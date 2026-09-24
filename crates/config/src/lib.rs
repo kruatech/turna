@@ -606,6 +606,16 @@ impl TurnaConfig {
         //
         // Hard error under production, warning otherwise: a dev box that flips the
         // flag while reading the code should be told, not blocked.
+        // An IPv6 TCP allocation advertises `external_ip6`; without one the
+        // switch could only ever produce 440, which is the config lying.
+        if self.turn.tcp_relay.allow_ipv6 && self.turn.external_ip6.trim().is_empty() {
+            errors.push(
+                "turn.tcp_relay.allow_ipv6 = true requires turn.external_ip6: an IPv6 TCP \
+                 allocation advertises that address, and without it every IPv6 TCP \
+                 Allocate would still be answered 440"
+                    .into(),
+            );
+        }
         if self.turn.tcp_relay.enabled && !self.tls.enabled {
             if prod {
                 errors.push(
@@ -857,6 +867,50 @@ impl TurnaConfig {
             }
         }
 
+        // RFC 5780 NAT discovery: two addresses, two ports, nothing shared with
+        // the UDP listeners or the relay ranges. Only UDP listeners are passed:
+        // a TCP listener on the same port does not collide.
+        {
+            let mut udp: Vec<(&str, SocketAddr)> = vec![("turn.listen", self.turn.listen)];
+            if self.turn.dtls.enabled {
+                udp.push(("turn.dtls.listen", self.turn.dtls.listen));
+            }
+            if self.turn.quic.enabled {
+                udp.push(("turn.quic.listen", self.turn.quic.listen));
+            }
+            let mut ranges = vec![(self.turn.relay.min_port, self.turn.relay.max_port)];
+            ranges.extend(
+                self.tenants
+                    .iter()
+                    .map(|t| (t.relay_port_range[0], t.relay_port_range[1])),
+            );
+            errors.extend(self.turn.nat_discovery.validate(&udp, &ranges));
+        }
+
+        // RFC 8489 §9.2.5: a client that sees "Username anonymity" in the nonce
+        // cookie MUST send USERHASH. Only a long-term (static_users) realm can
+        // resolve one, so advertising it anywhere else locks clients out.
+        if self.turn.auth.advertise_userhash {
+            if self.turn.auth.oauth.enabled || self.turn.auth.static_users.is_empty() {
+                errors.push(
+                    "turn.auth.advertise_userhash = true requires the base realm to use \
+                     static_users: a TURN REST or OAuth realm cannot resolve a USERHASH, \
+                     and a client told to send one would never authenticate"
+                        .into(),
+                );
+            }
+            for t in &self.tenants {
+                if t.static_users.is_empty() {
+                    errors.push(format!(
+                        "turn.auth.advertise_userhash = true but tenant '{}' uses a shared \
+                         secret; the nonce is issued before the realm is known, so every \
+                         realm must be able to resolve a USERHASH",
+                        t.id
+                    ));
+                }
+            }
+        }
+
         // Rate-limit tiers: a zero anywhere is a limiter that refuses forever.
         errors.extend(self.turn.rate_limit.default.validate("default"));
         errors.extend(self.turn.rate_limit.trusted.validate("trusted"));
@@ -1058,6 +1112,10 @@ pub struct TurnConfig {
     /// RFC 6062 TCP relay. Disabled by default; requires `[tls]` enabled.
     #[serde(default)]
     pub tcp_relay: TcpRelaySection,
+    /// RFC 5780 NAT behaviour discovery. Disabled by default; needs two
+    /// addresses of one family on this host.
+    #[serde(default)]
+    pub nat_discovery: NatDiscoverySection,
     /// Tiered rate limiting (`[turn.rate_limit]`). Until 0.5.0 these were
     /// readable only from `TURNA_RATE_LIMIT_*` and friends, so the values in
     /// force appeared in no config file and no config dump.
@@ -1092,6 +1150,7 @@ impl Default for TurnConfig {
             dtls: DtlsSection::default(),
             sctp: SctpSection::default(),
             tcp_relay: TcpRelaySection::default(),
+            nat_discovery: NatDiscoverySection::default(),
             rate_limit: RateLimitConfig::default(),
             peer_filter: PeerFilterConfig::default(),
         }
@@ -1278,6 +1337,23 @@ pub struct AuthConfig {
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
     pub oauth: OAuthConfig,
+    /// Advertise RFC 8489 username anonymity (USERHASH, §14.4).
+    ///
+    /// A request that names its user by USERHASH instead of USERNAME is
+    /// accepted whatever this says — long-term users, including those loaded
+    /// from the state backend, are resolved by `SHA-256(username ":" realm)`.
+    /// What this key controls is whether clients are *told* to do so: when
+    /// true, every nonce starts with the RFC 8489 "nonce cookie" with the
+    /// "Username anonymity" feature bit set, and a conforming client then MUST
+    /// send USERHASH (§9.2.5).
+    ///
+    /// Off by default because it changes every nonce on the wire. Refused
+    /// unless every realm on the node — the base realm and every tenant — uses
+    /// `static_users`: a TURN REST username embeds an expiry the server never
+    /// stores, so its hash cannot be resolved, and a REST client told to hash
+    /// would never authenticate. OAuth is refused for the same reason.
+    #[serde(default)]
+    pub advertise_userhash: bool,
 }
 
 impl Default for AuthConfig {
@@ -1291,6 +1367,7 @@ impl Default for AuthConfig {
             credential_clock_skew_secs: default_credential_clock_skew(),
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
+            advertise_userhash: false,
         }
     }
 }
@@ -2620,6 +2697,15 @@ pub struct TcpRelaySection {
     pub max_total: usize,
     /// Per-direction relay buffer size, bytes.
     pub buffer_size: usize,
+    /// Serve IPv6 TCP allocations (`REQUESTED-ADDRESS-FAMILY = IPv6`), relaying
+    /// from `[turn] external_ip6` with the listener on `[turn.relay] bind_ip6`.
+    ///
+    /// Off by default so that a node already relaying UDP over IPv6 and TCP
+    /// over IPv4 keeps answering an IPv6 TCP Allocate with 440 until the
+    /// operator opts in: a TCP allocation is a listener plus a connection per
+    /// peer, sized differently from a UDP socket. Requires `external_ip6`.
+    #[serde(default)]
+    pub allow_ipv6: bool,
 }
 
 impl Default for TcpRelaySection {
@@ -2631,7 +2717,133 @@ impl Default for TcpRelaySection {
             max_per_allocation: 10,
             max_total: 50_000,
             buffer_size: 16384,
+            allow_ipv6: false,
         }
+    }
+}
+
+/// RFC 5780 NAT behaviour discovery (`[turn.nat_discovery]`).
+///
+/// Answers STUN Binding requests on four UDP sockets — every combination of
+/// two addresses and two ports — so a client can ask for a reply from the
+/// other address and/or port (CHANGE-REQUEST) and learn how its NAT maps and
+/// filters. The TURN listener is not one of the four and keeps refusing
+/// CHANGE-REQUEST with 420, as RFC 5780 §6 requires of a socket with no
+/// alternate.
+///
+/// **Off by default.** It needs two addresses of the same family assigned to
+/// this host (coturn refuses without them for the same reason), and each reply
+/// is an unauthenticated one that CHANGE-REQUEST can send from three different
+/// sources — so it is bounded by the same `[turn.rate_limit]` tiers and the
+/// same unauthenticated-reply budget as Binding on the TURN listener, and
+/// PADDING / RESPONSE-PORT are refused. UDP only.
+///
+/// The addresses must be the ones clients reach: RESPONSE-ORIGIN and
+/// OTHER-ADDRESS name them, and a 1:1 NAT in front of the host would make those
+/// attributes name private addresses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NatDiscoverySection {
+    /// Serve RFC 5780 on the four sockets below.
+    pub enabled: bool,
+    /// A1: the address clients are pointed at (e.g. by `_stun-behavior._udp`).
+    pub primary_ip: String,
+    /// A2: a second address of the same family on this host.
+    pub alternate_ip: String,
+    /// P1. RFC 5780 §9.2's default is 3478, which collides with a TURN listener
+    /// on the same address or on the wildcard; pick another port or give the
+    /// TURN listener its own address.
+    pub primary_port: u16,
+    /// P2, distinct from P1.
+    pub alternate_port: u16,
+}
+
+impl Default for NatDiscoverySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            primary_ip: String::new(),
+            alternate_ip: String::new(),
+            primary_port: 3478,
+            alternate_port: 3479,
+        }
+    }
+}
+
+impl NatDiscoverySection {
+    /// Everything wrong with an enabled section, given the UDP listeners it
+    /// must not collide with and the relay port ranges it must stay out of.
+    pub(crate) fn validate(
+        &self,
+        udp_listeners: &[(&str, SocketAddr)],
+        relay_ranges: &[(u16, u16)],
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        let (Ok(a1), Ok(a2)) = (
+            self.primary_ip.parse::<std::net::IpAddr>(),
+            self.alternate_ip.parse::<std::net::IpAddr>(),
+        ) else {
+            errors.push(
+                "turn.nat_discovery.enabled requires primary_ip and alternate_ip to be two IP \
+                 addresses assigned to this host: RFC 5780 answers CHANGE-REQUEST from the \
+                 other address, and one address cannot do that"
+                    .into(),
+            );
+            return errors;
+        };
+        if a1 == a2 {
+            errors.push("turn.nat_discovery: primary_ip and alternate_ip must differ".into());
+        }
+        if a1.is_ipv4() != a2.is_ipv4() {
+            errors.push(
+                "turn.nat_discovery: primary_ip and alternate_ip must be the same address \
+                 family (RFC 5780 §6 changes the IP within one family)"
+                    .into(),
+            );
+        }
+        if a1.is_unspecified() || a2.is_unspecified() {
+            errors.push(
+                "turn.nat_discovery: primary_ip and alternate_ip must be concrete addresses, \
+                 not a wildcard — RESPONSE-ORIGIN has to name the address a reply came from"
+                    .into(),
+            );
+        }
+        if self.primary_port == 0
+            || self.alternate_port == 0
+            || self.primary_port == self.alternate_port
+        {
+            errors.push(
+                "turn.nat_discovery: primary_port and alternate_port must be non-zero and \
+                 different"
+                    .into(),
+            );
+        }
+        for port in [self.primary_port, self.alternate_port] {
+            for (lo, hi) in relay_ranges {
+                if (*lo..=*hi).contains(&port) {
+                    errors.push(format!(
+                        "turn.nat_discovery port {port} is inside the relay port range \
+                         {lo}-{hi}; an allocation could be handed the same port"
+                    ));
+                }
+            }
+            for ip in [a1, a2] {
+                for (name, l) in udp_listeners {
+                    if l.port() == port && (l.ip().is_unspecified() || l.ip() == ip) {
+                        errors.push(format!(
+                            "turn.nat_discovery {ip}:{port} collides with {name} ({l}); give \
+                             the discovery service other ports or {name} its own address"
+                        ));
+                    }
+                }
+            }
+        }
+        errors.sort();
+        errors.dedup();
+        errors
     }
 }
 
@@ -3609,6 +3821,77 @@ mod tests {
     }
 
     #[test]
+    fn nat_discovery_is_off_by_default_and_refused_without_two_addresses() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
+        let d = NatDiscoverySection::default();
+        assert!(!d.enabled, "RFC 5780 is opt-in");
+
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.listen = "192.0.2.10:3478".parse().unwrap();
+        cfg.turn.nat_discovery.enabled = true;
+        // One address only: refused, as coturn refuses.
+        cfg.turn.nat_discovery.primary_ip = "192.0.2.1".into();
+        let one_address = cfg.validate();
+        // Two addresses of different families: refused.
+        cfg.turn.nat_discovery.alternate_ip = "2001:db8::1".into();
+        let mixed = cfg.validate();
+        // Same address twice: refused.
+        cfg.turn.nat_discovery.alternate_ip = "192.0.2.1".into();
+        let same = cfg.validate();
+        // Wildcard: refused.
+        cfg.turn.nat_discovery.alternate_ip = "0.0.0.0".into();
+        let wildcard = cfg.validate();
+        // Two addresses, TURN listener on a third: accepted with default ports.
+        cfg.turn.nat_discovery.alternate_ip = "192.0.2.2".into();
+        let ok = cfg.validate();
+        // TURN listener on the wildcard at 3478 collides with P1 = 3478.
+        cfg.turn.listen = "0.0.0.0:3478".parse().unwrap();
+        let collides = cfg.validate();
+        // Moving the discovery ports clears it...
+        cfg.turn.nat_discovery.primary_port = 3480;
+        cfg.turn.nat_discovery.alternate_port = 3481;
+        let moved = cfg.validate();
+        // ...unless they land in the relay range.
+        cfg.turn.nat_discovery.alternate_port = 50000;
+        let in_relay_range = cfg.validate();
+
+        restore_turna_production(saved);
+        for (name, r) in [
+            ("one address", one_address),
+            ("mixed family", mixed),
+            ("same address", same),
+            ("wildcard", wildcard),
+            ("listener collision", collides),
+            ("relay range", in_relay_range),
+        ] {
+            let msg = r.expect_err(name).to_string();
+            assert!(msg.contains("nat_discovery"), "{name}: {msg}");
+        }
+        ok.expect("two addresses and free ports");
+        moved.expect("ports moved off the TURN listener");
+    }
+
+    #[test]
+    fn tcp_relay_ipv6_is_opt_in_and_needs_external_ip6() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        assert!(!TcpRelaySection::default().allow_ipv6, "off by default");
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.tcp_relay.allow_ipv6 = true;
+        let without = cfg.validate();
+        cfg.turn.external_ip6 = "2001:db8::10".into();
+        let with = cfg.validate();
+        restore_turna_production(saved);
+        let msg = without.expect_err("needs external_ip6").to_string();
+        assert!(msg.contains("allow_ipv6"), "{msg}");
+        with.expect("allow_ipv6 with external_ip6 is valid");
+    }
+
+    #[test]
     fn quic_rejects_unusable_transport_limits() {
         let _guard = production_env_lock();
         let saved = std::env::var_os("TURNA_PRODUCTION");
@@ -3995,6 +4278,50 @@ mod tests {
             msg.contains("cluster_secret"),
             "validation error should call out cluster_secret, got: {msg}"
         );
+    }
+
+    #[test]
+    fn advertise_userhash_is_off_by_default_and_needs_long_term_realms() {
+        let _guard = production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+
+        assert!(!AuthConfig::default().advertise_userhash, "opt-in only");
+
+        // Base realm on TURN REST (no static_users): refused.
+        let mut cfg = TurnaConfig::default();
+        cfg.turn.auth.advertise_userhash = true;
+        let rest = cfg.validate();
+
+        // Base realm on static users: accepted.
+        cfg.turn.auth.static_users = vec![StaticUser {
+            username: "alice".into(),
+            password: "a-long-enough-password".into(),
+        }];
+        let long_term = cfg.validate();
+
+        // ...until a shared-secret tenant is added.
+        cfg.tenants = vec![TenantConfig {
+            id: "t1".into(),
+            realm: "t1realm".into(),
+            relay_port_range: [50000, 50100],
+            shared_secret: "a-real-non-placeholder-secret".into(),
+            previous_shared_secret: String::new(),
+            static_users: Vec::new(),
+            max_allocations: 0,
+            quota: QuotaConfig::default(),
+            listen: None,
+        }];
+        let with_rest_tenant = cfg.validate();
+
+        restore_turna_production(saved);
+        let msg = rest.expect_err("REST base realm must refuse").to_string();
+        assert!(msg.contains("advertise_userhash"), "{msg}");
+        long_term.expect("static users can resolve a USERHASH");
+        let msg = with_rest_tenant
+            .expect_err("a REST tenant must refuse")
+            .to_string();
+        assert!(msg.contains("tenant 't1'"), "{msg}");
     }
 
     #[test]

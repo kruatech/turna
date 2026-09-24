@@ -4364,6 +4364,7 @@ dependencies = [
  "md5",
  "rand 0.10.2",
  "sha1",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "turna-common",

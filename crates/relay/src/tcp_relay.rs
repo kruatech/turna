@@ -92,6 +92,10 @@ pub struct TcpRelayConfig {
     pub max_per_allocation: usize,
     pub max_total: usize,
     pub buffer_size: usize,
+    /// Accept an IPv6 TCP allocation (`REQUESTED-ADDRESS-FAMILY = IPv6`) when the
+    /// processor also has an `external_ip6` to advertise. `false` (the default)
+    /// keeps the historical 440 — `[turn.tcp_relay] allow_ipv6`.
+    pub allow_ipv6: bool,
 }
 
 impl Default for TcpRelayConfig {
@@ -102,6 +106,7 @@ impl Default for TcpRelayConfig {
             max_per_allocation: 10,
             max_total: 50_000,
             buffer_size: 16384,
+            allow_ipv6: false,
         }
     }
 }
@@ -134,6 +139,174 @@ enum ConnState {
 }
 
 // ---------------------------------------------------------------------------
+// Peer-initiated connections (RFC 6062 §5.3)
+// ---------------------------------------------------------------------------
+
+/// What happened to one connection accepted on a relayed TCP listener.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerAcceptOutcome {
+    /// No permission for the peer (or the peer filter denies it): closed at
+    /// once, nothing sent to the client.
+    Refused,
+    /// Registered, and the ConnectionAttempt was queued to the client.
+    Announced(TcpConnectionId),
+    /// Permitted, but not registered (limits, duplicate) or the client could
+    /// not be told (gone, queue full, encode error): closed.
+    Dropped,
+}
+
+/// Handle one connection accepted on the relayed TCP listener of the
+/// allocation owned by `client_addr`.
+///
+/// Every relayed-TCP accept loop goes through here, so the §5.3 permission
+/// check cannot be skipped by a second listener variant. The permission check
+/// comes first, before the connection is registered or counted against
+/// `max_total`, so an unpermitted peer can neither occupy a connection slot nor
+/// cause a ConnectionAttempt. Dropping `stream` closes it.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_peer_initiated(
+    mgr: &TcpRelayManager,
+    processor: &crate::processor::PacketProcessor,
+    sinks: &crate::server::ClientSinks,
+    alloc: AllocationId,
+    relay_port: u16,
+    client_addr: SocketAddr,
+    owner_key: &[u8],
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> PeerAcceptOutcome {
+    if !processor.peer_connection_permitted(client_addr, relay_port, peer) {
+        drop(stream);
+        return PeerAcceptOutcome::Refused;
+    }
+    let id = match mgr
+        .register_incoming(alloc, peer, stream, owner_key.to_vec())
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            debug!(%peer, error = %e, "RFC 6062 peer connection rejected");
+            return PeerAcceptOutcome::Dropped;
+        }
+    };
+    let delivered = match processor.build_connection_attempt_indication(id.value(), peer) {
+        Some(bytes) => sinks
+            .get(&client_addr)
+            .map(|s| s.try_send(bytes).is_ok())
+            .unwrap_or(false),
+        None => false,
+    };
+    if delivered {
+        PeerAcceptOutcome::Announced(id)
+    } else {
+        // Client gone / queue full / encode error: the pending peer conn would
+        // never be bound — drop it.
+        mgr.release(id).await;
+        PeerAcceptOutcome::Dropped
+    }
+}
+
+/// Source address for an outbound CONNECT (RFC 6062 §5.2): the relay bind
+/// address of the peer's family — `[turn.relay] bind_ip` / `bind_ip6`, the
+/// same address the relayed listener and the UDP relay sockets bind. The peer's
+/// family is the allocation's (CreatePermission refuses a cross-family peer
+/// with 443, and CONNECT requires a permission). Unset bind addresses are the
+/// wildcard, which leaves the choice to the kernel exactly as before.
+pub fn relay_source_ip(peer: &SocketAddr) -> std::net::IpAddr {
+    if peer.is_ipv6() {
+        std::net::IpAddr::V6(turna_session::relay_bind_addr_v6())
+    } else {
+        std::net::IpAddr::V4(turna_session::relay_bind_addr_v4())
+    }
+}
+
+/// Connect to `peer` from `local_ip` (port chosen by the kernel).
+///
+/// RFC 6062 §5.2 says the local endpoint is the relayed transport address —
+/// address *and* port. The address is honoured here; the port is not, and
+/// cannot be without `SO_REUSEPORT` on the relayed listener: Linux refuses to
+/// bind a second socket to a port with a listener on it otherwise
+/// (`EADDRINUSE`, even with `SO_REUSEADDR`), and `SO_REUSEPORT` on the
+/// listener would let any other same-UID reuseport listener on that port —
+/// including a stale listener of an expired allocation during the 5 s before
+/// it notices — join the group and take half the incoming SYNs. See
+/// docs/protocol-gap.md → RFC 6062.
+pub async fn connect_from(
+    local_ip: std::net::IpAddr,
+    peer: SocketAddr,
+) -> std::io::Result<TcpStream> {
+    let socket = if local_ip.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    if !local_ip.is_unspecified() {
+        socket.bind(SocketAddr::new(local_ip, 0))?;
+    }
+    socket.connect(peer).await
+}
+
+/// How often a relayed TCP listener checks that its allocation is still live.
+/// Matches the 5 s expiry sweep that reconciles UDP relay sockets.
+pub const LISTENER_LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The accept loop of one TCP allocation's relayed listener (RFC 6062 §5.3).
+///
+/// Ends when `accept()` fails, when the task is aborted (`CloseRelay`, control
+/// connection closed), or — checked every `liveness` — when the allocation it
+/// belongs to is gone, expired or replaced by one on another port. The last
+/// case is the expiry path: the sweep removes the allocation and reconciles UDP
+/// relay sockets, but nothing emitted `CloseRelay` for a TCP listener, so one
+/// outlived its allocation and kept accepting. Pending and bound peer
+/// connections of the allocation are cleaned up when it ends that way.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_relayed_listener(
+    mgr: Arc<TcpRelayManager>,
+    processor: Arc<crate::processor::PacketProcessor>,
+    sinks: crate::server::ClientSinks,
+    listener: tokio::net::TcpListener,
+    relay_port: u16,
+    client_addr: SocketAddr,
+    owner_key: Vec<u8>,
+    liveness: Duration,
+) {
+    let alloc = AllocationId(relay_port as u64);
+    let mut tick = tokio::time::interval(liveness);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    handle_peer_initiated(
+                        &mgr,
+                        &processor,
+                        &sinks,
+                        alloc,
+                        relay_port,
+                        client_addr,
+                        &owner_key,
+                        stream,
+                        peer,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(port = relay_port, error = %e, "relayed TCP accept failed; stopping listener");
+                    return;
+                }
+            },
+            _ = tick.tick() => {
+                if !processor.tcp_listener_live(client_addr, relay_port) {
+                    debug!(port = relay_port, "relayed TCP listener stopped: allocation expired or replaced");
+                    mgr.cleanup_allocation(alloc).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
 
@@ -152,6 +325,11 @@ impl TcpRelayManager {
             alloc_peers: Arc::new(RwLock::new(HashMap::new())),
             counter: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
+    }
+
+    /// Whether IPv6 TCP allocations are enabled (see [`TcpRelayConfig::allow_ipv6`]).
+    pub fn ipv6_enabled(&self) -> bool {
+        self.config.allow_ipv6
     }
 
     fn next_id(&self) -> TcpConnectionId {
@@ -180,13 +358,16 @@ impl TcpRelayManager {
             });
         }
 
-        let stream = timeout(self.config.connect_timeout, TcpStream::connect(peer))
-            .await
-            .map_err(|_| TcpRelayError::ConnectTimeout {
-                addr: peer,
-                timeout: self.config.connect_timeout,
-            })?
-            .map_err(TcpRelayError::Io)?;
+        let stream = timeout(
+            self.config.connect_timeout,
+            connect_from(relay_source_ip(&peer), peer),
+        )
+        .await
+        .map_err(|_| TcpRelayError::ConnectTimeout {
+            addr: peer,
+            timeout: self.config.connect_timeout,
+        })?
+        .map_err(TcpRelayError::Io)?;
 
         let id = self.next_id();
         self.conns.write().await.insert(
@@ -563,5 +744,44 @@ mod tests {
             m.claim(id, &owner).await.is_ok(),
             "owner binds the peer-initiated conn"
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_source_tests {
+    use super::*;
+
+    /// RFC 6062 §5.2: the outbound CONNECT leaves from the relay bind address.
+    /// 127.0.0.2 stands in for a configured `bind_ip`: the peer must see it,
+    /// not the kernel's default choice (127.0.0.1 for a 127.0.0.1 peer).
+    #[tokio::test]
+    async fn connect_leaves_from_the_relay_bind_address() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let out = match connect_from("127.0.0.2".parse().unwrap(), addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: cannot bind 127.0.0.2 ({e})");
+                return;
+            }
+        };
+        let (_, seen) = peer.accept().await.unwrap();
+        assert_eq!(seen.ip(), "127.0.0.2".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(out.local_addr().unwrap().ip(), seen.ip());
+    }
+
+    /// Unset bind address (wildcard): no explicit bind, the kernel chooses,
+    /// exactly the pre-existing behaviour.
+    #[tokio::test]
+    async fn wildcard_bind_address_leaves_the_choice_to_the_kernel() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let _out = connect_from("0.0.0.0".parse().unwrap(), addr)
+            .await
+            .unwrap();
+        let (_, seen) = peer.accept().await.unwrap();
+        assert!(seen.ip().is_loopback());
+        // Without a configured bind_ip this is what the node uses.
+        assert!(relay_source_ip(&addr).is_unspecified());
     }
 }

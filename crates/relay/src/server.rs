@@ -504,6 +504,24 @@ impl RelayServer {
         self
     }
 
+    /// Share an unauthenticated-reply budget with other processors (see
+    /// [`crate::UnauthReplyBudget`]). `None` keeps this server's own. Same
+    /// `Arc::get_mut` pattern as [`with_external_ip6`](Self::with_external_ip6),
+    /// for the same reason.
+    pub fn with_unauth_reply_budget(mut self, budget: Option<&crate::UnauthReplyBudget>) -> Self {
+        let Some(budget) = budget else {
+            return self;
+        };
+        match Arc::get_mut(&mut self.processor) {
+            Some(p) => p.set_unauth_reply_budget(budget),
+            None => error!(
+                "cannot share the unauthenticated-reply budget: the processor is already \
+                 shared; this listener keeps its own"
+            ),
+        }
+        self
+    }
+
     /// Shared cross-transport client-sink registry (addr -> writer).
     /// DTLS/QUIC listeners register established client addresses here so
     /// peer->client relay data is delivered over the right transport.

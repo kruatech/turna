@@ -445,6 +445,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // default: most deployed TURN clients predate RFC 8489 and send only
     // MESSAGE-INTEGRITY, so turning it on where they exist locks them out.
     turna_auth::set_require_sha256(config.auth.require_sha256);
+    // RFC 8489 username anonymity: advertise it in the nonce cookie only when
+    // asked. Accepting USERHASH needs no switch. Set before any processor is
+    // built, because each processor's nonce issuer reads it at construction.
+    turna_relay::processor::set_advertise_userhash(config.auth.advertise_userhash);
+    if config.auth.advertise_userhash {
+        info!("RFC 8489 username anonymity advertised: clients will send USERHASH");
+    }
 
     metrics.set_capacity_limits(config.relay.max_allocations as u64, 75, 95);
     // The packet-rate ceiling and its thresholds. Separate call because the two
@@ -584,6 +591,7 @@ fn build_tcp_relay_config(
         max_per_allocation: c.max_per_allocation,
         max_total: c.max_total,
         buffer_size: c.buffer_size,
+        allow_ipv6: c.allow_ipv6,
     }
 }
 
@@ -801,6 +809,23 @@ fn apply_command(
 /// only mean the key was left empty — but it is reported rather than swallowed,
 /// because silently relaying IPv4-only after an operator set the key would be the
 /// worst outcome.
+/// The `[turn.nat_discovery]` topology. Config validation has already
+/// refused every shape this can reject; the error path is for an embedder that
+/// skipped it.
+fn nat_discovery_topology(
+    cfg: &turna_config::NatDiscoverySection,
+) -> Result<turna_relay::nat_discovery::NatDiscoveryTopology, Box<dyn std::error::Error>> {
+    let a1: std::net::IpAddr = cfg.primary_ip.parse()?;
+    let a2: std::net::IpAddr = cfg.alternate_ip.parse()?;
+    turna_relay::nat_discovery::NatDiscoveryTopology::new(
+        a1,
+        a2,
+        cfg.primary_port,
+        cfg.alternate_port,
+    )
+    .map_err(|e| format!("[turn.nat_discovery]: {e}").into())
+}
+
 fn resolve_external_ip6(cfg: &TurnConfig) -> Option<std::net::Ipv6Addr> {
     if cfg.external_ip6.is_empty() {
         return None;
@@ -1023,7 +1048,10 @@ fn run_tokio(
                     };
                     // `replace_base` refuses a realm change: the realm is hashed
                     // into every long-term key, so swapping it would invalidate
-                    // credentials rather than rotate a secret.
+                    // credentials rather than rotate a secret. It also refuses a
+                    // change of credential mechanism that would alter RFC 8489
+                    // USERHASH eligibility (logged by the registry): the nonce
+                    // cookie decided at startup would otherwise lie.
                     if rotate_auth.replace_base(new_base) {
                         rotated += 1;
                     } else {
@@ -1031,8 +1059,9 @@ fn run_tokio(
                         warn!(
                             event = "secret_reload_rejected",
                             realm = %root.turn.realm,
-                            "SIGHUP: base realm changed in the config; a realm cannot be \
-                             rotated under live clients. Base secret left unchanged."
+                            "SIGHUP: base realm or its credential mechanism changed in the \
+                             config; neither can change under live clients. Base secret left \
+                             unchanged."
                         );
                     }
                 } else {
@@ -2332,6 +2361,43 @@ fn run_tokio(
             let _ = shutdown_tx.send(true);
         });
 
+        // RFC 5780 NAT behaviour discovery, opt-in. Four sockets of its own
+        // (A1:P1, A1:P2, A2:P1, A2:P2) beside whichever TURN datapath is chosen
+        // below, because no datapath can answer from a socket other than the
+        // one a request arrived on. Bound here so a missing address fails
+        // startup rather than serving a topology that reports the wrong NAT
+        // type. A dedicated processor: its ingress tiers and unauthenticated-
+        // reply budget are the configured ones, in buckets of its own.
+        // With discovery on, every processor on the node draws unauthenticated
+        // replies from ONE budget per source, so the discovery sockets cannot
+        // double what a spoofed victim receives. Off: each keeps its own, as
+        // before.
+        let reply_budget = config
+            .nat_discovery
+            .enabled
+            .then(turna_relay::UnauthReplyBudget::new);
+        if let Some(budget) = &reply_budget {
+            let topology = nat_discovery_topology(&config.nat_discovery)?;
+            let sockets = turna_relay::nat_discovery::bind(&topology).await?;
+            let nd_processor = Arc::new(
+                turna_relay::PacketProcessor::new_with_cluster(
+                    store.clone(),
+                    auth.clone(),
+                    external_ip,
+                    metrics.clone(),
+                    None,
+                )
+                .with_rate_limits(&rate_limits)
+                .with_unauth_reply_budget(budget),
+            );
+            tokio::spawn(turna_relay::nat_discovery::run(
+                nd_processor,
+                topology,
+                sockets,
+                shutdown_rx.clone(),
+            ));
+        }
+
         let datapath_result: Result<(), Box<dyn std::error::Error>> =
             match transport_decision.backend {
             // AF_XDP ring datapath (Linux + af-xdp feature). Opt-in backend;
@@ -2346,7 +2412,8 @@ fn run_tokio(
                         cluster_routing.clone(),
                     )
                     .with_external_ip6(external_ip6)
-                    .with_rate_limits(&rate_limits),
+                    .with_rate_limits(&rate_limits)
+                    .maybe_unauth_reply_budget(reply_budget.as_ref()),
                 );
                 let af_cfg = config.af_xdp.clone();
                 let listen = config.listen;
@@ -2396,6 +2463,7 @@ fn run_tokio(
                     Some(&rate_limits),
                 )
                 .with_external_ip6(external_ip6)
+                .with_unauth_reply_budget(reply_budget.as_ref())
                 .with_drain_timeout_secs(config.relay.drain_timeout_secs);
                 #[cfg(feature = "tls")]
                 let server = if tls_cfg.enabled {
@@ -2507,7 +2575,8 @@ fn run_tokio(
                                 cluster_routing.clone(),
                             )
                             .with_external_ip6(external_ip6)
-                            .with_rate_limits(&rate_limits),
+                            .with_rate_limits(&rate_limits)
+                            .maybe_unauth_reply_budget(reply_budget.as_ref()),
                         );
                         let qd_sinks = turna_relay::new_client_sinks();
                         // Ephemeral fallback socket (bound off :3478 so it never
@@ -2576,6 +2645,7 @@ fn run_tokio(
                     let auth_f = auth.clone();
                     let metrics_f = metrics.clone();
                     let cluster_f = cluster_routing.clone();
+                    let budget_f = reply_budget.clone();
                     let handles = spawn_worker_pool(pool_cfg, move |_worker_id| {
                         RelayHandler::new_with_cluster(
                             store_f.clone(),
@@ -2584,6 +2654,7 @@ fn run_tokio(
                             metrics_f.clone(),
                             cluster_f.clone(),
                         )
+                        .with_unauth_reply_budget(budget_f.as_ref())
                     });
 
                     // io_uring mode does not run RelayServer::run, so nothing
