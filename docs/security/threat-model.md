@@ -214,8 +214,10 @@ OBSERVABILITY
     naming random users makes turna call out. Controls: a lookup is only started
     by requests that completed a NONCE round trip (Binding with
     MESSAGE-INTEGRITY never starts one), per-user coalescing, negative cache,
-    `max_concurrency` + `queue_depth`, the per-IP/prefix/Allocate rate limits,
-    and `[turn.auto_ban]` on the resulting 401s.
+    `max_concurrency` + `queue_depth`, a per-source (IP and prefix) budget on
+    lookups started so one host cannot fill the shared queue, the Allocate-tier
+    rate limit on both Allocate and Refresh, and `[turn.auto_ban]` on lookups
+    started (`credential_lookups`) and on the resulting 401s.
   - *Datapath stall* — none by construction: the packet path only reads the
     cache; lookups run on separate tasks and the request is parked.
   - *Endpoint outage* — fail closed (500), never fail open. Cached users keep

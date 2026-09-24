@@ -4,8 +4,12 @@
 //! The datapath never waits on anything in this file — see
 //! `turna_auth::webhook` for where the cache sits and why. This is a plain
 //! async worker: a bounded queue in, a semaphore on concurrency, one `reqwest`
-//! client (rustls with the aws-lc-rs provider the node already links; no
-//! OpenSSL), redirects off, environment proxies ignored.
+//! client, redirects off, environment proxies ignored.
+//!
+//! TLS is rustls with an **explicit ring `CryptoProvider`** handed to reqwest as
+//! a preconfigured `ClientConfig` (see [`tls_config`]). Nothing here depends on
+//! which provider, if any, is installed as the process default, and nothing
+//! here asks for aws-lc-rs. No OpenSSL.
 //!
 //! # What is logged
 //!
@@ -96,7 +100,7 @@ pub(crate) fn start(
 impl WebhookClient {
     pub(crate) fn new(cfg: &WebhookConfig) -> Result<Self, String> {
         let https = cfg.url.to_ascii_lowercase().starts_with("https://");
-        let mut b = reqwest::Client::builder()
+        let b = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.timeout_ms))
             .connect_timeout(Duration::from_millis(cfg.timeout_ms))
             // A redirect would re-send the credential to wherever the response
@@ -109,19 +113,9 @@ impl WebhookClient {
             .pool_max_idle_per_host(cfg.max_concurrency)
             .user_agent(concat!("turna/", env!("CARGO_PKG_VERSION")))
             .https_only(https);
-        if !cfg.ca_file.is_empty() {
-            let pem = std::fs::read(&cfg.ca_file)
-                .map_err(|e| format!("turn.auth.webhook.ca_file {}: {e}", cfg.ca_file))?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem)
-                .map_err(|e| format!("turn.auth.webhook.ca_file {}: {e}", cfg.ca_file))?;
-            if certs.is_empty() {
-                return Err(format!(
-                    "turn.auth.webhook.ca_file {} holds no certificate",
-                    cfg.ca_file
-                ));
-            }
-            b = b.tls_certs_only(certs);
-        }
+        // Always a preconfigured rustls config, so reqwest never picks a
+        // provider itself. It is harmless on plain http:// (dev stubs).
+        let b = b.tls_backend_preconfigured(tls_config(&cfg.ca_file)?);
         let client = b.build().map_err(|e| format!("auth webhook client: {e}"))?;
         Ok(Self {
             client,
@@ -200,6 +194,44 @@ impl WebhookClient {
             None => (FetchOutcome::Failed, "malformed_body"),
         }
     }
+}
+
+/// The rustls client configuration: ring, explicitly, with either the system
+/// roots (through rustls-platform-verifier, built on the same ring provider) or
+/// only the certificates in `ca_file`.
+pub(crate) fn tls_config(ca_file: &str) -> Result<rustls::ClientConfig, String> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("auth webhook TLS: {e}"))?;
+    let mut config = if ca_file.is_empty() {
+        let verifier = rustls_platform_verifier::Verifier::new(provider)
+            .map_err(|e| format!("auth webhook TLS: system roots: {e}"))?;
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+            .with_no_client_auth()
+    } else {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let pem = std::fs::read(ca_file)
+            .map_err(|e| format!("turn.auth.webhook.ca_file {ca_file}: {e}"))?;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(&pem) {
+            let cert = cert.map_err(|e| format!("turn.auth.webhook.ca_file {ca_file}: {e}"))?;
+            roots
+                .add(cert)
+                .map_err(|e| format!("turn.auth.webhook.ca_file {ca_file}: {e}"))?;
+        }
+        if roots.is_empty() {
+            return Err(format!(
+                "turn.auth.webhook.ca_file {ca_file} holds no certificate"
+            ));
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
+    // reqwest is built without HTTP/2 here; say so in ALPN.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
 }
 
 /// The 200 body: `{"password": "..."}` or `{"key_md5": "<32 hex>",
@@ -598,6 +630,37 @@ mod tests {
         assert!(parse_found(br#"{"password":""}"#, "u", "r").is_none());
         assert!(parse_found(br#"{"key_sha256":"0011"}"#, "u", "r").is_none());
         assert!(parse_found(br#"[]"#, "u", "r").is_none());
+    }
+
+    #[test]
+    fn tls_uses_ring_whatever_the_process_default() {
+        let c = tls_config("").expect("system roots load");
+        // The whole provider (suites, key provider, RNG) is ring's.
+        assert_eq!(
+            format!("{:?}", c.crypto_provider()),
+            format!("{:?}", rustls::crypto::ring::default_provider())
+        );
+        // A PEM file that holds no certificate is refused.
+        let dir = std::env::temp_dir().join(format!("turna-wh-ca-{}", std::process::id()));
+        std::fs::write(&dir, b"not a pem").unwrap();
+        assert!(tls_config(dir.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// reqwest accepts the preconfigured ring `ClientConfig` (a version skew
+    /// would make `build()` fail with an unknown TLS backend), and an https
+    /// request goes through it.
+    #[tokio::test]
+    async fn https_client_builds_on_the_preconfigured_ring_config() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let c = WebhookClient::new(&cfg(&format!("https://127.0.0.1:{port}/x")))
+            .expect("client builds");
+        let (out, kind) = c.fetch(&job()).await;
+        assert!(matches!(out, FetchOutcome::Failed));
+        assert_eq!(kind, "connect");
     }
 
     #[test]

@@ -53,6 +53,9 @@ pub struct AutoBanSettings {
     pub auth_failures: u32,
     /// Rate-limit refusals within `window` that trigger a ban. 0 disables it.
     pub rate_limit_violations: u32,
+    /// Credential-webhook lookups started (or refused by the per-source lookup
+    /// limit) within `window` that trigger a ban. 0 disables it.
+    pub credential_lookups: u32,
     /// Counting window.
     pub window: Duration,
     /// How long a ban lasts.
@@ -72,6 +75,11 @@ pub struct AutoBanSettings {
 pub enum Offence {
     AuthFailure,
     RateLimited,
+    /// `[turn.auth.webhook]`: this source started a credential lookup, or was
+    /// refused one by the per-source lookup limit. A client logs in with one
+    /// or two names; a source cycling through many is enumerating users or
+    /// trying to exhaust the lookup queue.
+    CredentialLookup,
 }
 
 impl Offence {
@@ -79,6 +87,7 @@ impl Offence {
         match self {
             Offence::AuthFailure => "auth_failures",
             Offence::RateLimited => "rate_limit_violations",
+            Offence::CredentialLookup => "credential_lookups",
         }
     }
 }
@@ -100,6 +109,7 @@ struct Counter {
     last_ms: u64,
     auth: u32,
     rate_limited: u32,
+    lookups: u32,
 }
 
 /// The ban table. Shared (`Arc`) by every processor on the node, so a source
@@ -174,10 +184,15 @@ impl AutoBan {
     }
 
     fn is_banned_at(&self, ip: IpAddr, now_ms: u64) -> bool {
-        match self.bans.get(&self.key(ip)) {
+        let ip = unmap(ip);
+        let live = match self.bans.get(&self.key(ip)) {
             Some(expiry) => *expiry > now_ms,
             None => false,
-        }
+        };
+        // Under prefix scope a ban covers addresses that were never counted,
+        // including allowlisted ones inside the banned block. The allowlist wins.
+        // Only reached when a ban matched, so the common path pays nothing.
+        live && !(self.settings.prefix_scope && self.allowlisted(ip))
     }
 
     fn allowlisted(&self, ip: IpAddr) -> bool {
@@ -190,9 +205,11 @@ impl AutoBan {
     }
 
     fn record_at(&self, ip: IpAddr, offence: Offence, now_ms: u64) -> Option<BanEvent> {
+        let ip = unmap(ip);
         let threshold = match offence {
             Offence::AuthFailure => self.settings.auth_failures,
             Offence::RateLimited => self.settings.rate_limit_violations,
+            Offence::CredentialLookup => self.settings.credential_lookups,
         };
         if threshold == 0 || self.allowlisted(ip) {
             return None;
@@ -214,16 +231,19 @@ impl AutoBan {
                 last_ms: now_ms,
                 auth: 0,
                 rate_limited: 0,
+                lookups: 0,
             });
             if now_ms.saturating_sub(c.window_start_ms) >= window_ms {
                 c.window_start_ms = now_ms;
                 c.auth = 0;
                 c.rate_limited = 0;
+                c.lookups = 0;
             }
             c.last_ms = now_ms;
             let slot = match offence {
                 Offence::AuthFailure => &mut c.auth,
                 Offence::RateLimited => &mut c.rate_limited,
+                Offence::CredentialLookup => &mut c.lookups,
             };
             *slot = slot.saturating_add(1);
             *slot
@@ -357,6 +377,16 @@ pub fn sweep_and_log(ban: &AutoBan) -> usize {
     ban.active()
 }
 
+/// A v4-mapped IPv6 address (`::ffff:a.b.c.d`, from a dual-stack socket) is
+/// the IPv4 client: key, allowlist and prefix all use the IPv4 form.
+#[inline]
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +395,7 @@ mod tests {
         AutoBanSettings {
             auth_failures: 3,
             rate_limit_violations: 0,
+            credential_lookups: 0,
             window: Duration::from_secs(60),
             ban: Duration::from_secs(600),
             prefix_scope: false,
@@ -458,6 +489,59 @@ mod tests {
         assert_eq!(ev.key, ip("203.0.113.0"));
         assert!(b.is_banned_at(ip("203.0.113.250"), 3));
         assert!(!b.is_banned_at(ip("203.0.114.1"), 3));
+    }
+
+    #[test]
+    fn allowlisted_address_inside_a_banned_prefix_is_not_dropped() {
+        let mut s = settings();
+        s.prefix_scope = true;
+        s.allowlist = vec!["203.0.113.200/32".into()];
+        let b = AutoBan::new(s);
+        for (i, t) in [(1, 0), (2, 1), (3, 2)] {
+            b.record_at(ip(&format!("203.0.113.{i}")), Offence::AuthFailure, t);
+        }
+        assert!(b.is_banned_at(ip("203.0.113.9"), 3));
+        assert!(
+            !b.is_banned_at(ip("203.0.113.200"), 3),
+            "the allowlist wins over a prefix ban"
+        );
+    }
+
+    #[test]
+    fn v4_mapped_sources_are_the_ipv4_client() {
+        let mut s = settings();
+        s.prefix_scope = true;
+        let b = AutoBan::new(s);
+        for t in 0..3 {
+            b.record_at(ip("::ffff:203.0.113.7"), Offence::AuthFailure, t);
+        }
+        assert!(b.is_banned_at(ip("203.0.113.8"), 5));
+        assert!(
+            !b.is_banned_at(ip("::ffff:198.51.100.1"), 5),
+            "other IPv4 clients of a dual-stack socket are not in the ban"
+        );
+        // Allowlist written in IPv4 applies to the mapped form.
+        let b = AutoBan::new(settings());
+        for t in 0..10 {
+            assert!(b
+                .record_at(ip("::ffff:10.1.2.3"), Offence::AuthFailure, t)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn credential_lookups_have_their_own_threshold() {
+        let mut s = settings();
+        s.credential_lookups = 2;
+        let b = AutoBan::new(s);
+        let a = ip("192.0.2.77");
+        assert!(b.record_at(a, Offence::CredentialLookup, 0).is_none());
+        // Auth failures do not add to the lookup count, and vice versa.
+        assert!(b.record_at(a, Offence::AuthFailure, 1).is_none());
+        let ev = b
+            .record_at(a, Offence::CredentialLookup, 2)
+            .expect("banned");
+        assert_eq!(ev.offence, Offence::CredentialLookup);
     }
 
     #[test]
