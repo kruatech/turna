@@ -19,7 +19,6 @@ pub mod tls_bridge;
 #[cfg(feature = "sctp")]
 pub mod sctp_bridge;
 
-#[cfg(any(feature = "tls", feature = "sctp"))]
 mod stream_retry;
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -32,7 +31,7 @@ pub use processor::{PacketProcessor, RateLimitSettings, UnauthReplyBudget};
 // adding one just to name a struct of five (burst, rate) pairs is not a trade
 // worth making.
 pub use server::RelayServer;
-pub use turna_qos::{ByteRateLimiter, TieredLimits};
+pub use turna_qos::{ByteRateLimiter, TieredLimits, TieredRateLimiter};
 #[cfg(target_os = "linux")]
 pub mod splice;
 

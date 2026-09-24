@@ -4454,6 +4454,8 @@ dependencies = [
  "libc",
  "parking_lot",
  "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "sysinfo",

@@ -387,7 +387,19 @@ impl ShardedRateLimiter {
 // so all the bucket/cap/cleanup logic is reused.
 
 /// Mask an address to its aggregation prefix: /24 for IPv4, /48 for IPv6.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a dual-stack socket
+/// reports for an IPv4 client) is unmapped first and gets the IPv4 /24. Masked
+/// as IPv6 it would land in `::/48`, putting every IPv4 client of the node in
+/// one prefix.
 pub fn aggregation_prefix(ip: IpAddr) -> IpAddr {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -432,6 +444,12 @@ pub struct TieredRateLimiter {
     allocate: ShardedRateLimiter,
     create_permission: ShardedRateLimiter,
     channel_bind: ShardedRateLimiter,
+}
+
+impl std::fmt::Debug for TieredRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TieredRateLimiter").finish_non_exhaustive()
+    }
 }
 
 impl TieredRateLimiter {
@@ -508,6 +526,27 @@ impl TieredRateLimiter {
         self.allocate.cleanup(max_age_secs);
         self.create_permission.cleanup(max_age_secs);
         self.channel_bind.cleanup(max_age_secs);
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    #[test]
+    fn v4_mapped_addresses_aggregate_as_ipv4() {
+        let mapped: IpAddr = "::ffff:203.0.113.77".parse().unwrap();
+        assert_eq!(
+            aggregation_prefix(mapped),
+            "203.0.113.0".parse::<IpAddr>().unwrap()
+        );
+        let other: IpAddr = "::ffff:198.51.100.1".parse().unwrap();
+        assert_ne!(aggregation_prefix(mapped), aggregation_prefix(other));
+        let v6: IpAddr = "2001:db8:1:2::5".parse().unwrap();
+        assert_eq!(
+            aggregation_prefix(v6),
+            "2001:db8:1::".parse::<IpAddr>().unwrap()
+        );
     }
 }
 

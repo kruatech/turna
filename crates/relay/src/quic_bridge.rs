@@ -118,6 +118,20 @@ struct SessionCtx {
     /// response goes back on that stream rather than whichever one the client
     /// happened to open first.
     last_stream: Option<u64>,
+    /// Distinguishes this session from an earlier one with the same id, so a
+    /// parked request is never re-processed on a session that replaced it.
+    seq: u64,
+}
+
+/// A control message parked on a credential lookup (`[turn.auth.webhook]`),
+/// handed back to the listener when the lookup finishes. The listener passes
+/// it to [`QuicBridge::reprocess`].
+#[derive(Debug)]
+pub struct QuicRetry {
+    session_id: String,
+    seq: u64,
+    stream_id: u64,
+    msg: Vec<u8>,
 }
 
 /// Bridges `QuicEvent`s into the processor. Tracks per-session remote address
@@ -130,6 +144,13 @@ pub struct QuicBridge {
     /// O(sessions) on the egress hot path.
     by_addr: HashMap<SocketAddr, String>,
     failed_sessions: Vec<String>,
+    /// Stream messages waiting on a credential lookup. QUIC streams are
+    /// reliable, so the client does not retransmit a request the processor
+    /// left unanswered; it is re-processed from here instead. `None` until the
+    /// listener opts in with [`with_credential_retry`](Self::with_credential_retry):
+    /// without it such a request goes unanswered, as before.
+    parked: Option<crate::stream_retry::ParkingLot<u64, QuicRetry>>,
+    next_seq: u64,
 }
 
 impl QuicBridge {
@@ -139,7 +160,65 @@ impl QuicBridge {
             sessions: HashMap::new(),
             by_addr: HashMap::new(),
             failed_sessions: Vec::new(),
+            parked: None,
+            next_seq: 0,
         }
+    }
+
+    /// Re-process stream requests parked on credential lookups: they come back
+    /// on `retry`, and the listener feeds each to [`reprocess`](Self::reprocess).
+    pub fn with_credential_retry(mut self, retry: tokio::sync::mpsc::Sender<QuicRetry>) -> Self {
+        self.parked = Some(crate::stream_retry::ParkingLot::new(retry));
+        self
+    }
+
+    /// Process a stream control message; park it if its credentials are being
+    /// looked up. Media (datagrams) never comes here: those clients retransmit.
+    fn process_stream_msg(
+        &mut self,
+        session_id: &str,
+        stream_id: u64,
+        msg: Vec<u8>,
+    ) -> Vec<Action> {
+        let Some(ctx) = self.sessions.get(session_id) else {
+            return Vec::new();
+        };
+        let (remote, seq) = (ctx.remote, ctx.seq);
+        let keep = self.parked.as_ref().map(|_| msg.clone());
+        let mut actions = self.processor.process_owned(msg, remote);
+        if let (Some(lot), Some(msg)) = (&self.parked, keep) {
+            let mut wait = None;
+            actions.retain_mut(|a| match a {
+                Action::AwaitCredentials { wait: w } => {
+                    wait = Some(w.clone());
+                    false
+                }
+                _ => true,
+            });
+            if let Some(w) = wait {
+                let retry = QuicRetry {
+                    session_id: session_id.to_string(),
+                    seq,
+                    stream_id,
+                    msg,
+                };
+                if !lot.park(w, seq, retry) {
+                    tracing::debug!(%remote, "credential-wait slots full; QUIC request dropped");
+                }
+            }
+        }
+        actions
+    }
+
+    /// Process a request that was parked on a credential lookup, if its session
+    /// is still the one it arrived on. The response goes back on the stream the
+    /// request came in on.
+    pub fn reprocess(&mut self, r: QuicRetry) -> Vec<Action> {
+        match self.sessions.get_mut(&r.session_id) {
+            Some(ctx) if ctx.seq == r.seq => ctx.last_stream = Some(r.stream_id),
+            _ => return Vec::new(),
+        }
+        self.process_stream_msg(&r.session_id, r.stream_id, r.msg)
     }
 
     pub fn take_failed_sessions(&mut self) -> Vec<String> {
@@ -196,18 +275,23 @@ impl QuicBridge {
         match ev {
             QuicEvent::NewSession(s) => {
                 self.by_addr.insert(s.remote_addr, s.session_id.clone());
+                self.next_seq += 1;
                 self.sessions.insert(
                     s.session_id.clone(),
                     SessionCtx {
                         remote: s.remote_addr,
                         framers: HashMap::new(),
                         last_stream: None,
+                        seq: self.next_seq,
                     },
                 );
                 Vec::new()
             }
             QuicEvent::SessionClosed { session_id, .. } => {
                 if let Some(ctx) = self.sessions.remove(&session_id) {
+                    if let Some(lot) = &self.parked {
+                        lot.forget(ctx.seq);
+                    }
                     // Only drop the reverse entry if it still points at us: a
                     // migrated session may have handed the old address on.
                     if self.by_addr.get(&ctx.remote).map(|s| s.as_str())
@@ -232,19 +316,23 @@ impl QuicBridge {
                 stream_id,
             } => {
                 let mut out = Vec::new();
+                let mut msgs = Vec::new();
                 if let Some(ctx) = self.sessions.get_mut(&session_id) {
                     // Remember which stream to answer on.
                     ctx.last_stream = Some(stream_id);
                     let framer = ctx.framers.entry(stream_id).or_default();
                     framer.push(&data);
                     while let Some(msg) = framer.next_message() {
-                        // Owned message from the framer — see the `Datagram`
-                        // arm for why `process_slice` must not be used here.
-                        out.extend(processor.process_owned(msg, ctx.remote));
+                        msgs.push(msg);
                     }
                     if framer.failed {
-                        self.failed_sessions.push(session_id);
+                        self.failed_sessions.push(session_id.clone());
                     }
+                }
+                // Owned messages from the framer — see the `Datagram` arm for
+                // why `process_slice` must not be used here.
+                for msg in msgs {
+                    out.extend(self.process_stream_msg(&session_id, stream_id, msg));
                 }
                 out
             }
@@ -524,5 +612,155 @@ mod tests {
         f.push(&wire);
         assert_eq!(f.next_message(), None);
         assert!(f.failed);
+    }
+}
+
+/// `[turn.auth.webhook]` over QUIC streams: a request whose USERNAME is being
+/// looked up is parked and re-processed, because the client will not
+/// retransmit on a reliable stream; a session that closes meanwhile gets
+/// nothing.
+#[cfg(test)]
+mod credential_retry_tests {
+    use super::*;
+    use std::time::Duration;
+    use turna_auth::webhook::{CredentialCache, FetchOutcome, WebhookSettings};
+    use turna_proto_stun::attribute::Attribute;
+    use turna_proto_stun::header::MessageClass;
+    use turna_proto_stun::message::StunMessage;
+    use turna_proto_stun::method::Method;
+
+    fn password() -> String {
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    struct Fixture {
+        bridge: QuicBridge,
+        cache: Arc<CredentialCache>,
+        _jobs: tokio::sync::mpsc::Receiver<turna_auth::webhook::FetchJob>,
+        retry: tokio::sync::mpsc::Receiver<QuicRetry>,
+    }
+
+    fn fixture() -> Fixture {
+        let (cache, jobs) = CredentialCache::new(
+            "q",
+            WebhookSettings {
+                positive_ttl: Duration::from_secs(60),
+                negative_ttl: Duration::from_secs(60),
+                error_ttl: Duration::from_secs(60),
+                max_entries: 16,
+                queue_depth: 16,
+            },
+        );
+        let mode = turna_auth::AuthMode::long_term("q", [("local", password())])
+            .with_webhook(cache.clone());
+        let processor = Arc::new(PacketProcessor::new(
+            Arc::new(turna_session::AllocationStore::new(41000, 41100, 16)),
+            Arc::new(turna_auth::AuthRegistry::new(mode)),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(turna_health::Metrics::new()),
+        ));
+        let (tx, retry) = tokio::sync::mpsc::channel(16);
+        let mut bridge = QuicBridge::new(processor).with_credential_retry(tx);
+        bridge.on_event(QuicEvent::NewSession(
+            turna_transport::quic::WebTransportSession {
+                session_id: "s".into(),
+                remote_addr: "127.0.0.1:51500".parse().unwrap(),
+                local_addr: "127.0.0.1:3479".parse().unwrap(),
+                connection_id: vec![],
+                datagrams_available: true,
+                alpn: "stun.turn".into(),
+                created_at: std::time::Instant::now(),
+            },
+        ));
+        Fixture {
+            bridge,
+            cache,
+            _jobs: jobs,
+            retry,
+        }
+    }
+
+    fn send(b: &mut QuicBridge, msg: &[u8]) -> Vec<Action> {
+        b.on_event(QuicEvent::StreamData {
+            session_id: "s".into(),
+            stream_id: 4,
+            data: msg.to_vec(),
+        })
+    }
+
+    fn reply(actions: &[Action]) -> Option<StunMessage> {
+        actions.iter().find_map(|a| match a {
+            Action::Send { data, .. } => StunMessage::decode(data).ok(),
+            _ => None,
+        })
+    }
+
+    /// Challenge, then an Allocate for `user` signed with `pass`.
+    fn allocate(b: &mut QuicBridge, user: &str, pass: &str) -> Vec<u8> {
+        let mut probe = StunMessage::new(Method::Allocate, MessageClass::Request);
+        probe.add(Attribute::RequestedTransport(17));
+        let mut buf = [0u8; 256];
+        let n = probe.encode(&mut buf).unwrap();
+        let challenge = reply(&send(b, &buf[..n])).expect("401");
+        let nonce = challenge.get_nonce().unwrap().to_string();
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::RequestedTransport(17));
+        m.add(Attribute::Username(user.into()));
+        m.add(Attribute::Realm("q".into()));
+        m.add(Attribute::Nonce(nonce));
+        let key = turna_crypto::long_term_key(user, "q", pass);
+        let mut buf = [0u8; 512];
+        let n = m.encode_with_integrity(&mut buf, &key).unwrap();
+        buf[..n].to_vec()
+    }
+
+    #[tokio::test]
+    async fn parked_stream_request_is_answered_after_the_lookup() {
+        let mut f = fixture();
+        let pw = password();
+        let req = allocate(&mut f.bridge, "remote", &pw);
+        let first = send(&mut f.bridge, &req);
+        assert!(reply(&first).is_none(), "nothing answered while pending");
+        assert!(
+            !first
+                .iter()
+                .any(|a| matches!(a, Action::AwaitCredentials { .. })),
+            "the bridge keeps the wait to itself"
+        );
+        f.cache.complete(
+            "remote",
+            FetchOutcome::Found {
+                keys: turna_auth::UserKeys::derive("remote", "q", &pw),
+                ttl: None,
+            },
+        );
+        let r = tokio::time::timeout(Duration::from_secs(2), f.retry.recv())
+            .await
+            .expect("re-injected")
+            .unwrap();
+        let answer = reply(&f.bridge.reprocess(r)).expect("answered");
+        assert!(matches!(answer.class, MessageClass::SuccessResponse));
+        assert_eq!(f.bridge.control_stream_for("s"), Some(4));
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_gets_nothing() {
+        let mut f = fixture();
+        let req = allocate(&mut f.bridge, "remote", &password());
+        let _ = send(&mut f.bridge, &req);
+        f.bridge.on_event(QuicEvent::SessionClosed {
+            session_id: "s".into(),
+            reason: "gone".into(),
+        });
+        f.cache.complete("remote", FetchOutcome::NotFound);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), f.retry.recv())
+                .await
+                .is_err(),
+            "no re-injection for a closed session"
+        );
     }
 }

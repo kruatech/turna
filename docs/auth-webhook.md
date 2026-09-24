@@ -92,20 +92,44 @@ and every client hashed to it. So:
      §6.2.1: first retransmission after 500 ms; browsers use less), the answer
      is in the cache by then, and the retransmission is served. The cost is one
      retransmission interval on a user's first allocation after a cache miss.
-   - **TURNS and SCTP**: clients on a reliable transport do not retransmit, so
-     the bridge re-processes the same request as soon as the lookup completes
-     (bounded to 4096 parked requests node-wide, 12 s each).
-   - **QUIC/WebTransport stream messages**: not re-processed. A first request for
-     an uncached user over a stream is not answered and the client's own
-     transaction timeout applies. Known gap.
+   - **TURNS, SCTP, and QUIC/WebTransport stream messages**: clients on a
+     reliable transport do not retransmit, so the bridge parks the request and
+     re-processes it as soon as the lookup completes. Bounded: 4096 parked
+     requests per bridge, 8 per connection, 12 s each; requests waiting on the
+     same lookup share one waiting task. A request whose connection (or QUIC
+     session) closes meanwhile is discarded, and the TURNS bridge drops any
+     packet for a connection it no longer knows, so no allocation is created
+     for a client that is gone.
 3. **Failure** — timeout, error status, malformed body, or no room to queue the
    fetch (`queue_depth` full, or the cache full of in-flight lookups): `500
    Server Error`. **Fail closed**: nobody is admitted on a lookup that did not
    succeed.
 
-Pending and failed lookups are not authentication failures: they are not in
-`turna_auth_failures`, and they never feed `[turn.auto_ban]`. A 404 followed by
-the client's credentials is an ordinary auth failure and does.
+Cache TTLs are never below one second, whatever the configuration or the
+endpoint's `ttl_secs` says: an answer that expired as it was stored would turn
+every retransmission into another HTTP request and never answer the client.
+
+### Lookup floods
+
+Only a request that has completed a NONCE round trip can start a lookup, but
+such a client can still name a different random user in every Allocate or
+Refresh. Unbounded, one host would fill `queue_depth` and every uncached user on
+the node would get 500 until it drained. Three controls stop that:
+
+- **A per-source lookup budget**: `lookups_per_ip_burst` / `lookups_per_ip_rps`
+  and `lookups_per_prefix_burst` / `lookups_per_prefix_rps` (per /24 or /48).
+  Charged only when a request would *start* a fetch — cache hits and requests
+  joining a lookup already in flight cost nothing. Over budget, that source gets
+  `500` (`turna_auth_webhook_throttled_total`); nobody else is affected.
+- **Auto-ban evidence**: with `[turn.auto_ban]` on, every lookup a source starts
+  and every one it is refused counts toward `credential_lookups` (default 20 per
+  window). A 404 answer followed by the client's credentials is an ordinary auth
+  failure and counts toward `auth_failures`.
+- **Refresh is rate-limited** with the Allocate tier, like Allocate itself.
+
+A lookup that is merely pending for a legitimate user, and an endpoint outage
+(`Unavailable`), are not auth failures: they are not in `turna_auth_failures`
+and an outage never feeds auto-ban.
 
 A STUN Binding carrying MESSAGE-INTEGRITY needs no NONCE, so its source address
 may be forged. It is validated against the cache only and **never starts a
@@ -117,7 +141,9 @@ reaches the webhook has already completed a NONCE round trip from its source.
 ## Operating it
 
 **Sizing.** `max_concurrency` bounds requests in flight; `queue_depth` bounds
-lookups waiting for a slot. With the defaults, a cold cache after a restart
+lookups waiting for a slot; the per-source budget bounds how much of that one
+source can use. An office where hundreds of users sign in at once behind one NAT
+address will need a larger `lookups_per_ip_*` than the defaults (16 burst, 2/s). With the defaults, a cold cache after a restart
 fetches 32 users at a time. The cache holds `max_entries` users; beyond it the
 entry expiring soonest is evicted (never one in flight).
 

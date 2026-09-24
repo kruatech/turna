@@ -1,6 +1,13 @@
 //! Node-wide relay bandwidth cap — `[turn.relay] max_total_bytes_per_sec`.
 //!
-//! One token bucket, in bytes, shared by every allocation and every datapath.
+//! One token bucket, in bytes, shared by every allocation on every packet
+//! datapath (UDP, TURNS, DTLS, QUIC, SCTP control connections relaying UDP).
+//! RFC 6062 TCP-relay data is **not** counted: it is copied between TCP sockets
+//! outside the packet processor.
+//!
+//! First come, first served: there is no fairness between allocations, so one
+//! heavy allocation can use the budget the others needed. The per-allocation
+//! quota is what bounds a single allocation; this bounds the sum.
 //! It is the node-level counterpart of the per-allocation quota: that one stops
 //! a single client from taking the uplink, this one stops the *sum* of clients
 //! from exceeding what the operator has decided the node may carry (a paid
