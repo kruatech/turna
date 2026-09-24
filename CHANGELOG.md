@@ -141,6 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Transport: the per-IP DTLS session counters (both listener paths), the
+  io_uring relay-route table, the UDP buffer pool and the hugepage free list use
+  `parking_lot::Mutex` instead of `std::sync::Mutex` + `.lock().unwrap()`. A
+  panic while one of these was held used to poison it, and every later
+  `.unwrap()` on the recv/send path then panicked too. The demux path already
+  ignored poisoning by hand (`into_inner()`); all of them now share the
+  workspace's stated hot-path lock policy.
+
 - **Key material was freed without being overwritten.** The shared secret is
   resident for the whole run, and a SIGHUP rotation made that worse rather than
   better: the new `AuthMode` and `TurnaConfig` were swapped in and the old
