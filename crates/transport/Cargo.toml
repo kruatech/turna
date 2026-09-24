@@ -29,7 +29,6 @@ tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-turna-packet.workspace = true
 libc = "0.2"
 hmac.workspace = true
 sha1.workspace = true

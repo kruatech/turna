@@ -4299,7 +4299,6 @@ dependencies = [
  "rand 0.10.2",
  "sha1",
  "sha2 0.10.9",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4469,13 +4468,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "turna-packet"
-version = "0.5.0"
-dependencies = [
- "bytes",
-]
-
-[[package]]
 name = "turna-proto-rtp"
 version = "0.5.0"
 dependencies = [
@@ -4513,7 +4505,6 @@ dependencies = [
  "dashmap",
  "loom",
  "parking_lot",
- "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -4534,7 +4525,6 @@ dependencies = [
  "turna-common",
  "turna-crypto",
  "turna-health",
- "turna-proto-rtp",
  "turna-proto-stun",
  "turna-proto-turn",
  "turna-qos",
@@ -4620,7 +4610,6 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "turna-dtls",
- "turna-packet",
  "webrtc-util",
  "wtransport",
  "xsk-rs",

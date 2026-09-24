@@ -9,7 +9,6 @@ members = [
     "crates/protocol/proto-turn",
     "crates/protocol/proto-rtp",
     "crates/rtp-analyzer",
-    "crates/packet",
     "crates/crypto",
     "crates/common",
 
@@ -35,6 +34,7 @@ members = [
     # binaries
     "services/node",
     "services/control-plane",
+    "services/admin",
 
     # tools
     "tools/turnactl",
@@ -46,7 +46,7 @@ members = [
     # tests
     "tests/integration",
     "tests/soak",
-    "services/admin",]
+]
 # fuzz — изолированный workspace для cargo-fuzz (как и было)
 exclude = ["fuzz"]
 
@@ -128,7 +128,6 @@ turna-proto-stun    = { path = "crates/protocol/proto-stun" }
 turna-proto-turn    = { path = "crates/protocol/proto-turn" }
 turna-proto-rtp     = { path = "crates/protocol/proto-rtp" }
 turna-rtp-analyzer  = { path = "crates/rtp-analyzer" }
-turna-packet        = { path = "crates/packet" }
 turna-crypto        = { path = "crates/crypto" }
 turna-relay         = { path = "crates/relay" }
 turna-session       = { path = "crates/session" }

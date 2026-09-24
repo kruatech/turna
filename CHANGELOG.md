@@ -404,6 +404,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PortAllocator::sweep_expired_reservations` now also runs from the periodic
   maintenance sweep, across the base pool and every tenant pool.
 
+### Removed
+
+- `turna-packet`: its `BufferPool` had no user anywhere in the workspace (the
+  transport crate keeps its own pool in `buffer.rs`); the crate and its Miri
+  run are gone. Unused dependency edges dropped as well: `turna-proto-rtp` from
+  `turna-relay` (only `turna-rtp-analyzer` uses it) and `thiserror` from
+  `turna-crypto` and `turna-qos`.
+- Admin frontend build outputs (`*.tsbuildinfo`, `vite.config.d.ts`) are no
+  longer tracked and are now ignored.
+
 ## [0.5.0] - 2026-09-14
 
 ### Breaking
