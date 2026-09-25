@@ -3751,7 +3751,7 @@ mod ops_it {
             .expect("probe answered");
         let realm = extract_realm(&resp).expect("realm");
         let nonce = extract_nonce(&resp).expect("nonce");
-        let key = long_term_key("testuser", &realm, "testpass");
+        let key = long_term_key("testuser", &realm, &test_pass());
         let mut alloc = TurnMsg::request(0x0003);
         alloc.add_requested_transport();
         alloc.add_lifetime(600);
