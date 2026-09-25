@@ -33,7 +33,7 @@ byteorder = "1"
 rand_core = "0.6"
 hkdf = "0.13"
 p256 = { version = "0.13", features = ["default", "ecdh", "ecdsa"] }
-p384 = "0.13"
+p384 = "0.14"
 rand = "0.10"
 hmac = "0.12"
 sha1 = "0.10"
