@@ -45,7 +45,7 @@ cbc = { version = "0.2", features = ["block-padding", "alloc"] }
 # under its own name until those move too.
 aes_cbc = { package = "aes", version = "0.9" }
 aes-gcm = "0.10"
-ccm = "0.5"
+ccm = "0.6"
 tokio = { version = "1.32.0", features = [
     "fs",
     "io-util",
