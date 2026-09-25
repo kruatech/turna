@@ -62,7 +62,7 @@ async-trait = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 x509-parser = "0.18"
 der-parser = "10.0"
-rcgen = "0.13"
+rcgen = "0.14"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 bincode = "1"
