@@ -69,7 +69,7 @@ bincode = "1"
 serde = { version = "1", features = ["derive"] }
 subtle = "2"
 log = "0.4"
-thiserror = "1"
+thiserror = "2"
 # Not optional. Upstream gated `Certificate::from_pem` behind a `pem` feature;
 # turna loads operator certificates from PEM on every DTLS path, so the gate
 # only created a way to build a crate that cannot read a certificate.
