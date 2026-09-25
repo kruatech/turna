@@ -3964,7 +3964,10 @@ mod webhook_tests {
         let flooder: SocketAddr = "203.0.113.30:5000".parse().unwrap();
         let mut throttled = 0;
         for i in 0..50 {
-            let actions = p.process(allocate(&p, flooder, &format!("rand{i}"), "x"), flooder);
+            let actions = p.process(
+                allocate(&p, flooder, &format!("rand{i}"), &password()),
+                flooder,
+            );
             if reply(&actions).and_then(|r| code(&r)) == Some(500) {
                 throttled += 1;
             }
@@ -3984,7 +3987,7 @@ mod webhook_tests {
 
         // A user on another network is looked up as normal.
         let other: SocketAddr = "198.51.100.40:6000".parse().unwrap();
-        let actions = p.process(allocate(&p, other, "realuser", "y"), other);
+        let actions = p.process(allocate(&p, other, "realuser", &password()), other);
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::AwaitCredentials { .. })));
@@ -3999,7 +4002,7 @@ mod webhook_tests {
         let (p, _cache, _jobs) = setup_flood();
         let src: SocketAddr = "203.0.113.31:5000".parse().unwrap();
         for _ in 0..10 {
-            let actions = p.process(allocate(&p, src, "sameuser", "x"), src);
+            let actions = p.process(allocate(&p, src, "sameuser", &password()), src);
             assert!(actions
                 .iter()
                 .any(|a| matches!(a, Action::AwaitCredentials { .. })));
