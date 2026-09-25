@@ -2567,22 +2567,32 @@ mod tests {
     /// teardown, and starts at `begin_window()`, not at construction.
     #[test]
     fn window_runs_from_begin_to_stop_not_to_snapshot() {
+        // Sleeps overshoot on loaded CI runners (a 100 ms sleep measured 150 ms
+        // on macOS), so the window is compared with the time actually taken by
+        // the measured phase, and setup/teardown are long enough that counting
+        // either of them cannot hide inside the tolerance.
         let s = Stats::new();
-        std::thread::sleep(Duration::from_millis(60)); // "setup" — excluded
+        std::thread::sleep(Duration::from_millis(200)); // "setup" — excluded
         s.begin_window();
+        let phase = std::time::Instant::now();
         std::thread::sleep(Duration::from_millis(100)); // measured
         s.sent.store(1000, Ordering::Relaxed);
         s.recv.store(1000, Ordering::Relaxed);
         s.stop();
-        std::thread::sleep(Duration::from_millis(150)); // "teardown" — excluded
+        let measured = phase.elapsed().as_secs_f64();
+        std::thread::sleep(Duration::from_millis(200)); // "teardown" — excluded
         let snap = s.snapshot("x", "channeldata");
         assert!(
-            (0.09..0.15).contains(&snap.duration_s),
-            "window {} s should be ~0.1 s",
+            snap.duration_s >= 0.099 && (snap.duration_s - measured).abs() < 0.05,
+            "window {} s should match the measured phase ({measured} s)",
             snap.duration_s
         );
         // Rate over the window, not over window + teardown.
-        assert!(snap.rps > 6_000.0, "rps {}", snap.rps);
+        assert!(
+            snap.rps > 1000.0 / (measured + 0.1),
+            "rps {} over a {measured} s phase",
+            snap.rps
+        );
         // A second stop must not move the end.
         let before = s.window_secs();
         std::thread::sleep(Duration::from_millis(20));
