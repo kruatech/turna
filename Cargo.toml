@@ -106,7 +106,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.33"
 hostname = "0.3"
 
