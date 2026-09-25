@@ -769,7 +769,12 @@ async fn send_recv(
     data: &[u8],
     timeout_ms: u64,
 ) -> Option<(Vec<u8>, SocketAddr)> {
-    socket.send_to(data, target).await.ok()?;
+    // A connected socket must use send(): BSD/macOS refuse sendto() with a
+    // destination on a connected UDP socket, Linux accepts it.
+    match socket.peer_addr() {
+        Ok(peer) if peer == target => socket.send(data).await.ok()?,
+        _ => socket.send_to(data, target).await.ok()?,
+    };
     let mut buf = vec![0u8; 4096];
     match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
@@ -2433,7 +2438,7 @@ async fn authenticated_allocate(socket: &UdpSocket, target: SocketAddr) -> bool 
     let (Some(realm), Some(nonce)) = (extract_realm(&resp401), extract_nonce(&resp401)) else {
         return false;
     };
-    let key = long_term_key("testuser", &realm, "testpass");
+    let key = long_term_key("testuser", &realm, &test_pass());
     let mut alloc = TurnMsg::request(0x0003);
     alloc.add_requested_transport();
     alloc.add_lifetime(600);
@@ -2850,7 +2855,7 @@ async fn allocate_and_request_permission(
         .expect("401 challenge");
     let realm = extract_realm(&r401).expect("realm");
     let nonce = extract_nonce(&r401).expect("nonce");
-    let key = long_term_key("testuser", &realm, "testpass");
+    let key = long_term_key("testuser", &realm, &test_pass());
     let mut alloc = TurnMsg::request(0x0003);
     alloc.add_requested_transport();
     alloc.add_lifetime(60);
@@ -3154,7 +3159,7 @@ fn tcp_authenticated(
     let r401 = read_stun_over_tcp(s).expect("401 challenge over TCP");
     let realm = extract_realm(&r401).expect("realm");
     let nonce = extract_nonce(&r401).expect("nonce");
-    let key = long_term_key("testuser", &realm, "testpass");
+    let key = long_term_key("testuser", &realm, &test_pass());
     s.write_all(&build(Some((&realm, &nonce))).encode_with_integrity(&key))
         .unwrap();
     read_stun_over_tcp(s).expect("authenticated response over TCP")
