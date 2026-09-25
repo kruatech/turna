@@ -303,6 +303,46 @@ pub struct Metrics {
     pub auth_fail_integrity: AtomicU64,
     pub auth_fail_bad_request: AtomicU64,
 
+    // ── Auto-ban (`[turn.auto_ban]`) ───────────────────────────────────────────
+    // All zero while the feature is off.
+    /// Bans imposed since start.
+    pub autoban_bans: AtomicU64,
+    /// Packets dropped because their source was banned.
+    pub autoban_dropped: AtomicU64,
+    /// Bans currently in the table (gauge, set by the node's sweep).
+    pub autoban_active: AtomicU64,
+    /// Bans refused because `max_bans` live bans were already in force.
+    pub autoban_refused_full: AtomicU64,
+
+    // ── Node-wide bandwidth cap (`[turn.relay] max_total_bytes_per_sec`) ───────
+    /// The configured cap, bytes/second (gauge; 0 = no cap).
+    pub capacity_bytes_per_sec: AtomicU64,
+    /// Relayed packets dropped because the node-wide cap was exhausted.
+    pub capacity_dropped_packets: AtomicU64,
+    /// Bytes in those packets.
+    pub capacity_dropped_bytes: AtomicU64,
+    /// Binding requests without credentials answered with 401 because
+    /// `[turn.auth] require_binding_auth` is on.
+    pub binding_auth_challenges: AtomicU64,
+
+    // ── Credential webhook (`[turn.auth.webhook]`) ─────────────────────────────
+    // Counted by the node's fetcher (requests/errors/not_found), the processor
+    // (deferred/unavailable) or mirrored from the cache's own counters.
+    pub auth_webhook_requests: AtomicU64,
+    pub auth_webhook_errors: AtomicU64,
+    pub auth_webhook_not_found: AtomicU64,
+    pub auth_webhook_cache_hits: AtomicU64,
+    pub auth_webhook_cache_negative_hits: AtomicU64,
+    pub auth_webhook_cache_misses: AtomicU64,
+    pub auth_webhook_rejected: AtomicU64,
+    pub auth_webhook_cache_entries: AtomicU64,
+    /// Requests parked (not answered) while their user was looked up.
+    pub auth_webhook_deferred: AtomicU64,
+    /// Requests refused with 500 because the lookup failed (fail closed).
+    pub auth_webhook_unavailable: AtomicU64,
+    /// Lookups refused by the per-source lookup budget (500 to that source).
+    pub auth_webhook_throttled: AtomicU64,
+
     // ── Experimental transports: QUIC/WebTransport + DTLS (RFC 7350) ──────────
     // Mirrored from the transport-layer QuicStats/DtlsStats by a periodic copy
     // task in the node listeners (the transport crate is leaf-level and cannot
@@ -537,6 +577,25 @@ impl Metrics {
             auth_fail_expired: AtomicU64::new(0),
             auth_fail_integrity: AtomicU64::new(0),
             auth_fail_bad_request: AtomicU64::new(0),
+            autoban_bans: AtomicU64::new(0),
+            autoban_dropped: AtomicU64::new(0),
+            autoban_active: AtomicU64::new(0),
+            autoban_refused_full: AtomicU64::new(0),
+            capacity_bytes_per_sec: AtomicU64::new(0),
+            capacity_dropped_packets: AtomicU64::new(0),
+            capacity_dropped_bytes: AtomicU64::new(0),
+            binding_auth_challenges: AtomicU64::new(0),
+            auth_webhook_requests: AtomicU64::new(0),
+            auth_webhook_errors: AtomicU64::new(0),
+            auth_webhook_not_found: AtomicU64::new(0),
+            auth_webhook_cache_hits: AtomicU64::new(0),
+            auth_webhook_cache_negative_hits: AtomicU64::new(0),
+            auth_webhook_cache_misses: AtomicU64::new(0),
+            auth_webhook_rejected: AtomicU64::new(0),
+            auth_webhook_cache_entries: AtomicU64::new(0),
+            auth_webhook_deferred: AtomicU64::new(0),
+            auth_webhook_unavailable: AtomicU64::new(0),
+            auth_webhook_throttled: AtomicU64::new(0),
             quic_active: AtomicU64::new(0),
             quic_sessions_total: AtomicU64::new(0),
             quic_closed_total: AtomicU64::new(0),
@@ -764,6 +823,91 @@ impl Metrics {
             self.auth_fail_expired.load(Ordering::Relaxed),
             self.auth_fail_integrity.load(Ordering::Relaxed),
             self.auth_fail_bad_request.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Abuse controls: `[turn.auto_ban]`, the node-wide bandwidth cap and
+    /// authenticated Binding. Emitted unconditionally (zero while
+    /// the feature is off) so scrapes have a stable series set.
+    fn render_abuse_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_autoban_bans_total Sources banned by [turn.auto_ban] since start\n\
+             # TYPE turna_autoban_bans_total counter\n\
+             turna_autoban_bans_total {}\n\
+             # HELP turna_autoban_active Bans currently in force (or expired and not yet swept)\n\
+             # TYPE turna_autoban_active gauge\n\
+             turna_autoban_active {}\n\
+             # HELP turna_autoban_dropped_total Packets dropped because their source was banned\n\
+             # TYPE turna_autoban_dropped_total counter\n\
+             turna_autoban_dropped_total {}\n\
+             # HELP turna_autoban_refused_full_total Bans not imposed because max_bans live bans were already in force\n\
+             # TYPE turna_autoban_refused_full_total counter\n\
+             turna_autoban_refused_full_total {}\n\
+             # HELP turna_relay_capacity_bytes_per_sec Configured node-wide relay bandwidth cap, bytes/second (0 = none)\n\
+             # TYPE turna_relay_capacity_bytes_per_sec gauge\n\
+             turna_relay_capacity_bytes_per_sec {}\n\
+             # HELP turna_relay_capacity_dropped_packets_total Relayed packets dropped because the node-wide bandwidth cap was exhausted\n\
+             # TYPE turna_relay_capacity_dropped_packets_total counter\n\
+             turna_relay_capacity_dropped_packets_total {}\n\
+             # HELP turna_relay_capacity_dropped_bytes_total Bytes in relayed packets dropped by the node-wide bandwidth cap\n\
+             # TYPE turna_relay_capacity_dropped_bytes_total counter\n\
+             turna_relay_capacity_dropped_bytes_total {}\n\
+             # HELP turna_binding_auth_challenges_total Binding requests without credentials challenged because require_binding_auth is on\n\
+             # TYPE turna_binding_auth_challenges_total counter\n\
+             turna_binding_auth_challenges_total {}\n\
+             # HELP turna_auth_webhook_requests_total Credential lookups sent to the auth webhook\n\
+             # TYPE turna_auth_webhook_requests_total counter\n\
+             turna_auth_webhook_requests_total {}\n\
+             # HELP turna_auth_webhook_errors_total Auth webhook lookups that failed (timeout, transport, non-2xx other than 404, malformed body)\n\
+             # TYPE turna_auth_webhook_errors_total counter\n\
+             turna_auth_webhook_errors_total {}\n\
+             # HELP turna_auth_webhook_not_found_total Auth webhook lookups answered 404 (unknown user)\n\
+             # TYPE turna_auth_webhook_not_found_total counter\n\
+             turna_auth_webhook_not_found_total {}\n\
+             # HELP turna_auth_webhook_cache_hits_total Credential lookups answered from a cached found user\n\
+             # TYPE turna_auth_webhook_cache_hits_total counter\n\
+             turna_auth_webhook_cache_hits_total {}\n\
+             # HELP turna_auth_webhook_cache_negative_hits_total Credential lookups answered from a cached unknown user\n\
+             # TYPE turna_auth_webhook_cache_negative_hits_total counter\n\
+             turna_auth_webhook_cache_negative_hits_total {}\n\
+             # HELP turna_auth_webhook_cache_misses_total Credential lookups that had to call the webhook\n\
+             # TYPE turna_auth_webhook_cache_misses_total counter\n\
+             turna_auth_webhook_cache_misses_total {}\n\
+             # HELP turna_auth_webhook_rejected_total Credential lookups refused because the fetch queue or cache was full\n\
+             # TYPE turna_auth_webhook_rejected_total counter\n\
+             turna_auth_webhook_rejected_total {}\n\
+             # HELP turna_auth_webhook_cache_entries Users currently held in the credential cache\n\
+             # TYPE turna_auth_webhook_cache_entries gauge\n\
+             turna_auth_webhook_cache_entries {}\n\
+             # HELP turna_auth_webhook_deferred_total Requests parked unanswered while their user was looked up\n\
+             # TYPE turna_auth_webhook_deferred_total counter\n\
+             turna_auth_webhook_deferred_total {}\n\
+             # HELP turna_auth_webhook_unavailable_total Requests refused with 500 because the credential lookup failed (fail closed)\n\
+             # TYPE turna_auth_webhook_unavailable_total counter\n\
+             turna_auth_webhook_unavailable_total {}\n\
+             # HELP turna_auth_webhook_throttled_total Credential lookups refused by the per-source lookup budget\n\
+             # TYPE turna_auth_webhook_throttled_total counter\n\
+             turna_auth_webhook_throttled_total {}\n",
+            l(&self.autoban_bans),
+            l(&self.autoban_active),
+            l(&self.autoban_dropped),
+            l(&self.autoban_refused_full),
+            l(&self.capacity_bytes_per_sec),
+            l(&self.capacity_dropped_packets),
+            l(&self.capacity_dropped_bytes),
+            l(&self.binding_auth_challenges),
+            l(&self.auth_webhook_requests),
+            l(&self.auth_webhook_errors),
+            l(&self.auth_webhook_not_found),
+            l(&self.auth_webhook_cache_hits),
+            l(&self.auth_webhook_cache_negative_hits),
+            l(&self.auth_webhook_cache_misses),
+            l(&self.auth_webhook_rejected),
+            l(&self.auth_webhook_cache_entries),
+            l(&self.auth_webhook_deferred),
+            l(&self.auth_webhook_unavailable),
+            l(&self.auth_webhook_throttled),
         )
     }
 
@@ -2302,6 +2446,7 @@ pub async fn serve_on(
                         m.processor_panics.load(Ordering::Relaxed)
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
+                    body.push_str(&m.render_abuse_metrics());
                     body.push_str(&m.render_transport_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());
@@ -2365,6 +2510,7 @@ mod metrics_format_regression {
             m.peer_rejected.load(Ordering::Relaxed),
         );
         body.push_str(&m.render_auth_reason_metrics());
+        body.push_str(&m.render_abuse_metrics());
         body.push_str(&m.render_transport_metrics());
         body
     }

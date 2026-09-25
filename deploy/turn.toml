@@ -108,6 +108,31 @@ transport   = "tokio"
 shared_secret = "${TURNA_SHARED_SECRET:-change-me-in-production}"
 token_ttl     = 86400
 
+# coturn's secure-stun: answer an anonymous STUN Binding with a 401 challenge.
+# Leave off where browsers use this node as their STUN server — they send
+# Binding without credentials and would lose their reflexive candidate.
+# require_binding_auth = false
+
+# Look up users that are not configured here through your signalling service
+# (docs/auth-webhook.md has the request/response contract). Off by default;
+# when on, this realm uses long-term credentials: static users first, then the
+# webhook. https:// and a bearer token or signing secret are required in
+# production. Any lookup failure refuses the user (500) — fail closed.
+# [turn.auth.webhook]
+# enabled = true
+# url = "https://signalling.internal/turn/credentials"
+# bearer_token = "${TURNA_WEBHOOK_TOKEN}"
+# signing_secret = "file:///run/secrets/turna_webhook_hmac"
+# timeout_ms = 2000
+# positive_ttl_secs = 300
+# negative_ttl_secs = 30
+# Per-source budget for lookups a client may start (one host naming random
+# users must not fill the shared queue). Raise for a large office behind one NAT.
+# lookups_per_ip_burst = 16
+# lookups_per_ip_rps = 2
+# lookups_per_prefix_burst = 64
+# lookups_per_prefix_rps = 8
+
 # Static long-term credentials — uncomment if you want fixed users
 # instead of (or in addition to) shared-secret. When non-empty,
 # AuthMode::LongTerm is selected in main.rs.
@@ -143,6 +168,11 @@ max_allocations = 8192
 [turn.relay.quota]
 max_bytes_per_sec_per_allocation = 0     # 0 = unlimited
 max_per_user      = 100   # 0 = unlimited (NOT recommended for prod)
+
+# Node-wide cap on relayed bytes/second (both directions, all allocations) — the
+# counterpart of coturn's bps-capacity, but packets over it are DROPPED rather
+# than new sessions refused. 0 (default) = no cap. Goes in [turn.relay] above:
+# max_total_bytes_per_sec = 125000000   # ~1 Gbit/s
 
 # =============================================================================
 # [turn.observability] — telemetry & tracing
@@ -203,6 +233,31 @@ max_spans_per_second = 1000
 # still override these, and now warn when they do. They are deprecated: a limit
 # set there appears in no config file and in no --dump-config output, which is
 # how an operator ends up looking for a ceiling that is not written down.
+
+# =============================================================================
+# [turn.auto_ban] — temporary bans after repeated failures (fail2ban built in)
+# =============================================================================
+# Off by default. A source that fails authentication `auth_failures` times in
+# `window_secs` has every packet dropped for `ban_secs`, before any other work.
+# Only failures behind a valid NONCE count, so a spoofed source cannot get a
+# victim banned that way.
+#
+# rate_limit_violations (0 = off) also bans on rate-limiter refusals. Those are
+# raw packets and CAN carry a forged source address: enable only where spoofing
+# is filtered upstream. [turn.rate_limit] trusted_prefixes are exempt by default.
+#
+# [turn.auto_ban]
+# enabled = true
+# auth_failures = 10
+# rate_limit_violations = 0
+# credential_lookups = 20         # [turn.auth.webhook] lookups started per source
+# window_secs = 60
+# ban_secs = 600
+# scope = "ip"                    # or "prefix": count and ban per /24 or /48
+# allowlist = ["198.51.100.0/24"]
+# exempt_trusted_prefixes = true
+# max_tracked = 65536
+# max_bans = 16384
 
 # =============================================================================
 # [health] — Prometheus metrics + /health endpoint

@@ -43,8 +43,11 @@ constraints below are taken from `crates/config/src/lib.rs`.
 | `shared_secret` | string | (built-in placeholder) | coturn-style `lt-cred-mech` (time-limited credentials). |
 | `token_ttl` | u64 | `86400` | Token lifetime, seconds. |
 | `static_users` | array of `{ username, password }` | `[]` | Long-term static credentials. |
+| `require_binding_auth` | bool | `false` | coturn `secure-stun`. When `true`, a STUN Binding without MESSAGE-INTEGRITY is answered with a 401 challenge; one with credentials must carry a valid NONCE and gets a response signed with the same MESSAGE-INTEGRITY variant. **Leave off** on a node browsers also use as their STUN server: they send Binding unauthenticated and would lose their server-reflexive candidate. Counted in `turna_binding_auth_challenges_total`. |
 
 Use **one** of: `static_users` (long-term) or `shared_secret` (time-limited).
+`[turn.auth.webhook]` (below) extends the long-term form with users looked up
+on your signalling service.
 
 ```toml
 [turn.auth]
@@ -52,6 +55,32 @@ static_users = [{ username = "alice", password = "s3cret" }]
 # or:
 # shared_secret = "${TURNA_SHARED_SECRET}"
 ```
+
+---
+
+## `[turn.auth.webhook]`
+
+Look up long-term users that are not in `static_users` through your signalling
+service. **Off by default.** The request/response contract, the signature, the
+caching and fail-closed behaviour, and what each transport does while a lookup is
+in flight are in **[auth-webhook.md](auth-webhook.md)**.
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Enabling it makes the base realm long-term (static users first, then the webhook). Refused together with `[turn.auth.oauth]`. |
+| `url` | string | `""` | `https://` required; `http://` only with `production = false`. `${VAR}` / `file://` substitution applies. |
+| `bearer_token` | string | `""` | Sent as `Authorization: Bearer …`. Masked in `--dump-config`. |
+| `signing_secret` | string | `""` | HMAC-SHA256 key for `X-Turna-Signature`. Masked in `--dump-config`. Under `production = true` at least one of this and `bearer_token` is required. |
+| `ca_file` | string | `""` | PEM bundle trusted **instead of** the system roots (private CA). An unreadable or empty file stops startup. |
+| `timeout_ms` | u64 | `2000` | Whole-request timeout, 1..=10000. A timeout is a failure. |
+| `max_concurrency` | usize | `32` | Lookups in flight at once. |
+| `queue_depth` | usize | `1024` | Lookups waiting for a slot; beyond it a request fails closed (500). |
+| `positive_ttl_secs` | u64 | `300` | Cache lifetime of a found user. Also the revocation lag. The endpoint can shorten it per user with `ttl_secs`. |
+| `negative_ttl_secs` | u64 | `30` | Cache lifetime of a 404. |
+| `error_ttl_secs` | u64 | `2` | How long a failed lookup keeps failing (500) before it is retried. ≥ 1. |
+| `max_entries` | usize | `100000` | Cap on cached users. |
+| `lookups_per_ip_burst` / `lookups_per_ip_rps` | u32 | `16` / `2` | Per-source-IP budget for lookups a request may **start** (cache hits and joining an in-flight lookup are free). Over it, that source gets 500. Stops one host with a valid NONCE from filling `queue_depth` with random usernames. Raise it for a large office behind one NAT. |
+| `lookups_per_prefix_burst` / `lookups_per_prefix_rps` | u32 | `64` / `8` | The same per /24 (IPv4) or /48 (IPv6). |
 
 ---
 
@@ -347,6 +376,7 @@ IP is required. Readiness follows initialization of every configured queue.
 | `rate_soft_percent` | u64 | `60` | Percent of the above at which `/capacity` reports `DEGRADED`. |
 | `rate_hard_percent` | u64 | `80` | Percent at which it reports `SATURATED`. |
 | `drain_timeout_secs` | u64 | `30` | How long shutdown waits for allocations to end. |
+| `max_total_bytes_per_sec` | u64 | `0` | Node-wide cap on relayed bytes/second, both directions and all allocations combined (coturn `bps-capacity`, different mechanism — see below). RFC 6062 TCP-relay data is not counted. `0` = no cap. Values below 1500 are refused. |
 
 **Measure `max_packets_per_sec`; do not estimate it.**
 `scripts/verify/capacity-profile.sh` on the hardware in question. A figure from
@@ -361,6 +391,25 @@ perfect and broken.
 
 At 80 % that leaves 30 400 pps of headroom before the cliff. At 90 % it would leave
 19 200, which at these rates is seconds of traffic growth.
+
+**`max_total_bytes_per_sec` drops, it does not refuse sessions.** One token
+bucket (one second of burst) shared by every allocation on every packet
+datapath (UDP, TURNS, DTLS, QUIC, SCTP). Once it is empty, relayed packets —
+ChannelData, Send indications and peer→client traffic alike — are dropped and counted in `turna_relay_capacity_dropped_packets_total` /
+`_bytes_total`; the configured figure is exported as
+`turna_relay_capacity_bytes_per_sec`. coturn's `bps-capacity` instead reserves
+bandwidth per session at allocation time and refuses new sessions when it runs
+out. The practical difference: under turna's cap every call on the node degrades
+together, so size it as a ceiling you never expect to reach (a paid egress
+allowance, a shared uplink), not as admission control. Every relayed packet
+updates one shared atomic while the cap is on; it costs nothing when off.
+
+Two limits of the mechanism. **It is first come, first served**: there is no
+fairness between allocations, so a single heavy allocation can spend the budget
+the others needed — bound each one with `max_bytes_per_sec_per_allocation`, and
+use this cap only for the sum. **RFC 6062 TCP-relay data is not counted**: it is
+copied between TCP sockets outside the packet processor, so a node relaying TCP
+peers can exceed the figure by that traffic.
 
 **`drain_timeout_secs` is a bound, not a target.** The drain loop also exits early
 when three consecutive polls remove nothing: a node whose clients vanished without
@@ -593,6 +642,10 @@ only prefixes you route. It is empty by default, because a default that guessed
 at RFC 1918 would hand the higher ceiling to whatever private network happened to
 reach the node.
 
+**Refresh shares the `allocate` tier.** It was the one authenticated method
+without a per-method limit; over the budget it is answered `486` like Allocate. A
+client refreshes every few minutes, so the shared budget costs it nothing.
+
 **No value may be `0`.** Config validation refuses it. A zero refill is a bucket
 that empties once and never fills again, which is never what "0" is meant to
 express, and this limiter has no way to say "unlimited".
@@ -602,6 +655,74 @@ variables still override these and now warn each time they do. They are
 deprecated: a limit set there appears in no config file and in no
 `--dump-config` output, which is how an operator ends up hunting for a ceiling
 that is written down nowhere.
+
+## Auto-ban (`[turn.auto_ban]`)
+
+fail2ban built into the datapath, **off by default**. A source that fails
+authentication `auth_failures` times — or, if enabled, is refused by a rate
+limiter `rate_limit_violations` times — within `window_secs` has **every packet**
+dropped for `ban_secs`: STUN, ChannelData, all transports. The check is the first
+thing the processor does with a packet, before classification, rate limiting,
+parsing or authentication, and costs one atomic load while nothing is banned.
+Bans expire on their own; there is no unban command to forget.
+
+| key | type | default | notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Turn the feature on. |
+| `auth_failures` | u32 | `10` | Auth failures in the window that trigger a ban. `0` disables this trigger. |
+| `rate_limit_violations` | u32 | `0` | Rate-limiter refusals in the window that trigger a ban. `0` (default) disables this trigger — see below. |
+| `credential_lookups` | u32 | `20` | `[turn.auth.webhook]` lookups one source starts, or is refused by its lookup budget, in the window that trigger a ban. Joining a lookup already in flight does not count. `0` disables it. Inert without the webhook. |
+| `window_secs` | u64 | `60` | Counting window. Must be > 0 when enabled. |
+| `ban_secs` | u64 | `600` | Ban duration. Must be > 0 when enabled. |
+| `scope` | string | `"ip"` | `"ip"` counts and bans the address; `"prefix"` counts and bans the /24 (IPv4) or /48 (IPv6), for attackers rotating through a block. |
+| `allowlist` | array of CIDR | `[]` | Never counted, never banned. |
+| `exempt_trusted_prefixes` | bool | `true` | Also exempt `[turn.rate_limit] trusted_prefixes` — the NAT addresses many users share. |
+| `max_tracked` | usize | `65536` | Cap on sources with a running offence count. The idlest of a small sample is evicted beyond it. |
+| `max_bans` | usize | `16384` | Cap on simultaneous bans. A ban beyond it is **refused** (`turna_autoban_refused_full_total`), never evicting another. |
+
+```toml
+[turn.auto_ban]
+enabled = true
+auth_failures = 10
+window_secs = 60
+ban_secs = 600
+allowlist = ["198.51.100.0/24"]   # your office egress
+```
+
+**What counts as an auth failure.** Only requests that carried a valid NONCE and
+then failed credential validation: Allocate, Refresh, CreatePermission,
+ChannelBind, CONNECT and ConnectionBind. The nonce is bound to the client address
+and has to be fetched with a round trip, so this evidence cannot be forged with a
+spoofed source. A Binding with bad MESSAGE-INTEGRITY is deliberately **not**
+counted: it needs no nonce, and counting it would let anyone get a victim banned.
+**`Expired` does not count.** A stale TURN REST credential or OAuth token is a
+client clock or a cached credential, not guessing; it is still counted in
+`turna_auth_failures`. A credential lookup that is merely pending or unavailable
+(the auth webhook) is not a failure either; lookups a source *starts* count
+separately, toward `credential_lookups`.
+
+**Prefix scope and the allowlist.** With `scope = "prefix"` a ban covers the
+whole /24 or /48, but an allowlisted address inside it is still let through.
+Addresses from a dual-stack socket (`::ffff:a.b.c.d`) are treated as the IPv4
+client for keys, prefixes and the allowlist.
+
+**Why `rate_limit_violations` is off by default.** It counts refused packets, and
+a UDP packet can carry any source address. An attacker who can spoof can make the
+node ban an address of their choosing — a customer, a partner's NAT, a monitoring
+probe. Turn it on only where spoofing is filtered upstream (BCP 38), and keep your
+own ranges in `allowlist`. `docs/security/accepted-risks.md` records this.
+
+**Events.** Each ban writes `auto-ban: source banned` (WARN) and each expiry
+`auto-ban: ban expired, source unbanned` (INFO) from `turna_relay::abuse`. Both
+reach syslog as `SOURCE_BANNED` with `src_ip`, `reason` and `detail`. The address
+follows `[observability] log_allocation_addresses` like every other client address.
+Metrics: `turna_autoban_bans_total`, `turna_autoban_active`,
+`turna_autoban_dropped_total`, `turna_autoban_refused_full_total`.
+
+**One table for the node.** Every datapath (UDP, TURNS, DTLS, QUIC, SCTP, the
+io_uring/AF_XDP processors) shares it, so a ban applies everywhere at once. It is
+per node, not per cluster: a source banned on one node can still reach another
+until it fails there too.
 
 ## Bandwidth quota: what it is and is not
 

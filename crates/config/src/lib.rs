@@ -865,6 +865,29 @@ impl TurnaConfig {
                 errors.push(format!("turn.rate_limit.trusted_prefixes: {e}"));
             }
         }
+        errors.extend(self.turn.auto_ban.validate());
+        errors.extend(
+            self.turn
+                .auth
+                .webhook
+                .validate(prod, self.turn.auth.oauth.enabled),
+        );
+        // A node-wide cap below one full-size datagram per second would drop
+        // every packet: that is never what anyone means, so say so at startup.
+        let cap = self.turn.relay.max_total_bytes_per_sec;
+        if cap != 0 && cap < 1_500 {
+            errors.push(format!(
+                "turn.relay.max_total_bytes_per_sec = {cap} is below one 1500-byte packet \
+                 per second, so nothing could be relayed. Use 0 for no cap."
+            ));
+        }
+        if self.turn.auto_ban.enabled && self.turn.auto_ban.rate_limit_violations > 0 {
+            warn!(
+                "turn.auto_ban.rate_limit_violations is set: a UDP flood can carry any \
+                 source address, so an attacker who can spoof can get a victim's address \
+                 banned. auth_failures cannot be forged this way."
+            );
+        }
         // A trusted tier stricter than the default one is almost certainly a
         // copy-paste or a swapped block: the point of the trusted set is a
         // higher ceiling for sources that share a NAT address.
@@ -1063,6 +1086,10 @@ pub struct TurnConfig {
     /// force appeared in no config file and no config dump.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Temporary source bans after repeated auth failures or rate-limit
+    /// refusals (`[turn.auto_ban]`). Off by default.
+    #[serde(default)]
+    pub auto_ban: AutoBanConfig,
     /// Peer-address filtering policy (M1). Defaults to `internet-facing`
     /// (denies RFC 1918 / ULA peers). Set `profile = "lan"` to allow private
     /// relaying. See `docs/security/peer-filter.md`.
@@ -1093,6 +1120,7 @@ impl Default for TurnConfig {
             sctp: SctpSection::default(),
             tcp_relay: TcpRelaySection::default(),
             rate_limit: RateLimitConfig::default(),
+            auto_ban: AutoBanConfig::default(),
             peer_filter: PeerFilterConfig::default(),
         }
     }
@@ -1189,6 +1217,8 @@ impl AuthConfig {
         use zeroize::Zeroize;
         self.shared_secret.zeroize();
         self.previous_shared_secret.zeroize();
+        self.webhook.bearer_token.zeroize();
+        self.webhook.signing_secret.zeroize();
     }
 }
 
@@ -1278,6 +1308,23 @@ pub struct AuthConfig {
     pub static_users: Vec<StaticUser>,
     /// RFC 7635 third-party (OAuth) authorization on the base realm.
     pub oauth: OAuthConfig,
+    /// Require credentials on STUN Binding (coturn's `secure-stun`).
+    ///
+    /// Off by default, and it must stay off wherever this node is also the
+    /// STUN server clients use to learn their reflexive address: browsers send
+    /// that Binding unauthenticated, so with this on they get a 401 and no
+    /// server-reflexive candidate. Turn it on for a TURN-only node whose clients
+    /// authenticate Binding (or never send one), to stop the node answering
+    /// anonymous Binding floods at all.
+    ///
+    /// When on: a Binding without MESSAGE-INTEGRITY is challenged with 401
+    /// (REALM + NONCE, from the same unauthenticated-reply budget as every
+    /// challenge); one with credentials must carry a valid NONCE and is answered
+    /// with a response signed with the same MESSAGE-INTEGRITY variant.
+    pub require_binding_auth: bool,
+    /// Look up unknown long-term users through the signalling service
+    /// (`[turn.auth.webhook]`). Off by default.
+    pub webhook: WebhookConfig,
 }
 
 impl Default for AuthConfig {
@@ -1291,6 +1338,8 @@ impl Default for AuthConfig {
             credential_clock_skew_secs: default_credential_clock_skew(),
             static_users: Vec::new(),
             oauth: OAuthConfig::default(),
+            require_binding_auth: false,
+            webhook: WebhookConfig::default(),
         }
     }
 }
@@ -1325,6 +1374,166 @@ pub struct OAuthConfig {
     /// of falling back to trial-decrypt. Default false keeps the rotation-friendly
     /// trial-decrypt behaviour; enable for a strict RFC / high-assurance profile.
     pub strict_kid: bool,
+}
+
+/// `[turn.auth.webhook]` — ask the operator's signalling service for a
+/// long-term user's key.
+///
+/// When enabled, the base realm uses long-term credentials: `static_users` are
+/// resolved locally first, and any other USERNAME is looked up by POSTing
+/// `{"username", "realm"}` to `url`. The answer (the user's password or its
+/// pre-derived keys, or 404 for "no such user") is cached. The request contract
+/// is in `docs/auth-webhook.md`.
+///
+/// The lookup never runs on the packet path: the datapath consults the cache,
+/// and a miss queues one fetch and parks the request (UDP clients retransmit
+/// into the warm cache; TURNS, SCTP and QUIC-stream requests are re-processed when the answer
+/// lands). Every failure — timeout, error status, malformed body, full queue —
+/// refuses the request (500) for `error_ttl_secs`: fail closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebhookConfig {
+    pub enabled: bool,
+    /// Endpoint. `https://` required; `http://` only with `production = false`
+    /// (a test stub on localhost). Subject to `${VAR}` / `file://` substitution.
+    pub url: String,
+    /// Sent as `Authorization: Bearer <token>`. Empty = not sent.
+    pub bearer_token: String,
+    /// HMAC-SHA256 key for `X-Turna-Signature`, see the contract. Empty = not
+    /// signed. Under `production = true` at least one of `bearer_token` and
+    /// `signing_secret` is required.
+    pub signing_secret: String,
+    /// PEM bundle to trust instead of the system roots (a private CA). Empty =
+    /// system roots.
+    pub ca_file: String,
+    /// Whole-request timeout, milliseconds (1..=10000). A timeout is a failure.
+    pub timeout_ms: u64,
+    /// Lookups in flight at once.
+    pub max_concurrency: usize,
+    /// Lookups waiting for a free slot. Beyond it a request fails closed.
+    pub queue_depth: usize,
+    /// How long a found user's keys are cached. The endpoint may shorten it per
+    /// answer with `ttl_secs`.
+    pub positive_ttl_secs: u64,
+    /// How long "no such user" (404) is cached.
+    pub negative_ttl_secs: u64,
+    /// How long a failed lookup keeps failing before it is retried.
+    pub error_ttl_secs: u64,
+    /// Cap on cached users.
+    pub max_entries: usize,
+    /// Per-source budget for lookups a client may start (a cache miss that
+    /// needs an HTTP request): token bucket per source IP ...
+    pub lookups_per_ip_burst: u32,
+    pub lookups_per_ip_rps: u32,
+    /// ... and per /24 (IPv4) or /48 (IPv6). Without it one host with a valid
+    /// NONCE could name random users and fill `queue_depth`, and every uncached
+    /// user on the node would get 500 until the queue drained. Joining a lookup
+    /// already in flight and cache hits cost nothing.
+    pub lookups_per_prefix_burst: u32,
+    pub lookups_per_prefix_rps: u32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            bearer_token: String::new(),
+            signing_secret: String::new(),
+            ca_file: String::new(),
+            timeout_ms: 2_000,
+            max_concurrency: 32,
+            queue_depth: 1_024,
+            positive_ttl_secs: 300,
+            negative_ttl_secs: 30,
+            error_ttl_secs: 2,
+            max_entries: 100_000,
+            lookups_per_ip_burst: 16,
+            lookups_per_ip_rps: 2,
+            lookups_per_prefix_burst: 64,
+            lookups_per_prefix_rps: 8,
+        }
+    }
+}
+
+impl WebhookConfig {
+    pub(crate) fn validate(&self, prod: bool, oauth_enabled: bool) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled {
+            return errors;
+        }
+        let lower = self.url.to_ascii_lowercase();
+        if self.url.is_empty() {
+            errors
+                .push("turn.auth.webhook.enabled = true but turn.auth.webhook.url is empty".into());
+        } else if lower.starts_with("http://") {
+            if prod {
+                errors.push(
+                    "turn.auth.webhook.url uses http:// in production; the request \
+                     carries the webhook credential and the answer carries user keys, \
+                     so it must be https://"
+                        .into(),
+                );
+            } else {
+                warn!(
+                    "turn.auth.webhook.url is plain http:// — acceptable for a local test \
+                     stub, refused under production = true"
+                );
+            }
+        } else if !lower.starts_with("https://") {
+            errors.push(
+                "turn.auth.webhook.url must start with https:// (or http:// outside production)"
+                    .into(),
+            );
+        }
+        if prod && self.bearer_token.is_empty() && self.signing_secret.is_empty() {
+            errors.push(
+                "turn.auth.webhook has neither bearer_token nor signing_secret in production: \
+                 the endpoint could not tell turna from anyone else asking for user keys"
+                    .into(),
+            );
+        }
+        if oauth_enabled {
+            errors.push(
+                "turn.auth.webhook and turn.auth.oauth are both enabled; the base realm \
+                 authenticates with one of them. Pick one."
+                    .into(),
+            );
+        }
+        if !(1..=10_000).contains(&self.timeout_ms) {
+            errors.push("turn.auth.webhook.timeout_ms must be in 1..=10000".into());
+        }
+        if self.max_concurrency == 0 || self.queue_depth == 0 || self.max_entries == 0 {
+            errors.push(
+                "turn.auth.webhook.max_concurrency, queue_depth and max_entries must be > 0".into(),
+            );
+        }
+        for (name, v) in [
+            ("lookups_per_ip_burst", self.lookups_per_ip_burst),
+            ("lookups_per_ip_rps", self.lookups_per_ip_rps),
+            ("lookups_per_prefix_burst", self.lookups_per_prefix_burst),
+            ("lookups_per_prefix_rps", self.lookups_per_prefix_rps),
+        ] {
+            if v == 0 {
+                errors.push(format!(
+                    "turn.auth.webhook.{name} must be > 0 (a zero bucket would refuse every lookup)"
+                ));
+            }
+        }
+        // A zero TTL would re-fetch on every packet, and a zero error TTL would
+        // let a stream client's re-processed request find no answer and be
+        // parked again.
+        for (name, v) in [
+            ("positive_ttl_secs", self.positive_ttl_secs),
+            ("negative_ttl_secs", self.negative_ttl_secs),
+            ("error_ttl_secs", self.error_ttl_secs),
+        ] {
+            if v == 0 {
+                errors.push(format!("turn.auth.webhook.{name} must be >= 1"));
+            }
+        }
+        errors
+    }
 }
 
 /// RFC 7635 kid-tagged AS-RS key (see [`OAuthConfig::keys`]).
@@ -1534,6 +1743,116 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// `[turn.auto_ban]` — fail2ban built into the datapath.
+///
+/// A source that fails authentication `auth_failures` times, or is refused by a
+/// rate limiter `rate_limit_violations` times, within `window_secs` has every
+/// packet dropped for `ban_secs`. The check runs before classification, rate
+/// limiting and authentication, and costs one atomic load while nothing is
+/// banned. Bans expire on their own; nothing has to unban.
+///
+/// **Off by default**, and the two triggers are not equally safe:
+///
+/// - `auth_failures` counts only requests that carried a valid, client-bound
+///   NONCE, i.e. the source completed a round trip. It cannot be pointed at a
+///   victim with a spoofed source address.
+/// - `rate_limit_violations` counts refused packets, and a UDP packet can carry
+///   any source address. Someone who can spoof can get an address banned. It is
+///   therefore 0 (off) by default — see `docs/security/accepted-risks.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoBanConfig {
+    pub enabled: bool,
+    /// Authentication failures within the window that trigger a ban. 0 turns
+    /// this trigger off.
+    pub auth_failures: u32,
+    /// Rate-limit refusals within the window that trigger a ban. 0 (default)
+    /// turns this trigger off.
+    pub rate_limit_violations: u32,
+    /// `[turn.auth.webhook]` credential lookups one source starts (or is
+    /// refused by `lookups_per_*`) within the window that trigger a ban. Only
+    /// requests behind a valid NONCE can start one, so this cannot be forged.
+    /// Joining a lookup already in flight does not count. 0 turns it off.
+    pub credential_lookups: u32,
+    /// Counting window, seconds.
+    pub window_secs: u64,
+    /// Ban duration, seconds.
+    pub ban_secs: u64,
+    /// `"ip"` (default) bans the address; `"prefix"` counts and bans per /24
+    /// (IPv4) or /48 (IPv6), for attackers that rotate through a block.
+    pub scope: String,
+    /// CIDR ranges that are never counted and never banned.
+    pub allowlist: Vec<String>,
+    /// Also exempt `[turn.rate_limit] trusted_prefixes`. True by default: those
+    /// are the NAT addresses hundreds of users share, where one person's typo is
+    /// everyone's outage.
+    pub exempt_trusted_prefixes: bool,
+    /// Cap on sources with a running offence count (memory bound).
+    pub max_tracked: usize,
+    /// Cap on simultaneous bans (memory bound). A ban beyond it is refused and
+    /// counted in `turna_autoban_refused_full_total`, never evicting another.
+    pub max_bans: usize,
+}
+
+impl Default for AutoBanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_failures: 10,
+            rate_limit_violations: 0,
+            credential_lookups: 20,
+            window_secs: 60,
+            ban_secs: 600,
+            scope: "ip".into(),
+            allowlist: Vec::new(),
+            exempt_trusted_prefixes: true,
+            max_tracked: 65_536,
+            max_bans: 16_384,
+        }
+    }
+}
+
+impl AutoBanConfig {
+    pub(crate) fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for r in &self.allowlist {
+            if let Err(why) = validate_cidr(r) {
+                errors.push(format!("turn.auto_ban.allowlist: {why}"));
+            }
+        }
+        if !matches!(self.scope.as_str(), "ip" | "prefix") {
+            errors.push(format!(
+                "turn.auto_ban.scope = {:?} is invalid; use \"ip\" or \"prefix\"",
+                self.scope
+            ));
+        }
+        if !self.enabled {
+            return errors;
+        }
+        if self.auth_failures == 0
+            && self.rate_limit_violations == 0
+            && self.credential_lookups == 0
+        {
+            errors.push(
+                "turn.auto_ban.enabled = true but every trigger is 0 \
+                 (auth_failures, rate_limit_violations, credential_lookups), so nothing \
+                 could ever be banned"
+                    .into(),
+            );
+        }
+        if self.window_secs == 0 {
+            errors.push("turn.auto_ban.window_secs must be > 0".into());
+        }
+        if self.ban_secs == 0 {
+            errors.push("turn.auto_ban.ban_secs must be > 0".into());
+        }
+        if self.max_tracked == 0 || self.max_bans == 0 {
+            errors.push("turn.auto_ban.max_tracked and max_bans must be > 0".into());
+        }
+        errors
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RelayConfig {
@@ -1599,6 +1918,24 @@ pub struct RelayConfig {
     /// inside it — see the stall detection in `relay::server::drain`, which now
     /// cuts that case short without shortening the wait for live traffic.
     pub drain_timeout_secs: u64,
+    /// Node-wide cap on relayed bytes per second, both directions and every
+    /// allocation combined. 0 (the default) is no cap.
+    ///
+    /// The node-level counterpart of `quota.max_bytes_per_sec_per_allocation`,
+    /// and the equivalent of coturn's `bps-capacity` — with one difference an
+    /// operator should know: coturn reserves bandwidth per session at
+    /// allocation time and refuses new sessions when it runs out; turna drops
+    /// packets once the node-wide bucket is empty, so existing calls degrade
+    /// together rather than new calls being refused. Burst is one second's
+    /// worth. Dropped traffic is counted in
+    /// `turna_relay_capacity_dropped_{packets,bytes}_total`.
+    ///
+    /// RFC 6062 TCP-relay data is not counted (it never passes through the
+    /// packet processor), and the budget is first come, first served — no
+    /// fairness between allocations; bound each with
+    /// `quota.max_bytes_per_sec_per_allocation`.
+    #[serde(default)]
+    pub max_total_bytes_per_sec: u64,
 }
 
 impl Default for RelayConfig {
@@ -1615,6 +1952,7 @@ impl Default for RelayConfig {
             rate_soft_percent: 60,
             rate_hard_percent: 80,
             drain_timeout_secs: 30,
+            max_total_bytes_per_sec: 0,
         }
     }
 }
@@ -3553,7 +3891,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
-    fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn production_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
@@ -4628,5 +4966,161 @@ shared_secret = \"a-real-secret-not-the-placeholder\"
             !err.contains("removed in 0.5.0"),
             "a typo must not be reported as a removed section: {err}"
         );
+    }
+}
+
+/// `[turn.auto_ban]`, `[turn.auth.webhook]`, `max_total_bytes_per_sec` and
+/// `require_binding_auth`: every one is off by default and validated when on.
+#[cfg(test)]
+mod abuse_controls_tests {
+    use super::*;
+
+    /// Parse with `TURNA_PRODUCTION` cleared, under the lock the other
+    /// production-sensitive tests hold.
+    fn parse_dev(toml: &str) -> Result<TurnaConfig> {
+        let _guard = super::tests::production_env_lock();
+        let saved = std::env::var_os("TURNA_PRODUCTION");
+        std::env::remove_var("TURNA_PRODUCTION");
+        let r = TurnaConfig::from_str(toml);
+        match saved {
+            Some(v) => std::env::set_var("TURNA_PRODUCTION", v),
+            None => std::env::remove_var("TURNA_PRODUCTION"),
+        }
+        r
+    }
+
+    #[test]
+    fn auto_ban_is_off_by_default_and_its_spoofable_trigger_too() {
+        let a = AutoBanConfig::default();
+        assert!(!a.enabled);
+        assert_eq!(a.rate_limit_violations, 0);
+        assert!(a.exempt_trusted_prefixes);
+        let cfg = parse_dev("").expect("empty config loads");
+        assert!(!cfg.turn.auto_ban.enabled);
+    }
+
+    #[test]
+    fn auto_ban_validates_when_enabled() {
+        let ok = parse_dev(
+            "[turn.auto_ban]\nenabled = true\nauth_failures = 5\nscope = \"prefix\"\n\
+             allowlist = [\"192.0.2.0/24\"]\n",
+        )
+        .expect("a sane auto_ban section loads");
+        assert_eq!(ok.turn.auto_ban.auth_failures, 5);
+
+        let err = parse_dev(
+            "[turn.auto_ban]\nenabled = true\nauth_failures = 0\nrate_limit_violations = 0\n\
+             credential_lookups = 0\n",
+        )
+        .expect_err("no trigger must be refused")
+        .to_string();
+        assert!(err.contains("every trigger is 0"), "{err}");
+
+        let err = parse_dev("[turn.auto_ban]\nenabled = true\nban_secs = 0\n")
+            .expect_err("zero ban must be refused")
+            .to_string();
+        assert!(err.contains("ban_secs"), "{err}");
+
+        let err = parse_dev("[turn.auto_ban]\nscope = \"subnet\"\n")
+            .expect_err("unknown scope must be refused even while disabled")
+            .to_string();
+        assert!(err.contains("turn.auto_ban.scope"), "{err}");
+
+        let err = parse_dev("[turn.auto_ban]\nallowlist = [\"not-a-cidr\"]\n")
+            .expect_err("bad CIDR must be refused")
+            .to_string();
+        assert!(err.contains("turn.auto_ban.allowlist"), "{err}");
+    }
+
+    #[test]
+    fn capacity_cap_and_binding_auth_are_off_by_default() {
+        let cfg = parse_dev("").expect("empty config loads");
+        assert_eq!(cfg.turn.relay.max_total_bytes_per_sec, 0);
+        assert!(!cfg.turn.auth.require_binding_auth);
+
+        let cfg = parse_dev(
+            "[turn.auth]\nrequire_binding_auth = true\n[turn.relay]\nmax_total_bytes_per_sec = 125000000\n",
+        )
+        .expect("both keys parse");
+        assert!(cfg.turn.auth.require_binding_auth);
+        assert_eq!(cfg.turn.relay.max_total_bytes_per_sec, 125_000_000);
+
+        let err = parse_dev("[turn.relay]\nmax_total_bytes_per_sec = 10\n")
+            .expect_err("a cap below one packet must be refused")
+            .to_string();
+        assert!(err.contains("max_total_bytes_per_sec"), "{err}");
+    }
+
+    #[test]
+    fn webhook_is_off_by_default() {
+        let w = WebhookConfig::default();
+        assert!(!w.enabled);
+        assert!(
+            w.validate(true, false).is_empty(),
+            "disabled means unchecked"
+        );
+    }
+
+    #[test]
+    fn webhook_requires_https_and_a_credential_in_production() {
+        let base = |url: &str, token: &str| WebhookConfig {
+            enabled: true,
+            url: url.into(),
+            bearer_token: token.into(),
+            ..WebhookConfig::default()
+        };
+        // Production: http refused, credential required.
+        let e = base("http://127.0.0.1:9000/turn", "t").validate(true, false);
+        assert!(
+            e.iter().any(|m| m.contains("http:// in production")),
+            "{e:?}"
+        );
+        let e = base("https://sig.example/turn", "").validate(true, false);
+        assert!(
+            e.iter().any(|m| m.contains("neither bearer_token")),
+            "{e:?}"
+        );
+        assert!(base("https://sig.example/turn", "t")
+            .validate(true, false)
+            .is_empty());
+        // Development: http allowed (a local stub), credential optional.
+        assert!(base("http://127.0.0.1:9000/turn", "")
+            .validate(false, false)
+            .is_empty());
+        // Nonsense schemes, empty url, and oauth together are refused anywhere.
+        assert!(!base("ftp://x", "t").validate(false, false).is_empty());
+        assert!(!base("", "t").validate(false, false).is_empty());
+        let e = base("https://sig.example/turn", "t").validate(false, true);
+        assert!(e.iter().any(|m| m.contains("Pick one")), "{e:?}");
+    }
+
+    #[test]
+    fn webhook_bounds_are_validated() {
+        let w = WebhookConfig {
+            enabled: true,
+            url: "https://sig.example/turn".into(),
+            bearer_token: "t".into(),
+            timeout_ms: 0,
+            error_ttl_secs: 0,
+            max_entries: 0,
+            lookups_per_ip_rps: 0,
+            ..WebhookConfig::default()
+        };
+        let e = w.validate(false, false);
+        assert!(e.iter().any(|m| m.contains("timeout_ms")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("error_ttl_secs")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("max_entries")), "{e:?}");
+        assert!(e.iter().any(|m| m.contains("lookups_per_ip_rps")), "{e:?}");
+    }
+
+    #[test]
+    fn webhook_section_parses_from_toml() {
+        let cfg = parse_dev(
+            "[turn.auth.webhook]\nenabled = true\nurl = \"http://127.0.0.1:1/x\"\n\
+             timeout_ms = 500\npositive_ttl_secs = 60\n",
+        )
+        .expect("a dev webhook section loads");
+        assert!(cfg.turn.auth.webhook.enabled);
+        assert_eq!(cfg.turn.auth.webhook.timeout_ms, 500);
     }
 }

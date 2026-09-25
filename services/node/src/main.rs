@@ -6,6 +6,7 @@
 
 mod af_xdp_listener;
 mod audit_layer;
+mod auth_webhook;
 mod bulk_load;
 mod dtls_listener;
 mod failover;
@@ -245,6 +246,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Base ([turn]) auth backend.
+    let mut webhook_fetch: Option<(
+        Arc<turna_auth::webhook::CredentialCache>,
+        tokio::sync::mpsc::Receiver<turna_auth::webhook::FetchJob>,
+    )> = None;
     let base_auth = if config.auth.oauth.enabled {
         // RFC 7635 third-party auth on the base realm. Keys are validated as hex
         // (16/32 B) in config::validate, so decoding here does not fail.
@@ -278,6 +283,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.auth.oauth.server_name.clone(),
             config.auth.oauth.as_identity.clone(),
         )
+    } else if config.auth.webhook.enabled {
+        // `[turn.auth.webhook]`: long-term credentials, `static_users` resolved
+        // locally first, every other USERNAME looked up through the cache. The
+        // cache is built here, synchronously; its HTTP fetcher is started once
+        // the runtime exists (`run_tokio`).
+        let (cache, rx) = turna_auth::webhook::CredentialCache::new(
+            config.realm.clone(),
+            turna_auth::webhook::WebhookSettings {
+                positive_ttl: Duration::from_secs(config.auth.webhook.positive_ttl_secs),
+                negative_ttl: Duration::from_secs(config.auth.webhook.negative_ttl_secs),
+                error_ttl: Duration::from_secs(config.auth.webhook.error_ttl_secs),
+                max_entries: config.auth.webhook.max_entries,
+                queue_depth: config.auth.webhook.queue_depth,
+            },
+        );
+        webhook_fetch = Some((cache.clone(), rx));
+        AuthMode::long_term(
+            config.realm.clone(),
+            config
+                .auth
+                .static_users
+                .iter()
+                .map(|u| (&u.username, &u.password)),
+        )
+        .with_webhook(cache)
     } else if config.auth.static_users.is_empty() {
         AuthMode::SharedSecret {
             realm: config.realm.clone(),
@@ -545,6 +575,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap_runtime,
         reload_path,
         audit_layer,
+        webhook_fetch,
     )
 }
 
@@ -837,7 +868,45 @@ fn rate_limit_settings(cfg: &turna_config::RateLimitConfig) -> turna_relay::Rate
         default: tier(&cfg.default),
         trusted: tier(&cfg.trusted),
         trusted_prefixes: cfg.trusted_prefixes.clone(),
+        auto_ban: None,
+        bandwidth_cap: None,
+        require_binding_auth: false,
+        webhook_lookup_limiter: None,
     }
+}
+
+/// `[turn.auto_ban]` → the shared ban table, or `None` when it is off.
+fn auto_ban_table(config: &TurnConfig) -> Option<Arc<turna_relay::AutoBan>> {
+    let a = &config.auto_ban;
+    if !a.enabled {
+        return None;
+    }
+    let mut allowlist = a.allowlist.clone();
+    if a.exempt_trusted_prefixes {
+        allowlist.extend(config.rate_limit.trusted_prefixes.iter().cloned());
+    }
+    info!(
+        auth_failures = a.auth_failures,
+        rate_limit_violations = a.rate_limit_violations,
+        window_secs = a.window_secs,
+        ban_secs = a.ban_secs,
+        scope = %a.scope,
+        allowlisted_ranges = allowlist.len(),
+        "auto-ban enabled"
+    );
+    Some(Arc::new(turna_relay::AutoBan::new(
+        turna_relay::AutoBanSettings {
+            auth_failures: a.auth_failures,
+            rate_limit_violations: a.rate_limit_violations,
+            credential_lookups: a.credential_lookups,
+            window: Duration::from_secs(a.window_secs),
+            ban: Duration::from_secs(a.ban_secs),
+            prefix_scope: a.scope == "prefix",
+            allowlist,
+            max_tracked: a.max_tracked,
+            max_bans: a.max_bans,
+        },
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -862,6 +931,12 @@ fn run_tokio(
     // join the chain while the subscriber is being built, and that already
     // happened in `main`; the audit log it writes to is opened below.
     audit_layer: audit_layer::AuditLayer,
+    // `[turn.auth.webhook]`: the cache the base realm consults and the queue its
+    // fetcher drains. The fetcher needs the runtime, which exists only below.
+    webhook_fetch: Option<(
+        Arc<turna_auth::webhook::CredentialCache>,
+        tokio::sync::mpsc::Receiver<turna_auth::webhook::FetchJob>,
+    )>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `tls_cfg` is only consumed when the `tls` feature is enabled.
     #[cfg(not(feature = "tls"))]
@@ -871,7 +946,45 @@ fn run_tokio(
     // the QUIC/DTLS processor): each builds its own limiter from these tiers, so
     // a source's budget is per-datapath, exactly as it was when the tiers came
     // from the environment.
-    let rate_limits = rate_limit_settings(&config.rate_limit);
+    let mut rate_limits = rate_limit_settings(&config.rate_limit);
+    // `[turn.auto_ban]`: one table shared by every datapath, so a source banned
+    // on UDP is banned on TURNS, DTLS and QUIC as well. Its sweeper is spawned
+    // inside the runtime below.
+    rate_limits.auto_ban = auto_ban_table(&config);
+    // `[turn.relay] max_total_bytes_per_sec`: one bucket for the whole node.
+    if config.relay.max_total_bytes_per_sec > 0 {
+        info!(
+            bytes_per_sec = config.relay.max_total_bytes_per_sec,
+            "node-wide relay bandwidth cap active"
+        );
+        rate_limits.bandwidth_cap = Some(Arc::new(turna_relay::ByteRateLimiter::new(
+            config.relay.max_total_bytes_per_sec,
+        )));
+    }
+    metrics.capacity_bytes_per_sec.store(
+        config.relay.max_total_bytes_per_sec,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // `[turn.auth.webhook]`: per-source budget for lookups a request may start.
+    if config.auth.webhook.enabled {
+        let w = &config.auth.webhook;
+        rate_limits.webhook_lookup_limiter = Some(Arc::new(turna_relay::TieredRateLimiter::new(
+            turna_relay::TieredLimits {
+                per_ip: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+                per_prefix: (w.lookups_per_prefix_burst, w.lookups_per_prefix_rps),
+                // Unused by the lookup budget; set to the same values so nothing
+                // reaching for them gets an accidental free pass.
+                allocate: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+                create_permission: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+                channel_bind: (w.lookups_per_ip_burst, w.lookups_per_ip_rps),
+            },
+        )));
+    }
+    // `[turn.auth] require_binding_auth` (coturn `secure-stun`).
+    rate_limits.require_binding_auth = config.auth.require_binding_auth;
+    if config.auth.require_binding_auth {
+        info!("STUN Binding requires credentials (require_binding_auth = true)");
+    }
 
     let node_audit = {
         let path = &config.observability.node_audit_path;
@@ -944,6 +1057,35 @@ fn run_tokio(
         .build()?;
 
     let result = rt.block_on(async {
+    // `[turn.auth.webhook]` fetcher. A client that cannot be built (unreadable
+    // ca_file, bad PEM) stops startup: a credential path that can only fail
+    // closed is an outage, and better found now than by the first user.
+    if let Some((cache, rx)) = webhook_fetch {
+        if let Err(e) = auth_webhook::spawn_fetcher(&config.auth.webhook, cache, rx, metrics.clone())
+        {
+            return Err(e.into());
+        }
+    }
+    // `[turn.auto_ban]` sweeper: expires bans (logging the unban security
+    // event) and publishes the active-ban gauge.
+    if let Some(ban) = rate_limits.auto_ban.clone() {
+        let ban_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let active = turna_relay::abuse::sweep_and_log(&ban);
+                ban_metrics
+                    .autoban_active
+                    .store(active as u64, std::sync::atomic::Ordering::Relaxed);
+                ban_metrics.autoban_refused_full.store(
+                    ban.bans_refused_full
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        });
+    }
     // MOVED HERE FROM `main`'s SYNCHRONOUS PROLOGUE. `tokio::spawn` needs a
     // runtime, and there is none until `run_tokio` builds one a few lines above
     // this — so spawning during config setup panicked with "there is no reactor
@@ -1014,7 +1156,14 @@ fn run_tokio(
                 // Base realm. Only a SharedSecret backend is rotated: a realm with
                 // static users is LongTerm and its credentials are managed through
                 // the user API, not this file.
-                if root.turn.auth.static_users.is_empty() && !root.turn.auth.oauth.enabled {
+                // A webhook-backed base realm is LongTerm too, and its webhook
+                // settings are read once at startup (a restart applies them);
+                // it must never be swapped for a SharedSecret backend here.
+                if root.turn.auth.static_users.is_empty()
+                    && !root.turn.auth.oauth.enabled
+                    && !root.turn.auth.webhook.enabled
+                    && rotate_auth.base_webhook().is_none()
+                {
                     let new_base = AuthMode::SharedSecret {
                         realm: root.turn.realm.clone(),
                         secret: root.turn.auth.shared_secret.as_bytes().to_vec(),
@@ -2940,6 +3089,23 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
         // for. Count them from the number of blocks.
         println!("username = \"<set>\"");
         println!("password = \"{}\"", redact_secret(&u.password));
+    }
+    if t.auth.webhook.enabled {
+        let w = &t.auth.webhook;
+        println!();
+        println!("[turn.auth.webhook]");
+        println!("enabled           = true");
+        println!("url               = \"{}\"", mask_uri_credentials(&w.url));
+        println!("bearer_token      = \"{}\"", mask(&w.bearer_token));
+        println!("signing_secret    = \"{}\"", mask(&w.signing_secret));
+        println!("ca_file           = \"{}\"", w.ca_file);
+        println!("timeout_ms        = {}", w.timeout_ms);
+        println!("max_concurrency   = {}", w.max_concurrency);
+        println!("queue_depth       = {}", w.queue_depth);
+        println!("positive_ttl_secs = {}", w.positive_ttl_secs);
+        println!("negative_ttl_secs = {}", w.negative_ttl_secs);
+        println!("error_ttl_secs    = {}", w.error_ttl_secs);
+        println!("max_entries       = {}", w.max_entries);
     }
     println!();
     println!("[turn.relay]");

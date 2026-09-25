@@ -67,7 +67,8 @@ project in this position can deliver.
 
 - **Refused in production** — RFC 7635 OAuth (`[turn.auth.oauth]`). Implemented
   and usable for testing, but has not been verified with a real authorization
-  server; `production = true` rejects it.
+  server; `production = true` rejects it. The verification kit and procedure for
+  doing that with your AS: [docs/runbooks/oauth-verification.md](docs/runbooks/oauth-verification.md).
 
   RFC 6062 TCP relay was on this list until 2026-08-25. It came off because the evidence
   the gate was waiting for arrived — interop against coturn's own client
@@ -290,7 +291,7 @@ per-feature production maturity always check
 | QUIC (`quic`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over raw QUIC; UDP peer relay. No independent raw-QUIC TURN client interoperability claim. Functional, lifecycle/limits, 20-minute load and WAN evidence recorded. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
 | WebTransport (`web-transport`) | — | **supported (Linux/macOS, tokio)** — Opt-in, project-specific TURN over WebTransport/H3; UDP peer relay. Browser interoperability recorded for tested Chrome versions; custom JavaScript client, not a WebRTC ICE TURN URI. H3 uses `h3` ALPN. See [docs/verification/quic-webtransport-supported-2026-09-18.md](docs/verification/quic-webtransport-supported-2026-09-18.md). |
 | TURN-over-SCTP transport (`sctp`) | Project-specific TURN mapping | **Supported on Linux/tokio**, opt-in, allowed in production. Native SCTP without TLS; control and ChannelData, UDP relay. [Evidence](docs/verification/sctp-supported-2026-09-18.md) |
-| Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** |
+| Third-party auth (`oauth`) | RFC 7635 | Implemented; **refused under `production = true`** until verified with a real AS — [verification kit](docs/runbooks/oauth-verification.md) |
 | NAT behaviour discovery | RFC 5780 | Not implemented (no codec; would also need a 2×IP/2×port topology) |
 | ALPN | RFC 7443 | Partial — labels advertised, no strict/compatible mode |
 | Shared-secret ("REST") credentials | none — expired draft | Compatibility extension, coturn-compatible. Not an RFC |

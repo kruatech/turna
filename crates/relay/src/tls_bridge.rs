@@ -62,6 +62,15 @@ pub(crate) async fn run_tls_bridge(
 
     // Events from the TLS server (opened / packet / closed).
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
+    // A handle on our own event queue, for re-processing a request that was
+    // parked on a credential lookup (see `stream_retry`).
+    let parked: Parked = crate::stream_retry::ParkingLot::new(event_tx.clone());
+    // Connections the transport has opened and not yet closed. A packet for any
+    // other conn_id — in practice, a request re-injected after its lookup
+    // finished and its connection went away — is dropped: processing it would
+    // create an allocation for a 5-tuple that no longer exists, held for its
+    // whole lifetime because the close that releases it has already happened.
+    let mut live = std::collections::HashSet::new();
     // Commands to the TLS server (write to a connection, keyed by conn_id).
     let (tls_send_tx, tls_send_rx) = mpsc::channel::<TcpSendCommand>(8192);
     // RFC 6062 role transition: detach requests (bridge -> transport) and the
@@ -112,6 +121,7 @@ pub(crate) async fn run_tls_bridge(
     while let Some(ev) = event_rx.recv().await {
         match ev {
             TcpTransportEvent::ConnectionOpened { conn_id, peer_addr } => {
+                live.insert(conn_id);
                 // Per-connection sink: the relay return path (server.rs) and any
                 // cross-client control Send push raw message bytes here; we forward
                 // each as a framed write to *this* connection.
@@ -141,6 +151,10 @@ pub(crate) async fn run_tls_bridge(
                 peer_addr,
                 data,
             } => {
+                if !live.contains(&conn_id) {
+                    debug!(%conn_id, "TURNS packet for a closed connection dropped");
+                    continue;
+                }
                 // `data` is one self-framed STUN/ChannelData message (the TLS
                 // codec already split the stream). Process it exactly like a UDP
                 // datagram from `peer_addr`.
@@ -152,7 +166,7 @@ pub(crate) async fn run_tls_bridge(
                         if matches!(m.method, Method::Connect)
                             && matches!(m.class, MessageClass::Request)
                         {
-                            bridge_handle_connect(
+                            let out = bridge_handle_connect(
                                 &processor,
                                 mgr,
                                 conn_id,
@@ -162,12 +176,15 @@ pub(crate) async fn run_tls_bridge(
                                 &tls_send_tx,
                             )
                             .await;
+                            if let Some(wait) = out.wait {
+                                park_request(&parked, wait, conn_id, peer_addr, &raw);
+                            }
                             continue;
                         }
                         if matches!(m.method, Method::ConnectionBind)
                             && matches!(m.class, MessageClass::Request)
                         {
-                            bridge_handle_connection_bind(
+                            let out = bridge_handle_connection_bind(
                                 &processor,
                                 mgr,
                                 conn_id,
@@ -178,6 +195,15 @@ pub(crate) async fn run_tls_bridge(
                                 &detach_req_tx,
                             )
                             .await;
+                            if let Some(wait) = out.wait {
+                                park_request(&parked, wait, conn_id, peer_addr, &raw);
+                            }
+                            if out.detached {
+                                // A detached connection never reports a close;
+                                // it is no longer a control connection either.
+                                live.remove(&conn_id);
+                                parked.forget(conn_id);
+                            }
                             continue;
                         }
                     }
@@ -187,6 +213,7 @@ pub(crate) async fn run_tls_bridge(
                 // RFC 6062 TCP allocation with 400 (§4.1 requires a TCP/TLS
                 // control connection) — making the whole CONNECT /
                 // ConnectionBind / detach path below unreachable.
+                let retry_raw = raw.clone();
                 for action in processor.process_tcp_control(raw, peer_addr) {
                     match action {
                         Action::Send { data, target } => {
@@ -330,6 +357,13 @@ pub(crate) async fn run_tls_bridge(
                                 "TURNS bridge: unexpected ForwardZeroCopy on owning-process path; dropping"
                             );
                         }
+                        // A TCP client does not retransmit, so an unanswered
+                        // request would sit until its 39.5 s transaction
+                        // timeout. Park it and process it again once the
+                        // credential lookup has finished.
+                        Action::AwaitCredentials { wait } => {
+                            park_request(&parked, wait, conn_id, peer_addr, &retry_raw);
+                        }
                         Action::None => {}
                     }
                 }
@@ -340,6 +374,8 @@ pub(crate) async fn run_tls_bridge(
                 peer_addr,
                 reason,
             } => {
+                live.remove(&conn_id);
+                parked.forget(conn_id);
                 client_sinks.remove(&peer_addr);
                 debug!(%peer_addr, %conn_id, %reason, "TURNS connection closed");
                 // §2c: release the allocation now instead of waiting for the TTL.
@@ -423,6 +459,37 @@ fn spawn_tls_metrics_mirror(stats: Arc<TlsStats>, metrics: Arc<turna_health::Met
 /// then perform the async outbound TCP connect to the peer and reply with
 /// CONNECTION-ID (or 447 on failure). The relayed data itself flows once the
 /// client issues CONNECTION-BIND on a fresh connection (handled elsewhere).
+/// What the out-of-band CONNECT / ConnectionBind handlers tell the event loop.
+#[derive(Default)]
+struct SideOutcome {
+    /// The request is waiting on a credential lookup: park it.
+    wait: Option<turna_auth::webhook::Waiter>,
+    /// The connection was handed to the raw relay (RFC 6062 phase 2).
+    detached: bool,
+}
+
+type Parked =
+    crate::stream_retry::ParkingLot<turna_transport::tcp_tls::TcpConnectionId, TcpTransportEvent>;
+
+/// Park a request whose USERNAME is being looked up; it is re-injected into
+/// the event queue when the lookup finishes (see `stream_retry`).
+fn park_request(
+    parked: &Parked,
+    wait: turna_auth::webhook::Waiter,
+    conn_id: turna_transport::tcp_tls::TcpConnectionId,
+    peer_addr: SocketAddr,
+    raw: &[u8],
+) {
+    let again = TcpTransportEvent::PacketReceived {
+        conn_id,
+        peer_addr,
+        data: bytes::BytesMut::from(raw),
+    };
+    if !parked.park(wait, conn_id, again) {
+        debug!(%peer_addr, "credential-wait slots full; request dropped");
+    }
+}
+
 async fn bridge_handle_connect(
     processor: &Arc<PacketProcessor>,
     mgr: &Arc<TcpRelayManager>,
@@ -431,11 +498,14 @@ async fn bridge_handle_connect(
     msg: &StunMessage,
     raw: &[u8],
     tls_send_tx: &mpsc::Sender<TcpSendCommand>,
-) {
+) -> SideOutcome {
+    let mut out = SideOutcome::default();
     match processor.connect_decision(msg, raw, peer_addr) {
         ConnectDecision::Reject(actions) => {
             for a in actions {
-                if let Action::Send { data, target } = a {
+                if let Action::AwaitCredentials { wait } = a {
+                    out.wait = Some(wait);
+                } else if let Action::Send { data, target } = a {
                     if target == peer_addr {
                         let _ = tls_send_tx
                             .send(TcpSendCommand {
@@ -478,6 +548,7 @@ async fn bridge_handle_connect(
             }
         }
     }
+    out
 }
 
 /// Handle one RFC 6062 ConnectionBind on a fresh TLS data connection: validate,
@@ -494,11 +565,14 @@ async fn bridge_handle_connection_bind(
     raw: &[u8],
     tls_send_tx: &mpsc::Sender<TcpSendCommand>,
     detach_req_tx: &mpsc::Sender<DetachRequest>,
-) {
+) -> SideOutcome {
+    let mut out = SideOutcome::default();
     match processor.connection_bind_decision(msg, raw, peer_addr) {
         ConnBindDecision::Reject(actions) => {
             for a in actions {
-                if let Action::Send { data, target } = a {
+                if let Action::AwaitCredentials { wait } = a {
+                    out.wait = Some(wait);
+                } else if let Action::Send { data, target } = a {
                     if target == peer_addr {
                         let _ = tls_send_tx
                             .send(TcpSendCommand {
@@ -537,6 +611,8 @@ async fn bridge_handle_connection_bind(
                             "RFC 6062 detach handoff failed — releasing claimed connection"
                         );
                         mgr.release(id).await;
+                    } else {
+                        out.detached = true;
                     }
                 }
                 Err(e) => {
@@ -560,4 +636,5 @@ async fn bridge_handle_connection_bind(
             }
         }
     }
+    out
 }

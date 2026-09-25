@@ -31,7 +31,9 @@
 // audited surface, which is confined to turna-transport and turna-relay.
 #![forbid(unsafe_code)]
 
+pub mod oauth_token;
 pub mod tenant;
+pub mod webhook;
 
 pub use tenant::{AuthRegistry, AuthResolution};
 
@@ -57,6 +59,21 @@ pub enum AuthError {
     /// with the integrity attribute actually used → 400 Bad Request.
     #[error("bad request")]
     BadRequest,
+    /// `[turn.auth.webhook]`: the user is not cached and a lookup is in flight.
+    /// Not a failure — the request is re-processed once the waiter resolves
+    /// (or, over UDP, when the client retransmits).
+    #[error("credential lookup in progress")]
+    Pending(webhook::Waiter),
+    /// `[turn.auth.webhook]`: the lookup failed or could not be started. Fail
+    /// closed: the request is refused, but it is not the client's fault, so it
+    /// is not counted as an auth failure and never feeds auto-ban.
+    #[error("credential lookup unavailable")]
+    Unavailable,
+    /// `[turn.auth.webhook]`: a lookup was needed and the caller's per-source
+    /// budget refused to start it. Refused like `Unavailable`, but it is the
+    /// source's doing, so the processor counts it as auto-ban evidence.
+    #[error("credential lookup throttled")]
+    Throttled,
 }
 
 // ── TURN auth mode ────────────────────────────────────────────────────────────
@@ -172,6 +189,9 @@ pub enum AuthMode {
     LongTerm {
         realm: String,
         users: Arc<DashMap<String, UserKeys>>,
+        /// `[turn.auth.webhook]`: consulted for a USERNAME not in `users`.
+        /// `None` (the default) keeps the local table authoritative.
+        webhook: Option<Arc<webhook::CredentialCache>>,
     },
     /// Time-limited credentials with shared secret.
     SharedSecret {
@@ -271,6 +291,20 @@ impl Drop for AuthMode {
 impl AuthMode {
     /// Validate a STUN message's credentials. Returns the key on success.
     pub fn validate(&self, msg: &StunMessage, raw: &[u8]) -> Result<Vec<u8>, AuthError> {
+        self.validate_opts(msg, raw, webhook::FetchPolicy::Always)
+    }
+
+    /// [`validate`](Self::validate) with control over the credential webhook:
+    /// `FetchPolicy::Never` consults its cache but never starts an HTTP lookup
+    /// (for requests whose source has not proven itself with a NONCE round
+    /// trip); `FetchPolicy::Admit` starts one only if the caller's per-source
+    /// budget allows.
+    pub fn validate_opts(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        fetch: webhook::FetchPolicy<'_>,
+    ) -> Result<Vec<u8>, AuthError> {
         // RFC 7635 third-party auth uses an ACCESS-TOKEN, not USERNAME/REALM —
         // handle it before the long-term credential extraction below.
         if let AuthMode::OAuth { .. } = self {
@@ -307,15 +341,42 @@ impl AuthMode {
         // SharedSecret (REST, coturn-compatible): derive the ephemeral key from
         // the time-limited credential at request time.
         let key: Vec<u8> = match self {
-            AuthMode::LongTerm { users, .. } => {
-                match users.get(username) {
-                    Some(entry) => {
-                        if has_sha256 {
-                            entry.key_sha256.clone()
-                        } else {
-                            entry.key_md5.clone()
+            AuthMode::LongTerm { users, webhook, .. } => {
+                // Local table first; the webhook only for names it lacks. The
+                // `Ref` is released before any webhook work.
+                let local = users.get(username).map(|entry| {
+                    if has_sha256 {
+                        entry.key_sha256.clone()
+                    } else {
+                        entry.key_md5.clone()
+                    }
+                });
+                let resolved = match (local, webhook) {
+                    (Some(k), _) => Some(k),
+                    (None, None) => None,
+                    (None, Some(cache)) => {
+                        let lookup = cache.lookup_with(username, fetch);
+                        match lookup {
+                            webhook::Lookup::Found(keys) => {
+                                let k = if has_sha256 {
+                                    keys.key_sha256
+                                } else {
+                                    keys.key_md5
+                                };
+                                // The endpoint may return only one of the two
+                                // keys; a client using the other variant is
+                                // then treated as an unknown user.
+                                (!k.is_empty()).then_some(k)
+                            }
+                            webhook::Lookup::NotFound => None,
+                            webhook::Lookup::Unavailable => return Err(AuthError::Unavailable),
+                            webhook::Lookup::Pending(w) => return Err(AuthError::Pending(w)),
+                            webhook::Lookup::Throttled => return Err(AuthError::Throttled),
                         }
                     }
+                };
+                match resolved {
+                    Some(key) => key,
                     None => {
                         // M3: equalize response latency between known and unknown
                         // users so timing doesn't leak whether `username` exists
@@ -473,11 +534,22 @@ impl AuthMode {
         msg: &StunMessage,
         raw: &[u8],
     ) -> Result<(Vec<u8>, Option<u32>), AuthError> {
+        self.validate_with_lifetime_opts(msg, raw, webhook::FetchPolicy::Always)
+    }
+
+    /// [`validate_with_lifetime`](Self::validate_with_lifetime) with the
+    /// webhook control of [`validate_opts`](Self::validate_opts).
+    pub fn validate_with_lifetime_opts(
+        &self,
+        msg: &StunMessage,
+        raw: &[u8],
+        fetch: webhook::FetchPolicy<'_>,
+    ) -> Result<(Vec<u8>, Option<u32>), AuthError> {
         match self {
             AuthMode::OAuth { .. } => self
                 .validate_oauth(msg, raw)
                 .map(|(k, life)| (k, Some(life))),
-            _ => self.validate(msg, raw).map(|k| (k, None)),
+            _ => self.validate_opts(msg, raw, fetch).map(|k| (k, None)),
         }
     }
 
@@ -506,6 +578,34 @@ impl AuthMode {
         AuthMode::LongTerm {
             realm,
             users: Arc::new(map),
+            webhook: None,
+        }
+    }
+
+    /// Attach a credential webhook cache to a LongTerm backend: USERNAMEs not
+    /// in the local table are looked up through it. No-op (returns `self`
+    /// unchanged) on the other modes, and a cache built for another realm is
+    /// refused the same way — its keys would be derived for the wrong realm.
+    pub fn with_webhook(self, cache: Arc<webhook::CredentialCache>) -> Self {
+        match self {
+            AuthMode::LongTerm {
+                ref realm,
+                ref users,
+                ..
+            } if cache.realm() == realm => AuthMode::LongTerm {
+                realm: realm.clone(),
+                users: users.clone(),
+                webhook: Some(cache),
+            },
+            other => other,
+        }
+    }
+
+    /// The webhook cache, when this backend has one.
+    pub fn webhook(&self) -> Option<&Arc<webhook::CredentialCache>> {
+        match self {
+            AuthMode::LongTerm { webhook, .. } => webhook.as_ref(),
+            _ => None,
         }
     }
 
@@ -513,7 +613,7 @@ impl AuthMode {
     /// Returns `true` if applied (i.e. this is a LongTerm backend).
     pub fn add_user(&self, username: &str, password: &str) -> bool {
         match self {
-            AuthMode::LongTerm { realm, users } => {
+            AuthMode::LongTerm { realm, users, .. } => {
                 users.insert(
                     username.to_string(),
                     UserKeys::derive(username, realm, password),
@@ -724,6 +824,43 @@ fn decrypt_access_token(
     as_rs_keys: &[Vec<u8>],
     server_name: &str,
 ) -> Result<(Vec<u8>, u32), AuthError> {
+    let opened = open_access_token(token, as_rs_keys, server_name)?;
+    let (mac_key, ts, lifetime) = (opened.mac_key, opened.timestamp, opened.lifetime);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // RFC 7635 §6.1: reject unless within the (symmetric, skew-tolerant) window.
+    if !token_time_valid(ts, lifetime, now, OAUTH_CLOCK_SKEW_SECS) {
+        return Err(AuthError::Expired);
+    }
+    // Remaining validity (seconds) = token end − now, clamped to u32. The caller
+    // caps the allocation lifetime by this so it never outlives the token.
+    let ts_secs = ts >> 16;
+    let remaining = ts_secs
+        .saturating_add(lifetime as u64)
+        .saturating_sub(now)
+        .min(u32::MAX as u64) as u32;
+    Ok((mac_key, remaining))
+}
+
+/// The fields of a decrypted ACCESS-TOKEN, before any freshness check.
+pub(crate) struct OpenedToken {
+    pub(crate) mac_key: Vec<u8>,
+    /// Raw 64-bit fixed-point timestamp (seconds in the top 48 bits).
+    pub(crate) timestamp: u64,
+    pub(crate) lifetime: u32,
+}
+
+/// AEAD-open an RFC 7635 §6.2 token and parse its block. No time check: the
+/// validator applies one, and the verification kit wants to show an expired
+/// token's fields rather than only say "expired".
+pub(crate) fn open_access_token(
+    token: &[u8],
+    as_rs_keys: &[Vec<u8>],
+    server_name: &str,
+) -> Result<OpenedToken, AuthError> {
     if token.len() < 2 {
         return Err(AuthError::InvalidCredentials);
     }
@@ -751,29 +888,17 @@ fn decrypt_access_token(
         return Err(AuthError::InvalidCredentials);
     }
     let mac_key = plaintext[2..2 + key_len].to_vec();
-    let ts = u64::from_be_bytes(plaintext[2 + key_len..2 + key_len + 8].try_into().unwrap());
+    let timestamp = u64::from_be_bytes(plaintext[2 + key_len..2 + key_len + 8].try_into().unwrap());
     let lifetime = u32::from_be_bytes(
         plaintext[2 + key_len + 8..2 + key_len + 12]
             .try_into()
             .unwrap(),
     );
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // RFC 7635 §6.1: reject unless within the (symmetric, skew-tolerant) window.
-    if !token_time_valid(ts, lifetime, now, OAUTH_CLOCK_SKEW_SECS) {
-        return Err(AuthError::Expired);
-    }
-    // Remaining validity (seconds) = token end − now, clamped to u32. The caller
-    // caps the allocation lifetime by this so it never outlives the token.
-    let ts_secs = ts >> 16;
-    let remaining = ts_secs
-        .saturating_add(lifetime as u64)
-        .saturating_sub(now)
-        .min(u32::MAX as u64) as u32;
-    Ok((mac_key, remaining))
+    Ok(OpenedToken {
+        mac_key,
+        timestamp,
+        lifetime,
+    })
 }
 
 /// AES-GCM AEAD decrypt (RFC 5116). Key length selects AES-128 (16 B) or
@@ -1284,5 +1409,157 @@ mod subject_tests {
     fn long_term_usernames_are_left_alone() {
         let m = AuthMode::long_term("r".to_string(), [("100:alice", "pw")]);
         assert_eq!(m.subject_of("100:alice"), "100:alice");
+    }
+}
+
+/// `[turn.auth.webhook]` through `AuthMode::validate`: local users win, unknown
+/// names go to the cache, and every non-answer fails closed.
+#[cfg(test)]
+mod webhook_validate_tests {
+    use super::webhook::{CredentialCache, FetchOutcome, WebhookSettings};
+    use super::*;
+    use std::time::Duration;
+    use turna_proto_stun::attribute::Attribute;
+    use turna_proto_stun::header::MessageClass;
+    use turna_proto_stun::method::Method;
+
+    fn password() -> String {
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn signed(user: &str, pass: &str, sha256: bool) -> (StunMessage, Vec<u8>) {
+        let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
+        m.add(Attribute::Username(user.into()));
+        m.add(Attribute::Realm("r".into()));
+        let mut buf = [0u8; 512];
+        let len = if sha256 {
+            let key = turna_crypto::long_term_key_sha256(user, "r", pass);
+            m.encode_with_integrity_sha256(&mut buf, &key).unwrap()
+        } else {
+            let key = turna_crypto::long_term_key(user, "r", pass);
+            m.encode_with_integrity(&mut buf, &key).unwrap()
+        };
+        let raw = buf[..len].to_vec();
+        (StunMessage::decode(&raw).unwrap(), raw)
+    }
+
+    fn mode(
+        local_pass: &str,
+    ) -> (
+        AuthMode,
+        Arc<CredentialCache>,
+        tokio::sync::mpsc::Receiver<webhook::FetchJob>,
+    ) {
+        let (cache, rx) = CredentialCache::new(
+            "r",
+            WebhookSettings {
+                positive_ttl: Duration::from_secs(60),
+                negative_ttl: Duration::from_secs(60),
+                error_ttl: Duration::from_secs(60),
+                max_entries: 16,
+                queue_depth: 16,
+            },
+        );
+        let m = AuthMode::long_term("r", [("local", local_pass)]).with_webhook(cache.clone());
+        (m, cache, rx)
+    }
+
+    #[test]
+    fn local_users_never_reach_the_webhook() {
+        let pw = password();
+        let (m, _c, mut rx) = mode(&pw);
+        let (msg, raw) = signed("local", &pw, false);
+        m.validate(&msg, &raw).expect("local user validates");
+        assert!(rx.try_recv().is_err(), "no lookup for a local user");
+    }
+
+    #[test]
+    fn unknown_user_is_pending_then_validates_from_the_cache() {
+        let (m, cache, mut rx) = mode(&password());
+        let remote_pw = password();
+        let (msg, raw) = signed("remote", &remote_pw, true);
+        assert!(matches!(m.validate(&msg, &raw), Err(AuthError::Pending(_))));
+        let job = rx.try_recv().expect("lookup queued");
+        assert_eq!(job.username, "remote");
+        cache.complete(
+            "remote",
+            FetchOutcome::Found {
+                keys: UserKeys::derive("remote", "r", &remote_pw),
+                ttl: None,
+            },
+        );
+        let key = m.validate(&msg, &raw).expect("validates from the cache");
+        assert_eq!(key.len(), 32, "SHA-256 key for a SHA-256 request");
+        // A wrong password against a cached user is an ordinary failure.
+        let (bad, bad_raw) = signed("remote", &password(), true);
+        assert!(matches!(
+            m.validate(&bad, &bad_raw),
+            Err(AuthError::IntegrityFailed)
+        ));
+    }
+
+    #[test]
+    fn not_found_is_invalid_and_failure_is_unavailable() {
+        let (m, cache, _rx) = mode(&password());
+        let (ghost, ghost_raw) = signed("ghost", &password(), false);
+        let _ = m.validate(&ghost, &ghost_raw);
+        cache.complete("ghost", FetchOutcome::NotFound);
+        assert!(matches!(
+            m.validate(&ghost, &ghost_raw),
+            Err(AuthError::InvalidCredentials)
+        ));
+
+        let (down, down_raw) = signed("down", &password(), false);
+        let _ = m.validate(&down, &down_raw);
+        cache.complete("down", FetchOutcome::Failed);
+        assert!(matches!(
+            m.validate(&down, &down_raw),
+            Err(AuthError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn a_missing_key_variant_reads_as_unknown_user() {
+        let (m, cache, _rx) = mode(&password());
+        let pw = password();
+        let (msg, raw) = signed("md5only", &pw, true);
+        let _ = m.validate(&msg, &raw);
+        let mut keys = UserKeys::derive("md5only", "r", &pw);
+        keys.key_sha256.clear();
+        cache.complete("md5only", FetchOutcome::Found { keys, ttl: None });
+        assert!(matches!(
+            m.validate(&msg, &raw),
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn no_fetch_mode_never_calls_out() {
+        let (m, _cache, mut rx) = mode(&password());
+        let (msg, raw) = signed("stranger", &password(), false);
+        assert!(matches!(
+            m.validate_opts(&msg, &raw, webhook::FetchPolicy::Never),
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_cache_for_another_realm_is_not_attached() {
+        let (cache, _rx) = CredentialCache::new(
+            "other",
+            WebhookSettings {
+                positive_ttl: Duration::from_secs(1),
+                negative_ttl: Duration::from_secs(1),
+                error_ttl: Duration::from_secs(1),
+                max_entries: 1,
+                queue_depth: 1,
+            },
+        );
+        let m = AuthMode::long_term("r", [("u", password())]).with_webhook(cache);
+        assert!(m.webhook().is_none());
     }
 }

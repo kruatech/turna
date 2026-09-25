@@ -51,5 +51,14 @@ turna-state-backend.workspace = true
 turna-proto-turn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `[turn.auth.webhook]` HTTPS client. reqwest is already in the node's graph
+# (opentelemetry-http) and in services/admin, so no new package enters
+# Cargo.lock. `rustls-no-provider`: reqwest picks no crypto provider; the node
+# hands it a rustls ClientConfig built on ring explicitly (auth_webhook.rs), so
+# this dependency adds no aws-lc-rs path. rustls, ring and
+# rustls-platform-verifier are all already in the lock. No OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = "0.7"
 # PR A (task 2.4): system resource metrics in heartbeat.
 sysinfo = "0.39"

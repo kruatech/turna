@@ -62,7 +62,7 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
 | Peer filtering (SSRF) | present | `peer_filter` module |
 | TCP relay (RFC 6062) | **near-complete (experimental)** | Allocate(TCP)+CONNECT+ConnectionBind raw-detach over TLS + **peer-initiated relayed TCP listener + accept loop + CONNECTION-ATTEMPT indication + ConnectionBind on peer-initiated conns**; ConnectionBind ownership-bound (O#1), leak-safe detach (O#2); off by default; remaining: pipelined-client hardening + interop verification; **still refused under `production=true`** pending interop verification |
 | NAT discovery (RFC 5780) | **absent** | no codec in the tree — see the section below; the earlier "codec done" claim was wrong |
-| OAuth (RFC 7635) | **done** (stages 1–3) | codec + AuthMode::OAuth (AEAD decrypt + MI-by-mac_key; token-time = §6.2 fixed-point + clock skew) + config wiring + 401 THIRD-PARTY-AUTHORIZATION challenge + §6.1 lifetime cap incl. zero-remaining 401 + **`kid`-from-USERNAME key selection (RFC 7635 §6.1): kid-tagged keys select one AS-RS key directly; `strict_kid` opt-in rejects unknown/absent kid, default keeps trial-decrypt fallback for rotation**. Remaining: RFC 6062 TCP-allocate binding |
+| OAuth (RFC 7635) | **done** (stages 1–3) | codec + AuthMode::OAuth (AEAD decrypt + MI-by-mac_key; token-time = §6.2 fixed-point + clock skew) + config wiring + 401 THIRD-PARTY-AUTHORIZATION challenge + §6.1 lifetime cap incl. zero-remaining 401 + **`kid`-from-USERNAME key selection (RFC 7635 §6.1): kid-tagged keys select one AS-RS key directly; `strict_kid` opt-in rejects unknown/absent kid, default keeps trial-decrypt fallback for rotation**. Remaining: RFC 6062 TCP-allocate binding; **verification against a real AS** — kit and procedure in [runbooks/oauth-verification.md](runbooks/oauth-verification.md) |
 | ORIGIN | **present (codec)** | `Attribute::Origin` (0x802F) parse/encode/getter |
 | QUIC / WebTransport | **supported**, Linux/macOS with tokio | Project-specific TURN mappings; shared transport limits and per-stream routing implemented on both paths. WebTransport uses H3 ALPN. Raw QUIC independent TURN-client interoperability is not established. [Support scope and evidence](verification/quic-webtransport-supported-2026-09-18.md). |
 | SCTP client transport | **supported on Linux/tokio** | Native SCTP, control and ChannelData, UDP relay; production allowed. [Evidence](verification/sctp-supported-2026-09-18.md). |
@@ -503,7 +503,12 @@ follow-up): the MI/fingerprint *compute* internals are now verified, not inferre
   Tests: `kid_username_selects_matching_key`,
   `strict_kid_rejects_unknown_and_missing_username` (auth).
 - **Remaining**: RFC 6062 TCP-allocate lifetime binding (the TCP relay datapath is
-  experimental/off).
+  experimental/off), and **verification against a real authorization server**,
+  which is what keeps the production refusal in place. The kit for it —
+  `turna-oauth-verify` (`tools/oauth-verify`, wrapped by
+  `scripts/verify/oauth-verification.sh`): mint and inspect §6.2 tokens, and run
+  the whole client flow against a node with tokens from your AS — and the
+  procedure are in [runbooks/oauth-verification.md](runbooks/oauth-verification.md).
 - **Priority**: low-medium (long-term + REST cover common cases).
 
 ### ORIGIN — present (codec)

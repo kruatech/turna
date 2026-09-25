@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — authentication and abuse
+
+- `[turn.auth.webhook]` (opt-in): look up long-term users on an HTTPS endpoint of
+  your signalling service, with positive/negative/error caching, bearer token and/or
+  HMAC-SHA256 signing, per-source lookup budgets, and fail-closed 500. The datapath
+  never blocks on it; TURNS, SCTP and QUIC/WebTransport stream requests are
+  re-processed when the lookup completes. Contract: `docs/auth-webhook.md`.
+- `[turn.auto_ban]` (opt-in): temporary per-address or per-prefix bans after
+  nonce-bound auth failures, credential lookups or (if enabled) rate-limit
+  refusals; bounded memory, allowlist, `SOURCE_BANNED` syslog events.
+- `[turn.relay] max_total_bytes_per_sec` (opt-in): node-wide relay bandwidth cap,
+  first come first served; RFC 6062 TCP-relay data is not counted.
+- `[turn.auth] require_binding_auth` (opt-in, coturn `secure-stun`).
+- RFC 7635 OAuth verification kit: `turna-oauth-verify`,
+  `scripts/verify/oauth-verification.sh`, `docs/runbooks/oauth-verification.md`.
+  OAuth stays refused under `production = true` until verified with a real AS.
+
+### Changed — authentication and abuse
+
+- Refresh is rate-limited with the Allocate tier (486 over the limit).
+- Per-prefix rate limiting treats `::ffff:a.b.c.d` as its IPv4 /24.
+
 ### Changed
 
 - Tooling: the workspace declares `rust-version = "1.95"` (the toolchain the

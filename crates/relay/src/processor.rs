@@ -112,6 +112,13 @@ pub enum Action {
     /// its fd is freed and the port can be safely reused.
     CloseRelay { port: u16 },
 
+    /// `[turn.auth.webhook]`: the request's USERNAME is being looked up and
+    /// nothing has been answered. Datagram transports drop this — the client's
+    /// STUN retransmission comes back after the lookup and is served from the
+    /// cache. Stream transports (TURNS, SCTP, QUIC streams), whose clients do not retransmit,
+    /// wait on `wait` and process the same request again.
+    AwaitCredentials { wait: turna_auth::webhook::Waiter },
+
     /// No action needed.
     None,
 }
@@ -302,7 +309,7 @@ fn hash_ip(ip: &std::net::IpAddr) -> String {
 /// carries one label across every line about it — a permission denial and the
 /// allocation it belongs to correlate, which is the whole reason the hash is
 /// stable within a process.
-fn loggable_ip(ip: &std::net::IpAddr) -> String {
+pub(crate) fn loggable_ip(ip: &std::net::IpAddr) -> String {
     if LOG_ALLOCATION_ADDRESSES.load(std::sync::atomic::Ordering::Relaxed) {
         return ip.to_string();
     }
@@ -552,6 +559,14 @@ pub struct PacketProcessor {
     trusted_limiter: Option<TieredRateLimiter>,
     /// Ranges whose sources use `trusted_limiter`. Empty unless configured.
     trusted_prefixes: Vec<crate::peer_filter::Cidr>,
+    /// `[turn.auto_ban]`. `None` unless configured; see [`crate::abuse`].
+    auto_ban: Option<Arc<crate::abuse::AutoBan>>,
+    /// `[turn.relay] max_total_bytes_per_sec`. `None` unless configured.
+    bandwidth_cap: Option<Arc<turna_qos::ByteRateLimiter>>,
+    /// `[turn.auth] require_binding_auth`.
+    require_binding_auth: bool,
+    /// Per-source credential-lookup budget. `None` = unlimited (no webhook).
+    webhook_lookup_limiter: Option<Arc<TieredRateLimiter>>,
     /// Budget for replies sent to an address that has not authenticated:
     /// Binding responses and 401 challenges.
     ///
@@ -602,6 +617,27 @@ pub struct RateLimitSettings {
     /// CIDR ranges whose sources get the `trusted` tier: the offices and VPN
     /// pools where hundreds of users share one NAT address.
     pub trusted_prefixes: Vec<String>,
+    /// `[turn.auto_ban]`: temporary bans fed by auth failures and rate-limit
+    /// refusals. `None` (the default) leaves the datapath exactly as before.
+    ///
+    /// Here rather than in a builder of its own because this struct is the one
+    /// thing every processor the node builds is already handed — the UDP server,
+    /// the AF_XDP loop and the QUIC/DTLS processor beside io_uring — and the
+    /// table is shared (`Arc`) so a ban on one path is a ban on all of them.
+    pub auto_ban: Option<Arc<crate::abuse::AutoBan>>,
+    /// `[turn.relay] max_total_bytes_per_sec`: one byte budget for everything
+    /// the packet processor relays, both directions (RFC 6062 TCP-relay data
+    /// bypasses the processor and is not counted), first come first served.
+    /// `None` (the default) is no cap. Shared (`Arc`) like `auto_ban`.
+    pub bandwidth_cap: Option<Arc<turna_qos::ByteRateLimiter>>,
+    /// `[turn.auth] require_binding_auth` (coturn's `secure-stun`): a Binding
+    /// without MESSAGE-INTEGRITY is challenged with 401 instead of answered.
+    /// `false` (the default) keeps anonymous Binding.
+    pub require_binding_auth: bool,
+    /// `[turn.auth.webhook] lookups_per_*`: per-source (IP and /24 or /48)
+    /// budget for credential lookups a request may start. Shared (`Arc`) so a
+    /// source's budget is node-wide. `None` without a webhook.
+    pub webhook_lookup_limiter: Option<Arc<TieredRateLimiter>>,
 }
 
 impl RateLimitSettings {
@@ -684,7 +720,87 @@ impl PacketProcessor {
             );
             Some(TieredRateLimiter::new(settings.trusted))
         };
+        self.auto_ban = settings.auto_ban.clone();
+        self.bandwidth_cap = settings.bandwidth_cap.clone();
+        self.require_binding_auth = settings.require_binding_auth;
+        self.webhook_lookup_limiter = settings.webhook_lookup_limiter.clone();
         self
+    }
+
+    /// Node-wide bandwidth cap: may `len` more relayed bytes go out? Always
+    /// true when no cap is configured.
+    #[inline]
+    fn within_capacity(&self, len: usize) -> bool {
+        match &self.bandwidth_cap {
+            Some(cap) if !cap.try_consume(len as u64) => {
+                self.metrics
+                    .capacity_dropped_packets
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .capacity_dropped_bytes
+                    .fetch_add(len as u64, Ordering::Relaxed);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Count one offence against `src` for `[turn.auto_ban]`, and announce the
+    /// ban if this one tipped it.
+    #[inline]
+    fn note_offence(&self, src: SocketAddr, offence: crate::abuse::Offence) {
+        if let Some(ban) = &self.auto_ban {
+            if let Some(ev) = ban.record(src.ip(), offence) {
+                self.metrics.autoban_bans.fetch_add(1, Ordering::Relaxed);
+                crate::abuse::log_ban(&ev);
+            }
+        }
+    }
+
+    /// A rate limiter refused `src`: the existing counter, plus auto-ban evidence.
+    #[inline]
+    fn note_rate_limited(&self, src: SocketAddr) {
+        self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+        self.note_offence(src, crate::abuse::Offence::RateLimited);
+    }
+
+    /// A request that carried a valid NONCE failed authentication. Only these
+    /// feed auto-ban: the client-bound nonce proves a round trip from `src`, so
+    /// the evidence cannot be forged with a spoofed source address.
+    ///
+    /// `Expired` is counted in `auth_failures` but is not ban evidence: a stale
+    /// TURN REST credential or OAuth token is a client clock or a cached
+    /// credential, not someone guessing — and a fleet of clients with one bad
+    /// clock would otherwise ban their shared NAT.
+    #[inline]
+    fn note_auth_failure(&self, src: SocketAddr, e: &turna_auth::AuthError) {
+        self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        if !matches!(e, turna_auth::AuthError::Expired) {
+            self.note_offence(src, crate::abuse::Offence::AuthFailure);
+        }
+    }
+
+    /// May `src` start another credential-webhook lookup? The per-source (IP
+    /// and prefix) budget from `[turn.auth.webhook] lookups_per_*`. Only asked
+    /// when a lookup would actually start. Always true without a webhook.
+    fn admit_lookup(&self, src: SocketAddr) -> bool {
+        match &self.webhook_lookup_limiter {
+            Some(l) => l.check_ingress(src.ip()),
+            None => true,
+        }
+    }
+
+    /// `[turn.auto_ban]` gate: drop everything from a banned source. One relaxed
+    /// load when nothing is banned (or the feature is off).
+    #[inline]
+    fn banned(&self, src: SocketAddr) -> bool {
+        match &self.auto_ban {
+            Some(ban) if ban.is_banned(src.ip()) => {
+                self.metrics.autoban_dropped.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Which limiter governs this source.
@@ -748,6 +864,10 @@ impl PacketProcessor {
             )),
             trusted_limiter: None,
             trusted_prefixes: Vec::new(),
+            auto_ban: None,
+            bandwidth_cap: None,
+            require_binding_auth: false,
+            webhook_lookup_limiter: None,
             // (64, 8): a legitimate client needs single digits of these, ever.
             // Only `per_ip` is consulted; the other tiers are set to the same
             // values rather than left at their generous defaults so that a
@@ -940,6 +1060,12 @@ impl PacketProcessor {
             .bytes_received
             .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
+        // `[turn.auto_ban]`: before classification, limiting, parsing or auth —
+        // a banned source costs one map read and nothing else.
+        if self.banned(src) {
+            return vec![Action::None];
+        }
+
         // Cheap stateless protocol classification BEFORE rate limiting.
         //
         // Garbage traffic must not touch the limiter/state/auth path: under
@@ -967,7 +1093,7 @@ impl PacketProcessor {
             // the per-allocation bandwidth quota — so a cheaper per-IP-only
             // gate (single shard lock) is sufficient here.
             if !self.limiter_for(src.ip()).check_ingress_ip(src.ip()) {
-                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                self.note_rate_limited(src);
                 return vec![Action::None];
             }
             // P2: only read the clock / update the histogram on sampled packets.
@@ -984,7 +1110,7 @@ impl PacketProcessor {
 
         // STUN is pre-auth: keep the full per-IP + per-prefix ingress gate.
         if !self.limiter_for(src.ip()).check_ingress(src.ip()) {
-            self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+            self.note_rate_limited(src);
             return vec![Action::None];
         }
         if should_sample() {
@@ -1017,9 +1143,13 @@ impl PacketProcessor {
                 .bytes_received
                 .fetch_add(raw.len() as u64, Ordering::Relaxed);
 
+            if self.banned(src) {
+                return vec![Action::None];
+            }
+
             // ChannelData uses the per-IP-only ingress gate (see P5 in process()).
             if !self.limiter_for(src.ip()).check_ingress_ip(src.ip()) {
-                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                self.note_rate_limited(src);
                 return vec![Action::None];
             }
 
@@ -1103,6 +1233,9 @@ impl PacketProcessor {
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return vec![Action::None];
         }
+        if !self.within_capacity(data.len()) {
+            return vec![Action::None];
+        }
         alloc.add_bytes(data.len() as u64);
         let ca = alloc.client_addr;
         let channel = alloc.get_peer_channel(&peer_addr);
@@ -1181,6 +1314,9 @@ impl PacketProcessor {
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        if !self.within_capacity(data_slice.len()) {
+            return None;
+        }
 
         alloc.add_bytes(data_slice.len() as u64);
         self.metrics
@@ -1221,23 +1357,42 @@ impl PacketProcessor {
     /// `AuthError` variant. The per-reason counters are a breakdown *under* the
     /// total `auth_failures`, which the call sites still bump — so the totals
     /// stay consistent and behaviour is unchanged.
+    ///
+    /// `allow_fetch` governs the credential webhook: `false` for requests whose
+    /// source address has not been proven by a NONCE round trip (cache only);
+    /// `true` lets a miss start a lookup within `src`'s per-source budget.
     fn auth_validate(
         &self,
         msg: &StunMessage,
         raw: &[u8],
+        src: SocketAddr,
+        allow_fetch: bool,
     ) -> Result<turna_auth::AuthResolution, turna_auth::AuthError> {
+        let admit = || self.admit_lookup(src);
+        let allow_fetch = if allow_fetch {
+            turna_auth::webhook::FetchPolicy::Admit(&admit)
+        } else {
+            turna_auth::webhook::FetchPolicy::Never
+        };
         let r = if should_sample() {
             let started = std::time::Instant::now();
-            let r = self.auth.validate(msg, raw);
+            let r = self.auth.validate_opts(msg, raw, allow_fetch);
             self.metrics
                 .histograms
                 .observe("turna_auth_duration_seconds", started.elapsed());
             r
         } else {
-            self.auth.validate(msg, raw)
+            self.auth.validate_opts(msg, raw, allow_fetch)
         };
         if let Err(e) = &r {
             let counter = match e {
+                // Not failures: a lookup in flight, or a credential backend that
+                // is down. Counted by `auth_deferred` instead.
+                turna_auth::AuthError::Pending(_)
+                | turna_auth::AuthError::Unavailable
+                | turna_auth::AuthError::Throttled => {
+                    return r;
+                }
                 turna_auth::AuthError::MissingCredentials => {
                     &self.metrics.auth_fail_missing_credentials
                 }
@@ -1251,6 +1406,52 @@ impl PacketProcessor {
             counter.fetch_add(1, Ordering::Relaxed);
         }
         r
+    }
+
+    /// `[turn.auth.webhook]` outcomes that are not authentication failures.
+    ///
+    /// `Pending`: the request is parked, not answered — see
+    /// [`Action::AwaitCredentials`]. `Unavailable`: fail closed with
+    /// `500 Server Error` (RFC 8489: a temporary error, try again).
+    /// `Throttled`: `src` used up its lookup budget; also 500.
+    ///
+    /// None of them is counted in `auth_failures`. For auto-ban, a lookup this
+    /// request *started* and a throttled one are `CredentialLookup` evidence
+    /// against `src` (a login needs one or two; a source cycling through names
+    /// is enumerating or trying to fill the queue). Joining a lookup someone
+    /// else started, and a backend outage, are not. `None` for every other
+    /// error, which the caller handles as before.
+    fn auth_deferred(
+        &self,
+        e: &turna_auth::AuthError,
+        msg: &StunMessage,
+        src: SocketAddr,
+    ) -> Option<Vec<Action>> {
+        match e {
+            turna_auth::AuthError::Pending(wait) => {
+                self.metrics
+                    .auth_webhook_deferred
+                    .fetch_add(1, Ordering::Relaxed);
+                if wait.started() {
+                    self.note_offence(src, crate::abuse::Offence::CredentialLookup);
+                }
+                Some(vec![Action::AwaitCredentials { wait: wait.clone() }])
+            }
+            turna_auth::AuthError::Throttled => {
+                self.metrics
+                    .auth_webhook_throttled
+                    .fetch_add(1, Ordering::Relaxed);
+                self.note_offence(src, crate::abuse::Offence::CredentialLookup);
+                Some(self.encode_error(msg, src, 500, "Server Error"))
+            }
+            turna_auth::AuthError::Unavailable => {
+                self.metrics
+                    .auth_webhook_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(self.encode_error(msg, src, 500, "Server Error"))
+            }
+            _ => None,
+        }
     }
 
     fn process_stun(&self, raw: Bytes, src: SocketAddr, ingress_tcp: bool) -> Vec<Action> {
@@ -1338,22 +1539,32 @@ impl PacketProcessor {
             (MessageClass::Request, Method::Binding) => self.handle_binding(msg, raw, src),
             (MessageClass::Request, Method::Allocate) => {
                 if !self.limiter_for(src.ip()).check_allocate(src.ip()) {
-                    self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.note_rate_limited(src);
                     return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_allocate(msg, raw, src, ingress_tcp)
             }
-            (MessageClass::Request, Method::Refresh) => self.handle_refresh(msg, raw, src),
+            // Refresh shares the Allocate tier. It was the one authenticated
+            // method with no per-method limit, and with the credential webhook
+            // it can start a lookup exactly as Allocate can. A client refreshes
+            // once every few minutes, so the shared budget costs it nothing.
+            (MessageClass::Request, Method::Refresh) => {
+                if !self.limiter_for(src.ip()).check_allocate(src.ip()) {
+                    self.note_rate_limited(src);
+                    return self.encode_error(msg, src, 486, "Allocation Quota Reached");
+                }
+                self.handle_refresh(msg, raw, src)
+            }
             (MessageClass::Request, Method::CreatePermission) => {
                 if !self.limiter_for(src.ip()).check_create_permission(src.ip()) {
-                    self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.note_rate_limited(src);
                     return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_create_permission(msg, raw, src)
             }
             (MessageClass::Request, Method::ChannelBind) => {
                 if !self.limiter_for(src.ip()).check_channel_bind(src.ip()) {
-                    self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    self.note_rate_limited(src);
                     return self.encode_error(msg, src, 486, "Allocation Quota Reached");
                 }
                 self.handle_channel_bind(msg, raw, src)
@@ -1509,12 +1720,41 @@ impl PacketProcessor {
         // SHA-1 variant let a SHA256-only Binding through unauthenticated (I6).
         let has_integrity =
             msg.get_message_integrity().is_some() || msg.get_message_integrity_sha256().is_some();
-        if has_integrity && self.auth_validate(msg, raw).is_err() {
-            self.metrics
-                .auth_failures
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return self.encode_auth_challenge(msg, src);
+        if self.require_binding_auth {
+            // coturn's `secure-stun`: Binding is served only to a client that
+            // holds credentials, with the same nonce discipline as Allocate.
+            // The 401 below spends the same unauthenticated-reply budget
+            // (checked above) as any other challenge.
+            if !has_integrity || msg.get_username().is_none() {
+                self.metrics
+                    .binding_auth_challenges
+                    .fetch_add(1, Ordering::Relaxed);
+                return self.encode_auth_challenge(msg, src);
+            }
+            if let Some(stale) = self.validate_nonce(msg, src) {
+                return stale;
+            }
         }
+        let binding_key = if has_integrity {
+            // The webhook may only be called for a Binding whose NONCE was
+            // checked above; otherwise a forged source could make the node send
+            // HTTP requests on its behalf. Without the check, an unknown user
+            // is simply unknown.
+            match self.auth_validate(msg, raw, src, self.require_binding_auth) {
+                Ok(r) => Some(r.key),
+                Err(e) => {
+                    if let Some(a) = self.auth_deferred(&e, msg, src) {
+                        return a;
+                    }
+                    // Counted, but never auto-ban evidence: without the nonce
+                    // check above this source address may be forged.
+                    self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    return self.encode_auth_challenge(msg, src);
+                }
+            }
+        } else {
+            None
+        };
 
         let mut resp = StunMessage::with_transaction_id(
             Method::Binding,
@@ -1536,7 +1776,15 @@ impl PacketProcessor {
         }
 
         let mut buf = [0u8; 256];
-        let len = encode_or_drop!(resp.encode(&mut buf), vec![Action::None]);
+        // An authenticated Binding gets an authenticated answer (RFC 8489
+        // §9.2.4) when the operator requires authentication. Otherwise the
+        // response is left exactly as it was, unsigned, so existing clients see
+        // no change.
+        let encoded = match (&binding_key, self.require_binding_auth) {
+            (Some(key), true) => encode_with_integrity_auto(&resp, &mut buf, key, msg),
+            _ => resp.encode(&mut buf),
+        };
+        let len = encode_or_drop!(encoded, vec![Action::None]);
         self.metrics.packets_sent.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_sent
@@ -1565,13 +1813,16 @@ impl PacketProcessor {
             return stale;
         }
 
-        let resolution = match self.auth_validate(msg, raw) {
+        let resolution = match self.auth_validate(msg, raw, src, true) {
             Ok(r) => r,
             Err(e) => {
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
                 if let Some(occurrences) = AUTH_FAILED_LOG.should_log() {
                     warn!(src = %loggable_addr(&src), %e, occurrences, "auth failed");
                 }
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                self.note_auth_failure(src, &e);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2032,10 +2283,13 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return ConnectDecision::Reject(stale);
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, src, true) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return ConnectDecision::Reject(a);
+                }
+                self.note_auth_failure(src, &e);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return ConnectDecision::Reject(self.encode_error(
                         msg,
@@ -2163,10 +2417,13 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return ConnBindDecision::Reject(stale);
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, src, true) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return ConnBindDecision::Reject(a);
+                }
+                self.note_auth_failure(src, &e);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return ConnBindDecision::Reject(self.encode_error(
                         msg,
@@ -2228,10 +2485,13 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let resolution = match self.auth_validate(msg, raw) {
+        let resolution = match self.auth_validate(msg, raw, src, true) {
             Ok(r) => r,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
+                self.note_auth_failure(src, &e);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2431,10 +2691,13 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, src, true) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
+                self.note_auth_failure(src, &e);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2522,10 +2785,13 @@ impl PacketProcessor {
         if let Some(stale) = self.validate_nonce(msg, src) {
             return stale;
         }
-        let key = match self.auth_validate(msg, raw) {
+        let key = match self.auth_validate(msg, raw, src, true) {
             Ok(r) => r.key,
             Err(e) => {
-                self.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                if let Some(a) = self.auth_deferred(&e, msg, src) {
+                    return a;
+                }
+                self.note_auth_failure(src, &e);
                 if matches!(e, turna_auth::AuthError::BadRequest) {
                     return self.encode_error(msg, src, 400, "Bad Request");
                 }
@@ -2644,6 +2910,9 @@ impl PacketProcessor {
         if bandwidth_disabled || (bw_limit > 0 && alloc.check_bandwidth(bw_limit).is_err()) {
             debug!(src = %loggable_addr(&src), "bandwidth quota exceeded, dropping Send indication");
             self.metrics.quota_exceeded.fetch_add(1, Ordering::Relaxed);
+            return vec![Action::None];
+        }
+        if !self.within_capacity(data.len()) {
             return vec![Action::None];
         }
 
@@ -3127,5 +3396,727 @@ mod udp_replay_tests {
             [Action::None]
         ));
         assert_eq!(p.metrics.total_allocations.load(Ordering::Relaxed), 1);
+    }
+}
+
+/// `[turn.auto_ban]` through the real request path: bad credentials behind a
+/// valid nonce ban the source, the ban drops everything from it (Binding and
+/// ChannelData included), and neighbours and forged Binding failures do not
+/// count.
+#[cfg(test)]
+mod auto_ban_tests {
+    use super::*;
+    use crate::abuse::{AutoBan, AutoBanSettings};
+
+    fn wrong_password() -> String {
+        // Random per run, and not the one the user was created with.
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn processor_with_ban(threshold: u32, rl_threshold: u32) -> PacketProcessor {
+        let ban = Arc::new(AutoBan::new(AutoBanSettings {
+            auth_failures: threshold,
+            rate_limit_violations: rl_threshold,
+            credential_lookups: 0,
+            window: Duration::from_secs(60),
+            ban: Duration::from_secs(600),
+            prefix_scope: false,
+            allowlist: vec!["192.0.2.0/24".into()],
+            max_tracked: 1024,
+            max_bans: 1024,
+        }));
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(25000, 25999, 128)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "ban-test",
+                [("alice", wrong_password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        );
+        p.with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: Some(ban),
+            bandwidth_cap: None,
+            require_binding_auth: false,
+            webhook_lookup_limiter: None,
+        })
+    }
+
+    /// An Allocate with a valid nonce and the wrong key.
+    fn bad_allocate(p: &PacketProcessor, src: SocketAddr) -> Bytes {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.add(Attribute::RequestedTransport(17));
+        msg.add(Attribute::Username("alice".into()));
+        msg.add(Attribute::Realm("ban-test".into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key("alice", "ban-test", &wrong_password());
+        let mut buf = [0; 512];
+        let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn binding() -> Bytes {
+        let msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        let mut buf = [0; 64];
+        let n = msg.encode(&mut buf).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn answered(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::Send { .. }))
+    }
+
+    #[test]
+    fn repeated_auth_failures_ban_the_source_and_nothing_else() {
+        let p = processor_with_ban(3, 0);
+        let bad: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let good: SocketAddr = "203.0.113.10:40000".parse().unwrap();
+
+        assert!(answered(&p.process(binding(), bad)), "not banned yet");
+        for _ in 0..3 {
+            // Each failure is still answered with a 401 challenge.
+            assert!(answered(&p.process(bad_allocate(&p, bad), bad)));
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 1);
+
+        // Everything from the banned address is dropped silently — including a
+        // Binding, which needs no credentials, and ChannelData.
+        assert!(!answered(&p.process(binding(), bad)));
+        assert!(!answered(&p.process(bad_allocate(&p, bad), bad)));
+        let cd = Bytes::from_static(&[0x40, 0x00, 0x00, 0x04, 1, 2, 3, 4]);
+        assert!(!answered(&p.process(cd.clone(), bad)));
+        assert!(matches!(p.process_slice(&cd, bad)[..], [Action::None]));
+        assert!(p.metrics.autoban_dropped.load(Ordering::Relaxed) >= 4);
+
+        // Another port on the same host is the same host.
+        let same_host: SocketAddr = "203.0.113.9:40001".parse().unwrap();
+        assert!(!answered(&p.process(binding(), same_host)));
+
+        // The neighbour is untouched.
+        assert!(answered(&p.process(binding(), good)));
+    }
+
+    #[test]
+    fn allowlisted_sources_are_never_banned() {
+        let p = processor_with_ban(2, 0);
+        let src: SocketAddr = "192.0.2.50:40000".parse().unwrap();
+        for _ in 0..10 {
+            p.process(bad_allocate(&p, src), src);
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+        assert!(answered(&p.process(binding(), src)));
+    }
+
+    /// A Binding with bad MESSAGE-INTEGRITY skips the nonce, so its source may
+    /// be forged. It must not count, or anyone could get a victim banned.
+    #[test]
+    fn forged_binding_failures_do_not_count() {
+        let p = processor_with_ban(2, 0);
+        let victim: SocketAddr = "198.51.100.77:3478".parse().unwrap();
+        let key = turna_crypto::long_term_key("alice", "ban-test", &wrong_password());
+        for _ in 0..10 {
+            let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+            msg.add(Attribute::Username("alice".into()));
+            msg.add(Attribute::Realm("ban-test".into()));
+            let mut buf = [0; 256];
+            let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+            p.process(Bytes::copy_from_slice(&buf[..n]), victim);
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+    }
+
+    /// A stale TURN REST credential is a clock or a cached credential, not
+    /// guessing: counted as an auth failure, never as ban evidence.
+    #[test]
+    fn expired_credentials_are_not_ban_evidence() {
+        let ban = Arc::new(AutoBan::new(AutoBanSettings {
+            auth_failures: 1,
+            rate_limit_violations: 0,
+            credential_lookups: 0,
+            window: Duration::from_secs(60),
+            ban: Duration::from_secs(600),
+            prefix_scope: false,
+            allowlist: Vec::new(),
+            max_tracked: 16,
+            max_bans: 16,
+        }));
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(25000, 25999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::SharedSecret {
+                realm: "rest".into(),
+                secret: wrong_password().into_bytes(),
+                previous: None,
+            })),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: Some(ban),
+            bandwidth_cap: None,
+            require_binding_auth: false,
+            webhook_lookup_limiter: None,
+        });
+        let src: SocketAddr = "203.0.113.50:40000".parse().unwrap();
+        for _ in 0..5 {
+            let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+            msg.add(Attribute::RequestedTransport(17));
+            // Expired in 1970, far outside any clock-skew grace.
+            msg.add(Attribute::Username("1:alice".into()));
+            msg.add(Attribute::Realm("rest".into()));
+            msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+            let key = turna_crypto::long_term_key("1:alice", "rest", &wrong_password());
+            let mut buf = [0; 512];
+            let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+            assert!(answered(&p.process(Bytes::copy_from_slice(&buf[..n]), src)));
+        }
+        assert_eq!(p.metrics.auth_fail_expired.load(Ordering::Relaxed), 5);
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+        assert!(answered(&p.process(binding(), src)), "not banned");
+    }
+
+    /// Refresh now has the Allocate tier's per-method limit.
+    #[test]
+    fn refresh_is_rate_limited_like_allocate() {
+        let p = processor_with_ban(1000, 0);
+        let src: SocketAddr = "203.0.113.51:40000".parse().unwrap();
+        let mut refused = 0;
+        for _ in 0..(TieredLimits::default().allocate.0 + 10) {
+            let mut msg = StunMessage::new(Method::Refresh, MessageClass::Request);
+            msg.add(Attribute::Username("alice".into()));
+            let mut buf = [0; 256];
+            let n = msg.encode(&mut buf).unwrap();
+            let actions = p.process(Bytes::copy_from_slice(&buf[..n]), src);
+            if let Some(Action::Send { data, .. }) = actions.first() {
+                let m = StunMessage::decode(data).unwrap();
+                if m.attributes
+                    .iter()
+                    .any(|a| matches!(a, Attribute::ErrorCode { code: 486, .. }))
+                {
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused >= 1, "the Allocate-tier burst was exceeded");
+    }
+
+    #[test]
+    fn off_by_default() {
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(26000, 26999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "ban-test",
+                [("alice", wrong_password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        );
+        let src: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        for _ in 0..50 {
+            p.process(bad_allocate(&p, src), src);
+        }
+        assert!(answered(&p.process(binding(), src)));
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// `[turn.relay] max_total_bytes_per_sec` and `[turn.auth] require_binding_auth`.
+#[cfg(test)]
+mod capacity_and_binding_auth_tests {
+    use super::*;
+
+    fn password() -> &'static str {
+        static PW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PW.get_or_init(|| {
+            turna_crypto::random_key_32()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+    }
+
+    fn processor(cap: Option<u64>, require_binding_auth: bool) -> PacketProcessor {
+        PacketProcessor::new(
+            Arc::new(AllocationStore::new(27000, 27999, 16)),
+            Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
+                "cap-test",
+                [("carol", password())],
+            ))),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: None,
+            bandwidth_cap: cap.map(|c| Arc::new(turna_qos::ByteRateLimiter::with_burst(c, c))),
+            require_binding_auth,
+            webhook_lookup_limiter: None,
+        })
+    }
+
+    fn send_indication(peer: SocketAddr, payload: &[u8]) -> Bytes {
+        let mut msg = StunMessage::new(Method::Send, MessageClass::Indication);
+        msg.attributes.push(Attribute::XorPeerAddress(peer));
+        msg.attributes.push(Attribute::Data(payload.to_vec()));
+        let mut buf = [0u8; 1500];
+        let n = msg.encode(&mut buf).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn relayed(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SendViaRelay { .. }))
+    }
+
+    /// The cap is node-wide: two allocations share one budget, and what is over
+    /// it is dropped and counted.
+    #[test]
+    fn node_wide_cap_is_shared_across_allocations_and_drops_the_excess() {
+        let p = processor(Some(2_000), false);
+        let peer: SocketAddr = "8.8.8.8:7000".parse().unwrap();
+        let clients: [SocketAddr; 2] = [
+            "127.0.0.1:50001".parse().unwrap(),
+            "127.0.0.1:50002".parse().unwrap(),
+        ];
+        for (i, c) in clients.iter().enumerate() {
+            let relay: SocketAddr = format!("127.0.0.1:{}", 27000 + i).parse().unwrap();
+            p.store()
+                .create(*c, relay, "carol".into(), vec![1], 600)
+                .unwrap();
+            p.store().add_permission(c, peer.ip()).unwrap();
+        }
+        let payload = [0u8; 600];
+        // 600 + 600 + 600 fits in 2000; the fourth does not, whichever client.
+        assert!(relayed(
+            &p.process(send_indication(peer, &payload), clients[0])
+        ));
+        assert!(relayed(
+            &p.process(send_indication(peer, &payload), clients[1])
+        ));
+        assert!(relayed(
+            &p.process(send_indication(peer, &payload), clients[0])
+        ));
+        assert!(!relayed(
+            &p.process(send_indication(peer, &payload), clients[1])
+        ));
+        assert_eq!(
+            p.metrics.capacity_dropped_packets.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            p.metrics.capacity_dropped_bytes.load(Ordering::Relaxed),
+            600
+        );
+    }
+
+    #[test]
+    fn no_cap_by_default() {
+        let p = processor(None, false);
+        let peer: SocketAddr = "8.8.8.8:7000".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:50003".parse().unwrap();
+        p.store()
+            .create(
+                c,
+                "127.0.0.1:27010".parse().unwrap(),
+                "carol".into(),
+                vec![1],
+                600,
+            )
+            .unwrap();
+        p.store().add_permission(&c, peer.ip()).unwrap();
+        for _ in 0..100 {
+            assert!(relayed(&p.process(send_indication(peer, &[0u8; 1200]), c)));
+        }
+    }
+
+    fn binding(creds: Option<(&str, &PacketProcessor, SocketAddr)>) -> Bytes {
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        let mut buf = [0u8; 256];
+        let n = match creds {
+            None => msg.encode(&mut buf).unwrap(),
+            Some((nonce_kind, p, src)) => {
+                msg.add(Attribute::Username("carol".into()));
+                msg.add(Attribute::Realm("cap-test".into()));
+                if nonce_kind == "valid" {
+                    msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+                }
+                let key = turna_crypto::long_term_key("carol", "cap-test", password());
+                msg.encode_with_integrity(&mut buf, &key).unwrap()
+            }
+        };
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn error_code(m: &StunMessage) -> Option<u16> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    fn mapped(m: &StunMessage) -> Option<SocketAddr> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::XorMappedAddress(x) => Some(*x),
+            _ => None,
+        })
+    }
+
+    fn reply(actions: &[Action]) -> StunMessage {
+        let data = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .expect("a reply");
+        StunMessage::decode(&data).unwrap()
+    }
+
+    #[test]
+    fn anonymous_binding_is_served_by_default() {
+        let p = processor(None, false);
+        let src: SocketAddr = "203.0.113.1:4000".parse().unwrap();
+        let r = reply(&p.process(binding(None), src));
+        assert!(matches!(r.class, MessageClass::SuccessResponse));
+        assert!(
+            r.get_message_integrity().is_none(),
+            "the default response is unchanged: unsigned"
+        );
+    }
+
+    #[test]
+    fn require_binding_auth_challenges_anonymous_binding() {
+        let p = processor(None, true);
+        let src: SocketAddr = "203.0.113.2:4000".parse().unwrap();
+        let r = reply(&p.process(binding(None), src));
+        assert!(matches!(r.class, MessageClass::ErrorResponse));
+        assert_eq!(error_code(&r), Some(401));
+        assert!(r.get_nonce().is_some() && r.get_realm().is_some());
+        assert_eq!(p.metrics.binding_auth_challenges.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn require_binding_auth_serves_and_signs_an_authenticated_binding() {
+        let p = processor(None, true);
+        let src: SocketAddr = "203.0.113.3:4000".parse().unwrap();
+        let actions = p.process(binding(Some(("valid", &p, src))), src);
+        let data = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Send { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let r = StunMessage::decode(&data).unwrap();
+        assert!(matches!(r.class, MessageClass::SuccessResponse));
+        assert_eq!(mapped(&r), Some(src));
+        let key = turna_crypto::long_term_key("carol", "cap-test", password());
+        assert!(
+            r.verify_integrity(&data, &key),
+            "the response must be signed with the client's key"
+        );
+    }
+
+    #[test]
+    fn require_binding_auth_demands_a_nonce() {
+        let p = processor(None, true);
+        let src: SocketAddr = "203.0.113.4:4000".parse().unwrap();
+        let r = reply(&p.process(binding(Some(("none", &p, src))), src));
+        assert!(matches!(r.class, MessageClass::ErrorResponse));
+    }
+}
+
+/// `[turn.auth.webhook]` in the processor: a pending lookup parks the request
+/// without answering or counting a failure; the retransmission is served from
+/// the cache; a failed lookup is a 500, never a 401, and never auto-ban
+/// evidence.
+#[cfg(test)]
+mod webhook_tests {
+    use super::*;
+    use turna_auth::webhook::{CredentialCache, FetchOutcome, WebhookSettings};
+
+    fn password() -> String {
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn setup() -> (
+        PacketProcessor,
+        Arc<CredentialCache>,
+        tokio::sync::mpsc::Receiver<turna_auth::webhook::FetchJob>,
+    ) {
+        let (cache, rx) = CredentialCache::new(
+            "hook",
+            WebhookSettings {
+                positive_ttl: Duration::from_secs(60),
+                negative_ttl: Duration::from_secs(60),
+                error_ttl: Duration::from_secs(60),
+                max_entries: 64,
+                queue_depth: 64,
+            },
+        );
+        let mode = turna_auth::AuthMode::long_term("hook", [("local", password())])
+            .with_webhook(cache.clone());
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(28000, 28999, 16)),
+            Arc::new(AuthRegistry::new(mode)),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: Some(Arc::new(crate::abuse::AutoBan::new(
+                crate::abuse::AutoBanSettings {
+                    auth_failures: 1,
+                    rate_limit_violations: 0,
+                    credential_lookups: 0,
+                    window: Duration::from_secs(60),
+                    ban: Duration::from_secs(60),
+                    prefix_scope: false,
+                    allowlist: Vec::new(),
+                    max_tracked: 64,
+                    max_bans: 64,
+                },
+            ))),
+            bandwidth_cap: None,
+            require_binding_auth: false,
+            webhook_lookup_limiter: None,
+        });
+        (p, cache, rx)
+    }
+
+    /// A small shared queue, a per-source lookup budget of 2 (per /24: 4), and
+    /// auto-ban on 3 lookups — the flood configuration.
+    fn setup_flood() -> (
+        PacketProcessor,
+        Arc<CredentialCache>,
+        tokio::sync::mpsc::Receiver<turna_auth::webhook::FetchJob>,
+    ) {
+        let (cache, rx) = CredentialCache::new(
+            "hook",
+            WebhookSettings {
+                positive_ttl: Duration::from_secs(60),
+                negative_ttl: Duration::from_secs(60),
+                error_ttl: Duration::from_secs(60),
+                max_entries: 1024,
+                queue_depth: 8,
+            },
+        );
+        let mode = turna_auth::AuthMode::long_term("hook", [("local", password())])
+            .with_webhook(cache.clone());
+        let p = PacketProcessor::new(
+            Arc::new(AllocationStore::new(29000, 29999, 16)),
+            Arc::new(AuthRegistry::new(mode)),
+            "127.0.0.1".parse().unwrap(),
+            Arc::new(Metrics::new()),
+        )
+        .with_rate_limits(&RateLimitSettings {
+            default: TieredLimits::default(),
+            trusted: TieredLimits::default(),
+            trusted_prefixes: Vec::new(),
+            auto_ban: Some(Arc::new(crate::abuse::AutoBan::new(
+                crate::abuse::AutoBanSettings {
+                    auth_failures: 0,
+                    rate_limit_violations: 0,
+                    credential_lookups: 3,
+                    window: Duration::from_secs(60),
+                    ban: Duration::from_secs(60),
+                    prefix_scope: false,
+                    allowlist: Vec::new(),
+                    max_tracked: 64,
+                    max_bans: 64,
+                },
+            ))),
+            bandwidth_cap: None,
+            require_binding_auth: false,
+            webhook_lookup_limiter: Some(Arc::new(TieredRateLimiter::new(TieredLimits {
+                per_ip: (2, 1),
+                per_prefix: (4, 1),
+                allocate: (2, 1),
+                create_permission: (2, 1),
+                channel_bind: (2, 1),
+            }))),
+        });
+        (p, cache, rx)
+    }
+
+    /// One host naming random users cannot fill the shared lookup queue: its
+    /// budget runs out (500 to it, not to others), the lookups it did start ban
+    /// it, and a user from elsewhere still gets a lookup.
+    #[test]
+    fn one_source_cannot_exhaust_the_lookup_queue() {
+        let (p, _cache, mut jobs) = setup_flood();
+        let flooder: SocketAddr = "203.0.113.30:5000".parse().unwrap();
+        let mut throttled = 0;
+        for i in 0..50 {
+            let actions = p.process(
+                allocate(&p, flooder, &format!("rand{i}"), &password()),
+                flooder,
+            );
+            if reply(&actions).and_then(|r| code(&r)) == Some(500) {
+                throttled += 1;
+            }
+        }
+        let mut queued = 0;
+        while jobs.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 2, "the flooder started only its budget of lookups");
+        assert!(throttled >= 1, "the rest were refused");
+        assert!(p.metrics.auth_webhook_throttled.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            p.metrics.autoban_bans.load(Ordering::Relaxed),
+            1,
+            "3 lookups (2 started + 1 throttled) ban the source"
+        );
+
+        // A user on another network is looked up as normal.
+        let other: SocketAddr = "198.51.100.40:6000".parse().unwrap();
+        let actions = p.process(allocate(&p, other, "realuser", &password()), other);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::AwaitCredentials { .. })));
+        assert_eq!(jobs.try_recv().unwrap().username, "realuser");
+    }
+
+    /// Joining a lookup someone else started costs no budget and is no
+    /// evidence: a user retransmitting, or many users behind one NAT logging in
+    /// as the same name, are not charged per request.
+    #[test]
+    fn joining_an_inflight_lookup_is_free() {
+        let (p, _cache, _jobs) = setup_flood();
+        let src: SocketAddr = "203.0.113.31:5000".parse().unwrap();
+        for _ in 0..10 {
+            let actions = p.process(allocate(&p, src, "sameuser", &password()), src);
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::AwaitCredentials { .. })));
+        }
+        assert_eq!(p.metrics.autoban_bans.load(Ordering::Relaxed), 0);
+        assert_eq!(p.metrics.auth_webhook_throttled.load(Ordering::Relaxed), 0);
+    }
+
+    fn allocate(p: &PacketProcessor, src: SocketAddr, user: &str, pass: &str) -> Bytes {
+        let mut msg = StunMessage::new(Method::Allocate, MessageClass::Request);
+        msg.add(Attribute::RequestedTransport(17));
+        msg.add(Attribute::Username(user.into()));
+        msg.add(Attribute::Realm("hook".into()));
+        msg.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
+        let key = turna_crypto::long_term_key(user, "hook", pass);
+        let mut buf = [0; 512];
+        let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+        Bytes::copy_from_slice(&buf[..n])
+    }
+
+    fn reply(actions: &[Action]) -> Option<StunMessage> {
+        actions.iter().find_map(|a| match a {
+            Action::Send { data, .. } => StunMessage::decode(data).ok(),
+            _ => None,
+        })
+    }
+
+    fn code(m: &StunMessage) -> Option<u16> {
+        m.attributes.iter().find_map(|a| match a {
+            Attribute::ErrorCode { code, .. } => Some(*code),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn pending_parks_then_the_retransmission_is_served_from_the_cache() {
+        let (p, cache, mut rx) = setup();
+        let pw = password();
+        let src: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let req = allocate(&p, src, "remote", &pw);
+
+        let first = p.process(req.clone(), src);
+        assert!(reply(&first).is_none(), "nothing is answered while pending");
+        assert!(first
+            .iter()
+            .any(|a| matches!(a, Action::AwaitCredentials { .. })));
+        assert_eq!(p.metrics.auth_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(p.metrics.auth_webhook_deferred.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().unwrap().username, "remote");
+
+        cache.complete(
+            "remote",
+            FetchOutcome::Found {
+                keys: turna_auth::UserKeys::derive("remote", "hook", &pw),
+                ttl: None,
+            },
+        );
+        // The client's retransmission: byte-identical.
+        let second = reply(&p.process(req, src)).expect("answered");
+        assert!(matches!(second.class, MessageClass::SuccessResponse));
+        assert!(p.store().get(&src).is_some(), "allocation created");
+    }
+
+    #[test]
+    fn unknown_user_is_a_401_and_a_failed_lookup_a_500() {
+        let (p, cache, _rx) = setup();
+        let ghost_src: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+        let _ = p.process(allocate(&p, ghost_src, "ghost", &password()), ghost_src);
+        cache.complete("ghost", FetchOutcome::NotFound);
+        let r = reply(&p.process(allocate(&p, ghost_src, "ghost", &password()), ghost_src))
+            .expect("answered");
+        assert_eq!(code(&r), Some(401));
+
+        let down_src: SocketAddr = "203.0.113.22:5000".parse().unwrap();
+        let _ = p.process(allocate(&p, down_src, "down", &password()), down_src);
+        cache.complete("down", FetchOutcome::Failed);
+        for _ in 0..3 {
+            let r = reply(&p.process(allocate(&p, down_src, "down", &password()), down_src))
+                .expect("answered");
+            assert_eq!(code(&r), Some(500), "fail closed, and not as a 401");
+        }
+        assert_eq!(
+            p.metrics.auth_webhook_unavailable.load(Ordering::Relaxed),
+            3
+        );
+        // auth_failures = 1 threshold: the ghost's 401 banned its source, but the
+        // backend outage banned nobody.
+        let binding = {
+            let m = StunMessage::new(Method::Binding, MessageClass::Request);
+            let mut b = [0; 64];
+            let n = m.encode(&mut b).unwrap();
+            Bytes::copy_from_slice(&b[..n])
+        };
+        assert!(reply(&p.process(binding.clone(), down_src)).is_some());
+        assert!(reply(&p.process(binding, ghost_src)).is_none());
+    }
+
+    /// A Binding with MESSAGE-INTEGRITY needs no NONCE, so its source may be
+    /// forged: it must not make the node call the webhook.
+    #[test]
+    fn binding_never_triggers_a_lookup() {
+        let (p, _cache, mut rx) = setup();
+        let src: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let mut msg = StunMessage::new(Method::Binding, MessageClass::Request);
+        msg.add(Attribute::Username("stranger".into()));
+        msg.add(Attribute::Realm("hook".into()));
+        let key = turna_crypto::long_term_key("stranger", "hook", &password());
+        let mut buf = [0; 256];
+        let n = msg.encode_with_integrity(&mut buf, &key).unwrap();
+        let r = reply(&p.process(Bytes::copy_from_slice(&buf[..n]), src)).expect("answered");
+        assert_eq!(code(&r), Some(401));
+        assert!(
+            rx.try_recv().is_err(),
+            "no HTTP lookup on a forgeable request"
+        );
     }
 }

@@ -152,3 +152,52 @@ IP/range per node; use drain for planned maintenance, monitor remaining
 allocations, and treat cluster StatefulSet mode as experimental.
 **Exit condition:** a separately verified socket/port ownership protocol and
 end-to-end media continuity tests across process/node death.
+
+## RISK-007 — auto-ban's rate-limit trigger can be aimed at a victim by spoofing
+
+- **Status:** accepted, and **off by default** (`[turn.auto_ban]
+  rate_limit_violations = 0`). The auth-failure trigger does not carry this risk.
+- **Description:** with `rate_limit_violations > 0`, a source is banned after
+  that many rate-limiter refusals in the window. Rate limits refuse raw packets,
+  and a UDP packet can carry any source address, so an attacker able to spoof
+  can flood with a victim's address and get the victim banned for `ban_secs` —
+  a customer, a partner's NAT, a monitoring probe.
+- **Why it is offered anyway:** where spoofing is filtered upstream (BCP 38 on
+  the provider edge, or a node reachable only through a load balancer that
+  terminates the path), it bans flooders that never attempt authentication,
+  which the auth-failure trigger cannot see.
+- **Compensating controls:** off by default; config validation warns when it is
+  enabled; `allowlist` and `exempt_trusted_prefixes` keep an operator's own
+  ranges out of reach; bans expire on their own; every ban is a
+  `SOURCE_BANNED` syslog event with the reason, so a mistaken ban is visible.
+  The auth-failure trigger counts only requests behind a valid client-bound
+  NONCE (a completed round trip), and Binding requests with bad
+  MESSAGE-INTEGRITY — which skip the nonce — are deliberately not counted.
+- **Review by:** if a cluster-wide ban table is ever added, since that would
+  multiply the reach of a forged ban across nodes.
+
+## RISK-008 — auth webhook: cached credentials outlive revocation, and uncached users depend on the endpoint
+
+- **Status:** accepted; applies only with `[turn.auth.webhook] enabled = true`
+  (off by default).
+- **Description:** (1) a user's keys are cached for up to `positive_ttl_secs`
+  (default 300 s, capped per answer by the endpoint's `ttl_secs`), so a user
+  removed or re-keyed in the signalling service can still authenticate against
+  this node until the entry expires, and an allocation already granted runs to
+  its own lifetime; (2) a user not in the cache cannot allocate while the
+  endpoint is down or slow — requests fail closed with `500` for
+  `error_ttl_secs` at a time; (3) the first request of an uncached user over
+  UDP costs one client retransmission interval; (4) a source over its
+  per-source lookup budget (`lookups_per_*`) is refused (500) until the budget
+  refills, which a large office behind one NAT can hit on a cold cache.
+- **Why it stays:** caching is what keeps the endpoint off the per-request
+  path; failing closed is the only safe default for an authentication decision;
+  the retransmission cost follows from never blocking the synchronous datapath.
+- **Compensating controls:** TTLs are configurable down to one second and the
+  endpoint can shorten them per user; `turna_auth_webhook_errors_total` and
+  `turna_auth_webhook_unavailable_total` with alert rules make an outage
+  visible; static users keep working throughout; TURNS and SCTP requests are
+  re-processed rather than left to time out, and so are QUIC/WebTransport
+  stream messages; the per-source budget is configurable.
+- **Review by:** if a revocation push channel is ever introduced.
+

@@ -42,8 +42,10 @@ reload or a database row. So a migration has three parts:
 | `lt-cred-mech` + `user=name:password` | static users in config, or `turnactl user add` | the runtime path needs the Tarantool backend — see below |
 | `static-auth-secret` in a DB table | — | no SQL backend exists. Use the file/env form: `shared_secret = "file:///run/secrets/turn"` or `"${TURNA_SHARED_SECRET}"` |
 | users in MySQL/PostgreSQL/SQLite/Redis | Tarantool backend + `turnactl user add` | this is the biggest structural change in a migration. `AddUser`/`RemoveUser` persist pre-derived long-term keys, never a plaintext password |
-| `oauth` (RFC 7635) | `[turn.auth.oauth]` | implemented including `kid` key selection and the §6.1 lifetime cap, **but the validator refuses it under `production = true`** pending interop against a real Authorization Server. coturn's own model expects an external program to manage keys in the database; turna reads them from config |
+| users in MySQL/PostgreSQL/SQLite/Redis, read per request | `[turn.auth.webhook]` | turna asks an HTTPS endpoint of your signalling service for the user's key and caches it; the endpoint can serve coturn's stored HMAC keys (`key_md5`) unchanged. See [auth-webhook.md](auth-webhook.md) |
+| `oauth` (RFC 7635) | `[turn.auth.oauth]` | implemented including `kid` key selection and the §6.1 lifetime cap, **but the validator refuses it under `production = true`** pending interop against a real Authorization Server ([verification kit](runbooks/oauth-verification.md)). coturn's own model expects an external program to manage keys in the database; turna reads them from config |
 | `max-allocate-lifetime` | `[turn.relay.quota]` lifetime overrides, per user/tenant | also settable at runtime via `set_user_limits` |
+| `secure-stun` | `[turn.auth] require_binding_auth = true` | anonymous Binding gets a 401; an authenticated one needs a valid NONCE and gets a signed response. Same caveat as coturn: browsers send an unauthenticated Binding to learn their reflexive address, so leave it off on a node that also serves as their STUN server |
 
 ## Peer access control
 
@@ -79,7 +81,9 @@ What is worth porting is any *business* deny/allow list specific to your network
 | `user-quota` | `[turn.relay.quota] max_per_user` |
 | `total-quota` | `[turn.relay] max_allocations` |
 | `max-bps` | `[turn.relay.quota] max_bytes_per_sec_per_allocation` (bytes/second) — `0` is unlimited and is **refused** under `production = true` unless you also set `allow_unlimited_bandwidth = true` |
+| `bps-capacity` | `[turn.relay] max_total_bytes_per_sec` (bytes/second, both directions combined) | **different mechanism**: coturn reserves bandwidth per session at allocation time and refuses new sessions when it is used up; turna drops relayed packets once the node-wide bucket (one second of burst) is empty, so existing calls degrade together instead of new ones being refused, first come first served; RFC 6062 TCP-relay data is not counted. `0` (default) is no cap |
 | `unauthorized-ratelimit` (4.14+) | tiered rate limiting is on by default; see the auth-failure metrics |
+| fail2ban on coturn's log | `[turn.auto_ban]` | built in, off by default: bans a source after N nonce-bound auth failures in a window, without a log parser in the loop |
 
 ## TLS
 

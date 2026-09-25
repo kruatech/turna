@@ -147,3 +147,72 @@ groups:
             the client population plausibly changes. New clients are still
             admitted — this is the design — but per-source limiting is less
             effective while the table turns over this fast.
+
+      # ── Auto-ban ([turn.auto_ban]) ────────────────────────────────────────
+      #
+      # Both read 0 while auto-ban is off, so the rules are inert until it is
+      # enabled.
+      #
+      # A full ban table means bans are being refused: the attack is wider than
+      # max_bans, and per-source bans have stopped being the right tool. Any
+      # refusal is worth a look — the table is sized far above a normal day.
+      - alert: TurnaAutoBanTableFull
+        expr: increase(turna_autoban_refused_full_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna auto-ban table is full on {{ $labels.instance }}"
+          description: >-
+            New bans are being refused because max_bans live bans are already in
+            force. Either raise [turn.auto_ban] max_bans or, for a distributed
+            attack, block upstream: per-address bans do not scale to it.
+
+      # Many bans in a short window is an attack being absorbed, and worth
+      # knowing about even though the node is coping. 50 in 10 minutes is well
+      # above a handful of misconfigured clients with a stale password.
+      - alert: TurnaAutoBanSurge
+        expr: increase(turna_autoban_bans_total[10m]) > 50
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "turna is banning many sources on {{ $labels.instance }}"
+          description: >-
+            Check the SOURCE_BANNED syslog events for the ranges involved. If
+            they are your own users (a rotated secret, a broken client release),
+            allowlist the range or fix the credential path before the bans lock
+            out real traffic.
+
+      # ── Credential webhook ([turn.auth.webhook]) ──────────────────────────
+      #
+      # Inert while the webhook is off. A failing lookup refuses the user
+      # (fail closed), so errors are users turned away — worth a page when it
+      # is more than a blip. 0.2/s over 10 minutes is ~120 failed lookups,
+      # well above a transient restart of the endpoint.
+      - alert: TurnaAuthWebhookFailing
+        expr: rate(turna_auth_webhook_errors_total[10m]) > 0.2
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "turna's auth webhook lookups are failing on {{ $labels.instance }}"
+          description: >-
+            Users not already cached are being refused with 500. Check the
+            endpoint's health and the `reason` in turna's "auth webhook lookup
+            failed" log line (timeout, connect, status, endpoint_rejected_turna,
+            malformed_body). Cached users keep working until their TTL.
+
+      # Lookups that could not even be queued: the endpoint is slower than the
+      # arrival rate of new users. Any sustained value refuses real users.
+      - alert: TurnaAuthWebhookSaturated
+        expr: increase(turna_auth_webhook_rejected_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "turna's auth webhook queue is full on {{ $labels.instance }}"
+          description: >-
+            Lookups are refused because queue_depth is full. Raise
+            max_concurrency, or look at the endpoint's latency
+            (turna_auth_webhook_duration_seconds).

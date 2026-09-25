@@ -143,6 +143,18 @@ OBSERVABILITY
 - **Controls:** auth before mutation, allocation/session indexes, permission TTL,
   channel binding validation.
 
+### 5.2a Repeated authentication failures and floods from one source
+
+- **Vector:** credential guessing against long-term users, or one address
+  flooding the rate limiters.
+- **Risk:** online password guessing; sustained cost from a source the limiters
+  already refuse.
+- **Controls:** per-IP/prefix and per-method token buckets; optional
+  `[turn.auto_ban]`, which drops everything from a source after N nonce-bound
+  auth failures (unforgeable by spoofing) and, if explicitly enabled, N
+  rate-limit refusals (forgeable — RISK-007 in `accepted-risks.md`). Bans are
+  per node, bounded in memory, and expire on their own.
+
 ### 5.3 Peer filtering
 
 - **Vector:** authenticated requests targeting denied IP ranges.
@@ -184,6 +196,36 @@ OBSERVABILITY
 - **Risk:** placeholder secret in production, bad external IP, secret leakage.
 - **Controls:** strict schema, production validation, file-secret support,
   masked `--dump-config`.
+
+### 5.8a Credential webhook (`[turn.auth.webhook]`, opt-in)
+
+- **Vector:** the HTTPS call from turna to the operator's signalling service,
+  and the USERNAME an unauthenticated client chooses, which becomes the body of
+  that call.
+- **Risks:**
+  - *Credential disclosure in transit* — the answer carries a user's key or
+    password. Controls: `https://` required in production, system or pinned
+    (`ca_file`) roots, redirects not followed, environment proxies ignored.
+  - *Endpoint impersonation / unauthorised queries* — anyone able to POST to the
+    endpoint could harvest keys. Controls: bearer token and/or HMAC-SHA256
+    request signature with a timestamp (one of them required in production);
+    the endpoint must verify it.
+  - *Amplification / enumeration against the signalling service* — a client
+    naming random users makes turna call out. Controls: a lookup is only started
+    by requests that completed a NONCE round trip (Binding with
+    MESSAGE-INTEGRITY never starts one), per-user coalescing, negative cache,
+    `max_concurrency` + `queue_depth`, a per-source (IP and prefix) budget on
+    lookups started so one host cannot fill the shared queue, the Allocate-tier
+    rate limit on both Allocate and Refresh, and `[turn.auto_ban]` on lookups
+    started (`credential_lookups`) and on the resulting 401s.
+  - *Datapath stall* — none by construction: the packet path only reads the
+    cache; lookups run on separate tasks and the request is parked.
+  - *Endpoint outage* — fail closed (500), never fail open. Cached users keep
+    working until their TTL.
+  - *Log leakage* — the lookup path logs no USERNAME, password, key, token or
+    signature; `--dump-config` masks the token and secret.
+- **Accepted:** revocation lag up to `positive_ttl_secs`; availability of TURN
+  for uncached users depends on the endpoint (RISK-008).
 
 ## 6. Security invariants
 
