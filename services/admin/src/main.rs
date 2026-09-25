@@ -83,7 +83,8 @@ struct Config {
     tls_key: Option<PathBuf>,
 
     // ── Operator auth (browser → admin) ───────────────────────────────────────
-    /// Static token required in X-Admin-Token header for mutating requests.
+    /// Static token required in the X-Admin-Token header on every /api route,
+    /// reads included.
     /// Unset = open access (safe only on loopback or trusted network).
     #[arg(long, env = "TURNA_ADMIN_AUTH_TOKEN")]
     auth_token: Option<String>,

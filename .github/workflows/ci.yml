@@ -52,7 +52,7 @@ jobs:
       # Clippy, build and test results. A floating `stable` changed rustfmt/lint
       # behaviour independently of the source revision and broke otherwise
       # reproducible CI.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
@@ -63,6 +63,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Documented claims (metric names, feature states, the Helm chart's scope,
+      # the management proto's field numbers) are asserted against the code.
+      # The script existed and passed, but no workflow ran it.
+      - name: doc-claims gate
+        run: bash scripts/check-doc-claims.sh
 
   msrv:
     name: msrv (pinned 1.95.0)
@@ -74,7 +79,7 @@ jobs:
       # but it runs only on `v*` tags, so without this nothing proves a PR still
       # compiles + tests under the pinned channel. --locked also proves the
       # committed Cargo.lock is consistent.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -100,7 +105,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -129,7 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -157,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -223,7 +228,7 @@ jobs:
             features: af-xdp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -265,7 +270,7 @@ jobs:
     # silent UDP-only node.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -314,7 +319,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -443,11 +448,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # SHA-pinned to match the repo's pinned-actions policy. Resolve/update with:
       #   git ls-remote https://github.com/actions/setup-node refs/tags/v4
-      # Node major aligned with deploy/Dockerfile.admin (node:22) so the frontend
-      # CI job and the real container build share one toolchain.
+      # Node major aligned with deploy/Dockerfile.admin (node:24, LTS) so the
+      # frontend CI job and the real container build share one toolchain.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '24'
       # This is the contour that catches admin TypeScript <-> backend contract
       # drift before release. Requires services/admin/frontend/package-lock.json
       # to be committed (npm ci refuses to run without it).
@@ -455,10 +460,11 @@ jobs:
         working-directory: services/admin/frontend
         run: |
           npm ci
+          npm run lint
           npm run build
 
   deny:
-    name: cargo-deny (лицензии, advisories)
+    name: cargo-deny (licenses, advisories)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -471,7 +477,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -490,7 +496,7 @@ jobs:
           fi
       - run: cargo install cargo-fuzz
       - run: cd fuzz && cargo +nightly fuzz build
-      # короткий smoke-прогон каждой цели, 30 секунд
+      # short smoke run of every target, 30 seconds each
       - run: |
           cd fuzz
           # Derived from the manifest, not hardcoded. The list used to be five
@@ -521,8 +527,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      # Miri takes hours on its abstract machine, and it only ever runs two crates —
-      # both pure parsing. A change that touches neither cannot alter what it would
+      # Miri takes hours on its abstract machine, and it only ever runs one crate —
+      # pure parsing. A change that does not touch it cannot alter what it would
       # find, so documentation, scripts and Dockerfiles skip it rather than paying
       # for a result that is decided in advance.
       #
@@ -541,13 +547,13 @@ jobs:
             echo "could not diff against $BASE — running Miri rather than guessing"
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          if echo "$CHANGED" | grep -qE '^(crates/protocol/proto-stun/|crates/packet/|Cargo\.lock$|Cargo\.toml$|\.github/workflows/ci\.yml$)'; then
+          if echo "$CHANGED" | grep -qE '^(crates/protocol/proto-stun/|Cargo\.lock$|Cargo\.toml$|\.github/workflows/ci\.yml$)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "skipped: nothing under the crates Miri covers changed"
           fi
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         if: steps.scope.outputs.run == 'true'
         with:
           toolchain: nightly
@@ -564,14 +570,14 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
-          cargo +nightly miri test -p turna-proto-stun -p turna-packet
+          cargo +nightly miri test -p turna-proto-stun
 
   loom:
     name: loom (lock-free concurrency model)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -600,7 +606,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
@@ -646,7 +652,7 @@ jobs:
         # Three Lua suites pin the CAS semantics the failover claim depends on:
         # migration idempotency, the exact-u64 parser, and the runtime /
         # user-limits CAS round-trip including rollback on an injected write
-        # failure. GA_FINAL_REPORT.md documented how to run them by hand, and
+        # failure. docs/verification/v0.3.0-ga-final-report.md documented how to run them by hand, and
         # nothing ever did — so the contract they pin was unenforced, in the one
         # place where getting CAS wrong loses allocations silently.
         #
@@ -710,7 +716,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2

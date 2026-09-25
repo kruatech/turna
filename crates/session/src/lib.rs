@@ -2251,7 +2251,7 @@ impl AllocationStore {
     /// its own allocation — that is benign, since the client has by definition
     /// just changed address. Concurrent migration of the *same* allocation is
     /// additionally prevented one level up (the processor's per-ticket guard,
-    /// Заход 2).
+    /// pass 2).
     pub fn re_key(
         &self,
         old_addr: &SocketAddr,

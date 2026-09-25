@@ -3,6 +3,7 @@ publish = false
 name = "turna-relay"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [features]
 default = []
@@ -23,7 +24,6 @@ parking_lot.workspace = true
 turna-common.workspace = true
 turna-proto-stun.workspace = true
 turna-proto-turn.workspace = true
-turna-proto-rtp.workspace = true
 turna-transport.workspace = true
 turna-cluster.workspace = true
 turna-session.workspace = true

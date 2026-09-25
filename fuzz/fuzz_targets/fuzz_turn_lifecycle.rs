@@ -1,14 +1,14 @@
 //! Stateful fuzz target: TURN allocation lifecycle
 //!
-//! Вместо случайных байтов генерирует **семантически корректные** TURN
-//! последовательности и мутирует их структурно:
+//! Instead of random bytes, generates **semantically valid** TURN
+//! sequences and mutates them structurally:
 //!
 //!   ALLOCATE → CREATE_PERMISSION → CHANNEL_BIND → SEND → REFRESH → EXPIRE
 //!
-//! Цель: найти баги в state machine процессора, которые coverage-fuzzing
-//! на случайных байтах не находит (нужно сначала пройти auth challenge).
+//! Goal: find bugs in the processor state machine that coverage-guided fuzzing
+//! on random bytes cannot reach (the auth challenge must be passed first).
 //!
-//! Контракт: ни один вариант входа не должен вызывать panic, hang или OOM.
+//! Contract: no input variant may cause a panic, hang or OOM.
 
 #![no_main]
 
@@ -23,7 +23,7 @@ use turna_proto_turn as turn;
 
 // ── Lifecycle stage enum ──────────────────────────────────────────────────────
 
-/// Стадия жизненного цикла TURN-аллокации.
+/// Lifecycle stage of a TURN allocation.
 #[derive(Debug, Arbitrary)]
 enum LifecycleStage {
     Allocate,
@@ -31,49 +31,49 @@ enum LifecycleStage {
     ChannelBind,
     Send,
     Refresh,
-    RefreshZero,   // lifetime=0 → явное удаление аллокации
+    RefreshZero,   // lifetime=0 → explicit allocation deletion
     ChannelData,
 }
 
-/// Мутации атрибутов для negative testing.
+/// Attribute mutations for negative testing.
 #[derive(Debug, Arbitrary)]
 enum AttributeMutation {
-    /// Нормальные атрибуты (happy path).
+    /// Normal attributes (happy path).
     Normal,
-    /// Отсутствует LIFETIME.
+    /// LIFETIME is missing.
     MissingLifetime,
-    /// LIFETIME=0 в Allocate (не Refresh).
+    /// LIFETIME=0 in Allocate (not Refresh).
     ZeroLifetimeInAllocate,
-    /// Неверный REQUESTED-TRANSPORT (не UDP=17).
+    /// Wrong REQUESTED-TRANSPORT (not UDP=17).
     WrongTransport(u8),
-    /// Несуществующий channel number (< 0x4000).
+    /// Nonexistent channel number (< 0x4000).
     InvalidChannelNumber(u16),
-    /// XOR-PEER-ADDRESS — мультикастовый адрес.
+    /// XOR-PEER-ADDRESS is a multicast address.
     MulticastPeerAddress,
-    /// Дублирующийся атрибут USERNAME.
+    /// Duplicate USERNAME attribute.
     DuplicateUsername,
-    /// Очень длинный NONCE (до MAX_ATTRIBUTE_VALUE_LEN).
-    LongNonce(u8),          // длина = value * 6 (max ~1500)
-    /// Отсутствует XOR-PEER-ADDRESS в CreatePermission.
+    /// Very long NONCE (up to MAX_ATTRIBUTE_VALUE_LEN).
+    LongNonce(u8),          // length = value * 6 (max ~1500)
+    /// XOR-PEER-ADDRESS is missing in CreatePermission.
     MissingPeerAddress,
 }
 
-/// Параметры одного шага последовательности.
+/// Parameters of a single sequence step.
 #[derive(Debug, Arbitrary)]
 struct Step {
     stage:    LifecycleStage,
     mutation: AttributeMutation,
-    /// Случайная часть transaction ID — имитирует параллельные запросы.
+    /// Random part of the transaction ID — simulates concurrent requests.
     tid_seed: [u8; 12],
 }
 
-/// Вся фаззируемая последовательность.
+/// The whole fuzzed sequence.
 #[derive(Debug, Arbitrary)]
 struct Sequence {
     steps: Vec<Step>,
-    /// Добавить ли ChannelData-фрейм в конце (exercise разбора заголовка).
+    /// Whether to append a ChannelData frame at the end (exercises header parsing).
     trailing_channel_data: bool,
-    /// Число байт в payload ChannelData (0..=4000).
+    /// Number of bytes in the ChannelData payload (0..=4000).
     channel_data_payload_len: u16,
 }
 
@@ -90,7 +90,7 @@ fn add_auth_attrs(msg: &mut StunMessage, mutation: &AttributeMutation) {
     match mutation {
         AttributeMutation::DuplicateUsername => {
             msg.add(Attribute::Username(FUZZ_USERNAME.into()));
-            msg.add(Attribute::Username(FUZZ_USERNAME.into())); // дубль
+            msg.add(Attribute::Username(FUZZ_USERNAME.into())); // duplicate
         }
         _ => {
             msg.add(Attribute::Username(FUZZ_USERNAME.into()));
@@ -218,7 +218,7 @@ fn build_channel_data(channel: u16, payload_len: usize) -> Vec<u8> {
 // ── Fuzz target ───────────────────────────────────────────────────────────────
 
 fuzz_target!(|seq: Sequence| {
-    // Ограничиваем количество шагов чтобы не уходить в бесконечность
+    // Cap the number of steps so we do not run forever
     let steps = seq.steps.iter().take(16);
 
     for step in steps {
@@ -239,7 +239,7 @@ fuzz_target!(|seq: Sequence| {
                 build_channel_data(0x4000, 200),
         };
 
-        // Прогоняем через парсеры — ни один не должен паниковать
+        // Run through the parsers — none may panic
         let _ = StunMessage::decode(&raw);
         let _ = turna_proto_stun::message::decode_channel_data(&raw);
         let _ = turna_proto_stun::message::is_stun_message(&raw);
@@ -250,7 +250,7 @@ fuzz_target!(|seq: Sequence| {
         }
     }
 
-    // Trailing ChannelData с произвольным payload
+    // Trailing ChannelData with an arbitrary payload
     if seq.trailing_channel_data {
         let len = (seq.channel_data_payload_len as usize).min(4000);
         let raw = build_channel_data(0x4000, len);

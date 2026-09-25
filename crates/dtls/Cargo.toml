@@ -21,6 +21,7 @@
 name = "turna-dtls"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 description = "DTLS 1.2 for the turna TURN datapath, derived from webrtc-dtls"
 publish = false
@@ -30,16 +31,19 @@ util = { version = "0.9.0", package = "webrtc-util", default-features = false, f
 
 byteorder = "1"
 rand_core = "0.6"
-hkdf = "0.12"
+hkdf = "0.13"
 p256 = { version = "0.13", features = ["default", "ecdh", "ecdsa"] }
 p384 = "0.13"
-rand = "0.8"
+rand = "0.10"
 hmac = "0.12"
-sec1 = { version = "0.7", features = ["std"] }
 sha1 = "0.10"
 sha2 = "0.10"
 aes = "0.8"
-cbc = { version = "0.1", features = ["block-padding", "alloc"] }
+cbc = { version = "0.2", features = ["block-padding", "alloc"] }
+# cbc 0.2 is built on cipher 0.5, which aes 0.9 implements; aes-gcm 0.10 and
+# ccm 0.5 still need aes 0.8 (cipher 0.4), so the CBC suite takes aes 0.9
+# under its own name until those move too.
+aes_cbc = { package = "aes", version = "0.9" }
 aes-gcm = "0.10"
 ccm = "0.5"
 tokio = { version = "1.32.0", features = [
@@ -56,7 +60,7 @@ tokio = { version = "1.32.0", features = [
 ] }
 async-trait = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 der-parser = "10.0"
 rcgen = "0.13"
 ring = "0.17"

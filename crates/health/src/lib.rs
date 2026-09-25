@@ -161,7 +161,7 @@ pub struct Metrics {
     pub auth_failures: AtomicU64,
     pub rate_limited: AtomicU64,
     pub zero_copy_forwards: AtomicU64,
-    /// Пакеты дропнутые из-за переполнения send channel (backpressure).
+    /// Packets dropped because the send channel was full (backpressure).
     pub send_queue_dropped: AtomicU64,
     /// STUN messages that failed to decode (malformed header/attributes).
     pub parser_rejections: AtomicU64,

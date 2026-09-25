@@ -3,6 +3,7 @@ publish = false
 name = "turna-transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [features]
 default = []
@@ -23,11 +24,11 @@ dtls = ["dep:turna-dtls", "dep:webrtc-util", "dep:rustls", "dep:async-trait"]
 sctp = ["tls"]
 
 [dependencies]
+parking_lot.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-turna-packet.workspace = true
 libc = "0.2"
 hmac.workspace = true
 sha1.workspace = true
