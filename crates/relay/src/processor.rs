@@ -3691,7 +3691,7 @@ mod userhash_tests {
             src,
             Method::Allocate,
             "mallory",
-            "whatever",
+            password(),
             vec![Attribute::RequestedTransport(17)],
         );
         let resp = reply(&p.process(req, src));
@@ -3723,7 +3723,7 @@ mod userhash_tests {
             src,
             Method::Allocate,
             "4102444800:alice",
-            "irrelevant",
+            password(),
             vec![Attribute::RequestedTransport(17)],
         );
         assert_eq!(error_code(&reply(&p.process(req, src))), Some(401));
@@ -3956,6 +3956,25 @@ mod nat_discovery_tests {
     }
 }
 
+/// Test password for the TCP-relay and NAT-discovery test modules: fixed for
+/// the test process, random so it is not a literal
+/// (`rust/hard-coded-cryptographic-value`), as `userhash_tests::password()`.
+#[cfg(test)]
+fn fixed_test_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(random_test_password).as_str()
+}
+
+/// A fresh random password, for wrong-password cases. Differs from
+/// `fixed_test_password()` except with negligible probability.
+#[cfg(test)]
+fn random_test_password() -> String {
+    turna_crypto::random_key_32()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tcp_relay_ipv6_tests {
     //! RFC 6062 TCP allocations in the IPv6 family. The paths that bind a v6
@@ -3972,7 +3991,7 @@ mod tcp_relay_ipv6_tests {
             Arc::new(AllocationStore::new(29000, 29999, 64)),
             Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
                 REALM,
-                [("u", "pw")],
+                [("u", fixed_test_password())],
             ))),
             "127.0.0.1".parse().unwrap(),
             Arc::new(Metrics::new()),
@@ -3997,7 +4016,7 @@ mod tcp_relay_ipv6_tests {
         m.add(Attribute::Username("u".into()));
         m.add(Attribute::Realm(REALM.into()));
         m.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
-        let key = turna_crypto::long_term_key("u", REALM, "pw");
+        let key = turna_crypto::long_term_key("u", REALM, fixed_test_password());
         let mut buf = [0u8; 512];
         let n = m.encode_with_integrity(&mut buf, &key).unwrap();
         Bytes::copy_from_slice(&buf[..n])
@@ -4182,7 +4201,7 @@ mod tcp_relay_peer_permission_tests {
             Arc::new(AllocationStore::new(30000, 30999, 64)),
             Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
                 REALM,
-                [("u", "pw")],
+                [("u", fixed_test_password())],
             ))),
             "127.0.0.1".parse().unwrap(),
             Arc::new(Metrics::new()),
@@ -4205,7 +4224,7 @@ mod tcp_relay_peer_permission_tests {
         m.add(Attribute::Username("u".into()));
         m.add(Attribute::Realm(REALM.into()));
         m.add(Attribute::Nonce(p.nonce_mgr.issue(src)));
-        let key = turna_crypto::long_term_key("u", REALM, "pw");
+        let key = turna_crypto::long_term_key("u", REALM, fixed_test_password());
         let mut buf = [0u8; 512];
         let n = m.encode_with_integrity(&mut buf, &key).unwrap();
         Bytes::copy_from_slice(&buf[..n])
@@ -4551,7 +4570,7 @@ mod nat_discovery_auth_and_budget_tests {
             Arc::new(AllocationStore::new(32000, 32099, 8)),
             Arc::new(AuthRegistry::new(turna_auth::AuthMode::long_term(
                 "nd",
-                [("u", "pw")],
+                [("u", fixed_test_password())],
             ))),
             "127.0.0.1".parse().unwrap(),
             Arc::new(Metrics::new()),
@@ -4596,7 +4615,12 @@ mod nat_discovery_auth_and_budget_tests {
 
         // No NONCE with MESSAGE-INTEGRITY: 400, from Da:Dp.
         let (r, from) = p
-            .handle_nat_discovery(&signed_binding(None, "pw"), src, local, &topo())
+            .handle_nat_discovery(
+                &signed_binding(None, fixed_test_password()),
+                src,
+                local,
+                &topo(),
+            )
             .unwrap();
         assert_eq!((code(&r), from), (Some(400), local));
 
@@ -4604,7 +4628,12 @@ mod nat_discovery_auth_and_budget_tests {
         // fresh one, so a captured request cannot be replayed elsewhere.
         let foreign = processor().nonce_mgr.issue(src);
         let (r, _) = p
-            .handle_nat_discovery(&signed_binding(Some(&foreign), "pw"), src, local, &topo())
+            .handle_nat_discovery(
+                &signed_binding(Some(&foreign), fixed_test_password()),
+                src,
+                local,
+                &topo(),
+            )
             .unwrap();
         assert_eq!(code(&r), Some(438));
         let fresh = StunMessage::decode(&r)
@@ -4615,19 +4644,24 @@ mod nat_discovery_auth_and_budget_tests {
 
         // Wrong password with a valid nonce: 401.
         let (r, _) = p
-            .handle_nat_discovery(&signed_binding(Some(&fresh), "WRONG"), src, local, &topo())
+            .handle_nat_discovery(
+                &signed_binding(Some(&fresh), &random_test_password()),
+                src,
+                local,
+                &topo(),
+            )
             .unwrap();
         assert_eq!(code(&r), Some(401));
 
         // Valid: success from Ca:Cp, signed with the long-term key.
-        let raw_req = signed_binding(Some(&fresh), "pw");
+        let raw_req = signed_binding(Some(&fresh), fixed_test_password());
         let (r, from) = p
             .handle_nat_discovery(&raw_req, src, local, &topo())
             .unwrap();
         assert_eq!(from, "127.0.0.2:3479".parse::<SocketAddr>().unwrap());
         let resp = StunMessage::decode(&r).unwrap();
         assert!(matches!(resp.class, MessageClass::SuccessResponse));
-        let key = turna_crypto::long_term_key("u", "nd", "pw");
+        let key = turna_crypto::long_term_key("u", "nd", fixed_test_password());
         assert!(resp.verify_integrity(&r, &key), "response must be signed");
     }
 
