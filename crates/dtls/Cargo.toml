@@ -65,7 +65,7 @@ der-parser = "10.0"
 rcgen = "0.13"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-bincode = "1"
+bincode = "3"
 serde = { version = "1", features = ["derive"] }
 subtle = "2"
 log = "0.4"
