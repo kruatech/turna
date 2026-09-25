@@ -205,7 +205,7 @@ pub(crate) async fn allocate_and_permit(
     let Some((realm, nonce)) = challenge(socket, target).await else {
         return false;
     };
-    let key = long_term_key("testuser", &realm, "testpass");
+    let key = long_term_key("testuser", &realm, &test_pass());
     let mut alloc = TurnMsg::request(0x0003);
     alloc.add_requested_transport();
     alloc.add_lifetime(600);
