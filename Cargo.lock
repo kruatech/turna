@@ -4370,7 +4370,7 @@ dependencies = [
  "tokio-test",
  "webrtc-util",
  "x25519-dalek",
- "x509-parser 0.16.0",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
