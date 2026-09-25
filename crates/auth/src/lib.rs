@@ -1419,6 +1419,29 @@ mod subject_tests {
 #[cfg(test)]
 mod userhash_tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// Per-user test passwords: fixed for the test process, random so none is
+    /// a literal (`rust/hard-coded-cryptographic-value`).
+    fn pw(user: &str) -> &'static str {
+        static PASSWORDS: [OnceLock<String>; 4] = [const { OnceLock::new() }; 4];
+        let slot = match user {
+            "alice" => 0,
+            "bob" => 1,
+            "carol" => 2,
+            "dave" => 3,
+            other => panic!("no test password for {other}"),
+        };
+        PASSWORDS[slot].get_or_init(random_pw).as_str()
+    }
+
+    /// A fresh random password, for the wrong-password cases.
+    fn random_pw() -> String {
+        turna_crypto::random_key_32()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
     use turna_proto_stun::attribute::Attribute;
     use turna_proto_stun::header::MessageClass;
     use turna_proto_stun::message::StunMessage;
@@ -1444,9 +1467,9 @@ mod userhash_tests {
 
     #[test]
     fn long_term_resolves_userhash_to_the_user() {
-        let mode = AuthMode::long_term("r", [("alice", "pw-a"), ("bob", "pw-b")]);
+        let mode = AuthMode::long_term("r", [("alice", pw("alice")), ("bob", pw("bob"))]);
         for sha256 in [true, false] {
-            let (msg, raw) = by_hash("r", "bob", "pw-b", sha256);
+            let (msg, raw) = by_hash("r", "bob", pw("bob"), sha256);
             assert!(msg.get_username().is_none());
             let v = mode
                 .validate_identity(&msg, &raw)
@@ -1458,8 +1481,8 @@ mod userhash_tests {
 
     #[test]
     fn userhash_with_wrong_password_fails_integrity() {
-        let mode = AuthMode::long_term("r", [("alice", "pw-a")]);
-        let (msg, raw) = by_hash("r", "alice", "WRONG", true);
+        let mode = AuthMode::long_term("r", [("alice", pw("alice"))]);
+        let (msg, raw) = by_hash("r", "alice", &random_pw(), true);
         assert!(matches!(
             mode.validate_identity(&msg, &raw),
             Err(AuthError::IntegrityFailed)
@@ -1468,8 +1491,8 @@ mod userhash_tests {
 
     #[test]
     fn unknown_userhash_is_invalid_credentials() {
-        let mode = AuthMode::long_term("r", [("alice", "pw-a")]);
-        let (msg, raw) = by_hash("r", "mallory", "x", true);
+        let mode = AuthMode::long_term("r", [("alice", pw("alice"))]);
+        let (msg, raw) = by_hash("r", "mallory", &random_pw(), true);
         assert!(matches!(
             mode.validate_identity(&msg, &raw),
             Err(AuthError::InvalidCredentials)
@@ -1480,13 +1503,13 @@ mod userhash_tests {
     /// keyed by this backend's realm, and REALM itself is checked first.
     #[test]
     fn userhash_for_another_realm_does_not_resolve() {
-        let mode = AuthMode::long_term("r", [("alice", "pw-a")]);
+        let mode = AuthMode::long_term("r", [("alice", pw("alice"))]);
         let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
         m.add(Attribute::UserHash(turna_crypto::userhash(
             "alice", "other",
         )));
         m.add(Attribute::Realm("r".into()));
-        let key = turna_crypto::long_term_key_sha256("alice", "r", "pw-a");
+        let key = turna_crypto::long_term_key_sha256("alice", "r", pw("alice"));
         let mut buf = [0u8; 512];
         let len = m.encode_with_integrity_sha256(&mut buf, &key).unwrap();
         let msg = StunMessage::decode(&buf[..len]).unwrap();
@@ -1502,10 +1525,10 @@ mod userhash_tests {
     #[test]
     fn index_follows_add_remove_and_rehydrate() {
         let mode = AuthMode::long_term("r", Vec::<(&str, &str)>::new());
-        let (msg, raw) = by_hash("r", "carol", "pw-c", true);
+        let (msg, raw) = by_hash("r", "carol", pw("carol"), true);
         assert!(mode.validate_identity(&msg, &raw).is_err());
 
-        assert!(mode.add_user("carol", "pw-c"));
+        assert!(mode.add_user("carol", pw("carol")));
         assert_eq!(
             mode.validate_identity(&msg, &raw).unwrap().username,
             "carol"
@@ -1517,7 +1540,7 @@ mod userhash_tests {
             Err(AuthError::InvalidCredentials)
         ));
 
-        assert!(mode.add_user_keys("carol", UserKeys::derive("carol", "r", "pw-c")));
+        assert!(mode.add_user_keys("carol", UserKeys::derive("carol", "r", pw("carol"))));
         assert_eq!(
             mode.validate_identity(&msg, &raw).unwrap().username,
             "carol"
@@ -1535,7 +1558,7 @@ mod userhash_tests {
             previous: None,
         };
         assert!(!mode.supports_userhash());
-        let (msg, raw) = by_hash("r", "1700000000:alice", "whatever", true);
+        let (msg, raw) = by_hash("r", "1700000000:alice", &random_pw(), true);
         assert!(matches!(
             mode.validate_identity(&msg, &raw),
             Err(AuthError::InvalidCredentials)
@@ -1546,12 +1569,12 @@ mod userhash_tests {
     /// is ignored rather than consulted.
     #[test]
     fn username_takes_precedence_over_userhash() {
-        let mode = AuthMode::long_term("r", [("alice", "pw-a"), ("bob", "pw-b")]);
+        let mode = AuthMode::long_term("r", [("alice", pw("alice")), ("bob", pw("bob"))]);
         let mut m = StunMessage::new(Method::Allocate, MessageClass::Request);
         m.add(Attribute::Username("alice".into()));
         m.add(Attribute::UserHash(turna_crypto::userhash("bob", "r")));
         m.add(Attribute::Realm("r".into()));
-        let key = turna_crypto::long_term_key_sha256("alice", "r", "pw-a");
+        let key = turna_crypto::long_term_key_sha256("alice", "r", pw("alice"));
         let mut buf = [0u8; 512];
         let len = m.encode_with_integrity_sha256(&mut buf, &key).unwrap();
         let msg = StunMessage::decode(&buf[..len]).unwrap();
@@ -1561,9 +1584,9 @@ mod userhash_tests {
 
     #[test]
     fn registry_subject_is_the_resolved_name() {
-        let reg = AuthRegistry::new(AuthMode::long_term("r", [("dave", "pw-d")]));
+        let reg = AuthRegistry::new(AuthMode::long_term("r", [("dave", pw("dave"))]));
         assert!(reg.all_realms_support_userhash());
-        let (msg, raw) = by_hash("r", "dave", "pw-d", true);
+        let (msg, raw) = by_hash("r", "dave", pw("dave"), true);
         let res = reg.validate(&msg, &raw).unwrap();
         assert_eq!(res.subject, "dave");
 
