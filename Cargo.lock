@@ -556,6 +556,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ccm"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be9b34d99d395af800e996c5784f810f8400ccd64202f91859dc677825b5378"
+dependencies = [
+ "aead 0.6.1",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+]
+
+[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4345,7 +4357,7 @@ dependencies = [
  "bincode",
  "byteorder",
  "cbc 0.2.1",
- "ccm",
+ "ccm 0.6.1",
  "chrono",
  "der-parser 10.0.0",
  "env_logger",
@@ -4880,7 +4892,7 @@ dependencies = [
  "bincode",
  "byteorder",
  "cbc 0.1.2",
- "ccm",
+ "ccm 0.5.0",
  "der-parser 8.2.0",
  "hkdf 0.12.4",
  "hmac 0.12.1",
