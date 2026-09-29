@@ -1054,17 +1054,17 @@ fn spawn_recv_worker(
     reply_via: Option<TokioTransport>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // До BATCH датаграмм на один recvmmsg; ответы — одним sendmmsg.
+        // Up to BATCH datagrams per recvmmsg; replies in a single sendmmsg.
         const BATCH: usize = 32;
         let zero: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 0));
         let mut metas = [(0usize, zero); BATCH];
         loop {
-            // Одна арена на батч: 1 malloc на 32 пакета; каждый пакет —
-            // Bytes-слайс арены без копирования (zero-copy Forward жив).
+            // One arena per batch: 1 malloc per 32 packets; each packet is a
+            // Bytes slice of the arena, no copying (zero-copy Forward preserved).
             let mut arena = bytes::BytesMut::with_capacity(BATCH * MAX_UDP_PACKET);
-            // SAFETY: capacity == BATCH*MAX_UDP_PACKET; recvmmsg пишет
-            // первые len байт каждого слота, slice(..len) ниже не даёт
-            // прочитать неинициализированный хвост.
+            // SAFETY: capacity == BATCH*MAX_UDP_PACKET; recvmmsg writes
+            // the first len bytes of each slot; slice(..len) below prevents
+            // reading the uninitialized tail.
             unsafe {
                 arena.set_len(BATCH * MAX_UDP_PACKET);
             }
@@ -1130,7 +1130,7 @@ fn spawn_recv_worker(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
-                        // Control-plane: не дропаем при полной очереди.
+                        // Control-plane: do not drop when the queue is full.
                         Action::RegisterRelay { port, socket, .. } => {
                             if send_tx
                                 .send(OutMsg::RegisterRelay {
