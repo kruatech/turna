@@ -1040,6 +1040,18 @@ impl TurnaConfig {
                         .into(),
                 );
             }
+            // A USERHASH is resolved from the local user table only; the
+            // credential webhook is consulted by USERNAME. A user the webhook
+            // knows would be told to hash and could then never authenticate.
+            if self.turn.auth.webhook.enabled {
+                errors.push(
+                    "turn.auth.advertise_userhash = true cannot be combined with \
+                     turn.auth.webhook.enabled = true: a USERHASH is resolved from the \
+                     local user table only, so a user known only to the webhook would \
+                     never authenticate"
+                        .into(),
+                );
+            }
             for t in &self.tenants {
                 if t.static_users.is_empty() {
                     errors.push(format!(
@@ -5227,6 +5239,21 @@ mod tests {
         assert!(
             msg.contains("cluster_secret"),
             "validation error should call out cluster_secret, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn advertise_userhash_refuses_the_credential_webhook() {
+        let err = TurnaConfig::from_str(
+            "[turn]\nexternal_ip = \"203.0.113.10\"\n\
+             [turn.auth]\nadvertise_userhash = true\n\
+             [turn.auth.webhook]\nenabled = true\nurl = \"https://auth.example.test/turn\"\n",
+        )
+        .expect_err("advertise_userhash with the credential webhook must be refused")
+        .to_string();
+        assert!(
+            err.contains("cannot be combined with turn.auth.webhook.enabled"),
+            "{err}"
         );
     }
 
