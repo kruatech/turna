@@ -68,6 +68,20 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-platform-verifier = "0.7"
 # PR A (task 2.4): system resource metrics in heartbeat.
 sysinfo = "0.39"
+
+# ---------------------------------------------------------------------------
+# Distribution packages: .deb (cargo-deb) and .rpm (cargo-generate-rpm).
+#
+# Built by the `packages` job in .github/workflows/release.yml; docs/DEPLOY.md
+# "Installing from a .deb or .rpm" says what they contain and do. Asset paths in
+# the deb section are relative to this crate (cargo-deb resolves them against
+# services/node); `target/release/` is cargo-deb's placeholder for the real
+# target dir and must be written exactly like that.
+#
+# Neither package enables or starts the service: the shipped config uses a
+# placeholder shared secret, and a TURN server that mints credentials from a
+# public placeholder must not come up on its own.
+# ---------------------------------------------------------------------------
 [package.metadata.deb]
 name = "turna-node"
 maintainer = "turna maintainers <a@krutilin.pro>"
