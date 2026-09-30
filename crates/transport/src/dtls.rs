@@ -369,8 +369,8 @@ impl DtlsServer {
         // again rather than staying quiet because the listener was idle earlier.
         let mut consecutive_timeouts: u64 = 0;
         let per_ip: std::sync::Arc<
-            std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>,
+        > = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         loop {
             // DTL-4: stop accepting new handshakes on shutdown. accept() is
             // cancel-safe (dropped if shutdown wins); the listener is released
@@ -473,7 +473,7 @@ impl DtlsServer {
             // DTL-9: per-source-IP concurrent session cap (anti slot-exhaustion).
             {
                 let ip = remote.ip();
-                let mut m = per_ip.lock().unwrap();
+                let mut m = per_ip.lock();
                 let n = *m.get(&ip).unwrap_or(&0);
                 if max_per_ip != 0 && n as usize >= max_per_ip {
                     drop(m);
@@ -548,7 +548,7 @@ pub(crate) async fn handle_dtls_session(
     idle_timeout: Duration,
     capacity: usize,
     stats: std::sync::Arc<DtlsStats>,
-    per_ip: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>>,
+    per_ip: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -643,7 +643,7 @@ pub(crate) async fn handle_dtls_session(
     stats.closed.fetch_add(1, Relaxed);
     {
         let ip = remote.ip();
-        let mut m = per_ip.lock().unwrap();
+        let mut m = per_ip.lock();
         if let Some(n) = m.get_mut(&ip) {
             *n = n.saturating_sub(1);
             if *n == 0 {

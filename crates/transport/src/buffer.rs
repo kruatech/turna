@@ -110,7 +110,8 @@ impl BufferRing {
 // ── tokio path ───────────────────────────────────────────────────────────────
 
 use bytes::BytesMut;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Lock-free-ish pool of `BytesMut` buffers for the tokio recv path.
 ///
@@ -119,7 +120,7 @@ use std::sync::{Arc, Mutex};
 /// At 200k pps that is 200 000 allocations/second hitting the global allocator.
 /// With a pool: acquire = pop from a Vec (O(1), no alloc), release = push back.
 ///
-/// The `Mutex` here is std (not tokio) and is held for only a single
+/// The `Mutex` here is parking_lot (not tokio) and is held for only a single
 /// `Vec::pop` / `Vec::push` — contention is negligible compared to I/O.
 /// If profiling shows lock contention, replace the inner `Mutex<Vec<...>>`
 /// with `crossbeam::queue::ArrayQueue`.
@@ -172,7 +173,7 @@ impl BytesPool {
     /// Acquire a buffer. Returns a pooled buffer if available, or allocates
     /// a fresh one. Never blocks.
     pub fn acquire(&self) -> BytesMut {
-        let mut pool = self.inner.lock().unwrap();
+        let mut pool = self.inner.lock();
         pool.pop().unwrap_or_else(|| {
             tracing::debug!(
                 buf_size = self.buf_size,
@@ -186,7 +187,7 @@ impl BytesPool {
     /// frozen (e.g. packet was dropped). Do NOT call after `buf.freeze()`.
     pub fn release(&self, mut buf: BytesMut) {
         buf.clear();
-        let mut pool = self.inner.lock().unwrap();
+        let mut pool = self.inner.lock();
         // Cap pool size to avoid unbounded growth after traffic spikes.
         if pool.len() < 8192 {
             pool.push(buf);
@@ -195,7 +196,7 @@ impl BytesPool {
 
     /// Current number of idle buffers in the pool.
     pub fn idle(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().len()
     }
 }
 

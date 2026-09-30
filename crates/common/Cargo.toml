@@ -3,6 +3,7 @@ publish = false
 name = "turna-common"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 serde.workspace = true

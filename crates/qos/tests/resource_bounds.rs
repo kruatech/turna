@@ -68,5 +68,5 @@ fn known_ip_not_blocked_when_table_full() {
     assert!(rl.check(known));
     assert!(rl.check(ip(10, 0, 0, 1)));
     assert!(rl.check(ip(10, 0, 0, 2)));
-    assert!(rl.check(known)); // known уже в таблице — не блокируется
+    assert!(rl.check(known)); // known is already in the table, so it is not blocked
 }

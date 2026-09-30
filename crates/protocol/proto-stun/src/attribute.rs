@@ -27,11 +27,22 @@ pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 /// redirect silently did nothing. Comprehension-optional (>= 0x8000), which is
 /// also correct for a response-only attribute.
 pub const ATTR_ALTERNATE_SERVER: u16 = 0x8023;
-/// RFC 5780 CHANGE-REQUEST. Reserved here only to document what 0x0003 actually
-/// is, so the collision above cannot be reintroduced. NAT behaviour discovery is
-/// NOT implemented (see docs/protocol-gap.md → RFC 5780).
-pub const ATTR_CHANGE_REQUEST_RESERVED: u16 = 0x0003;
+/// RFC 5780 §7.2 CHANGE-REQUEST (comprehension-required, Binding requests only).
+/// This is the value `ATTR_ALTERNATE_SERVER` wrongly held for three releases;
+/// the two constants are asserted distinct in the tests below so the collision
+/// cannot come back.
+pub const ATTR_CHANGE_REQUEST: u16 = 0x0003;
+/// RFC 5780 §7.3 RESPONSE-ORIGIN (comprehension-optional): the address and port
+/// a Binding response was sent from. MAPPED-ADDRESS format (§7.1), not XOR.
+pub const ATTR_RESPONSE_ORIGIN: u16 = 0x802B;
+/// RFC 5780 §7.4 OTHER-ADDRESS (comprehension-optional): where the response
+/// would come from with both change flags set. MAPPED-ADDRESS format (§7.1).
+pub const ATTR_OTHER_ADDRESS: u16 = 0x802C;
 pub const ATTR_USERNAME: u16 = 0x0006;
+/// RFC 8489 §14.4 USERHASH (comprehension-required): 32 bytes,
+/// `SHA-256(username ":" realm)`, sent in place of USERNAME when the server's
+/// nonce cookie advertises "Username anonymity".
+pub const ATTR_USERHASH: u16 = 0x001E;
 pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
 /// RFC 8489 §14.6 MESSAGE-INTEGRITY-SHA256 (HMAC-SHA-256; 16..=32 bytes).
 pub const ATTR_MESSAGE_INTEGRITY_SHA256: u16 = 0x001C;
@@ -123,6 +134,8 @@ pub enum Attribute {
     AlternateServer(SocketAddr),
     XorMappedAddress(SocketAddr),
     Username(String),
+    /// RFC 8489 §14.4 USERHASH — SHA-256 over `username ":" realm`.
+    UserHash([u8; 32]),
     MessageIntegrity([u8; 20]),
     Fingerprint(u32),
     ErrorCode {
@@ -148,6 +161,16 @@ pub enum Attribute {
     ReservationToken([u8; 8]),
     /// RFC 8656 §14.1 REQUESTED-ADDRESS-FAMILY (Allocate request only).
     RequestedAddressFamily(AddressFamily),
+    /// RFC 5780 §7.2 CHANGE-REQUEST: the "change IP" (A) and "change port" (B)
+    /// flags of a Binding request.
+    ChangeRequest {
+        change_ip: bool,
+        change_port: bool,
+    },
+    /// RFC 5780 §7.3 RESPONSE-ORIGIN (Binding responses only).
+    ResponseOrigin(SocketAddr),
+    /// RFC 5780 §7.4 OTHER-ADDRESS (Binding responses only).
+    OtherAddress(SocketAddr),
     /// RFC 8016 MOBILITY-TICKET — opaque, server-signed token bytes.
     MobilityTicket(Vec<u8>),
     /// draft-ietf-tram-stun-origin ORIGIN — client-supplied web origin (UTF-8).
@@ -173,6 +196,7 @@ impl Attribute {
             Self::AlternateServer(_) => ATTR_ALTERNATE_SERVER,
             Self::XorMappedAddress(_) => ATTR_XOR_MAPPED_ADDRESS,
             Self::Username(_) => ATTR_USERNAME,
+            Self::UserHash(_) => ATTR_USERHASH,
             Self::MessageIntegrity(_) => ATTR_MESSAGE_INTEGRITY,
             Self::Fingerprint(_) => ATTR_FINGERPRINT,
             Self::ErrorCode { .. } => ATTR_ERROR_CODE,
@@ -190,6 +214,9 @@ impl Attribute {
             Self::EvenPort(_) => ATTR_EVEN_PORT,
             Self::ReservationToken(_) => ATTR_RESERVATION_TOKEN,
             Self::RequestedAddressFamily(_) => ATTR_REQUESTED_ADDRESS_FAMILY,
+            Self::ChangeRequest { .. } => ATTR_CHANGE_REQUEST,
+            Self::ResponseOrigin(_) => ATTR_RESPONSE_ORIGIN,
+            Self::OtherAddress(_) => ATTR_OTHER_ADDRESS,
             Self::MobilityTicket(_) => ATTR_MOBILITY_TICKET,
             Self::Origin(_) => ATTR_ORIGIN,
             Self::AccessToken(_) => ATTR_ACCESS_TOKEN,
@@ -211,6 +238,26 @@ impl Attribute {
             // (plain, NOT XOR). Encoding it as XOR breaks spec-compliant
             // clients (pion, libnice) parsing the 300 Try Alternate redirect.
             Self::MappedAddress(addr) | Self::AlternateServer(addr) => encode_address(buf, addr),
+            // RFC 5780 §7.1: both carry a transport address in the plain
+            // MAPPED-ADDRESS format.
+            Self::ResponseOrigin(addr) | Self::OtherAddress(addr) => encode_address(buf, addr),
+            Self::UserHash(h) => {
+                ensure(buf.len(), 32)?;
+                buf[..32].copy_from_slice(h);
+                Ok(32)
+            }
+            Self::ChangeRequest {
+                change_ip,
+                change_port,
+            } => {
+                // RFC 5780 §7.2: 32 bits, only A (0x4) and B (0x2) of the last
+                // byte are defined.
+                ensure(buf.len(), 4)?;
+                buf[..3].copy_from_slice(&[0, 0, 0]);
+                buf[3] =
+                    (if *change_ip { 0x04 } else { 0 }) | (if *change_port { 0x02 } else { 0 });
+                Ok(4)
+            }
             Self::Username(s) | Self::Realm(s) | Self::Nonce(s) | Self::Software(s) => {
                 let b = s.as_bytes();
                 ensure(buf.len(), b.len())?;
@@ -504,6 +551,37 @@ pub fn parse_attributes(buf: &[u8], transaction_id: &[u8; 12]) -> Result<Vec<Att
                     .map_err(|_| StunError::AttributeParse("USERNAME is not valid UTF-8".into()))?;
                 Attribute::Username(name.to_string())
             }
+            // The four attributes below were `Attribute::Unknown` before they
+            // had typed variants, and a malformed value keeps it that way
+            // rather than failing the whole message: typing them must not turn
+            // what used to be an answered request (420 for the two
+            // comprehension-required ones) or an ignored attribute (the two
+            // comprehension-optional ones) into a silent drop on every
+            // listener. The relay layer then answers an Unknown below 0x8000
+            // with 420, exactly as it did before.
+            ATTR_USERHASH => match <[u8; 32]>::try_from(value) {
+                // RFC 8489 §14.4: fixed length of 32 bytes.
+                Ok(h) => Attribute::UserHash(h),
+                Err(_) => Attribute::Unknown {
+                    attr_type,
+                    value: value.to_vec(),
+                },
+            },
+            // RFC 5780 §7.2: exactly 32 bits. Only the A and B flags are
+            // defined; the other bits are not checked, consistent with the
+            // reserved bytes of REQUESTED-TRANSPORT.
+            ATTR_CHANGE_REQUEST if value.len() == 4 => Attribute::ChangeRequest {
+                change_ip: value[3] & 0x04 != 0,
+                change_port: value[3] & 0x02 != 0,
+            },
+            ATTR_RESPONSE_ORIGIN | ATTR_OTHER_ADDRESS => match decode_address(value) {
+                Ok(a) if attr_type == ATTR_RESPONSE_ORIGIN => Attribute::ResponseOrigin(a),
+                Ok(a) => Attribute::OtherAddress(a),
+                Err(_) => Attribute::Unknown {
+                    attr_type,
+                    value: value.to_vec(),
+                },
+            },
             ATTR_MESSAGE_INTEGRITY => {
                 if value.len() != 20 {
                     return Err(StunError::AttributeParse(format!(
@@ -1004,6 +1082,167 @@ mod tests {
             !matches!(attrs.as_slice(), [Attribute::Unknown { .. }]),
             "0x0017 must not decode as Unknown (would trigger 420)"
         );
+    }
+}
+
+#[cfg(test)]
+mod userhash_and_rfc5780_codec {
+    use super::*;
+
+    const TID: [u8; 12] = [7u8; 12];
+
+    fn frame(attr: &Attribute) -> Vec<u8> {
+        let mut value = [0u8; 64];
+        let len = attr.encode_value(&mut value, &TID).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&attr.attr_type().to_be_bytes());
+        buf.extend_from_slice(&(len as u16).to_be_bytes());
+        buf.extend_from_slice(&value[..len]);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    #[test]
+    fn userhash_roundtrips_and_is_not_unknown() {
+        // A typed variant matters beyond tidiness: `Attribute::Unknown` with a
+        // type below 0x8000 is what the relay answers with 420.
+        let h: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let buf = frame(&Attribute::UserHash(h));
+        assert_eq!(
+            &buf[..4],
+            &[0x00, 0x1E, 0x00, 0x20],
+            "type 0x001E, length 32"
+        );
+        let attrs = parse_attributes(&buf, &TID).unwrap();
+        assert!(matches!(attrs.as_slice(), [Attribute::UserHash(v)] if *v == h));
+    }
+
+    #[test]
+    fn userhash_wrong_length_rejected() {
+        // RFC 8489 §14.4: fixed length of 32 bytes.
+        for len in [0usize, 20, 31, 33, 64] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&ATTR_USERHASH.to_be_bytes());
+            buf.extend_from_slice(&(len as u16).to_be_bytes());
+            buf.extend(std::iter::repeat_n(0xAB, len));
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+            // Not a parse error: it stays the Unknown it was before the
+            // typed variant existed, so the relay still answers 420.
+            assert!(
+                matches!(
+                    parse_attributes(&buf, &TID).unwrap().as_slice(),
+                    [Attribute::Unknown {
+                        attr_type: ATTR_USERHASH,
+                        ..
+                    }]
+                ),
+                "USERHASH of {len} bytes must decode as Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn change_request_flag_bits_match_rfc5780() {
+        // RFC 5780 §7.2: A ("change IP") and B ("change port") are bits 29 and
+        // 30 of the 32-bit value, i.e. 0x04 and 0x02 of the last byte.
+        for (ip, port, byte) in [
+            (false, false, 0x00u8),
+            (true, false, 0x04),
+            (false, true, 0x02),
+            (true, true, 0x06),
+        ] {
+            let attr = Attribute::ChangeRequest {
+                change_ip: ip,
+                change_port: port,
+            };
+            let buf = frame(&attr);
+            assert_eq!(&buf[..4], &[0x00, 0x03, 0x00, 0x04]);
+            assert_eq!(&buf[4..8], &[0, 0, 0, byte]);
+            let attrs = parse_attributes(&buf, &TID).unwrap();
+            assert!(matches!(
+                attrs.as_slice(),
+                [Attribute::ChangeRequest { change_ip, change_port }]
+                    if *change_ip == ip && *change_port == port
+            ));
+        }
+        // Wrong length is not silently truncated: it stays Unknown (→ 420).
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&ATTR_CHANGE_REQUEST.to_be_bytes());
+        bad.extend_from_slice(&8u16.to_be_bytes());
+        bad.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            parse_attributes(&bad, &TID).unwrap().as_slice(),
+            [Attribute::Unknown {
+                attr_type: ATTR_CHANGE_REQUEST,
+                ..
+            }]
+        ));
+    }
+
+    /// Regression: RESPONSE-ORIGIN / OTHER-ADDRESS are comprehension-optional
+    /// and were ignored as Unknown before they were typed. A malformed value
+    /// (bad family, short) must still not fail the message.
+    #[test]
+    fn malformed_optional_addresses_stay_unknown() {
+        for typ in [ATTR_RESPONSE_ORIGIN, ATTR_OTHER_ADDRESS] {
+            for value in [
+                &[0u8, 0x07, 0, 1, 1, 2, 3, 4][..],
+                &[0u8, 1, 0][..],
+                &[][..],
+            ] {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&typ.to_be_bytes());
+                buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                buf.extend_from_slice(value);
+                while buf.len() % 4 != 0 {
+                    buf.push(0);
+                }
+                let attrs = parse_attributes(&buf, &TID).expect("must not fail the message");
+                assert!(
+                    matches!(attrs.as_slice(), [Attribute::Unknown { attr_type, .. }] if *attr_type == typ),
+                    "{typ:#06x} {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn change_request_is_not_alternate_server() {
+        // The collision that shipped for three releases, pinned both ways.
+        assert_eq!(ATTR_CHANGE_REQUEST, 0x0003);
+        assert_ne!(ATTR_CHANGE_REQUEST, ATTR_ALTERNATE_SERVER);
+    }
+
+    #[test]
+    fn response_origin_and_other_address_are_plain_addresses() {
+        for addr in [
+            "192.0.2.7:3478".parse::<SocketAddr>().unwrap(),
+            "[2001:db8::7]:3479".parse::<SocketAddr>().unwrap(),
+        ] {
+            for attr in [
+                Attribute::ResponseOrigin(addr),
+                Attribute::OtherAddress(addr),
+            ] {
+                let buf = frame(&attr);
+                // RFC 5780 §7.1: MAPPED-ADDRESS format, so the port is sent
+                // as-is, not XORed with the magic cookie.
+                assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), addr.port());
+                let parsed = parse_attributes(&buf, &TID).unwrap();
+                match (&attr, parsed.as_slice()) {
+                    (Attribute::ResponseOrigin(_), [Attribute::ResponseOrigin(a)])
+                    | (Attribute::OtherAddress(_), [Attribute::OtherAddress(a)]) => {
+                        assert_eq!(*a, addr)
+                    }
+                    other => panic!("unexpected decode: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(ATTR_RESPONSE_ORIGIN, 0x802B);
+        assert_eq!(ATTR_OTHER_ADDRESS, 0x802C);
     }
 }
 

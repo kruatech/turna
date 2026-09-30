@@ -1,8 +1,0 @@
-[package]
-publish = false
-name = "turna-packet"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-bytes.workspace = true

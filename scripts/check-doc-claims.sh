@@ -83,6 +83,31 @@ if [ "$CODEC_5780" = no ]; then
   fi
 else
   pass "RFC 5780 codec present in crates/protocol (doc claims are allowed)"
+
+  # With the codec in, the claims flip: the docs say the service exists, is
+  # wired, and is OFF by default. Each half is checked against the code.
+  if grep -qE '^pub async fn run\(' crates/relay/src/nat_discovery.rs 2>/dev/null &&
+    grep -qE 'nat_discovery::run\(' services/node/src/main.rs; then
+    pass "RFC 5780 responder exists and the node starts it"
+  else
+    fail "RFC 5780 codec present, but the responder is missing or not started by the node" \
+      "Docs describe [turn.nat_discovery] as a working service; wire it or correct them."
+  fi
+  ND_DEFAULT=$(awk '/^impl Default for NatDiscoverySection/,/^}/' crates/config/src/lib.rs)
+  if printf '%s' "$ND_DEFAULT" | grep -qE 'enabled: false'; then
+    pass "[turn.nat_discovery] defaults to enabled = false"
+  else
+    fail "[turn.nat_discovery] no longer defaults to off" \
+      "Every doc says RFC 5780 is opt-in (amplification: coturn keeps it off too). Restore the default or rewrite the docs."
+  fi
+  STALE=$(grep -nE '5780' README.md docs/feature-support.md docs/PRODUCTION_READINESS.md 2>/dev/null |
+    grep -iE 'not implemented|no codec' | grep -viE 'was wrong|earlier|previously|once claimed')
+  if [ -n "$STALE" ]; then
+    fail "a doc still says RFC 5780 is not implemented" \
+      "Lines: $(printf '%s' "$STALE" | head -3 | tr '\n' ';')"
+  else
+    pass "no doc still calls RFC 5780 unimplemented"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -241,6 +266,96 @@ if [ -f "$CONFIG" ]; then
       pass "$key stays lifted (gate not reintroduced)"
     fi
   done
+fi
+
+# ---------------------------------------------------------------------------
+section "Lifted and implemented features: docs must not still call them refused or missing"
+# ---------------------------------------------------------------------------
+
+# The reverse check above watches the code. This one watches the prose: after the
+# RFC 6062 gate was lifted on 2026-08-25, docs/migrating-from-coturn.md,
+# docs/COMPLIANCE.md, docs/protocol-gap.md and docs/CONFIGURATION.md went on
+# telling operators it was "refused under production = true" — a migration
+# blocker that did not exist. Same shape for OAuth, which docs/why-turna.md
+# listed as "Not implemented" while `AuthMode::OAuth` shipped.
+#
+# How a claim is found (the scanner is shared by both checks):
+#   - Claims wrap across lines, so text is read as blocks — paragraphs, list
+#     items, table rows — flattened to one line, then split into sentences and
+#     table cells.
+#   - A claim is attributed to the nearest feature named before it in the
+#     block, or failing that in the heading the block sits under: a sentence listing TCP relay and then OAuth "(refused under
+#     production = true)" is about OAuth; a table row "OAuth | 📋 | Not
+#     implemented." is about OAuth although the cell does not say so.
+#   - A retraction marker ("lift(ed)", "until 2026-…", "used to", …) exempts only
+#     the sentence it is in, so a paragraph cannot launder a live claim by
+#     mentioning history in another sentence.
+#   - Text in double quotes is a mention of a phrase, not a claim.
+#   - For 6062, "refused/rejected … under/with/in production" may have up to
+#     six words in between ("refused by config validation under …"), and a
+#     sentence about the remaining [tls] condition ("refuses it without
+#     [tls]") is not the lifted gate.
+# Verified: flags each stale site on the pre-fix tree, and planted variants
+# (wrapped, words in between, retraction in a neighbouring sentence).
+# shellcheck disable=SC2016  # Python source: the backticks and $ are regex text.
+STALE_SCAN='
+import glob, re, sys
+mode = sys.argv[1]
+FEATURE = re.compile(r"6062|tcp_relay|TCP relay|OAuth|7635|SCTP|QUIC|WebTransport|io_uring|AF_XDP|DTLS|5780|USERHASH|ADDITIONAL-ADDRESS-FAMILY|SQL|Redis|Mongo", re.I)
+RETRACT = re.compile(r"\blift|until 20|no longer|used to|was refused|previously|reintroduc|came back|come back|earlier|was wrong|correction", re.I)
+if mode == "6062":
+    TARGET = re.compile(r"6062|tcp_relay|TCP relay", re.I)
+    CLAIM = re.compile(r"\b(?:refus|reject)\w*\b(?:\W+[\w=`.\[\]]+){0,6}?\W+(?:under|with|in)\W+`?production"
+                       r"|production\s*=\s*true`?\W+(?:\w+\W+){0,4}?(?:refus|reject)", re.I)
+    EXEMPT = re.compile(r"without|\[tls\]", re.I)
+else:
+    TARGET = re.compile(r"OAuth|7635", re.I)
+    CLAIM = re.compile(r"\bnot\s+(?:yet\s+)?implemented\b|\bunimplemented\b", re.I)
+    EXEMPT = re.compile(r"$^")
+SPLIT = re.compile(r"(?<=[.;!?])\s+(?=[A-Z*`(\[_])|\s\|\s")
+for f in sorted(glob.glob("docs/**/*.md", recursive=True)) + ["README.md"]:
+    text = open(f, encoding="utf-8").read()
+    heading = ""
+    for block in re.split(r"\n\s*\n|\n(?=\|)|\n(?=\s*[-*] )", text):
+        flat = " ".join(block.split())
+        if flat.startswith("#"):
+            heading = flat
+        pos = 0
+        for sent in SPLIT.split(flat):
+            start = flat.find(sent, pos)
+            pos = start + len(sent)
+            if RETRACT.search(sent) or EXEMPT.search(sent):
+                continue
+            # A quoted phrase is a mention (\"the refused in production
+            # wording\"), not a claim; blank it, keeping offsets.
+            m = CLAIM.search(re.sub(r"\"[^\"]*\"", lambda q: " " * len(q.group(0)), sent))
+            if not m:
+                continue
+            # Nearest feature before the claim in this block, else in the
+            # section heading the block sits under.
+            before = list(FEATURE.finditer(flat[: start + m.start()])) or list(FEATURE.finditer(heading))
+            if before and TARGET.fullmatch(before[-1].group(0)):
+                print(f + ": " + sent[:110])
+                break
+'
+if ! grep -qF "turn.tcp_relay.enabled = true in production" "$CONFIG"; then
+  STALE_6062=$(python3 -c "$STALE_SCAN" 6062)
+  if [ -n "$STALE_6062" ]; then
+    fail "docs still say RFC 6062 TCP relay is refused in production; validate() no longer refuses it" \
+      "Correct the doc (the gate was lifted 2026-08-25), or mark the sentence as history. $(printf '%s' "$STALE_6062" | head -3 | tr '\n' ';')"
+  else
+    pass "no doc calls RFC 6062 TCP relay refused in production"
+  fi
+fi
+
+if grep -qE 'OAuth \{' crates/auth/src/lib.rs 2>/dev/null; then
+  STALE_OAUTH=$(python3 -c "$STALE_SCAN" oauth)
+  if [ -n "$STALE_OAUTH" ]; then
+    fail "docs say RFC 7635 OAuth is not implemented, but AuthMode::OAuth exists" \
+      "It is implemented and refused under production = true — say that. $(printf '%s' "$STALE_OAUTH" | head -3 | tr '\n' ';')"
+  else
+    pass "no doc calls OAuth unimplemented while AuthMode::OAuth exists"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -825,6 +940,105 @@ CFGPY
     "") pass "shipped configs use only declared keys" ;;
     *) fail "shipped configs carry keys no config struct declares:$CFG_BAD" \
          "deny_unknown_fields makes these fatal at startup, not ignored. Remove the key or restore the field." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+section "coturn migration table names only config keys that exist"
+# ---------------------------------------------------------------------------
+
+# docs/migrating-from-coturn.md maps every coturn option to a turna key. A key
+# that is misspelled or later renamed turns the table into instructions that
+# fail at startup (deny_unknown_fields). This resolves config references in the
+# table rows — the turna column AND the note column — against the config
+# structs *by path*, not just by field name, so `[management.rbac]` (the struct
+# field lives under [grpc]) fails even though a field called `rbac` exists:
+#
+#   - `[section]`, `[[section]]`, `[section] key`, `[section] key = value`,
+#     anywhere in the row: section and key must resolve;
+#   - a bare `snake_case` token after a `[section]` in the turna column
+#     (`[turn.relay] min_port`, `max_port`), or in the note column: a key of the
+#     row's last turna-column section. With no such section — or when it is
+#     not a key there — it passes only as a field of the management proto and
+#     only if the note says gRPC (`max_lifetime_secs` in `SetUserLimits`).
+#
+# Prose outside the tables is not checked, and the doc says so.
+MIG=docs/migrating-from-coturn.md
+if [ -f "$MIG" ] && [ -f "$CFG_SRC" ]; then
+  MIG_BAD=$(python3 - "$CFG_SRC" "$MIG" crates/control/proto <<'MIGPY'
+import glob, os, re, sys
+src, doc, proto_dir = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
+structs = {}
+for m in re.finditer(r"pub struct (\w+)\s*\{(.*?)\n\}", src, re.S):
+    fields = {}
+    for fm in re.finditer(r'(?:#\[serde\(rename\s*=\s*"([^"]+)"\)\][^\n]*\n\s*)?pub (?:r#)?(\w+)\s*:\s*([^\n]+?),?\s*$', m.group(2), re.M):
+        fields[fm.group(1) or fm.group(2)] = fm.group(3)
+    structs[m.group(1)] = fields
+proto_fields = set()
+for p in glob.glob(os.path.join(proto_dir, "*.proto")):
+    proto_fields |= set(re.findall(r"^\s*(?:optional\s+|repeated\s+)?[\w.]+\s+(\w+)\s*=\s*\d+;", open(p).read(), re.M))
+if "TurnaConfig" not in structs or len(structs) < 20 or len(proto_fields) < 20:
+    print("PARSER"); raise SystemExit(0)
+
+def resolve(path):
+    cur = "TurnaConfig"
+    for seg in path:
+        ty = structs.get(cur, {}).get(seg)
+        if ty is None:
+            return None
+        inner = [t for t in re.findall(r"\w+", ty) if t in structs]
+        cur = inner[-1] if inner else ""
+    return cur
+
+SECTION = re.compile(r"^\[\[?([a-z0-9_.]+)\]\]?(?:\s+([a-z0-9_]+)(?:\s*=.*)?)?$")
+BARE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$|^[a-z][a-z0-9]+$")
+SNAKE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+bad, seen = [], 0
+for line in doc.splitlines():
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 3 or not cells[0].startswith("`"):
+        continue
+    note = cells[3] if len(cells) > 3 else ""
+    grpc = "gRPC" in note
+    row_section = None          # last [section] in the turna column
+    for col, text in ((1, cells[1]), (3, note)):
+        section = row_section
+        for tok in re.findall(r"`([^`]+)`", text):
+            m = SECTION.match(tok)
+            if m:
+                st = resolve(m.group(1).split("."))
+                seen += 1
+                if st is None:
+                    bad.append("[" + m.group(1) + "]"); continue
+                if m.group(2) and m.group(2) not in structs.get(st, {}):
+                    bad.append("[" + m.group(1) + "] " + m.group(2)); continue
+                if col == 1:
+                    section = row_section = m.group(1)
+                continue
+            # In the turna column any bare word after a section is a key; in a
+            # note only snake_case words are (plain words there are prose).
+            if not (BARE.match(tok) if col == 1 else SNAKE.match(tok)):
+                continue
+            if col == 1 and section is None:
+                continue
+            seen += 1
+            st = resolve(section.split(".")) if section else None
+            if st is not None and tok in structs.get(st, {}):
+                continue
+            if grpc and tok in proto_fields:
+                continue
+            bad.append(("[" + section + "] " if section else "(no section) ") + tok)
+if seen < 40:
+    print("PARSER"); raise SystemExit(0)
+print("; ".join(bad))
+MIGPY
+)
+  case "$MIG_BAD" in
+    PARSER) fail "the migration-table key extractor found too little to judge" \
+              "Either the table format or the config structs changed shape; fix the extractor rather than skipping the check." ;;
+    "") pass "every config reference in the coturn mapping table exists at its path" ;;
+    *) fail "the coturn mapping table names keys the config does not have: $MIG_BAD" \
+         "Correct the row in $MIG (or restore the key); an operator copying it gets a startup failure." ;;
   esac
 fi
 

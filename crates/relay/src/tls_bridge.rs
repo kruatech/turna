@@ -18,6 +18,12 @@
 //!
 //! Only the client↔server *control* channel and client↔peer *data* travel over
 //! TLS here; the relay socket to the peer remains UDP (TURN relays UDP to peers).
+//!
+//! The plain TURN-over-TCP listener (`[turn.tcp]`) runs through this same
+//! bridge with [`StreamKind::Plain`]: the transport skips the handshake and the
+//! bridge mirrors its counters into the `turna_tcp_*` metrics instead of
+//! `turna_tls_*`. Everything else — control responses, relay sinks, RFC 6062
+//! CONNECT / ConnectionBind / detach, release on close — is identical.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,6 +45,24 @@ use turna_proto_stun::method::Method;
 
 type BridgeResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// Which stream listener a bridge is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamKind {
+    /// TURNS (`[tls]`).
+    Tls,
+    /// Plain TURN over TCP (`[turn.tcp]`).
+    Plain,
+}
+
+impl StreamKind {
+    fn label(self) -> &'static str {
+        match self {
+            StreamKind::Tls => "TURNS",
+            StreamKind::Plain => "TURN-over-TCP",
+        }
+    }
+}
+
 /// Run the TURNS bridge. Returns when the TLS event stream ends (server stopped).
 ///
 /// * `cfg` — TLS listener config (cert/key paths, listen addr, limits).
@@ -46,6 +70,7 @@ type BridgeResult = std::result::Result<(), Box<dyn std::error::Error + Send + S
 /// * `relay_tx` — the UDP server's relay [`OutMsg`] channel.
 /// * `client_sinks` — shared addr→TLS-writer registry.
 pub(crate) async fn run_tls_bridge(
+    kind: StreamKind,
     cfg: TlsTransportConfig,
     processor: Arc<PacketProcessor>,
     relay_tx: mpsc::Sender<OutMsg>,
@@ -53,12 +78,19 @@ pub(crate) async fn run_tls_bridge(
     tcp_relay: Option<Arc<TcpRelayManager>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> BridgeResult {
-    let server = TlsTransportServer::new(cfg)?;
+    let label = kind.label();
+    let server = match kind {
+        StreamKind::Tls => TlsTransportServer::new(cfg)?,
+        StreamKind::Plain => TlsTransportServer::new_plain(cfg)?,
+    };
 
     // Shared counters for the TURNS listener, mirrored into the Prometheus
     // metrics below. Before this the TLS transport exported nothing at all.
     let stats = Arc::new(TlsStats::default());
-    spawn_tls_metrics_mirror(stats.clone(), processor.metrics().clone());
+    match kind {
+        StreamKind::Tls => spawn_tls_metrics_mirror(stats.clone(), processor.metrics().clone()),
+        StreamKind::Plain => spawn_tcp_metrics_mirror(stats.clone(), processor.metrics().clone()),
+    }
 
     // Events from the TLS server (opened / packet / closed).
     let (event_tx, mut event_rx) = mpsc::channel::<TcpTransportEvent>(8192);
@@ -83,7 +115,7 @@ pub(crate) async fn run_tls_bridge(
             )
             .await
         {
-            error!(error = %e, "TURNS server stopped");
+            error!(error = %e, "{label} server stopped");
         }
     });
 
@@ -102,7 +134,7 @@ pub(crate) async fn run_tls_bridge(
         }
     });
 
-    info!("TURNS bridge started");
+    info!("{label} bridge started");
 
     // RFC 6062 §4.4 peer-initiated: per-allocation relayed TCP accept loops,
     // keyed by relay port so CloseRelay can abort them.
@@ -231,7 +263,13 @@ pub(crate) async fn run_tls_bridge(
                             // Allocate: the relay socket was bound during process();
                             // hand it to the UDP server, which adopts it and spawns
                             // the peer→client relay-recv task (TLS-aware via sinks).
-                            let _ = relay_tx.send(OutMsg::RegisterRelay { port, socket }).await;
+                            let _ = relay_tx
+                                .send(OutMsg::RegisterRelay {
+                                    port,
+                                    socket,
+                                    reply_via: None,
+                                })
+                                .await;
                         }
                         Action::RegisterTcpListener {
                             relay_port,
@@ -252,54 +290,22 @@ pub(crate) async fn run_tls_bridge(
                                 listener.set_nonblocking(true).ok();
                                 match tokio::net::TcpListener::from_std(listener) {
                                     Ok(l) => {
+                                        // Runs until the listener fails, the
+                                        // task is aborted (CloseRelay / control
+                                        // connection closed), or the allocation
+                                        // expires.
                                         let handle = tokio::spawn(async move {
-                                            let alloc = AllocationId(relay_port as u64);
-                                            loop {
-                                                match l.accept().await {
-                                                    Ok((stream, peer)) => {
-                                                        match mgr
-                                                            .register_incoming(
-                                                                alloc,
-                                                                peer,
-                                                                stream,
-                                                                owner_key.clone(),
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(id) => {
-                                                                let ind = proc
-                                                                    .build_connection_attempt_indication(
-                                                                        id.value(),
-                                                                        peer,
-                                                                    );
-                                                                let delivered = match ind {
-                                                                    Some(bytes) => sinks
-                                                                        .get(&client_addr)
-                                                                        .map(|s| {
-                                                                            s.try_send(bytes)
-                                                                                .is_ok()
-                                                                        })
-                                                                        .unwrap_or(false),
-                                                                    None => false,
-                                                                };
-                                                                if !delivered {
-                                                                    // Client gone / queue full / encode
-                                                                    // error: the pending peer conn would
-                                                                    // never be bound — drop it.
-                                                                    mgr.release(id).await;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                debug!(%peer, error = %e, "RFC 6062 peer connection rejected");
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(port = relay_port, error = %e, "relayed TCP accept failed; stopping listener");
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            crate::tcp_relay::run_relayed_listener(
+                                                mgr,
+                                                proc,
+                                                sinks,
+                                                l,
+                                                relay_port,
+                                                client_addr,
+                                                owner_key,
+                                                crate::tcp_relay::LISTENER_LIVENESS_INTERVAL,
+                                            )
+                                            .await
                                         });
                                         tcp_listeners.insert(relay_port, handle);
                                     }
@@ -365,7 +371,7 @@ pub(crate) async fn run_tls_bridge(
         }
     }
 
-    warn!("TURNS bridge event stream ended");
+    warn!("{label} bridge event stream ended");
     Ok(())
 }
 
@@ -409,11 +415,46 @@ fn spawn_tls_metrics_mirror(stats: Arc<TlsStats>, metrics: Arc<turna_health::Met
                 .tls_rejected_rate_limit
                 .store(s.rejected_rate_limit, Relaxed);
             metrics.tls_alpn_rejected.store(s.alpn_rejected, Relaxed);
+            metrics.tls_proxy_rejected.store(s.proxy_rejected, Relaxed);
             metrics.set_tls_readiness(if s.listening {
                 turna_health::Readiness::Ready
             } else {
                 turna_health::Readiness::Degraded
             });
+        }
+    });
+}
+
+/// The plain TCP listener's counterpart of [`spawn_tls_metrics_mirror`]. It
+/// has no readiness gauge of its own: a dead listener is caught by
+/// `RelayServer::run`, which watches the bridge task and marks the node
+/// Degraded.
+fn spawn_tcp_metrics_mirror(stats: Arc<TlsStats>, metrics: Arc<turna_health::Metrics>) {
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let s = stats.snapshot();
+            metrics.tcp_active.store(s.active as u64, Relaxed);
+            metrics.tcp_conns_total.store(s.accepted, Relaxed);
+            metrics.tcp_closed_total.store(s.closed, Relaxed);
+            metrics
+                .tcp_rejected_over_cap
+                .store(s.rejected_over_cap, Relaxed);
+            metrics
+                .tcp_rejected_per_ip
+                .store(s.rejected_per_ip, Relaxed);
+            metrics
+                .tcp_rejected_rate_limit
+                .store(s.rejected_rate_limit, Relaxed);
+            metrics.tcp_idle_timeouts.store(s.idle_timeouts, Relaxed);
+            metrics.tcp_framing_errors.store(s.framing_errors, Relaxed);
+            metrics.tcp_accept_errors.store(s.accept_errors, Relaxed);
+            metrics.tcp_bytes_rx.store(s.bytes_rx, Relaxed);
+            metrics.tcp_bytes_tx.store(s.bytes_tx, Relaxed);
+            metrics.tcp_proxy_rejected.store(s.proxy_rejected, Relaxed);
         }
     });
 }

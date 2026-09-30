@@ -53,8 +53,9 @@ The node logs the size it actually got and warns when it was clamped.
 
 ## 3. Certificates
 
-TURNS is not optional: turna has no plain TURN-over-TCP listener, so it is the
-only way in for a client on a network that blocks UDP. Corporate guests are
+TURNS is not optional: plain TURN over TCP (`[turn.tcp]`) is opt-in and off by
+default, and TURNS is the encrypted way in for a client on a network that blocks
+UDP. Corporate guests are
 exactly that population.
 
 Two workable paths:
@@ -229,7 +230,7 @@ it explicitly — the number is now a decision either way.
 enforced on the stock listener, where the handshake runs below `accept()`.
 Validation refuses the combination rather than accepting a limit that would do
 nothing. Add `max_handshakes_per_sec_per_ip = 0` to keep the stock listener, or
-drop `demux = false` — it has been the default since 0.4.1, and the stock path
+drop `demux = false` — it has been the default since 0.5.0, and the stock path
 has neither handshake rate limiting nor certificate hot-reload.
 
 The default is not made to depend on `demux`, deliberately: a setting whose

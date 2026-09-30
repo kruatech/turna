@@ -7,18 +7,39 @@ export class NodeUnreachable extends Error {
   constructor() { super('node_unreachable'); this.name = 'NodeUnreachable' }
 }
 
+// The backend was started with an admin token and this tab has none, or a
+// wrong one. Since 0.5.0 the token guards every /api route, reads included,
+// so a read failing this way is an auth problem, not a node problem.
+export class AuthRequired extends Error {
+  constructor() { super('auth_required'); this.name = 'AuthRequired' }
+}
+
+function isAuthFailure(resp: Response): boolean {
+  return resp.status === 401 || resp.status === 403
+}
+
+function withToken(headers: Record<string, string>): Record<string, string> {
+  const token = getAdminToken()
+  if (token) headers['x-admin-token'] = token
+  return headers
+}
+
 async function getJson<T>(path: string): Promise<T> {
   let resp: Response
-  try { resp = await fetch(path, { headers: { accept: 'application/json' } }) }
+  try { resp = await fetch(path, { headers: withToken({ accept: 'application/json' }) }) }
   catch { throw new NodeUnreachable() }
   if (resp.status === 503) throw new NodeUnreachable()
+  if (isAuthFailure(resp)) throw new AuthRequired()
   if (!resp.ok) throw new Error(`http ${resp.status}`)
   return (await resp.json()) as T
 }
 
 async function getLive(path: string): Promise<boolean> {
   let resp: Response
-  try { resp = await fetch(path) } catch { throw new NodeUnreachable() }
+  try { resp = await fetch(path, { headers: withToken({}) }) } catch { throw new NodeUnreachable() }
+  // A 401 here would otherwise read as "not live", sending the operator after
+  // a node that is fine.
+  if (isAuthFailure(resp)) throw new AuthRequired()
   return resp.ok
 }
 
@@ -45,15 +66,23 @@ export function setAdminToken(token: string): void {
   } catch { /* storage unavailable */ }
 }
 
+// Ask the operator for the admin token and keep it for this tab. Returns
+// whether a non-empty token was entered.
+export function promptAdminToken(): boolean {
+  const entered = typeof prompt === 'function'
+    ? prompt('Admin token required (sent as the X-Admin-Token header):')
+    : null
+  if (!entered || !entered.trim()) return false
+  setAdminToken(entered.trim())
+  return true
+}
+
 async function postManage<T = unknown>(command: string, params: Record<string, unknown> = {}): Promise<T> {
   // Mutations require the operator's X-Admin-Token when the backend is secured.
   const send = async (): Promise<Response> => {
-    const headers: Record<string, string> = { 'content-type': 'application/json' }
-    const token = getAdminToken()
-    if (token) headers['x-admin-token'] = token
     return fetch('/api/manage', {
       method: 'POST',
-      headers,
+      headers: withToken({ 'content-type': 'application/json' }),
       body: JSON.stringify({ command, params }),
     })
   }
@@ -62,18 +91,14 @@ async function postManage<T = unknown>(command: string, params: Record<string, u
   if (resp.status === 503) throw new NodeUnreachable()
   // Missing/invalid token → prompt once, persist, retry, so a secured backend is
   // usable from the browser instead of failing every mutation with 401.
-  if (resp.status === 401 || resp.status === 403) {
-    const entered = typeof prompt === 'function'
-      ? prompt('Admin token required (sent as the X-Admin-Token header):')
-      : null
-    if (entered && entered.trim()) {
-      setAdminToken(entered.trim())
+  if (isAuthFailure(resp)) {
+    if (promptAdminToken()) {
       try { resp = await send() } catch { throw new NodeUnreachable() }
       // A token the node still rejects must NOT stay in sessionStorage. It would
       // be replayed on every later mutation, each one failing and prompting
       // again, and a typo would survive until the operator thought to close the
       // tab. Drop it so the next attempt starts from an empty prompt.
-      if (resp.status === 401 || resp.status === 403) setAdminToken('')
+      if (isAuthFailure(resp)) setAdminToken('')
     }
   }
   if (!resp.ok) {

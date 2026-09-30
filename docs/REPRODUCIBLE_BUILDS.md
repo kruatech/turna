@@ -1,43 +1,43 @@
 # Reproducible Builds
 
-## Требования
+## Requirements
 
-- Rust 1.95.0 (зафиксирован в `rust-toolchain.toml`)
-- Зависимости зафиксированы в `Cargo.lock`
+- Rust 1.95.0 (pinned in `rust-toolchain.toml`)
+- Dependencies are pinned in `Cargo.lock`
 
-## Сборка
+## Build
 
 ```bash
-# Установить правильную версию Rust
+# Install the correct Rust version
 rustup toolchain install 1.95.0
 
-# Верифицировать версию
-rustc --version  # должно быть 1.95.0
+# Verify the version
+rustc --version  # should be 1.95.0
 
-# Собрать
+# Build
 cargo build --release -p turna-node
 
-# Проверить зависимости на уязвимости
+# Check dependencies for vulnerabilities
 cargo deny check
 ```
 
-## Верификация
+## Verification
 
 ```bash
-# Хэш бинарника должен совпадать на одинаковом окружении
+# The binary hash must match on an identical environment
 sha256sum target/release/turna-node
 ```
 
 ## Lockfile
 
-`Cargo.lock` коммитится в репозиторий — гарантирует идентичные
-версии зависимостей на всех машинах.
+`Cargo.lock` is committed to the repository — this guarantees identical
+dependency versions on all machines.
 
 ## cargo-deny
 
-Проверка зависимостей:
+Dependency check:
 ```bash
 cargo deny check
 ```
 
-Конфиг: `deny.toml`
+Config: `deny.toml`

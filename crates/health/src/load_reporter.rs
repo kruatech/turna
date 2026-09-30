@@ -1,7 +1,7 @@
-//! Load Reporter — сбор метрик ноды и reporting в gossip/control-plane
+//! Load Reporter — collects node metrics and reports to gossip/control-plane
 //!
-//! Собирает: CPU, allocations, bandwidth, ports → composite load %.
-//! Публикует через watch channel (gossip, gRPC, Prometheus подписываются).
+//! Collects: CPU, allocations, bandwidth, ports → composite load %.
+//! Publishes via a watch channel (gossip, gRPC, Prometheus subscribe).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -70,7 +70,7 @@ pub trait MetricsSource: Send + Sync {
     fn bandwidth_bytes_per_sec(&self) -> u64;
 }
 
-/// Простая реализация на атомиках.
+/// Simple atomics-based implementation.
 pub struct AtomicMetrics {
     pub allocations: AtomicU32,
     pub relay_ports: AtomicU32,

@@ -272,7 +272,7 @@ fn processor_actually_processes_packets() {
 
 /// Memory stress: 10 000 allocations → 1 000 000 packets → remove all.
 /// Checks that no panic, no unbounded allocation growth occurs.
-/// This mirrors the soak numbers from the ТЗ.
+/// This mirrors the soak numbers from the spec.
 #[test]
 #[ignore] // Run explicitly: cargo test -p turna-soak -- --ignored --nocapture
 fn full_soak_10k_allocs_1m_packets() {

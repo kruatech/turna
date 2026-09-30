@@ -3,6 +3,7 @@ publish = false
 name = "turna-observability"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tracing.workspace = true

@@ -62,6 +62,6 @@ impl HandshakeRandom {
     // may be called multiple times
     pub fn populate(&mut self) {
         self.gmt_unix_time = SystemTime::now();
-        rand::thread_rng().fill(&mut self.random_bytes);
+        rand::rng().fill_bytes(&mut self.random_bytes);
     }
 }

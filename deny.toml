@@ -20,10 +20,10 @@ targets = [
 ]
 
 [advisories]
-# Блокируем уязвимые зависимости.
-# Записи в ignore — осознанный техдолг: транзитивные зависимости старых
-# стеков (tonic 0.11 / webrtc / rustls 0.22-эпоха), закрываются только
-# апгрейдом этих стеков. Убирать записи по мере апгрейдов.
+# Block vulnerable dependencies.
+# Entries in ignore are deliberate tech debt: transitive dependencies of old
+# stacks (tonic 0.11 / webrtc / rustls 0.22 era), resolvable only by
+# upgrading those stacks. Remove entries as the upgrades happen.
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained: no upstream path exists. Transitive via webrtc-dtls, and every published webrtc-dtls release through 0.12.0 depends on bincode ^1 (re-verified against index.crates.io: 0.10.0, 0.11.0 and 0.12.0 all declare bincode ^1, and 0.12.0 is still the latest). The advisory sets patched = [] with no unaffected range, so bincode 2.x/3.x would not clear it either. Recheck when webrtc-rs changes serializer." },
     # RUSTSEC-2024-0436 (paste unmaintained) was here and is GONE, not silenced.
@@ -36,7 +36,7 @@ ignore = [
 ]
 
 [licenses]
-# Разрешённые лицензии — только permissive и weak-copyleft
+# Allowed licences — permissive and weak-copyleft only
 allow = [
     "MIT",
     "Apache-2.0",
@@ -57,7 +57,7 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# ring имеет нестандартную лицензию — уточняем вручную
+# ring has a non-standard licence — clarified manually
 [[licenses.clarify]]
 crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
@@ -93,18 +93,18 @@ license-files = [
 ]
 
 [licenses.private]
-# Не проверяем лицензии наших internal крейтов (publish = false)
+# Do not check licences of our internal crates (publish = false)
 ignore = true
 
 [bans]
-# Предупреждаем о дублирующихся версиях зависимостей
+# Warn about duplicate dependency versions
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 
-# Запрещаем известно проблемные крейты
+# Ban known-problematic crates
 deny = [
-    # Старый unmaintained openssl bindings
+    # Old unmaintained openssl bindings
     { crate = "openssl-sys@0.9.0", reason = "use newer version" },
 ]
 

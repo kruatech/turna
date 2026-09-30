@@ -86,7 +86,8 @@ there is nothing the relay can do about a packet it must not fragment.
 Relayed IPv6 works and is verified between two globally routable addresses. Two
 limits worth knowing before designing around it: `ADDITIONAL-ADDRESS-FAMILY` is
 not implemented, so a client cannot request both families in one allocation; and
-the RFC 6062 TCP relay is IPv4-only — an IPv6 `Connect` answers 440.
+the RFC 6062 TCP relay is IPv4-only unless `[turn.tcp_relay] allow_ipv6 = true` is
+set — otherwise an IPv6 TCP Allocate answers 440.
 
 ## What to give a network team
 

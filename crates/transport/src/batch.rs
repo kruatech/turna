@@ -1,8 +1,8 @@
-//! SQE Batching — группировка отправок для снижения syscall overhead
+//! SQE Batching — grouping sends to reduce syscall overhead
 //!
-//! - Linux: sendmmsg(2) — до 64 пакетов за один syscall
+//! - Linux: sendmmsg(2) — up to 64 packets per syscall
 //! - macOS/other: single send fallback
-//! - Адаптивный режим: батчинг включается только при PPS > threshold
+//! - Adaptive mode: batching is enabled only when PPS > threshold
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

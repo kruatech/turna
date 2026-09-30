@@ -42,7 +42,7 @@ RUN cargo build --locked --release --features tls \
 # =============================================================================
 # Stage 2: Runtime
 # =============================================================================
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 # Pinned non-root UID/GID so the Helm chart can set
 # runAsUser/runAsGroup/fsGroup to a known value (65532, the conventional
@@ -79,9 +79,10 @@ LABEL org.opencontainers.image.title="turna" \
 #   5349/tcp  - TURNS (TLS), when enabled in config
 #   5350/tcp  - gRPC management API, when enabled/bound externally
 #
-# 3478/tcp is deliberately absent: turna has no plain TURN-over-TCP listener.
-# The supported client URLs are turn:<host>:3478?transport=udp and
-# turns:<host>:5349?transport=tcp. See "Client ICE configuration" in README.md.
+# 3478/tcp is absent because plain TURN over TCP is opt-in ([turn.tcp], off by
+# default); publish it yourself if you enable that listener. The default client
+# URLs are turn:<host>:3478?transport=udp and turns:<host>:5349?transport=tcp.
+# See "Client ICE configuration" in README.md.
 #
 # 9090/tcp is absent too: health and the full Prometheus surface bind
 # 127.0.0.1 in deploy/turn.toml, so EXPOSE would advertise a port that is

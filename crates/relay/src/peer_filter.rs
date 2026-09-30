@@ -116,6 +116,10 @@ pub struct PeerPolicy {
     /// `external_ip` / `external_ip6` and the relay `bind_ip`. Denied
     /// unconditionally — see `is_forbidden`.
     self_addrs: Vec<IpAddr>,
+    /// Ranges that are never relay peers, whatever the allow list says. Today
+    /// that is the PROXY-protocol trusted sources (see
+    /// [`with_forbidden_ranges`](Self::with_forbidden_ranges)).
+    forbidden: Vec<Cidr>,
     /// Deny RFC 1918 / ULA peers (the `internet-facing` profile).
     deny_private: bool,
     /// Allow loopback peers (dev/test only).
@@ -140,6 +144,7 @@ impl PeerPolicy {
     pub fn internet_facing() -> Self {
         Self {
             self_addrs: Vec::new(),
+            forbidden: Vec::new(),
             deny_private: true,
             allow_loopback: env_allow_loopback(),
             denied: Vec::new(),
@@ -151,6 +156,7 @@ impl PeerPolicy {
     pub fn lan() -> Self {
         Self {
             self_addrs: Vec::new(),
+            forbidden: Vec::new(),
             deny_private: false,
             allow_loopback: env_allow_loopback(),
             denied: Vec::new(),
@@ -175,6 +181,7 @@ impl PeerPolicy {
         };
         Self {
             self_addrs: Vec::new(),
+            forbidden: Vec::new(),
             deny_private,
             allow_loopback: allow_loopback_peers || env_allow_loopback(),
             denied: parse_ranges(denied_peer_ranges, "denied_peer_ranges"),
@@ -200,8 +207,32 @@ impl PeerPolicy {
         self
     }
 
+    /// Deny these CIDRs unconditionally — the allow list cannot re-open them,
+    /// exactly like this node's own addresses.
+    ///
+    /// The node passes the `proxy_protocol_trusted_cidrs` of every listener
+    /// that has the PROXY protocol on. A source in that range may tell the
+    /// listener which address a connection comes from; if a client could make
+    /// the relay open a connection (RFC 6062 CONNECT) or send datagrams into
+    /// that range, it could reach a PROXY-trusting listener — this node's, or
+    /// another node's behind the same balancer — from a trusted address and
+    /// write its own header, choosing the source address that auth, rate
+    /// limits and the peer filter see. A load-balancer subnet is never a
+    /// legitimate media peer, so there is nothing to lose by refusing it.
+    pub fn with_forbidden_ranges(mut self, ranges: &[String]) -> Self {
+        self.forbidden
+            .extend(parse_ranges(ranges, "proxy_protocol_trusted_cidrs"));
+        self
+    }
+
     /// Returns true if relaying to/from this **normalized** peer is refused.
     pub fn is_forbidden(&self, ip: IpAddr) -> bool {
+        // PROXY-trusted ranges first: not even `allow_loopback_peers` reopens
+        // them (a loopback listener trusting 127.0.0.0/8 is the dev setup
+        // where the forged-header path would otherwise be wide open).
+        if self.forbidden.iter().any(|c| c.contains(ip)) {
+            return true;
+        }
         // Hardcoded special-use denies — never valid relay peers, and the
         // allow-list cannot override them (loopback has its own flag).
         if ip.is_loopback() {
@@ -487,5 +518,26 @@ mod tests {
         assert!(!c6.contains(ip("2001:db8::1")));
         assert!(Cidr::parse("10.0.0.0/33").is_none()); // bad prefix
         assert!(Cidr::parse("nonsense").is_none());
+    }
+
+    /// PROXY-trusted ranges are refused as peers even under `lan` with an
+    /// explicit allow entry covering them, and on v4-mapped v6 spellings.
+    #[test]
+    fn forbidden_ranges_beat_the_allow_list() {
+        let p = PeerPolicy::from_config("lan", false, &[], &["10.0.0.0/8".to_string()])
+            .with_forbidden_ranges(&["10.0.5.0/24".to_string()]);
+        assert!(p.is_forbidden(ip("10.0.5.7")));
+        assert!(p.is_forbidden(normalize_ip(ip("::ffff:10.0.5.7"))));
+        assert!(
+            !p.is_forbidden(ip("10.0.6.7")),
+            "the rest of the allow list stands"
+        );
+        // Loopback too, even with allow_loopback_peers.
+        let lo = PeerPolicy::from_config("lan", true, &[], &[])
+            .with_forbidden_ranges(&["127.0.0.0/8".to_string()]);
+        assert!(lo.is_forbidden(ip("127.0.0.1")));
+        // Without the forbidden range the same address is allowed.
+        let open = PeerPolicy::from_config("lan", false, &[], &["10.0.0.0/8".to_string()]);
+        assert!(!open.is_forbidden(ip("10.0.5.7")));
     }
 }

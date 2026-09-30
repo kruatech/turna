@@ -25,9 +25,9 @@ updates:
     commit-message:
       prefix: deps
     ignore:
-      # API-завязанные крейты: код таргетит конкретный major. У pre-1.0 крейтов
-      # ломающие изменения приходят в minor-позиции (0.x -> 0.(x+1)), поэтому
-      # глушим и semver-minor — иначе ignore не срабатывает. Patch разрешён.
+      # API-bound crates: the code targets a specific major. Pre-1.0 crates put
+      # breaking changes in the minor position (0.x -> 0.(x+1)), so semver-minor
+      # is ignored too, otherwise the ignore has no effect. Patch is allowed.
       - dependency-name: "xsk-rs"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "wtransport"
@@ -40,7 +40,7 @@ updates:
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "netlink-packet-route"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
-      # RustCrypto движется в лок-степе — бампить вместе, не поштучно.
+      # RustCrypto moves in lock-step: bump these together, not one at a time.
       - dependency-name: "hmac"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "sha1"
@@ -66,10 +66,29 @@ updates:
       - dependency-name: "hmac"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
-  # Base image referenced by deploy/Dockerfile.
+  # Base images referenced by deploy/Dockerfile and deploy/Dockerfile.admin.
   - package-ecosystem: docker
     directory: /deploy
     schedule:
       interval: weekly
     commit-message:
       prefix: deps(docker)
+    ignore:
+      # Node majors are chosen by hand: only even majors become LTS, and odd
+      # ones live about eight months (25 reached end of life on 2026-06-01).
+      # Patch and minor bumps of the pinned LTS major still arrive here.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+
+  # Admin console frontend (Vite/React). Keep the Node major used by
+  # `npm ci` in step with deploy/Dockerfile.admin.
+  - package-ecosystem: npm
+    directory: /services/admin/frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps(frontend)
+    groups:
+      frontend-dev:
+        dependency-type: development

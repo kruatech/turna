@@ -571,6 +571,8 @@ pub async fn run_tls_load(
     if !warmup.is_zero() {
         tokio::time::sleep(warmup).await;
         stats.reset();
+    } else {
+        stats.begin_window();
     }
     tokio::time::sleep(duration).await;
     stats.stop();

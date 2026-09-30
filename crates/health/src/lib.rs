@@ -161,7 +161,7 @@ pub struct Metrics {
     pub auth_failures: AtomicU64,
     pub rate_limited: AtomicU64,
     pub zero_copy_forwards: AtomicU64,
-    /// Пакеты дропнутые из-за переполнения send channel (backpressure).
+    /// Packets dropped because the send channel was full (backpressure).
     pub send_queue_dropped: AtomicU64,
     /// STUN messages that failed to decode (malformed header/attributes).
     pub parser_rejections: AtomicU64,
@@ -172,6 +172,11 @@ pub struct Metrics {
     /// Permission/ChannelBind/Send requests refused because the peer address
     /// is in a denied (special-use) range — see relay::peer_filter.
     pub peer_rejected: AtomicU64,
+    /// RFC 6062 §5.3: peer-initiated TCP connections to a relayed address that
+    /// were accepted and closed at once because the allocation holds no
+    /// permission for the peer (or the peer filter denies it). No
+    /// ConnectionAttempt is sent for these.
+    pub tcp_relay_peer_refused: AtomicU64,
     /// A3-O1: packet-processing panics caught by the worker's panic guard.
     /// A non-zero rate means a packet tripped a bug in `PacketProcessor`; the
     /// worker survived (the offending packet was dropped). Alert on rate > 0.
@@ -370,6 +375,25 @@ pub struct Metrics {
     pub tls_cert_reload_failures: AtomicU64,
     pub tls_rejected_rate_limit: AtomicU64,
     pub tls_alpn_rejected: AtomicU64,
+    /// TURNS connections refused by the PROXY protocol (untrusted source, or
+    /// a missing, malformed or late header). Zero unless `[tls] proxy_protocol`.
+    pub tls_proxy_rejected: AtomicU64,
+    // Plain TURN over TCP (`[turn.tcp]`). Mirrored from the same
+    // `TlsStats` type by the bridge running that listener; all zero when it is
+    // disabled. Handshake and certificate counters have no plain-TCP meaning
+    // and are not exported for it.
+    pub tcp_active: AtomicU64,
+    pub tcp_conns_total: AtomicU64,
+    pub tcp_closed_total: AtomicU64,
+    pub tcp_rejected_over_cap: AtomicU64,
+    pub tcp_rejected_per_ip: AtomicU64,
+    pub tcp_rejected_rate_limit: AtomicU64,
+    pub tcp_idle_timeouts: AtomicU64,
+    pub tcp_framing_errors: AtomicU64,
+    pub tcp_accept_errors: AtomicU64,
+    pub tcp_bytes_rx: AtomicU64,
+    pub tcp_bytes_tx: AtomicU64,
+    pub tcp_proxy_rejected: AtomicU64,
 
     // TURN-over-SCTP. Mirrored from `turna_transport::sctp::SctpStats` by the
     // SCTP bridge; all zero when the listener is disabled or not built.
@@ -476,6 +500,7 @@ impl Metrics {
             malformed_packets: AtomicU64::new(0),
             quota_exceeded: AtomicU64::new(0),
             peer_rejected: AtomicU64::new(0),
+            tcp_relay_peer_refused: AtomicU64::new(0),
             processor_panics: AtomicU64::new(0),
             rtp_streams: AtomicU64::new(0),
             rtp_avg_loss_pct_x100: AtomicU64::new(0),
@@ -592,6 +617,19 @@ impl Metrics {
             tls_cert_reload_failures: AtomicU64::new(0),
             tls_rejected_rate_limit: AtomicU64::new(0),
             tls_alpn_rejected: AtomicU64::new(0),
+            tls_proxy_rejected: AtomicU64::new(0),
+            tcp_active: AtomicU64::new(0),
+            tcp_conns_total: AtomicU64::new(0),
+            tcp_closed_total: AtomicU64::new(0),
+            tcp_rejected_over_cap: AtomicU64::new(0),
+            tcp_rejected_per_ip: AtomicU64::new(0),
+            tcp_rejected_rate_limit: AtomicU64::new(0),
+            tcp_idle_timeouts: AtomicU64::new(0),
+            tcp_framing_errors: AtomicU64::new(0),
+            tcp_accept_errors: AtomicU64::new(0),
+            tcp_bytes_rx: AtomicU64::new(0),
+            tcp_bytes_tx: AtomicU64::new(0),
+            tcp_proxy_rejected: AtomicU64::new(0),
             sctp_active: AtomicU64::new(0),
             sctp_conns_total: AtomicU64::new(0),
             sctp_closed_total: AtomicU64::new(0),
@@ -867,11 +905,21 @@ impl Metrics {
         )
     }
 
+    /// RFC 6062 TCP relay counters. Zero unless `[turn.tcp_relay]` is enabled.
+    fn render_tcp_relay_metrics(&self) -> String {
+        format!(
+            "# HELP turna_tcp_relay_peer_refused_total Peer-initiated TCP connections to a relayed address closed because the allocation has no permission for the peer, or the peer filter denies it (RFC 6062 5.3)\n\
+             # TYPE turna_tcp_relay_peer_refused_total counter\n\
+             turna_tcp_relay_peer_refused_total {}\n",
+            self.tcp_relay_peer_refused.load(Ordering::Relaxed)
+        )
+    }
+
     /// mirrored from the transport layer by the node's periodic copy task. All
     /// zero unless the corresponding transport is enabled and built in.
     fn render_transport_metrics(&self) -> String {
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
-        format!(
+        let mut out = format!(
             "# HELP turna_quic_active_sessions Active QUIC/WebTransport sessions\n\
              # TYPE turna_quic_active_sessions gauge\n\
              turna_quic_active_sessions {}\n\
@@ -1305,6 +1353,69 @@ impl Metrics {
             self.quic_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.afxdp_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
             self.management_readiness.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        );
+        out.push_str(&self.render_tcp_listener_metrics());
+        out
+    }
+
+    /// Plain TURN over TCP and the PROXY-protocol refusal counters. A separate
+    /// block from the one above so adding a listener does not mean threading
+    /// arguments through a hundred-placeholder `format!`.
+    fn render_tcp_listener_metrics(&self) -> String {
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "# HELP turna_tls_proxy_rejected_total TURNS connections refused by the PROXY protocol (untrusted source; missing, malformed or late header)\n\
+             # TYPE turna_tls_proxy_rejected_total counter\n\
+             turna_tls_proxy_rejected_total {}\n\
+             # HELP turna_tcp_active_connections Active plain TURN-over-TCP connections\n\
+             # TYPE turna_tcp_active_connections gauge\n\
+             turna_tcp_active_connections {}\n\
+             # HELP turna_tcp_connections_total Plain TURN-over-TCP connections accepted since start\n\
+             # TYPE turna_tcp_connections_total counter\n\
+             turna_tcp_connections_total {}\n\
+             # HELP turna_tcp_closed_total Plain TURN-over-TCP connections closed since start\n\
+             # TYPE turna_tcp_closed_total counter\n\
+             turna_tcp_closed_total {}\n\
+             # HELP turna_tcp_rejected_over_cap_total Plain TCP connections refused at the max_connections cap\n\
+             # TYPE turna_tcp_rejected_over_cap_total counter\n\
+             turna_tcp_rejected_over_cap_total {}\n\
+             # HELP turna_tcp_rejected_per_ip_total Plain TCP connections refused at max_connections_per_ip\n\
+             # TYPE turna_tcp_rejected_per_ip_total counter\n\
+             turna_tcp_rejected_per_ip_total {}\n\
+             # HELP turna_tcp_rejected_rate_limit_total Plain TCP connections refused by the per-IP connection rate limiter\n\
+             # TYPE turna_tcp_rejected_rate_limit_total counter\n\
+             turna_tcp_rejected_rate_limit_total {}\n\
+             # HELP turna_tcp_idle_timeouts_total Plain TCP connections closed by the idle read timeout\n\
+             # TYPE turna_tcp_idle_timeouts_total counter\n\
+             turna_tcp_idle_timeouts_total {}\n\
+             # HELP turna_tcp_framing_errors_total Plain TCP connections closed on invalid or over-sized TURN-over-TCP framing\n\
+             # TYPE turna_tcp_framing_errors_total counter\n\
+             turna_tcp_framing_errors_total {}\n\
+             # HELP turna_tcp_accept_errors_total Plain TCP accept() errors survived without stopping the listener\n\
+             # TYPE turna_tcp_accept_errors_total counter\n\
+             turna_tcp_accept_errors_total {}\n\
+             # HELP turna_tcp_bytes_rx_total Bytes read from plain TURN-over-TCP clients\n\
+             # TYPE turna_tcp_bytes_rx_total counter\n\
+             turna_tcp_bytes_rx_total {}\n\
+             # HELP turna_tcp_bytes_tx_total Bytes written to plain TURN-over-TCP clients\n\
+             # TYPE turna_tcp_bytes_tx_total counter\n\
+             turna_tcp_bytes_tx_total {}\n\
+             # HELP turna_tcp_proxy_rejected_total Plain TCP connections refused by the PROXY protocol (untrusted source; missing, malformed or late header)\n\
+             # TYPE turna_tcp_proxy_rejected_total counter\n\
+             turna_tcp_proxy_rejected_total {}\n",
+            l(&self.tls_proxy_rejected),
+            l(&self.tcp_active),
+            l(&self.tcp_conns_total),
+            l(&self.tcp_closed_total),
+            l(&self.tcp_rejected_over_cap),
+            l(&self.tcp_rejected_per_ip),
+            l(&self.tcp_rejected_rate_limit),
+            l(&self.tcp_idle_timeouts),
+            l(&self.tcp_framing_errors),
+            l(&self.tcp_accept_errors),
+            l(&self.tcp_bytes_rx),
+            l(&self.tcp_bytes_tx),
+            l(&self.tcp_proxy_rejected),
         )
     }
 }
@@ -2303,6 +2414,7 @@ pub async fn serve_on(
                     ));
                     body.push_str(&m.render_auth_reason_metrics());
                     body.push_str(&m.render_transport_metrics());
+                    body.push_str(&m.render_tcp_relay_metrics());
                     body.push_str(&m.render_command_log_metrics());
                     body.push_str(&m.histograms.render_prometheus());
                     if let Some(provider) = &relay_routes {
@@ -2366,6 +2478,7 @@ mod metrics_format_regression {
         );
         body.push_str(&m.render_auth_reason_metrics());
         body.push_str(&m.render_transport_metrics());
+        body.push_str(&m.render_tcp_relay_metrics());
         body
     }
 
@@ -2399,6 +2512,7 @@ mod metrics_format_regression {
             "turna_malformed_packets_total",
             "turna_quota_exceeded_total",
             "turna_peer_rejected_total",
+            "turna_tcp_relay_peer_refused_total",
         ] {
             let sample = format!("{name} ");
             assert!(

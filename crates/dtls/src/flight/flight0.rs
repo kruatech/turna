@@ -223,7 +223,7 @@ impl Flight for Flight0 {
         // Initialize
         if !cfg.insecure_skip_verify_hello {
             state.cookie = vec![0; COOKIE_LENGTH];
-            rand::thread_rng().fill(state.cookie.as_mut_slice());
+            rand::rng().fill_bytes(state.cookie.as_mut_slice());
         }
         // Otherwise the cookie stays empty. Nothing reads it on this path —
         // Flight2 is never entered — and leaving a field populated after it has

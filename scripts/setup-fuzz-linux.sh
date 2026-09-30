@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # scripts/setup-fuzz-linux.sh
 #
-# Готовит Ubuntu 22.04 / 24.04 к запуску 24-часовой fuzz-кампании.
-# Запускать один раз на чистой машине или в Docker-образе.
+# Prepares Ubuntu 22.04 / 24.04 for running a 24-hour fuzz campaign.
+# Run once on a clean machine or in a Docker image.
 #
-# Использование:
+# Usage:
 #   bash scripts/setup-fuzz-linux.sh
-#   bash scripts/setup-fuzz-linux.sh --dry-run   # только покажет что будет делать
+#   bash scripts/setup-fuzz-linux.sh --dry-run   # only shows what it would do
 #
-# После завершения:
+# After completion:
 #   cargo +nightly fuzz run fuzz_stun fuzz/corpus/fuzz_stun -- -max_total_time=86400
 
 set -euo pipefail
@@ -21,7 +21,7 @@ run() {
     [[ $DRY -eq 1 ]] || "$@"
 }
 
-echo "━━━ [1/4] Системные зависимости ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━ [1/4] System dependencies ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 run sudo apt-get update -qq
 run sudo apt-get install -y --no-install-recommends \
     build-essential pkg-config curl git \
@@ -31,12 +31,12 @@ run sudo apt-get install -y --no-install-recommends \
     libpcap-dev libnuma-dev \
     protobuf-compiler \
     dpdk-dev \
-    screen                  # для фоновых сессий без tmux
+    screen                  # for background sessions without tmux
 
 echo ""
 echo "━━━ [2/4] Rust (stable + nightly) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if command -v rustup &>/dev/null; then
-    echo "  rustup уже установлен ($(rustup --version 2>&1 | head -1))"
+    echo "  rustup already installed ($(rustup --version 2>&1 | head -1))"
     run rustup update stable
     run rustup update nightly
 else
@@ -50,32 +50,32 @@ run rustup toolchain install nightly --component rust-src
 echo ""
 echo "━━━ [3/4] cargo-fuzz ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if cargo fuzz --version &>/dev/null 2>&1; then
-    echo "  cargo-fuzz уже установлен ($(cargo fuzz --version))"
+    echo "  cargo-fuzz already installed ($(cargo fuzz --version))"
 else
     run cargo install --locked cargo-fuzz
 fi
 
 echo ""
-echo "━━━ [4/4] Smoke-run (60 секунд на fuzz_stun) ━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━ [4/4] Smoke-run (60 seconds on fuzz_stun) ━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if [[ $DRY -eq 1 ]]; then
-    echo "  (пропущен в --dry-run)"
+    echo "  (skipped in --dry-run)"
 else
     cd "$(git rev-parse --show-toplevel)"
     cargo +nightly fuzz run fuzz_stun fuzz/corpus/fuzz_stun \
         -- -max_total_time=60 -print_final_stats=1
     echo ""
-    echo "  Smoke-run прошёл — можно запускать полную кампанию."
+    echo "  Smoke-run passed — the full campaign can be started."
 fi
 
 echo ""
-echo "━━━ Готово ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "━━━ Done ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 cat <<'EOF'
 
-Запуск 24-часовой кампании (три окна screen или tmux):
+Running the 24-hour campaign (three screen or tmux windows):
 
   screen -S fuzz_stun
   cargo +nightly fuzz run fuzz_stun fuzz/corpus/fuzz_stun -- -max_total_time=86400
-  Ctrl-A D  ← отцепиться
+  Ctrl-A D  ← detach
 
   screen -S fuzz_turn
   cargo +nightly fuzz run fuzz_turn fuzz/corpus/fuzz_turn -- -max_total_time=86400
@@ -85,10 +85,10 @@ cat <<'EOF'
   cargo +nightly fuzz run fuzz_rtcp fuzz/corpus/fuzz_rtcp -- -max_total_time=86400
   Ctrl-A D
 
-Посмотреть результат:
+View the results:
   screen -r fuzz_stun
 
-Крэши будут в:
+Crashes will be in:
   fuzz/artifacts/fuzz_stun/
   fuzz/artifacts/fuzz_turn/
   fuzz/artifacts/fuzz_rtcp/

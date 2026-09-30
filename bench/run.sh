@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# bench/run.sh — compare turna vs coturn on the same hardware.
+# bench/run.sh — quick STUN Binding comparison, turna vs coturn.
+#
+# Binding only. For allocation rate, relay throughput/loss, memory per
+# allocation and server CPU, use bench/matrix.sh — the full harness.
 #
 # Three runs, all using turna-load-test as the client:
 #   1. turna with BPF filter ON  (production setup)
@@ -14,6 +17,7 @@
 #   - jq installed   (`apt install jq`)
 #   - this repo built in release mode (`cargo build --release`)
 #   - ports 3478, 3479, 9101, 9190, 5350 free
+#   - ulimit -n above CONCURRENCY x SOCKETS_PER_TASK (51 200 by default)
 #
 # Usage:
 #   bash bench/run.sh                       # defaults: c=200, duration=30s
@@ -30,10 +34,16 @@ set -euo pipefail
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 CONCURRENCY="${CONCURRENCY:-200}"
+# Load is spread over many loopback source addresses: turna answers at most 8
+# unauthenticated replies per second per source (burst 64, not configurable),
+# so from 127.0.0.1 alone this would measure that anti-reflection budget.
+# CONCURRENCY x SOCKETS_PER_TASK sources; see bench/matrix.sh for the detail.
+SOURCE_IPS="${SOURCE_IPS:-65534}"
+SOCKETS_PER_TASK="${SOCKETS_PER_TASK:-256}"
 DURATION="${DURATION:-30}"
 SKIP_COTURN="${SKIP_COTURN:-0}"
 GARBAGE_PPS="${GARBAGE_PPS:-0}"        # pps of random garbage; 0 = clean run
-TARGET_DIR="${TARGET_DIR:-$(pwd)/target/release}"
+TARGET_DIR="${TARGET_DIR:-${CARGO_TARGET_DIR:-$(pwd)/target}/release}"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULTS_DIR="$BENCH_DIR/results"
 mkdir -p "$RESULTS_DIR"
@@ -93,7 +103,8 @@ trap cleanup EXIT INT TERM
 wait_port() {
     local port="$1"
     for _ in $(seq 1 50); do
-        if ss -lnu 2>/dev/null | grep -qE ":$port\b"; then
+        # /proc/net/udp{,6} rather than ss(8), which minimal hosts lack.
+        if grep -qE "^ *[0-9]+: [0-9A-F]+:$(printf '%04X' "$port") " /proc/net/udp /proc/net/udp6 2>/dev/null; then
             return 0
         fi
         sleep 0.1
@@ -111,8 +122,10 @@ run_one() {
         --duration "$DURATION" \
         --json \
         --label "$label" \
+        --source-ips "$SOURCE_IPS" \
         binding \
         --concurrency "$CONCURRENCY" \
+        --sockets-per-task "$SOCKETS_PER_TASK" \
         > "$out"
     log "  → $(jq -r '"rps=\(.rps|round)  p50=\(.lat_p50_us)µs  p95=\(.lat_p95_us)µs  p99=\(.lat_p99_us)µs  errs=\(.errs)"' "$out")"
 }
@@ -124,7 +137,7 @@ start_garbage() {
     if [ "${GARBAGE_PPS}" != "0" ]; then
         log "starting garbage sender @ ${GARBAGE_PPS} pps"
         local _port="${CURRENT_TARGET_PORT:-3478}"
-        GARBAGE_PPS="$GARBAGE_PPS" DURATION="$DURATION" \
+        DURATION="$DURATION" \
             bash "$BENCH_DIR/garbage.sh" --target "127.0.0.1:$_port" --pps "$GARBAGE_PPS" &
         GARBAGE_PID=$!
     fi
@@ -140,7 +153,8 @@ GARBAGE_LABEL=""
 
 # ── Run 1: turna with BPF on ────────────────────────────────────────────────────
 log "── starting turna (BPF ON) ──"
-TURNA_BUFFER_POOL_SIZE=65536 TURNA_RATE_LIMIT_BURST=1000000 TURNA_RATE_LIMIT_RPS=10000000 TURNA_BPF_FILTER=1 "$TURNA_NODE" "$BENCH_DIR/turna.toml" >/tmp/turna-bpf-on.log 2>&1 &
+# Rate limits for the bench live in bench/turna.toml ([turn.rate_limit.default]).
+TURNA_BPF_FILTER=1 "$TURNA_NODE" "$BENCH_DIR/turna.toml" >/tmp/turna-bpf-on.log 2>&1 &
 TURNA_PID=$!
 export CURRENT_TARGET_PORT=3478
 wait_port 3478
@@ -154,7 +168,7 @@ sleep 1
 
 # ── Run 2: turna with BPF off ───────────────────────────────────────────────────
 log "── starting turna (BPF OFF) ──"
-TURNA_BUFFER_POOL_SIZE=65536 TURNA_RATE_LIMIT_BURST=1000000 TURNA_RATE_LIMIT_RPS=10000000 TURNA_BPF_FILTER=0 "$TURNA_NODE" "$BENCH_DIR/turna.toml" >/tmp/turna-bpf-off.log 2>&1 &
+TURNA_BPF_FILTER=0 "$TURNA_NODE" "$BENCH_DIR/turna.toml" >/tmp/turna-bpf-off.log 2>&1 &
 TURNA_PID=$!
 export CURRENT_TARGET_PORT=3478
 wait_port 3478

@@ -126,7 +126,9 @@ affinity: {}
 # objects cannot compactly expose arbitrary relay UDP port ranges.
 hostNetwork: false
 
-# Prometheus ServiceMonitor
+# Prometheus ServiceMonitor (Prometheus Operator). Created only when the
+# cluster serves monitoring.coreos.com/v1; it scrapes /metrics on the internal
+# ClusterIP service, never the public TURN service.
 metrics:
   enabled: true
   serviceMonitor:

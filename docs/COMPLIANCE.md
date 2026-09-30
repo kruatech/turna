@@ -18,6 +18,8 @@ Suggested home in-repo: `docs/COMPLIANCE.md`.
 | 5389 / 8489 | STUN Binding, MESSAGE-INTEGRITY | **Verified** | Binding request → XOR-MAPPED-ADDRESS + SOFTWARE. HMAC-SHA-1 (5389) and HMAC-SHA-256 (8489) both accepted (`processor::handle_binding`, `proto-stun/message.rs`). |
 | 8489 | MESSAGE-INTEGRITY-SHA256 hardening | **Verified** | Tag length constrained to 16–32 and a multiple of 4 before truncated verify (F1, `proto-stun/integrity.rs`); any non-FINGERPRINT attribute after MESSAGE-INTEGRITY invalidates it (I1, `proto-stun/message.rs`). |
 | 5389 | FINGERPRINT | **Verified** | Handled; only FINGERPRINT may follow MESSAGE-INTEGRITY (I1). |
+| 8489 §14.4 / §9.2 | USERHASH (username anonymity) | **Verified (unit/processor tests)** | Accepted on LongTerm realms (static users, runtime and Tarantool-rehydrated users) by `SHA-256(username ":" realm)` lookup (`auth::AuthMode::validate_identity`); resolved name is the quota subject. TURN REST / OAuth realms answer `401` (a REST username cannot be recovered from its hash). Nonce-cookie advertisement (`obMatJos2QAAA`, bit 1 only) is opt-in via `[turn.auth] advertise_userhash` and refused unless every realm uses `static_users`. No third-party client interop recorded. |
+| 5780 | NAT behaviour discovery (CHANGE-REQUEST, RESPONSE-ORIGIN, OTHER-ADDRESS) | **Verified, optional, UDP only** | Off by default (`[turn.nat_discovery]`); four sockets A1/A2 × P1/P2, reply source per §6.1 Table 1 (`relay::nat_discovery`, `processor::handle_nat_discovery`). PADDING / RESPONSE-PORT → 420. TURN listener still answers CHANGE-REQUEST with 420 (§6). Interop: coturn `turnutils_natdiscovery`, loopback (`docs/interop/rfc5780-natdiscovery-2026-09-24.md`). |
 | 5389 §7.3.1 | Unknown comprehension-required attrs | **Verified** | Unknown type `< 0x8000` in a request → 420 + UNKNOWN-ATTRIBUTES; `0x8000+` ignored; 0x001C/0x001D allowlisted (I3, `processor::reject_unknown_comprehension_required`). |
 | 5766 / 8656 | Allocate / Refresh / CreatePermission / ChannelBind | **Verified** | All four methods handled with long-term auth challenge, nonce, MESSAGE-INTEGRITY (`processor` handlers). |
 | 5766 / 8656 | Send / Data indications | **Verified** | Send indication relays to a permitted peer; peer→client falls back to a Data indication when no channel is bound (`processor::handle_send_indication`, `process_relay_recv`). |
@@ -28,7 +30,7 @@ Suggested home in-repo: `docs/COMPLIANCE.md`.
 | 8016 | Connection Migration (MOBILITY-TICKET) | **Verified, optional** | Off by default; when enabled, a signed ticket + valid credentials re-key an allocation to a new 5-tuple with epoch anti-replay (`processor::try_migration_refresh`, `session::re_key`). |
 | — | Cluster redirect (300 Try Alternate) | **Verified** | New clients redirected to their owning node via a 300 with ALTERNATE-SERVER when clustering is on / during drain (`processor::maybe_redirect_new_client`). |
 | 5389 / 8489 | SASLprep / OpaqueString on credentials | **Verified: not applied (by design)** | `long_term_key` = `MD5(username:realm:password)` and `long_term_key_sha256` = `SHA-256(...)` hash the raw UTF-8 bytes with no normalization (`crypto/lib.rs`, explicitly documented). See §3 constraint. |
-| 8656 | Channel-number range | **Verified** | `is_valid_channel` accepts `0x4000..=0x7FFE` (`CHANNEL_MIN`/`CHANNEL_MAX`, `proto-turn/lib.rs`) — the RFC 8656 usable range. |
+| 8656 | Channel-number range | **Verified — wider than RFC 8656** | `is_valid_channel` accepts `0x4000..=0x7FFE` (`CHANNEL_MIN`/`CHANNEL_MAX`, `proto-turn/lib.rs`). That is RFC 5766's range (less 0x7FFF). RFC 8656 §12 narrows the usable range to 0x4000–0x4FFF and reserves 0x5000–0xFFFF for DTLS-SRTP demultiplexing (RFC 7983); turna still accepts 0x5000–0x7FFE. Current coturn refuses them unless `rfc5766-channel-numbers` is set. (This row used to call 0x4000–0x7FFE "the RFC 8656 usable range", which it is not.) |
 | 5766/8656 | ALTERNATE-SERVER | **Verified** | `build_redirect_response` emits a 300 "Try Alternate" carrying `Attribute::AlternateServer(addr)` (`proto-turn/lib.rs`). |
 
 ---
@@ -59,7 +61,7 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
 - **420** Unknown Attribute — unknown comprehension-required attribute (I3).
 - **437** Allocation Mismatch — no allocation on the 5-tuple; lost create race (B1); migration ticket/epoch mismatch.
 - **438** Stale Nonce — expired/rotated nonce.
-- **440** Address Family not Supported — `REQUESTED-ADDRESS-FAMILY = IPv6` when `[turn] external_ip6` is unset, or on an RFC 6062 TCP allocation (always).
+- **440** Address Family not Supported — `REQUESTED-ADDRESS-FAMILY = IPv6` when `[turn] external_ip6` is unset, or on an RFC 6062 TCP allocation unless `[turn.tcp_relay] allow_ipv6` is also set.
 - **442** Unsupported Transport Protocol — REQUESTED-TRANSPORT is neither UDP nor (TCP with `[turn.tcp_relay]` enabled).
 - **443** Peer Address Family Mismatch — CreatePermission/ChannelBind naming a peer in a different family than the allocation's relayed address (RFC 6156 §4.2).
 - **486** Allocation Quota Reached — per-allocation permission/channel cap (B5); rate-limit rejections.
@@ -74,10 +76,23 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   *unless* `[turn.tcp_relay]` is enabled, in which case `REQUESTED-TRANSPORT = TCP`
   (RFC 6062) is accepted. Two conditions apply to that path: the request must
   arrive over the TCP/TLS control connection (RFC 6062 §4.1) or it is rejected
-  with **400**, and `production = true` refuses to start with
-  `[turn.tcp_relay].enabled = true` at all. So on a production profile the
-  constraint still reads "UDP relay only" — but it is now a config gate, not an
-  absence of implementation. TLS/DTLS *relay-leg* transports remain unoffered.
+  with **400**, and a TCP control listener must be enabled, `[tls]` or the opt-in plain
+  `[turn.tcp]` (`config::validate()` refuses `[turn.tcp_relay]` without one under
+  `production = true`, and warns otherwise). The
+  earlier `production = true` refusal of `[turn.tcp_relay].enabled` was lifted on
+  2026-08-25, after interop with coturn's client
+  (`docs/interop/coturn-2026-08-23.md`); `scripts/check-doc-claims.sh` fails if it
+  comes back. TCP relay is IPv4 by default; IPv6 is opt-in with `[turn.tcp_relay] allow_ipv6`
+  (otherwise a v6 TCP allocation answers 440). TLS/DTLS
+  *relay-leg* transports remain unoffered.
+  **Fixed 2026-09-24 (security), RFC 6062 §5.3:** a peer-initiated TCP connection to
+  a relayed address is now closed immediately, with no ConnectionAttempt, unless the
+  allocation holds an unexpired permission for the peer's IP and the peer filter
+  allows it (`PacketProcessor::peer_connection_permitted`, counted in
+  `turna_tcp_relay_peer_refused_total`). Before the fix every such connection was
+  announced to the client. **RFC 6062 §5.2, partly:** an outbound CONNECT now leaves
+  from the relay bind address (`bind_ip` / `bind_ip6`); the relayed *port* is still
+  kernel-chosen (see `docs/protocol-gap.md` → RFC 6062 for why).
   This concerns the turna↔peer leg only. The *client↔turna* leg supports TURNS
   (TURN-over-TLS-over-TCP) via the `tls` feature — verified end-to-end with
   Chrome, Firefox and Safari (see `docs/interop/`).
@@ -97,7 +112,8 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   express), so the family separation is explicit at the socket rather than resting
   only on the checks above. Still missing for a complete v6 story:
   `ADDITIONAL-ADDRESS-FAMILY` — blocked on a storage decision, see
-  `docs/design/additional-address-family.md` — and v6 for RFC 6062 TCP relay.
+  `docs/design/additional-address-family.md`. v6 for RFC 6062 TCP relay is opt-in
+  (`[turn.tcp_relay] allow_ipv6`) and not yet exercised on a v6 host.
   **Interop verified** on routable global v6 addresses, both by our own client and by coturn's (`docs/interop/relayed-media-2026-08-19.md`, `docs/interop/coturn-2026-08-23.md`). Not covered: routing between different hosts.
 - **Default MTU 1280.** `PacketProcessor` defaults to `mtu = 1280`; DONT-FRAGMENT drops oversized Send-indication payloads against this value. Operators set the real path MTU at construction (`with_mtu`).
 - **Optional transports are feature-gated and off by default.** `quic` /
@@ -114,7 +130,7 @@ Codes actually emitted by `processor` (grep `encode_error` / builders):
   native SCTP support from standardized TURN interoperability and encryption.
 - **Nonce lifetime 630s, client-bound.** Nonces are an HMAC over client address + issue time under an ephemeral per-process key (`processor::NonceManager`): no server-side nonce table, and a restart forces a fresh 401 for outstanding nonces.
 - **Per-allocation resource caps.** 256 permissions and 256 channel bindings per allocation; 32 peers per CreatePermission (B5). Compile-time constants, not config.
-- **Credentials are not SASLprep/OpaqueString-normalized.** Long-term keys hash the raw `username:realm:password` UTF-8 bytes (`crypto/lib.rs`). ASCII credentials (the common case) interoperate fine; a client that normalizes non-ASCII credentials per RFC 8489 OpaqueString / RFC 5389 SASLprep before hashing would derive a different key and fail integrity. If non-ASCII credentials must interoperate, add normalization at both key-derivation sites (kept in parity today).
+- **Credentials are not SASLprep/OpaqueString-normalized.** Long-term keys hash the raw `username:realm:password` UTF-8 bytes (`crypto/lib.rs`), and the USERHASH index hashes the raw `username:realm` the same way, so the two can never disagree about a name. ASCII credentials (the common case) interoperate fine; a client that normalizes non-ASCII credentials per RFC 8489 OpaqueString / RFC 5389 SASLprep before hashing would derive a different key and fail integrity. If non-ASCII credentials must interoperate, add normalization at both key-derivation sites (kept in parity today).
 - **Cluster failover assumes roughly-synchronized clocks (NTP).** Node liveness is `last_seen_ms` compared against the sweeper's local wall-clock; a dead node is confirmed after ~5s (`live_window` 3s + `suspicion_ticks` 2 × `sweep_interval` 1s). NTP-class skew (<1s) is well within this margin. If a node's clock runs minutes ahead it may mis-classify live peers as dead — but `claim_allocation` CAS preserves correctness: the mis-claim spins against the live node's re-asserted heartbeats rather than producing split-brain or data loss (`services/node/src/failover.rs`). Deploy nodes with NTP and keep inter-node skew below `live_window`. Confirmed by the failover-integration tests against a live Tarantool (`integration_failover_claim_is_atomic`, `_stale_claim_rejected`, `_sweep_reassigns_dead_node`).
 - **Failover time scales linearly with allocations-per-node.** A dead node's orphans are enumerated once (`find_by_node` — ~84 ms for 50k rows, 23.7 MB), then reassigned one `claim_allocation` CAS at a time over iproto. At 50k allocations this is on the order of tens of seconds in production (sequential claim loop + parsing a ~24 MB response); see `docs/scale/`. It is correct (all rows reassigned, exactly-one-winner) but not instant. Keep per-node allocation counts within a few thousand for fast failover. `find_by_node` has no limit, so 100k+ per node would warrant pagination on that path.
 
@@ -138,20 +154,29 @@ coturn and all three major browser engines — Chrome 150, Firefox 152, Safari
 end-to-end relay data, TLS transport, RAF) (`docs/interop/`); a 12-hour relay
 soak with no memory/fd leak (`docs/soak/`).
 
-**Not supported as stable (experimental / out of scope / unverified):** RFC 6062
-TCP relay,
+**Not supported as stable at the v0.4.0 cut (experimental / out of scope /
+unverified):** RFC 6062 TCP relay,
 RFC 7635 OAuth (implemented but refused under
 `production = true`); QUIC / WebTransport ingress (feature-gated); AF_XDP and
-io_uring datapaths (feature-gated, not runtime-verified); TURN-over-DTLS
-(transport verified — DTLS 1.2 handshake + operator cert, `openssl s_client
--dtls`, verify code 0 — but the full allocate-over-DTLS cycle is not exercised
-by a live TURN client; no common DTLS-TURN client exists and browsers use
-TURNS/TCP. The STUN/TURN layer is transport-independent and is verified over
-UDP/TURNS. DTLS requires a PKCS#8 ECDSA-P-256 key and fails closed if a
-configured cert cannot load; see `docs/dtls/`); an exhaustive
+io_uring datapaths (feature-gated); TURN-over-DTLS (DTLS requires a PKCS#8
+ECDSA-P-256 key and fails closed if a configured cert cannot load; see
+`docs/dtls/`); an exhaustive
 browser matrix (three engines verified on macOS; mobile browsers, other OSes
 and older versions not yet); large-scale (10k–50k allocations) and real-network
 (non-loopback) load; SASLprep / non-ASCII credentials (absent by design, §3).
+
+**Moved since that cut** — the list above is the v0.4.0 scope statement, not the
+current one; [feature-support.md](feature-support.md) is. In particular:
+RFC 6062 TCP relay is beta and no longer refused under `production = true`
+(2026-08-25); a full allocate-and-relay cycle over DTLS *has* been exercised by
+an independent TURN client — coturn's `turnutils_uclient`, 40/40 relayed
+(`docs/interop/coturn-2026-08-23.md`) — and DTLS is supported within the scope
+recorded there and in `docs/interop/dtls-stack-2026-09-16.md`; io_uring is
+supported on Linux ([scope](verification/io-uring-supported-2026-09-19.md)) and
+AF_XDP within its verified Linux IPv4 UDP copy-mode scope
+([scope](verification/af-xdp-supported-2026-09-22.md)); QUIC/WebTransport and
+SCTP are supported within their recorded scopes. OAuth remains refused under
+`production = true`.
 
 ## 5. Not covered here / owed verification
 
@@ -165,8 +190,12 @@ before it can be stated as fact — deliberately **not** asserted above:
   **Decided, then implemented as opt-in.** The earlier decision was "out of scope,
   440 always". It is now `[turn] external_ip6`: empty keeps the 440 behaviour, set
   enables per-family relay sockets with RFC 6156 §4.2 enforcement (443 on a
-  cross-family peer). What remains open is *evidence*, not implementation — no
-  test or interop run covers a v6 allocation. Recorded in `README.md`,
+  cross-family peer). Evidence has since been recorded: control-plane conformance
+  in both configurations (`docs/interop/conformance-2026-08-18.md`), relayed media
+  over v6 including between two routable global addresses
+  (`docs/interop/relayed-media-2026-08-19.md`), and agreement with coturn's client
+  (`docs/interop/coturn-2026-08-23.md`). What remains open is routing between
+  different hosts, and `ADDITIONAL-ADDRESS-FAMILY`. Recorded in `README.md`,
   `docs/CONFIGURATION.md`, `docs/feature-support.md` and
   `docs/PRODUCTION_READINESS.md` (R10); gaps in `docs/protocol-gap.md` → IPv6.
 - **Datagram/size constants** — partially closed. The `read_to_end(1 MiB)` on
@@ -188,12 +217,18 @@ before it can be stated as fact — deliberately **not** asserted above:
 `docs/alerts/` are backed by a grep over the code:
 
 - `ATTR_ALTERNATE_SERVER` is 0x8023, not the CHANGE-REQUEST value 0x0003.
-- No document makes a live claim of an RFC 5780 codec while none exists.
+- No document makes a live claim of an RFC 5780 codec while none exists; once the
+  codec exists, the `[turn.nat_discovery]` switch must exist and default to off.
 - If `node_migration.rs` has no callers, some document says "unwired".
 - Every metric in an alert `expr:` is actually exported by `turna-health`.
 - Each `production = true` refusal named in the docs still exists in
   `config::validate()`, matched on the operator-visible diagnostic rather than the
-  field path (the field path alone still matches after the gate is deleted).
+  field path (the field path alone still matches after the gate is deleted) — and,
+  in reverse, that the lifted gates (`turn.tcp_relay.enabled`,
+  `turn.sctp.enabled`) have not come back.
+- No document still presents the lifted RFC 6062 production gate as current once
+  `validate()` has dropped it, and none calls OAuth unimplemented while
+  `AuthMode::OAuth` exists.
 - Every bypass-relevant v6 prefix the peer filter denies (NAT64, 6to4, Teredo,
   IPv4-compatible) is mentioned somewhere in the docs. An incomplete deny list
   reads as permission, and this is the one check whose subject is a security

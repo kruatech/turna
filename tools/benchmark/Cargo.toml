@@ -2,7 +2,8 @@
 publish = false
 name = "turna-benchmark"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

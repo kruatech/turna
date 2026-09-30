@@ -1,11 +1,9 @@
-use cbc::cipher::block_padding::{PadType, RawPadding, UnpadError};
+use cbc::cipher::block_padding::{Error as UnpadError, Padding};
 use core::panic;
 
 pub enum DtlsPadding {}
 /// Reference: RFC5246, 6.2.3.2
-impl RawPadding for DtlsPadding {
-    const TYPE: PadType = PadType::Reversible;
-
+impl Padding for DtlsPadding {
     fn raw_pad(block: &mut [u8], pos: usize) {
         if pos >= block.len() {
             panic!("`pos` is bigger or equal to block size");
@@ -60,7 +58,7 @@ pub mod tests {
         for original_length in 0..128 {
             for padding_length in 0..(256 - original_length) {
                 let mut block = vec![0; original_length + padding_length + 1];
-                rand::thread_rng().fill(&mut block[0..original_length]);
+                rand::rng().fill_bytes(&mut block[0..original_length]);
                 let original = block[0..original_length].to_vec();
                 DtlsPadding::raw_pad(&mut block, original_length);
 

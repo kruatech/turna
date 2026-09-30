@@ -48,6 +48,19 @@ export default function App() {
           </div>
         )}
 
+        {p.authRequired && (
+          <div className="flex items-center gap-2.5 border-b border-amber-400/20 bg-amber-400/8 px-5 py-2 shrink-0">
+            <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shrink-0" />
+            <span className="text-xs font-medium text-amber-400">
+              {t('topbar.authRequired')}
+            </span>
+            <button onClick={p.enterToken}
+              className="ml-auto rounded border border-amber-400/40 px-2 py-0.5 text-xs font-medium text-amber-400 hover:bg-amber-400/10">
+              {t('topbar.enterToken')}
+            </button>
+          </div>
+        )}
+
         <main className="flex-1 overflow-y-auto p-5">
           {page === 'overview'    && <OverviewPage    {...props} />}
           {page === 'allocations' && <AllocationsPage {...props} />}

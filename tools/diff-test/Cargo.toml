@@ -2,7 +2,8 @@
 publish = false
 name    = "turna-diff-test"
 version.workspace = true
-edition = "2021"
+edition.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "diff-test"

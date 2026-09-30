@@ -132,6 +132,13 @@ option 1 with the halved guarantee written down at the call site rather than dis
 later. Not option 2 (two tuples per allocation) — it double-counts `by_user` quotas and
 makes refresh and remove non-atomic.
 
+**Reopened 2026-09-24:** a re-read of RFC 8656 found that the options above model one
+lifetime per allocation, while §8.1 gives each family of a dual allocation its own
+lifetime, permissions and channels (a Refresh with REQUESTED-ADDRESS-FAMILY can delete
+one half), and §7.2 step 9 answers a half-successful Allocate with success plus
+ADDRESS-ERROR-CODE rather than failure. A per-family expiry index is a cost none of the
+options priced. Details: `design/additional-address-family.md` §8.
+
 **Prerequisite either way:** plain IPv6 relaying is verified
 (`docs/interop/relayed-media-2026-08-19.md`), so this no longer stacks on an unverified
 base.
@@ -158,14 +165,22 @@ drain are implemented. The channel remains plaintext and the peer-side relay UDP
 No independent implementation interoperability, browser DataChannel compatibility,
 non-Linux support or multi-day endurance is claimed. QUIC/WT decisions are separate.
 
-### 6. Is RFC 5780 (NAT behaviour discovery) wanted?
+### 6. Is RFC 5780 (NAT behaviour discovery) wanted? — **implemented opt-in, 2026-09-24**
 
-Not implemented — no `ChangeRequest`, `OtherAddress` or `ResponseOrigin` anywhere. It
-needs a two-address deployment topology, so this is a deployment question before it is
-a coding one.
+Answered by building it the only way that costs an existing deployment nothing:
+off by default, on four sockets of its own (A1/A2 × P1/P2), never on the TURN
+listener, which keeps answering CHANGE-REQUEST with 420. `[turn.nat_discovery]`
+refuses to start without two concrete addresses of one family, so the deployment
+question is now the operator's: assign a second address and enable it, or don't.
+Replies are rate-limited like Binding, and PADDING / RESPONSE-PORT are refused.
+UDP only. Details and what is still owed:
+[roadmap/rfc5780-nat-discovery.md](roadmap/rfc5780-nat-discovery.md); interop with
+coturn's `turnutils_natdiscovery` on loopback:
+[interop/rfc5780-natdiscovery-2026-09-24.md](interop/rfc5780-natdiscovery-2026-09-24.md).
 
-Worth knowing: the documentation used to claim the codec was complete. That false claim
-is what hid the `ATTR_ALTERNATE_SERVER` wire bug for as long as it did.
+Worth knowing: the documentation once claimed the codec was complete when it did not
+exist. That false claim is what hid the `ATTR_ALTERNATE_SERVER` wire bug;
+`scripts/check-doc-claims.sh` now ties this feature's claims to the code.
 
 ### 7. `turna-auth`'s user/JWT subsystem — wire it or delete it?
 

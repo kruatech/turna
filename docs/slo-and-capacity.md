@@ -99,7 +99,7 @@ Use the load generator in **steady state** so setup/ramp does not skew results:
 # warm up 10s, then measure 60s; JSON for automation
 turna-bench --warmup 10 --duration 60 --json binding    -c 50
 turna-bench --warmup 10 --duration 60 --json allocate   -c 100
-turna-bench --warmup 10 --duration 60 --json channeldata -n 200 --pps 1000
+turna-bench --warmup 10 --duration 60 --json channel-data -n 200 --pps 1000
 ```
 
 - The `--warmup` window is discarded; reported `rps`, latency percentiles, and

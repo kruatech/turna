@@ -140,11 +140,11 @@ impl TokioTransport {
         }
     }
 
-    /// Bind с SO_REUSEPORT, выставленным ДО bind (только Unix).
-    /// Несколько таких сокетов на одном порту образуют kernel
-    /// load-balancing группу (Linux >= 3.9) — как у coturn.
-    /// Linux: принять до `bufs.len()` датаграмм ОДНИМ вызовом recvmmsg.
-    /// `out[k] = (len, src)` для каждой принятой. Возвращает их число (>=1).
+    /// Bind with SO_REUSEPORT set BEFORE bind (Unix only).
+    /// Several such sockets on one port form a kernel
+    /// load-balancing group (Linux >= 3.9), like coturn.
+    /// Linux: receive up to `bufs.len()` datagrams in ONE recvmmsg call.
+    /// `out[k] = (len, src)` for each one received. Returns their count (>=1).
     #[cfg(target_os = "linux")]
     pub async fn recv_mmsg(
         &self,
@@ -218,7 +218,7 @@ impl TokioTransport {
         }
     }
 
-    /// Переносимый fallback: один пакет за вызов.
+    /// Portable fallback: one packet per call.
     #[cfg(not(target_os = "linux"))]
     pub async fn recv_mmsg(
         &self,
@@ -230,7 +230,7 @@ impl TokioTransport {
         Ok(1)
     }
 
-    /// Linux: отправить все пакеты, батчами sendmmsg.
+    /// Linux: send all packets in sendmmsg batches.
     #[cfg(target_os = "linux")]
     pub async fn send_mmsg(&self, pkts: &[(bytes::Bytes, SocketAddr)]) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
@@ -285,7 +285,7 @@ impl TokioTransport {
         Ok(())
     }
 
-    /// Переносимый fallback: по одному send_to.
+    /// Portable fallback: one send_to per packet.
     #[cfg(not(target_os = "linux"))]
     pub async fn send_mmsg(&self, pkts: &[(bytes::Bytes, SocketAddr)]) -> std::io::Result<()> {
         for (data, target) in pkts {
@@ -317,7 +317,7 @@ impl TokioTransport {
         }
         #[cfg(not(unix))]
         {
-            tracing::warn!(%addr, "SO_REUSEPORT недоступен — обычный bind");
+            tracing::warn!(%addr, "SO_REUSEPORT unavailable, falling back to plain bind");
             Self::bind(addr).await
         }
     }

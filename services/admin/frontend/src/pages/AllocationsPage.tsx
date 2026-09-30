@@ -37,7 +37,7 @@ export function AllocationsPage({ status, metrics, history, frozen }: PanelProps
     try {
       const res = await api.manage.allocList(100)
       setAllocs(res.allocations ?? [])
-    } catch (e) {
+    } catch {
       setError(t('alloc.loadError'))
     } finally { setLoading(false) }
   }, [t])

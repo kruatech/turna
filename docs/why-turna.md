@@ -21,9 +21,10 @@ Status legend: ✅ shipped · 🚧 implemented/experimental · 📋 planned.
    OTLP traces, and explicit counters for auth failures, quota, parser rejects,
    peer-filter rejects and backend health.
 3. **High-performance path without hiding risk.** Tokio UDP is the recommended
-   baseline. io_uring, AF_XDP, QUIC/WebTransport and DTLS are available as
-   explicit/feature-gated paths and are documented as experimental until proven
-   in a given deployment.
+   baseline. io_uring, AF_XDP, QUIC/WebTransport and DTLS are explicit,
+   feature-gated opt-ins, each supported only within the scope its evidence
+   document records (linked in the table below) — validate them in your own
+   deployment before relying on them.
 4. **Cluster-aware deployment.** Gossip-based node discovery/redirects,
    Tarantool-backed allocation persistence, failover counters and drain mode are
    first-class concerns instead of external-only glue.
@@ -42,22 +43,24 @@ Status legend: ✅ shipped · 🚧 implemented/experimental · 📋 planned.
 | Shared-secret time-limited credentials | ✅ | Coturn-compatible username/password formula for common WebRTC credential services. |
 | Peer filtering | ✅ | Default `internet-facing` profile denies private/special-use targets. |
 | Prometheus metrics / health | ✅ | See `OBSERVABILITY.md`. |
-| gRPC management / `turnactl` | 🚧 | Status/drain/allocation/failover operations exist; runtime user CRUD is not implemented. |
+| gRPC management / `turnactl` | 🚧 | Served by `turna-control-plane`. Status/drain/allocation/failover operations exist, and so does runtime user management: `AddUser` / `RemoveUser` / `SetUserLimits` (`crates/control/src/grpc.rs`); `AddUser` needs the Tarantool backend. `turnactl` covers `user add` / `user remove` only — see its header for which commands reach a server. |
 | Tarantool backend | 🚧 | Implemented; production requires backend auth and monitoring writer drops. |
 | Cluster redirect/gossip | 🚧 | Implemented path; secure gossip with `cluster_secret`. |
-| TURNS / TCP/TLS | 🚧 | Feature-dependent and less exercised than UDP. |
-| DTLS | 🚧 | Optional feature; validate with your clients. |
+| TURNS / TCP/TLS | ✅ | In the default build (`tls` is a default feature of `turna-node`). Interop with Chrome, Firefox, Safari and coturn's client; see [feature-support.md](feature-support.md). There is no plain TURN-over-TCP listener. |
+| TCP relay (RFC 6062) | 🚧 | Beta, off by default; allowed under `production = true` since 2026-08-25. Needs `[tls]` (the control connection is TURNS). IPv4 only. |
+| DTLS | ✅ | Opt-in (`--features dtls`, `[turn.dtls]`); supported within the scope in [feature-support.md](feature-support.md). |
 | QUIC/WebTransport | Supported | Opt-in, Linux/macOS with tokio; project-specific TURN mappings. See [support scope](verification/quic-webtransport-supported-2026-09-18.md). |
 | io_uring | ✅ | Supported Linux UDP datapath, opt-in; tokio remains default. [Tested scope](verification/io-uring-supported-2026-09-19.md). |
 | AF_XDP | ✅ scoped | Opt-in Linux IPv4 UDP copy-mode backend; [verified environment and limitations](verification/af-xdp-supported-2026-09-22.md). |
-| OAuth RFC 7635 | 📋 | Not implemented. |
+| OAuth RFC 7635 | 🚧 | Implemented (`[turn.auth.oauth]`, `kid` selection, §6.1 lifetime cap) but refused by `config::validate()` under `production = true`. |
 | SQL/Redis/Mongo user DB backends | 📋 | Not implemented. |
 | Full coturn flag parity | 📋 | Not a near-term goal. |
 
 ## Why not just use coturn?
 
-Use coturn when you need maximum maturity, broad DB/backend support, OAuth,
-legacy flags, packaged distro defaults, or a well-known operational baseline.
+Use coturn when you need maximum maturity, broad DB/backend support, OAuth in
+production, legacy flags, packaged distro defaults, or a well-known operational
+baseline.
 
 Use Turna when these are more important for your deployment:
 
@@ -74,8 +77,9 @@ Use Turna when these are more important for your deployment:
   reproducible numbers for a specific hardware/kernel/config combination.
 - It does not claim full coturn compatibility until `tools/diff-test` covers the
   relevant STUN/TURN behaviours.
-- It does not ship a built-in signaling server, browser demo, SFU, OAuth server,
-  SQL/Redis/Mongo user DB, or runtime user CRUD.
+- It does not ship a built-in signaling server, browser demo, SFU, OAuth
+  authorization server, or SQL/Redis/Mongo user DB. Runtime user management
+  exists but stores users only in the Tarantool backend.
 - It does not make experimental datapaths production-safe just because they
   compile. See `PRODUCTION_READINESS.md` before enabling them.
 

@@ -151,12 +151,48 @@ pub fn control_bind_addr(server: SocketAddr) -> String {
     match SOURCE_SPREAD.get().copied().unwrap_or(1) {
         0 | 1 => peer_bind_addr(false),
         spread => {
-            // Capped at 250 to stay inside the last octet; a run needing more
-            // sources than that needs more than one host anyway.
-            let spread = spread.min(250);
+            let spread = spread.min(SPREAD_MAX);
             let n = SPREAD_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % spread + 1;
-            format!("127.0.0.{n}:0")
+            format!("{}:0", spread_addr(n))
         }
+    }
+}
+
+/// Most source addresses `--source-ips` can spread over: `127.0.0.1` to
+/// `127.0.255.254`.
+///
+/// It was 250 (the last octet only). That is too few for a benchmark against
+/// turna: the node answers at most 8 unauthenticated replies per second per
+/// source address (burst 64 — `unauth_reply_limiter` in
+/// `crates/relay/src/processor.rs`, not configurable), and every Binding
+/// response and every 401 challenge is such a reply. From 250 addresses that
+/// budget caps a run at about 2 000 per second whatever the server could do.
+/// Linux routes all of 127.0.0.0/8 to `lo`, so the wider spread costs nothing
+/// there; macOS still needs an `lo0` alias per address.
+pub const SPREAD_MAX: u32 = 65_534;
+
+/// The `n`-th spread address, 1-based: 1 → 127.0.0.1, 256 → 127.0.1.0.
+pub fn spread_addr(n: u32) -> std::net::Ipv4Addr {
+    let n = n.clamp(1, SPREAD_MAX);
+    std::net::Ipv4Addr::new(127, 0, (n >> 8) as u8, (n & 0xFF) as u8)
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::*;
+
+    #[test]
+    fn spread_addresses_stay_in_loopback_and_are_distinct() {
+        assert_eq!(spread_addr(1).to_string(), "127.0.0.1");
+        assert_eq!(spread_addr(250).to_string(), "127.0.0.250");
+        assert_eq!(spread_addr(256).to_string(), "127.0.1.0");
+        assert_eq!(spread_addr(SPREAD_MAX).to_string(), "127.0.255.254");
+        // Out of range is clamped, never wrapped onto another address class.
+        assert_eq!(spread_addr(0).to_string(), "127.0.0.1");
+        assert_eq!(spread_addr(u32::MAX).to_string(), "127.0.255.254");
+        let all: std::collections::HashSet<_> = (1..=SPREAD_MAX).map(spread_addr).collect();
+        assert_eq!(all.len(), SPREAD_MAX as usize);
+        assert!(all.iter().all(|a| a.is_loopback()));
     }
 }
 
@@ -800,6 +836,20 @@ impl Session {
     pub async fn release(&mut self) {
         let _ = self.auth_request(M_REFRESH, |m| m.add_lifetime(0)).await;
     }
+}
+
+/// A success response to `request`, as a server with no authentication would
+/// send it: same transaction id, and an XOR-RELAYED-ADDRESS on Allocate. For
+/// mock servers in other modules' tests.
+#[cfg(test)]
+pub(crate) fn test_success_for(request: &[u8], relayed: SocketAddr) -> Vec<u8> {
+    let method = u16::from_be_bytes([request[0], request[1]]);
+    let mut m = Msg::request(method | 0x0100);
+    m.buf[8..20].copy_from_slice(&request[8..20]);
+    if method == M_ALLOCATE {
+        m.add(A_XOR_RELAYED_ADDRESS, &xor_addr_encode(relayed, &m.txid()));
+    }
+    m.encode()
 }
 
 #[cfg(test)]

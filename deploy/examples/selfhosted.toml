@@ -124,9 +124,9 @@ per_ip_burst = 200000
 per_ip_rps = 1000000
 
 [tls]
-# TURNS, and it is not optional here: turna has no plain TURN-over-TCP listener,
-# so this is the only way in for a client whose network blocks UDP. Corporate
-# guests are exactly that population.
+# TURNS, and it is not optional here: it is the only encrypted way in for a
+# client whose network blocks UDP (plain TURN over TCP, [turn.tcp], is opt-in
+# and off in this example). Corporate guests are exactly that population.
 #
 # Put it on 443 instead of 5349 if your users sit behind filters that only allow
 # well-known ports. Nothing else in the config changes.

@@ -769,7 +769,12 @@ async fn send_recv(
     data: &[u8],
     timeout_ms: u64,
 ) -> Option<(Vec<u8>, SocketAddr)> {
-    socket.send_to(data, target).await.ok()?;
+    // A connected socket must use send(): BSD/macOS refuse sendto() with a
+    // destination on a connected UDP socket, Linux accepts it.
+    match socket.peer_addr() {
+        Ok(peer) if peer == target => socket.send(data).await.ok()?,
+        _ => socket.send_to(data, target).await.ok()?,
+    };
     let mut buf = vec![0u8; 4096];
     match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
@@ -2433,7 +2438,7 @@ async fn authenticated_allocate(socket: &UdpSocket, target: SocketAddr) -> bool 
     let (Some(realm), Some(nonce)) = (extract_realm(&resp401), extract_nonce(&resp401)) else {
         return false;
     };
-    let key = long_term_key("testuser", &realm, "testpass");
+    let key = long_term_key("testuser", &realm, &test_pass());
     let mut alloc = TurnMsg::request(0x0003);
     alloc.add_requested_transport();
     alloc.add_lifetime(600);
@@ -2744,4 +2749,795 @@ fn metric_value(health: &SocketAddr, name: &str) -> f64 {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0)
+}
+
+// ── Network & deployment: listen_extra, plain TCP, PROXY protocol ────────────
+
+/// A node started from a complete config written by the test, killed on drop.
+struct PrivateNode {
+    child: std::process::Child,
+    health: SocketAddr,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for PrivateNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Start the node with `body` (a full config minus `[health]`, which is added
+/// here) and wait for `/ready`. `None` = skip (no binary); a node that never
+/// becomes ready is a failure, with its output.
+fn start_private_node(tag: &str, body: &str) -> Option<PrivateNode> {
+    let bin = node_binary();
+    if !bin.exists() {
+        eprintln!("skipping: node binary not built");
+        return None;
+    }
+    let health_port = free_port(false);
+    let dir =
+        std::env::temp_dir().join(format!("turna-{tag}-{}-{health_port}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cfg_path = dir.join("turn.toml");
+    std::fs::write(
+        &cfg_path,
+        format!("{body}\n[health]\nlisten = \"127.0.0.1:{health_port}\"\n"),
+    )
+    .expect("write config");
+    let log = std::fs::File::create(dir.join("node.log")).expect("log file");
+    let child = std::process::Command::new(&bin)
+        .arg(&cfg_path)
+        .stdout(log.try_clone().expect("log clone"))
+        .stderr(log)
+        .spawn()
+        .expect("spawn node");
+    let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+    let mut node = PrivateNode { child, health, dir };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !http_ready(&node.health) {
+        if let Ok(Some(st)) = node.child.try_wait() {
+            let out = std::fs::read_to_string(node.dir.join("node.log")).unwrap_or_default();
+            panic!("{tag}: node exited with {st} instead of starting:\n{out}");
+        }
+        if std::time::Instant::now() > deadline {
+            let out = std::fs::read_to_string(node.dir.join("node.log")).unwrap_or_default();
+            panic!("{tag}: node not ready within 20 s:\n{out}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Some(node)
+}
+
+/// One STUN message off a TCP stream (20-byte header + length).
+fn read_stun_over_tcp(s: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut hdr = [0u8; 20];
+    s.read_exact(&mut hdr)?;
+    let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body)?;
+    let mut msg = hdr.to_vec();
+    msg.extend_from_slice(&body);
+    Ok(msg)
+}
+
+/// Allocate as `testuser` through `target` and permit `peer`. Returns the
+/// XOR-RELAYED-ADDRESS. Panics with the error code on any failure: callers
+/// are tests that need the allocation.
+async fn allocate_with_permission(
+    client: &UdpSocket,
+    target: SocketAddr,
+    peer: SocketAddr,
+) -> SocketAddr {
+    let (relay, presp) = allocate_and_request_permission(client, target, peer).await;
+    assert!(
+        is_success(&presp),
+        "CreatePermission failed: {:?}",
+        extract_error_code(&presp)
+    );
+    relay
+}
+
+/// As [`allocate_with_permission`], returning the CreatePermission response
+/// instead of asserting on it.
+async fn allocate_and_request_permission(
+    client: &UdpSocket,
+    target: SocketAddr,
+    peer: SocketAddr,
+) -> (SocketAddr, Vec<u8>) {
+    let mut probe = TurnMsg::request(0x0003);
+    probe.add_requested_transport();
+    let (r401, _) = send_recv(client, target, &probe.encode(), 2000)
+        .await
+        .expect("401 challenge");
+    let realm = extract_realm(&r401).expect("realm");
+    let nonce = extract_nonce(&r401).expect("nonce");
+    let key = long_term_key("testuser", &realm, &test_pass());
+    let mut alloc = TurnMsg::request(0x0003);
+    alloc.add_requested_transport();
+    alloc.add_lifetime(60);
+    alloc.add_username("testuser");
+    alloc.add_realm(&realm);
+    alloc.add_nonce(&nonce);
+    let (aresp, _) = send_recv(client, target, &alloc.encode_with_integrity(&key), 2000)
+        .await
+        .expect("Allocate response");
+    assert!(
+        is_success(&aresp),
+        "Allocate via {target} failed: {:?}",
+        extract_error_code(&aresp)
+    );
+    let relay = extract_xor_relayed_address(&aresp).expect("relayed address");
+    let mut perm = TurnMsg::request(0x0008);
+    perm.add_xor_peer_address(peer);
+    perm.add_username("testuser");
+    perm.add_realm(&realm);
+    perm.add_nonce(&extract_nonce(&aresp).unwrap_or(nonce));
+    let (presp, _) = send_recv(client, target, &perm.encode_with_integrity(&key), 2000)
+        .await
+        .expect("CreatePermission response");
+    (relay, presp)
+}
+
+/// `external_ip = "PUBLIC/PRIVATE"`: the public half is advertised in
+/// XOR-RELAYED-ADDRESS while the relay socket is bound on the private half —
+/// a peer that sends to the private address with the advertised port reaches
+/// the allocation. (On a real 1:1 NAT the provider rewrites PUBLIC to PRIVATE
+/// in between; here the test plays that part.)
+#[tokio::test]
+async fn external_ip_mapping_advertises_public_and_binds_private() {
+    let p1 = free_port(true);
+    let body = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{p1}\"\n\
+         external_ip = \"192.0.2.44/127.0.0.1\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 50401\n\
+         max_port = 50500\n\
+         max_allocations = 32\n\
+         [turn.peer_filter]\n\
+         allow_loopback_peers = true\n"
+    );
+    let Some(_node) = start_private_node("external-mapping", &body) else {
+        return;
+    };
+    let target: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay = allocate_with_permission(&client, target, peer.local_addr().unwrap()).await;
+    assert_eq!(
+        relay.ip(),
+        "192.0.2.44".parse::<std::net::IpAddr>().unwrap(),
+        "the public half must be advertised"
+    );
+    let private = SocketAddr::new("127.0.0.1".parse().unwrap(), relay.port());
+    peer.send_to(b"via-the-nat", private).await.unwrap();
+    let mut buf = vec![0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+        .await
+        .expect("relay socket is not bound on the private half")
+        .expect("recv");
+    assert!(buf[..n].windows(11).any(|w| w == b"via-the-nat"));
+}
+
+/// `[turn] listen_extra`: a second UDP listener answers STUN, and an
+/// allocation made through it gets its relayed data back **from that
+/// listener's address**. The client socket is `connect()`ed to the extra
+/// address, so the kernel drops anything from another source — which is what
+/// a client behind a NAT would do, and exactly the failure a single egress
+/// socket would cause.
+#[tokio::test]
+async fn listen_extra_serves_and_relays_back_from_the_listener_used() {
+    let p1 = free_port(true);
+    let p2 = free_port(true);
+    let body = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{p1}\"\n\
+         listen_extra = [\"127.0.0.1:{p2}\"]\n\
+         external_ip = \"127.0.0.1\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 50000\n\
+         max_port = 50200\n\
+         max_allocations = 64\n\
+         [turn.peer_filter]\n\
+         allow_loopback_peers = true\n"
+    );
+    let Some(_node) = start_private_node("listen-extra", &body) else {
+        return;
+    };
+    let primary: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+    let extra: SocketAddr = format!("127.0.0.1:{p2}").parse().unwrap();
+
+    // Binding on both listeners, each answered from the address it was sent to.
+    for target in [primary, extra] {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (resp, from) = send_recv(&s, target, &build_binding_request(), 2000)
+            .await
+            .unwrap_or_else(|| panic!("no Binding response from {target}"));
+        assert!(is_stun_success(&resp), "Binding on {target} failed");
+        assert_eq!(from, target, "Binding answered from the wrong socket");
+    }
+
+    // Allocate through the extra listener with a connected socket.
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(extra).await.unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let relay = allocate_with_permission(&client, extra, peer.local_addr().unwrap()).await;
+
+    // Peer -> relay -> client: a Data indication, which a connected socket
+    // only receives if it comes from `extra`.
+    peer.send_to(b"from-the-peer", relay).await.unwrap();
+    let mut buf = vec![0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(3), client.recv(&mut buf))
+        .await
+        .expect("relayed data did not come back from the listen_extra address")
+        .expect("recv");
+    assert_eq!(
+        u16::from_be_bytes([buf[0], buf[1]]),
+        0x0017,
+        "expected a Data indication"
+    );
+    assert!(buf[..n].windows(13).any(|w| w == b"from-the-peer"));
+}
+
+/// Plain TURN over TCP: opt-in `[turn.tcp]` answers a Binding request over a
+/// bare TCP connection, reporting the connection's own address.
+#[test]
+fn plain_tcp_listener_answers_binding() {
+    use std::io::Write;
+    let udp = free_port(true);
+    let tcp = free_port(false);
+    let body = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{udp}\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 50201\n\
+         max_port = 50300\n\
+         max_allocations = 32\n\
+         [turn.tcp]\n\
+         enabled = true\n\
+         listen = \"127.0.0.1:{tcp}\"\n"
+    );
+    let Some(_node) = start_private_node("plain-tcp", &body) else {
+        return;
+    };
+    let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{tcp}")).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(&build_binding_request()).unwrap();
+    let resp = read_stun_over_tcp(&mut s).expect("Binding response over TCP");
+    assert!(is_stun_success(&resp));
+    assert_eq!(
+        extract_xor_mapped_address(&resp),
+        Some(s.local_addr().unwrap())
+    );
+}
+
+/// PROXY protocol on `[turn.tcp]`: from a trusted source the header's address
+/// is what the node sees (XOR-MAPPED-ADDRESS echoes it); from an untrusted one
+/// the connection is closed and counted.
+#[test]
+fn proxy_protocol_on_plain_tcp_uses_the_header_address_and_refuses_untrusted() {
+    use std::io::{Read, Write};
+    for (trusted, expect_proxied) in [("127.0.0.0/8", true), ("10.0.0.0/8", false)] {
+        let udp = free_port(true);
+        let tcp = free_port(false);
+        let body = format!(
+            "production = false\n\
+             [turn]\n\
+             listen = \"127.0.0.1:{udp}\"\n\
+             realm = \"turna\"\n\
+             transport = \"tokio\"\n\
+             [[turn.auth.static_users]]\n\
+             username = \"testuser\"\n\
+             password = \"testpass\"\n\
+             [turn.relay]\n\
+             min_port = 50301\n\
+             max_port = 50400\n\
+             max_allocations = 32\n\
+             [turn.tcp]\n\
+             enabled = true\n\
+             listen = \"127.0.0.1:{tcp}\"\n\
+             proxy_protocol = true\n\
+             proxy_protocol_trusted_cidrs = [\"{trusted}\"]\n"
+        );
+        let Some(node) = start_private_node("proxy-tcp", &body) else {
+            return;
+        };
+        let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{tcp}")).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut wire = format!("PROXY TCP4 198.51.100.20 127.0.0.1 40000 {tcp}\r\n").into_bytes();
+        wire.extend_from_slice(&build_binding_request());
+        let _ = s.write_all(&wire);
+        if expect_proxied {
+            let resp = read_stun_over_tcp(&mut s).expect("Binding response");
+            assert_eq!(
+                extract_xor_mapped_address(&resp),
+                Some("198.51.100.20:40000".parse().unwrap()),
+                "the node must see the PROXY header's source, not the balancer"
+            );
+        } else {
+            let mut b = [0u8; 1];
+            match s.read(&mut b) {
+                Ok(0) | Err(_) => {}
+                Ok(_) => panic!("an untrusted source was served"),
+            }
+            // The mirror into Prometheus ticks every five seconds.
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            let mut refused = 0.0;
+            while std::time::Instant::now() < deadline {
+                refused = metric_value(&node.health, "turna_tcp_proxy_rejected_total");
+                if refused >= 1.0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            assert!(refused >= 1.0, "turna_tcp_proxy_rejected_total = {refused}");
+        }
+    }
+}
+
+#[test]
+fn network_config_refusals_name_the_problem() {
+    // Written out in full: the gate harness's `@turn` splice ends a key block
+    // at the first `[`, which an array value contains.
+    if node_binary().exists() {
+        let dir = std::env::temp_dir().join(format!("turna-lx-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cfg = dir.join("turn.toml");
+        std::fs::write(
+            &cfg,
+            "[turn]\nlisten = \"127.0.0.1:3478\"\ntransport = \"io_uring\"\n\
+             listen_extra = [\"127.0.0.2:3478\"]\n",
+        )
+        .expect("write config");
+        let out = std::process::Command::new(node_binary())
+            .arg(&cfg)
+            .output()
+            .expect("run node");
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stderr).into_owned()
+            + &String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success(),
+            "listen_extra on io_uring started:\n{text}"
+        );
+        assert!(text.contains("turn.listen_extra is set"), "{text}");
+    }
+    assert_refused(
+        "PROXY protocol without an allowlist",
+        "[tls]\nproxy_protocol = true\n",
+        "proxy_protocol_trusted_cidrs",
+    );
+    assert_refused(
+        "unknown cipher suite",
+        "[tls]\ncipher_suites = [\"TLS_RSA_WITH_RC4_128_MD5\"]\n",
+        "not a cipher suite this build implements",
+    );
+    assert_refused(
+        "PUBLIC/PRIVATE across families",
+        "@turn\nexternal_ip = \"203.0.113.10/2001:db8::1\"\n",
+        "same address family",
+    );
+    assert_refused(
+        "PUBLIC/PRIVATE disagreeing with bind_ip",
+        // `@relay` first: the `@turn` block runs to the next `[` or the end.
+        "@relay\nbind_ip = \"127.0.0.2\"\n@turn\nexternal_ip = \"203.0.113.10/127.0.0.1\"\n",
+        "names a different address",
+    );
+}
+
+/// Send `build(None)` unauthenticated on a TCP stream, take REALM/NONCE from
+/// the 401, then send `build(Some(..))` with MESSAGE-INTEGRITY. Returns the
+/// final response.
+fn tcp_authenticated(
+    s: &mut std::net::TcpStream,
+    build: impl Fn(Option<(&str, &str)>) -> TurnMsg,
+) -> Vec<u8> {
+    use std::io::Write;
+    s.write_all(&build(None).encode()).unwrap();
+    let r401 = read_stun_over_tcp(s).expect("401 challenge over TCP");
+    let realm = extract_realm(&r401).expect("realm");
+    let nonce = extract_nonce(&r401).expect("nonce");
+    let key = long_term_key("testuser", &realm, &test_pass());
+    s.write_all(&build(Some((&realm, &nonce))).encode_with_integrity(&key))
+        .unwrap();
+    read_stun_over_tcp(s).expect("authenticated response over TCP")
+}
+
+/// RFC 6062 over plain TURN-over-TCP. RFC 6062 §4.1 requires the control
+/// connection to be TCP *or* TLS, so the opt-in plain listener is a valid one:
+/// Allocate (REQUESTED-TRANSPORT = TCP), CreatePermission, CONNECT to a TCP
+/// peer, ConnectionBind on a second connection, then raw bytes both ways over
+/// the detached plain stream.
+#[test]
+fn rfc6062_tcp_relay_over_plain_tcp_listener() {
+    use std::io::{Read, Write};
+    let udp = free_port(true);
+    let tcp = free_port(false);
+    let body = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{udp}\"\n\
+         external_ip = \"127.0.0.1\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 50501\n\
+         max_port = 50600\n\
+         max_allocations = 32\n\
+         [turn.peer_filter]\n\
+         allow_loopback_peers = true\n\
+         [turn.tcp_relay]\n\
+         enabled = true\n\
+         [turn.tcp]\n\
+         enabled = true\n\
+         listen = \"127.0.0.1:{tcp}\"\n"
+    );
+    let Some(_node) = start_private_node("rfc6062-plain", &body) else {
+        return;
+    };
+    let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let server = format!("127.0.0.1:{tcp}");
+
+    let auth = |m: &mut TurnMsg, a: Option<(&str, &str)>| {
+        if let Some((realm, nonce)) = a {
+            m.add_username("testuser");
+            m.add_realm(realm);
+            m.add_nonce(nonce);
+        }
+    };
+    let mut control = std::net::TcpStream::connect(&server).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resp = tcp_authenticated(&mut control, |a| {
+        let mut m = TurnMsg::request(0x0003);
+        m.add_attr(0x0019, &[6, 0, 0, 0]); // REQUESTED-TRANSPORT = TCP
+        auth(&mut m, a);
+        m
+    });
+    assert!(
+        is_success(&resp),
+        "TCP Allocate over plain TCP failed: {:?}",
+        extract_error_code(&resp)
+    );
+    let resp = tcp_authenticated(&mut control, |a| {
+        let mut m = TurnMsg::request(0x0008);
+        m.add_xor_peer_address(peer_addr);
+        auth(&mut m, a);
+        m
+    });
+    assert!(
+        is_success(&resp),
+        "CreatePermission: {:?}",
+        extract_error_code(&resp)
+    );
+    let resp = tcp_authenticated(&mut control, |a| {
+        let mut m = TurnMsg::request(0x000A); // CONNECT
+        m.add_xor_peer_address(peer_addr);
+        auth(&mut m, a);
+        m
+    });
+    assert!(
+        is_success(&resp),
+        "CONNECT: {:?}",
+        extract_error_code(&resp)
+    );
+    let conn_id = iter_attrs(&resp)
+        .find(|(t, _)| *t == 0x002A)
+        .map(|(_, v)| v.to_vec())
+        .expect("CONNECTION-ID in the CONNECT response");
+    let (mut peer_side, _) = peer.accept().expect("the relay connected to the peer");
+    peer_side
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let mut data = std::net::TcpStream::connect(&server).unwrap();
+    data.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = tcp_authenticated(&mut data, |a| {
+        let mut m = TurnMsg::request(0x000B); // CONNECTION-BIND
+        m.add_attr(0x002A, &conn_id);
+        auth(&mut m, a);
+        m
+    });
+    assert!(
+        is_success(&resp),
+        "ConnectionBind: {:?}",
+        extract_error_code(&resp)
+    );
+
+    // Raw relay both ways over the detached plain TCP stream.
+    data.write_all(b"client->peer").unwrap();
+    let mut buf = [0u8; 12];
+    peer_side.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"client->peer");
+    peer_side.write_all(b"peer->client").unwrap();
+    data.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"peer->client");
+}
+
+/// A PROXY-trusted range is never a relay peer. Otherwise a client could have
+/// the relay connect (RFC 6062) or send into the balancer range and reach a
+/// PROXY-trusting listener from a trusted source, forging its own header. Here
+/// the trusted range is loopback and `allow_loopback_peers` is on — the
+/// forbidden range must still win.
+#[tokio::test]
+async fn proxy_trusted_range_is_refused_as_a_relay_peer() {
+    let udp = free_port(true);
+    let tcp = free_port(false);
+    let body = format!(
+        "production = false\n\
+         [turn]\n\
+         listen = \"127.0.0.1:{udp}\"\n\
+         external_ip = \"127.0.0.1\"\n\
+         realm = \"turna\"\n\
+         transport = \"tokio\"\n\
+         [[turn.auth.static_users]]\n\
+         username = \"testuser\"\n\
+         password = \"testpass\"\n\
+         [turn.relay]\n\
+         min_port = 50601\n\
+         max_port = 50700\n\
+         max_allocations = 32\n\
+         [turn.peer_filter]\n\
+         allow_loopback_peers = true\n\
+         [turn.tcp]\n\
+         enabled = true\n\
+         listen = \"127.0.0.1:{tcp}\"\n\
+         proxy_protocol = true\n\
+         proxy_protocol_trusted_cidrs = [\"127.0.0.0/8\"]\n"
+    );
+    let Some(_node) = start_private_node("proxy-peer-deny", &body) else {
+        return;
+    };
+    let target: SocketAddr = format!("127.0.0.1:{udp}").parse().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let listener: SocketAddr = format!("127.0.0.1:{tcp}").parse().unwrap();
+    let (_, presp) = allocate_and_request_permission(&client, target, listener).await;
+    assert!(
+        is_error(&presp),
+        "CreatePermission towards a PROXY-trusted address must be refused"
+    );
+    assert_eq!(extract_error_code(&presp).map(|(c, _)| c), Some(403));
+}
+
+#[cfg(test)]
+mod userhash_e2e {
+    //! RFC 8489 §14.4 USERHASH against a real node: an Allocate that names its
+    //! user by `SHA-256(username ":" realm)` and carries no USERNAME at all.
+    //! Until this landed the node answered 420, because 0x001E is
+    //! comprehension-required and was not understood.
+    use super::*;
+
+    const ATTR_USERHASH: u16 = 0x001E;
+
+    fn userhash(user: &str, realm: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("{user}:{realm}").as_bytes()).into()
+    }
+
+    #[tokio::test]
+    async fn allocate_by_userhash_succeeds_on_a_long_term_realm() {
+        let target = target_addr();
+        let sock = bind_socket().await;
+        let mut probe = TurnMsg::request(0x0003);
+        probe.add_requested_transport();
+        let r401 = skip_if_no_server!(
+            send_recv(&sock, target, &probe.encode(), 2000).await,
+            target
+        );
+        let (r401, _) = r401;
+        if test_secret().is_some() {
+            // A TURN REST realm cannot resolve a hash (the username embeds an
+            // expiry the server never stores); the processor tests pin the 401.
+            eprintln!("SKIP: target uses a shared secret; USERHASH needs a long-term realm");
+            return;
+        }
+        let realm = extract_realm(&r401).expect("401 carries REALM");
+        let nonce = extract_nonce(&r401).expect("401 carries NONCE");
+        let (username, password) = effective_credentials();
+
+        let mut alloc = TurnMsg::request(0x0003);
+        alloc.add_requested_transport();
+        alloc.add_lifetime(600);
+        alloc.add_attr(ATTR_USERHASH, &userhash(&username, &realm));
+        alloc.add_realm(&realm);
+        alloc.add_nonce(&nonce);
+        let key = long_term_key(&username, &realm, &password);
+        let (resp, _) = send_recv(&sock, target, &alloc.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to USERHASH Allocate");
+        assert!(
+            is_success(&resp),
+            "USERHASH Allocate must succeed; err={:?}",
+            extract_error_code(&resp)
+        );
+
+        // A hash of a name the node does not know is a 401, not a 420.
+        let sock2 = bind_socket().await;
+        let (r401, _) = send_recv(&sock2, target, &probe.encode(), 2000)
+            .await
+            .expect("challenge");
+        let nonce = extract_nonce(&r401).expect("NONCE");
+        let mut bad = TurnMsg::request(0x0003);
+        bad.add_requested_transport();
+        bad.add_attr(ATTR_USERHASH, &userhash("nobody-by-this-name", &realm));
+        bad.add_realm(&realm);
+        bad.add_nonce(&nonce);
+        let (resp, _) = send_recv(&sock2, target, &bad.encode_with_integrity(&key), 2000)
+            .await
+            .expect("no response to unknown USERHASH");
+        assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(401));
+
+        // Release the first allocation so the shared node stays clean.
+        let mut rel = TurnMsg::request(0x0004);
+        rel.add_lifetime(0);
+        rel.add_attr(ATTR_USERHASH, &userhash(&username, &realm));
+        rel.add_realm(&realm);
+        rel.add_nonce(&extract_nonce(&r401).unwrap_or_default());
+        let _ = send_recv(&sock, target, &rel.encode_with_integrity(&key), 1000).await;
+    }
+}
+
+/// RFC 5780 needs both addresses: an enabled `[turn.nat_discovery]` with one
+/// address must stop the node, not start a discovery service that can never
+/// answer CHANGE-REQUEST correctly.
+#[test]
+fn refuses_nat_discovery_without_an_alternate_address() {
+    assert_refused(
+        "RFC 5780 with one address",
+        "[turn.nat_discovery]\nenabled = true\nprimary_ip = \"127.0.0.1\"\n\
+         primary_port = 3490\nalternate_port = 3491",
+        "nat_discovery",
+    );
+}
+
+#[cfg(test)]
+mod nat_discovery_e2e {
+    //! RFC 5780 against a real node on 127.0.0.1 + 127.0.0.2 (both loopback,
+    //! so any Linux host has them).
+    use super::*;
+
+    const ATTR_CHANGE_REQUEST: u16 = 0x0003;
+    const ATTR_RESPONSE_ORIGIN: u16 = 0x802B;
+    const ATTR_OTHER_ADDRESS: u16 = 0x802C;
+
+    struct Node(std::process::Child);
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn plain_addr(v: &[u8]) -> Option<SocketAddr> {
+        (v.len() >= 8 && v[1] == 0x01)
+            .then(|| SocketAddr::from(([v[4], v[5], v[6], v[7]], u16::from_be_bytes([v[2], v[3]]))))
+    }
+
+    fn attr(data: &[u8], typ: u16) -> Option<Vec<u8>> {
+        iter_attrs(data)
+            .find(|(t, _)| *t == typ)
+            .map(|(_, v)| v.to_vec())
+    }
+
+    #[tokio::test]
+    async fn change_request_is_answered_from_the_alternate_address() {
+        let bin = node_binary();
+        if !bin.exists() {
+            eprintln!("skipping: node binary not built");
+            return;
+        }
+        if std::net::UdpSocket::bind("127.0.0.2:0").is_err() {
+            eprintln!("skipping: 127.0.0.2 is not usable on this host");
+            return;
+        }
+        let turn_port = free_port(true);
+        let health_port = free_port(false);
+        // Two ports; a collision with something else makes the node refuse to
+        // start, which the readiness wait below reports.
+        let (p1, p2) = (free_port(true), free_port(true));
+        let dir =
+            std::env::temp_dir().join(format!("turna-nat-{}-{turn_port}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("turn.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[turn]\nlisten = \"127.0.0.1:{turn_port}\"\nrealm = \"turna\"\n\
+                 transport = \"tokio\"\n\
+                 [[turn.auth.static_users]]\nusername = \"testuser\"\npassword = \"testpass\"\n\
+                 [turn.relay]\nmin_port = 49152\nmax_port = 49500\nmax_allocations = 16\n\
+                 [turn.nat_discovery]\nenabled = true\nprimary_ip = \"127.0.0.1\"\n\
+                 alternate_ip = \"127.0.0.2\"\nprimary_port = {p1}\nalternate_port = {p2}\n\
+                 [health]\nlisten = \"127.0.0.1:{health_port}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg(&cfg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let node = Node(cmd.spawn().expect("spawn node"));
+        let health: SocketAddr = format!("127.0.0.1:{health_port}").parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !http_ready(&health) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node with [turn.nat_discovery] did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let a1p1: SocketAddr = format!("127.0.0.1:{p1}").parse().unwrap();
+        let a2p2: SocketAddr = format!("127.0.0.2:{p2}").parse().unwrap();
+        let sock = bind_socket().await;
+        for (flags, want) in [
+            (0u8, a1p1),
+            (0x06, a2p2),
+            (0x04, format!("127.0.0.2:{p1}").parse().unwrap()),
+            (0x02, format!("127.0.0.1:{p2}").parse().unwrap()),
+        ] {
+            let mut m = TurnMsg::request(0x0001);
+            if flags != 0 {
+                m.add_attr(ATTR_CHANGE_REQUEST, &[0, 0, 0, flags]);
+            }
+            let (resp, from) = send_recv(&sock, a1p1, &m.encode(), 2000)
+                .await
+                .unwrap_or_else(|| panic!("no reply for flags {flags:#x}"));
+            assert!(is_success(&resp), "flags {flags:#x}");
+            assert_eq!(
+                from, want,
+                "flags {flags:#x}: reply came from the wrong socket"
+            );
+            assert_eq!(
+                attr(&resp, ATTR_RESPONSE_ORIGIN)
+                    .as_deref()
+                    .and_then(plain_addr),
+                Some(want)
+            );
+            assert_eq!(
+                attr(&resp, ATTR_OTHER_ADDRESS)
+                    .as_deref()
+                    .and_then(plain_addr),
+                Some(a2p2)
+            );
+        }
+
+        // The TURN listener itself still refuses CHANGE-REQUEST (RFC 5780 §6).
+        let turn: SocketAddr = format!("127.0.0.1:{turn_port}").parse().unwrap();
+        let mut m = TurnMsg::request(0x0001);
+        m.add_attr(ATTR_CHANGE_REQUEST, &[0, 0, 0, 0x06]);
+        let (resp, _) = send_recv(&sock, turn, &m.encode(), 2000)
+            .await
+            .expect("reply");
+        assert_eq!(extract_error_code(&resp).map(|(c, _)| c), Some(420));
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

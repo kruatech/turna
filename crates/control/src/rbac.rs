@@ -31,7 +31,7 @@
 //!
 //! An identity with no mapping gets nothing. That is the safe direction, and it
 //! means enabling RBAC on a running deployment locks out every existing client
-//! until they are mapped — so it is off unless `[management.rbac] enabled = true`,
+//! until they are mapped — so it is off unless `[grpc.rbac] enabled = true`,
 //! and the disabled path is a straight bypass rather than an implicit
 //! "everyone is admin" role. An implicit role would appear in audit entries as a
 //! real grant and be indistinguishable from a deliberate one.
@@ -286,7 +286,7 @@ impl RbacPolicy {
 
         if self.bindings.is_empty() {
             errors.push(
-                "[management.rbac] enabled = true with no bindings: every management \
+                "[grpc.rbac] enabled = true with no bindings: every management \
                  request would be denied. Add at least one binding, or disable RBAC."
                     .to_string(),
             );

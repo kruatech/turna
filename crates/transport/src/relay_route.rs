@@ -8,10 +8,11 @@
 //! NOT touch the socket — it forwards the send to the owner through the owner's
 //! command channel. The relay socket itself never moves.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -163,12 +164,12 @@ impl RelayRoutes {
         allocation_id: String,
     ) -> u64 {
         let generation = {
-            let mut g = self.gen.lock().unwrap();
+            let mut g = self.gen.lock();
             let e = g.entry(relay_port).or_insert(0);
             *e = e.wrapping_add(1);
             *e
         };
-        self.inner.lock().unwrap().insert(
+        self.inner.lock().insert(
             relay_port,
             RelayOwner {
                 worker_id,
@@ -185,7 +186,7 @@ impl RelayRoutes {
     /// mismatch (port already re-owned by a newer allocation) is left intact
     /// and counted.
     pub fn unregister_if(&self, relay_port: u16, allocation_id: &str, generation: u64) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock();
         match map.get(&relay_port) {
             Some(o) if o.allocation_id == allocation_id && o.generation == generation => {
                 map.remove(&relay_port);
@@ -201,7 +202,7 @@ impl RelayRoutes {
     }
 
     pub fn lookup(&self, relay_port: u16) -> Option<RelayOwner> {
-        self.inner.lock().unwrap().get(&relay_port).cloned()
+        self.inner.lock().get(&relay_port).cloned()
     }
 
     /// Snapshot the forwarding counters for metrics export. See

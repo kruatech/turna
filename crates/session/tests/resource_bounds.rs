@@ -1,11 +1,11 @@
 //! Resource verification tests
 //!
-//! Проверяет что все hard limits соблюдаются при любых входных данных:
-//! - AllocationStore не превышает max_allocations
+//! Checks that all hard limits hold for any input:
+//! - AllocationStore never exceeds max_allocations
 //! - max_per_user enforced
-//! - PortAllocator никогда не выходит за [min_port, max_port]
-//! - Port exhaustion возвращает Err, не паникует
-//! - Bandwidth window корректно сбрасывается
+//! - PortAllocator never goes outside [min_port, max_port]
+//! - Port exhaustion returns Err, does not panic
+//! - Bandwidth window resets correctly
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use turna_session::{AllocationStore, BandwidthQuota};
@@ -19,8 +19,8 @@ fn relay(port: u16) -> SocketAddr {
 
 // ── AllocationStore: max_allocations ─────────────────────────────────────────
 
-/// Создание сверх лимита должно вернуть Err, не паниковать.
-/// После отказа store.len() == max_allocations (не больше).
+/// Creating beyond the limit must return Err, not panic.
+/// After a rejection store.len() == max_allocations (no more).
 #[test]
 fn allocation_count_never_exceeds_max() {
     let max = 10usize;
@@ -45,12 +45,12 @@ fn allocation_count_never_exceeds_max() {
     assert!(store.len() <= max, "invariant: len <= max_allocations");
 }
 
-/// После cleanup_expired место освобождается и новые аллокации снова работают.
+/// After cleanup_expired, capacity is freed and new allocations work again.
 #[test]
 fn allocations_freed_after_cleanup() {
     let store = AllocationStore::new(49200, 49210, 5);
 
-    // Заполняем полностью
+    // Fill completely
     for i in 0..5u16 {
         store
             .create(client(2000 + i), relay(49200 + i), "u".into(), vec![], 0)
@@ -58,7 +58,7 @@ fn allocations_freed_after_cleanup() {
     }
     assert_eq!(store.len(), 5);
 
-    // lifetime=0 → сразу expired
+    // lifetime=0 → expired immediately
     store.cleanup_expired();
     assert_eq!(
         store.len(),
@@ -66,7 +66,7 @@ fn allocations_freed_after_cleanup() {
         "all zero-lifetime allocations should be cleaned"
     );
 
-    // Теперь можем создать снова
+    // Now we can create again
     store
         .create(client(3000), relay(49200), "u2".into(), vec![], 600)
         .expect("should succeed after cleanup");
@@ -82,7 +82,7 @@ fn per_user_limit_enforced() {
         max_per_user: 3,
     });
 
-    // 3 аллокации от одного пользователя — ок
+    // 3 allocations from one user — ok
     for i in 0..3u16 {
         store
             .create(
@@ -95,11 +95,11 @@ fn per_user_limit_enforced() {
             .expect("first 3 must succeed");
     }
 
-    // 4-я — должна упасть
+    // The 4th must fail
     let err = store.create(client(4003), relay(49303), "alice".into(), vec![], 600);
     assert!(err.is_err(), "4th allocation for same user must fail");
 
-    // Другой пользователь — может
+    // A different user can
     store
         .create(client(5000), relay(49304), "bob".into(), vec![], 600)
         .expect("different user must succeed");
@@ -161,11 +161,11 @@ fn bandwidth_quota_enforced() {
 
     let alloc = store.get(&client(9000)).unwrap();
 
-    // Добавляем 500 байт — ок
+    // Add 500 bytes — ok
     alloc.add_bytes(500);
     assert!(alloc.check_bandwidth(1000).is_ok());
 
-    // Добавляем ещё 600 — превышаем 1000
+    // Add another 600 — exceeds 1000
     alloc.add_bytes(600);
     assert!(
         alloc.check_bandwidth(1000).is_err(),
@@ -180,19 +180,19 @@ async fn dropped_writes_bounded_counter() {
     use tokio::sync::mpsc;
 
     let store = AllocationStore::new(53000, 53500, 10_000);
-    let (tx, _rx) = mpsc::channel(1); // capacity=1 — сразу переполняется
+    let (tx, _rx) = mpsc::channel(1); // capacity=1 — overflows immediately
     store.attach_writer(tx);
 
-    // Создаём много аллокаций — большинство WriteOp будут дропнуты
+    // Create many allocations — most WriteOps will be dropped
     for i in 0..20u16 {
         let _ = store.create(client(10000 + i), relay(53000 + i), "u".into(), vec![], 600);
     }
 
     let dropped = store.dropped_writes_count();
-    // Хотя бы часть дропнулась (channel size=1, 20 событий)
+    // At least some were dropped (channel size=1, 20 events)
     assert!(dropped >= 10, "expected significant drops, got {dropped}");
 
-    // Счётчик не должен уменьшаться
+    // The counter must not decrease
     let dropped2 = store.dropped_writes_count();
     assert!(
         dropped2 >= dropped,

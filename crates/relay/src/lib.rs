@@ -4,6 +4,7 @@
 //! - `RelayServer`: async, uses tokio Transport (all platforms)
 //! - `RelayHandler`: sync, implements `PacketHandler` for io_uring workers (Linux)
 
+pub mod nat_discovery;
 pub mod peer_filter;
 pub mod processor;
 pub mod server;
@@ -20,7 +21,7 @@ pub mod sctp_bridge;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod handler;
 
-pub use processor::{PacketProcessor, RateLimitSettings};
+pub use processor::{PacketProcessor, RateLimitSettings, UnauthReplyBudget};
 // Re-exported so a caller can build `RateLimitSettings` without taking a direct
 // dependency on turna-qos. The node does not depend on that crate today, and
 // adding one just to name a struct of five (burst, rate) pairs is not a trade

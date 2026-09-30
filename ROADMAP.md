@@ -1,6 +1,6 @@
 # Roadmap
 
-`turna` is Production GA (`0.3.0`). This roadmap is intentionally
+`turna` is Production GA (`0.5.0`). This roadmap is intentionally
 direction-only — no committed dates — and points to the living documents that
 track detail.
 
@@ -18,16 +18,16 @@ See first:
 These are the areas we want to harden, in rough priority order:
 
 1. **Stabilize the core path.** The tokio UDP datapath, TURN allocation
-   lifecycle, long-term/shared-secret and JWT auth, config validation, and
+   lifecycle, long-term/shared-secret auth, config validation, and
    graceful drain are the supported surface; keep them well-tested and stable.
 2. **Mature the alternative transports.** All are behind Cargo features. They
    are no longer one undifferentiated bucket:
-   - `tls` (TURNS, incl. RFC 6062 TCP relay) and `dtls` are **beta** — the
-     hardening is in source (per-IP and global limits, metrics, per-listener
-     readiness, cooperative drain, fail-fast startup, allocation release on
-     connection close). The remaining work is *evidence*: run
-     [docs/verification/encrypted-transports.md](docs/verification/encrypted-transports.md)
-     and record it, then they can be called supported.
+   - `tls` (TURNS) and `dtls` are **supported**: TURNS on three-engine browser
+     interop, a public certificate chain and a 24 h soak
+     ([docs/soak/endurance-24h-2026-08-22.md](docs/soak/endurance-24h-2026-08-22.md));
+     DTLS on OpenSSL/coturn interop and a 24 h soak of the shipped stack
+     ([docs/interop/dtls-stack-2026-09-16.md](docs/interop/dtls-stack-2026-09-16.md)).
+     RFC 6062 TCP relay remains **beta**, allowed in production, IPv4 only.
    - `quic` / `web-transport` are **supported** on Linux/macOS with tokio.
      Limits, per-stream replies and migration handling are implemented.
      Scope and evidence: [support record](docs/verification/quic-webtransport-supported-2026-09-18.md).
@@ -47,14 +47,13 @@ These are the areas we want to harden, in rough priority order:
      plaintext, UDP peer-side relay, kernel SCTP/IP protocol 132 required.
      Independent-client interoperability and multi-day endurance are not claimed.
 
-   Cross-cutting gaps that block *all* of the encrypted transports from
-   "supported": on the **default** DTLS path there is still no certificate
-   hot-reload and no handshake **rate** limit — both need to sit above
-   `webrtc-dtls`'s `accept()`, which is exactly what `[turn.dtls] demux = true`
-   does; that path has both, and is off by default only because it displaces the
-   one DTLS path with recorded verification. And no integration test covers
-   bidirectional media on any encrypted transport — only a STUN Binding test on
-   DTLS today.
+   Remaining cross-cutting gaps: the stock DTLS listener (`demux = false`) has
+   no certificate hot-reload and no handshake rate limit by construction — the
+   default path since 0.5.0 (`demux = true`) has both. DTLS end-to-end relay
+   across two hosts is untested. And no Rust integration test covers
+   bidirectional media on an encrypted transport — `tests/integration` has only
+   a STUN Binding test over DTLS; media coverage lives in the
+   `scripts/verify/` runs.
 
 3. **Finish OAuth verification before lifting its production gate.**
    RFC 7635 needs a real authorization-server interoperability run. RFC 6062
@@ -81,8 +80,8 @@ These are the areas we want to harden, in rough priority order:
    keeping the implemented-vs-not documentation current.
 6. **Supply-chain hardening for releases.** The release workflow already
    produces SBOMs, artifact checksums, cosign-signed images and SLSA
-   provenance, with its actions pinned by commit SHA. Remaining: extend the
-   same SHA-pinning and hardening discipline to the rest of the CI workflows.
+   provenance. Every workflow's actions are pinned by commit SHA. Remaining:
+   container image scanning.
 7. **Operability.** Clustering ergonomics, runbooks, and dashboards.
 
 ## Contributing to the roadmap
