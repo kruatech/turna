@@ -197,11 +197,11 @@ What is worth porting is any *business* deny/allow list specific to your network
 |---|---|---|---|
 | `verbose` | — | by design | log level is the `RUST_LOG` environment variable |
 | `Verbose` | — | by design | as `verbose` (`RUST_LOG=debug`) |
-| `no-stdout-log` | — | no equivalent | logs always go to stdout, for the init system to route <!-- parity-pr --> |
-| `log-file` | — | no equivalent | no log file; stdout only <!-- parity-pr --> |
-| `syslog` | `[turn.observability] syslog_endpoint` | by design | forwards **security events only** (auth failures, denials, rate-limit trips, audit entries) as RFC 5424 to `udp://` or `tcp://`; the general log does not go to syslog <!-- parity-pr --> |
-| `syslog-facility` | — | no equivalent | the facility of the security-event export is not configurable <!-- parity-pr --> |
-| `simple-log` | — | no equivalent | no log file to roll over <!-- parity-pr --> |
+| `no-stdout-log` | `[turn.observability] log_to_stdout` | key | `false` stops logging to stdout; validation refuses a configuration that logs nowhere |
+| `log-file` | `[turn.observability.log_file] path` | key | optional log file; rotation by `[turn.observability.log_file] rotation` (size, daily, hourly or external) with `[turn.observability.log_file] max_size_mb` and `[turn.observability.log_file] max_files`; SIGHUP reopens the file for logrotate (`deploy/logrotate/turna-node`) |
+| `syslog` | `[turn.observability.log_syslog] endpoint` | key | the full log to `/dev/log` or a remote syslog, filtered by `[turn.observability.log_syslog] level`. Separate from `[turn.observability] syslog_endpoint`, which forwards security events only (RFC 5424) |
+| `syslog-facility` | — | no equivalent | neither syslog output has a facility key |
+| `simple-log` | `[turn.observability.log_file] rotation` | key | `"external"` keeps one file name and leaves rotation to logrotate (SIGHUP reopens the file), which is what `simple-log` is for |
 | `log-min-level` | — | by design | `RUST_LOG` |
 | `new-log-timestamp` | — | by design | timestamps are always RFC 3339; `[turn.observability] json_logs = true` for structured output |
 | `new-log-timestamp-format` | — | no equivalent | the timestamp format is fixed |
@@ -209,7 +209,7 @@ What is worth porting is any *business* deny/allow list specific to your network
 | `prometheus` | `[health] listen` | by design | metrics are always on, at `/metrics` on the health listener |
 | `prometheus-port` | `[health] listen` | key | address and port in one value |
 | `prometheus-username-labels` | — | no equivalent | per-user traffic is not a metric label; gRPC `GetTopTalkers` answers the question at runtime |
-| `redis-statsdb` | — | no equivalent | no allocation-event or traffic accounting export; allocation state lives in the Tarantool backend when clustered <!-- parity-pr --> |
+| `redis-statsdb` | `[turn.accounting] enabled` | by design | no Redis; per-allocation usage records go to a JSON-lines file (`[turn.accounting.file] path`) and/or a webhook (`[turn.accounting.webhook] url`) |
 
 Tracing has no coturn counterpart: `[turn.observability] otlp_endpoint`,
 `trace_sample_rate`, `max_spans_per_second`.
@@ -259,7 +259,7 @@ Differences an operator comparing the two will ask about, as they stand on
 | IPv6 for RFC 6062 TCP relay | opt-in: `[turn.tcp_relay] allow_ipv6` together with `[turn] external_ip6`; without it a v6 TCP allocation answers 440. Not yet run on an IPv6 host |
 | Authentication through an external HTTP service | opt-in: `[turn.auth.webhook]` — a long-term USERNAME the local table lacks is looked up on an HTTPS endpoint of your service and cached; fails closed, with a per-source lookup budget. Contract in [auth-webhook.md](auth-webhook.md) |
 | Automatic banning of abusive sources | opt-in: `[turn.auto_ban]` — repeated auth failures behind a valid nonce, rate-limit violations or credential lookups ban the source (optionally its prefix) for a while; allowlisted addresses are exempt |
-| Distribution packages (deb/rpm) | not available; build from source and install the binary with `deploy/systemd`, or build the image from `deploy/Dockerfile` / use the Helm chart ([DEPLOY.md](DEPLOY.md)) <!-- parity-pr --> |
+| Distribution packages (deb/rpm) | built and attested on release (cargo-deb, cargo-generate-rpm); they install the binary and the unit but neither enables nor starts the service — see [DEPLOY.md](DEPLOY.md), "Installing from a .deb or .rpm" |
 
 ## Things that are not a translation
 

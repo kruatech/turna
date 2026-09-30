@@ -323,36 +323,43 @@ impl TurnCoreImpl {
     fn all_allocations(&self) -> Vec<AllocationInfo> {
         self.store
             .iter_all()
-            .map(|a| AllocationInfo {
-                id: a.relay_addr.to_string(),
-                username: a.username.clone(),
-                realm: a.realm.clone(),
-                client_address: a.client_addr,
-                relay_address: a.relay_addr,
-                created_at_ms: instant_to_ms(a.created_at),
-                expires_at_ms: instant_to_ms(a.expires_at),
-                transport: "UDP".into(),
-                address_family: if a.client_addr.is_ipv6() {
-                    "IPv6"
-                } else {
-                    "IPv4"
+            .map(|a| {
+                let usage = a.usage();
+                AllocationInfo {
+                    id: a.relay_addr.to_string(),
+                    username: a.username.clone(),
+                    realm: a.realm.clone(),
+                    client_address: a.client_addr,
+                    relay_address: a.relay_addr,
+                    created_at_ms: instant_to_ms(a.created_at),
+                    expires_at_ms: instant_to_ms(a.expires_at),
+                    transport: "UDP".into(),
+                    address_family: if a.client_addr.is_ipv6() {
+                        "IPv6"
+                    } else {
+                        "IPv4"
+                    }
+                    .into(),
+                    organization: None,
+                    // Split by direction since the store keeps the peer→client
+                    // share. `in` is client→peer, `out` is peer→client, matching
+                    // the proto's bytes_from_client / bytes_to_client. Until then
+                    // `in` carried both directions and `out` was always 0.
+                    bytes_in: usage.bytes_from_client,
+                    bytes_out: usage.bytes_to_client,
+                    packets_in: usage.packets_from_client,
+                    packets_out: usage.packets_to_client,
+                    permissions: a.permission_ips(),
+                    channels: a
+                        .channel_list()
+                        .into_iter()
+                        .map(|(num, peer, exp)| ChannelInfo {
+                            number: num,
+                            peer_addr: peer.to_string(),
+                            expires_at_ms: instant_to_ms(exp),
+                        })
+                        .collect(),
                 }
-                .into(),
-                organization: None,
-                bytes_in: a.bytes_relayed.load(Ordering::Relaxed),
-                bytes_out: 0,
-                packets_in: a.packets_relayed.load(Ordering::Relaxed),
-                packets_out: 0,
-                permissions: a.permission_ips(),
-                channels: a
-                    .channel_list()
-                    .into_iter()
-                    .map(|(num, peer, exp)| ChannelInfo {
-                        number: num,
-                        peer_addr: peer.to_string(),
-                        expires_at_ms: instant_to_ms(exp),
-                    })
-                    .collect(),
             })
             .collect()
     }

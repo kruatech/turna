@@ -1,0 +1,32 @@
+# logrotate policy for the turna node's log file.
+#
+# Pairs with:
+#
+#   [turn.observability.log_file]
+#   path     = "/var/log/turna/turna.log"
+#   rotation = "external"
+#
+# `external` means the node never rotates the file itself. logrotate renames it,
+# then SIGHUP makes the node reopen the path and start a fresh file. SIGHUP also
+# reloads shared secrets from the config file; that is idempotent, so a reload
+# with an unchanged config changes nothing (the node logs "shared secrets
+# republished" each time).
+#
+# Not needed with rotation = "size" / "daily" / "hourly", where the node rotates
+# and prunes on its own — running both would rotate twice.
+#
+# Install: cp deploy/logrotate/turna-node /etc/logrotate.d/turna-node
+/var/log/turna/turna.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    # The node creates the file 0640 on reopen; `create` would race it.
+    nocreate
+    sharedscripts
+    postrotate
+        systemctl kill --kill-whom=main --signal=HUP turna-node.service >/dev/null 2>&1 || true
+    endscript
+}

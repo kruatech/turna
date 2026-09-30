@@ -71,6 +71,33 @@ pub struct TelemetryConfig {
     /// the operator's trust boundary, a log shipper's retention is whatever it
     /// happens to be.
     pub redact_stdout_addresses: bool,
+    /// Write the log to stdout. True by default and in every release before
+    /// this key existed; false only makes sense with a file or syslog sink, and
+    /// the node's config validation refuses it otherwise.
+    pub log_to_stdout: bool,
+    /// Also write the log to a rotating file. `None` (the default) writes none.
+    pub log_file: Option<FileSink>,
+    /// Also send the log to syslog. `None` (the default) sends nothing beyond
+    /// the security events governed by `syslog_endpoint`.
+    pub log_syslog: Option<SyslogSink>,
+}
+
+/// `[turn.observability.log_file]`, as the telemetry layer needs it.
+#[derive(Debug, Clone)]
+pub struct FileSink {
+    pub file: crate::log_file::LogFileConfig,
+    /// Narrows what reaches the file. Applied after the global filter
+    /// (`RUST_LOG` / `log_filter`), so it can only remove lines, never add them.
+    pub level: tracing::level_filters::LevelFilter,
+}
+
+/// `[turn.observability.log_syslog]`, as the telemetry layer needs it.
+#[derive(Debug, Clone)]
+pub struct SyslogSink {
+    pub endpoint: String,
+    /// Narrows what is sent. Applied after the global filter, like `FileSink`.
+    pub level: tracing::level_filters::LevelFilter,
+    pub queue_capacity: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +126,9 @@ impl Default for TelemetryConfig {
             syslog_endpoint: String::new(),
             syslog_redact_addresses: false,
             redact_stdout_addresses: false,
+            log_to_stdout: true,
+            log_file: None,
+            log_syslog: None,
         }
     }
 }
@@ -302,27 +332,45 @@ where
     // has to be set before the subscriber is installed.
     crate::fmt_redact::set_redact_addresses(config.redact_stdout_addresses);
 
+    // Optional sinks, opened before the subscriber is built so that a sink that
+    // cannot be opened is an error returned from here — the caller decides what
+    // to do about it — rather than a layer that silently writes nowhere.
+    let log_file = match &config.log_file {
+        Some(sink) => {
+            let f = crate::log_file::LogFile::open(sink.file.clone()).map_err(|e| {
+                TelemetryError::Tracer(format!("log file {}: {e}", sink.file.path.display()))
+            })?;
+            Some((f, sink.level))
+        }
+        None => None,
+    };
+    let log_syslog = match &config.log_syslog {
+        Some(sink) => {
+            let layer =
+                crate::syslog_log::SyslogLogLayer::spawn(&crate::syslog_log::SyslogLogConfig {
+                    endpoint: sink.endpoint.clone(),
+                    app_name: config.service_name.clone(),
+                    queue_capacity: sink.queue_capacity,
+                })
+                .map_err(|e| TelemetryError::Tracer(e.to_string()))?;
+            Some((layer, sink.level))
+        }
+        None => None,
+    };
+
     macro_rules! try_init_with_fmt {
-        ($base:expr) => {
-            if config.json_logs {
-                $base
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .json()
-                            .fmt_fields(crate::fmt_redact::RedactingJsonFields),
-                    )
-                    .try_init()
-                    .map_err(|e| TelemetryError::Tracer(e.to_string()))
-            } else {
-                $base
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .fmt_fields(crate::fmt_redact::RedactingFields),
-                    )
-                    .try_init()
-                    .map_err(|e| TelemetryError::Tracer(e.to_string()))
-            }
-        };
+        ($base:expr) => {{
+            let sinks = sink_layers(
+                config.json_logs,
+                config.log_to_stdout,
+                log_file.clone(),
+                log_syslog.clone(),
+            );
+            $base
+                .with(sinks)
+                .try_init()
+                .map_err(|e| TelemetryError::Tracer(e.to_string()))
+        }};
     }
 
     // The security-event layer, added to whichever branch runs below.
@@ -354,6 +402,7 @@ where
             .with(filter)
             .with(syslog_layer.clone());
         try_init_with_fmt!(base)?;
+        mark_sinks_active(&log_file, &log_syslog);
     } else {
         // No log here: the subscriber is installed on the next line, and anything
         // emitted before it exists is discarded. This message used to live here
@@ -367,6 +416,7 @@ where
             .with(filter)
             .with(syslog_layer.clone());
         try_init_with_fmt!(base)?;
+        mark_sinks_active(&log_file, &log_syslog);
     }
 
     if !otlp_enabled {
@@ -388,6 +438,128 @@ where
     Ok(TelemetryGuard {
         provider: guard_provider,
     })
+}
+
+/// The output layers: stdout, and the optional file and syslog sinks.
+///
+/// Boxed into one `Vec` because each is optional and the file and stdout ones
+/// differ in type between text and JSON; a `Vec<Box<dyn Layer<S>>>` is the
+/// shape tracing-subscriber provides for exactly that. Every sink that renders
+/// fields does so through `fmt_redact`, so address and credential redaction is
+/// the same on all of them.
+///
+/// The per-sink levels are per-layer filters: they sit on top of the global
+/// `EnvFilter`, so they can narrow a sink but not widen it past `RUST_LOG`.
+fn sink_layers<S>(
+    json: bool,
+    stdout: bool,
+    file: Option<(
+        std::sync::Arc<crate::log_file::LogFile>,
+        tracing::level_filters::LevelFilter,
+    )>,
+    syslog: Option<(
+        crate::syslog_log::SyslogLogLayer,
+        tracing::level_filters::LevelFilter,
+    )>,
+) -> Vec<Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + 'static,
+{
+    use tracing_subscriber::Layer as _;
+    let mut out: Vec<Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>> = Vec::new();
+    if stdout {
+        if json {
+            out.push(Box::new(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .fmt_fields(crate::fmt_redact::RedactingJsonFields),
+            ));
+        } else {
+            out.push(Box::new(
+                tracing_subscriber::fmt::layer().fmt_fields(crate::fmt_redact::RedactingFields),
+            ));
+        }
+    }
+    if let Some((f, level)) = file {
+        let writer = crate::log_file::LogFileMakeWriter(f);
+        // No ANSI colour codes in a file: they are noise to every tool that
+        // reads it afterwards.
+        if json {
+            out.push(Box::new(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .fmt_fields(crate::fmt_redact::RedactingJsonFields)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .with_filter(level),
+            ));
+        } else {
+            out.push(Box::new(
+                tracing_subscriber::fmt::layer()
+                    .fmt_fields(crate::fmt_redact::RedactingFields)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .with_filter(level),
+            ));
+        }
+    }
+    if let Some((layer, level)) = syslog {
+        out.push(Box::new(layer.with_filter(level)));
+    }
+    out
+}
+
+/// Publish the sinks as active. Only after `try_init` succeeded: a sink opened
+/// for a subscriber that then failed to install writes nothing, and reporting it
+/// as active would hide exactly that.
+fn mark_sinks_active(
+    file: &Option<(
+        std::sync::Arc<crate::log_file::LogFile>,
+        tracing::level_filters::LevelFilter,
+    )>,
+    syslog: &Option<(
+        crate::syslog_log::SyslogLogLayer,
+        tracing::level_filters::LevelFilter,
+    )>,
+) {
+    if let Some((f, _)) = file {
+        crate::log_file::set_active(f.clone());
+    }
+    if let Some((l, _)) = syslog {
+        crate::syslog_log::set_active(l.stats().clone());
+    }
+}
+
+/// Counters for the optional log sinks, for the node to mirror into metrics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogSinkStats {
+    pub file_rotations: u64,
+    pub file_write_errors: u64,
+    pub file_rotation_errors: u64,
+    pub syslog_sent: u64,
+    pub syslog_dropped: u64,
+}
+
+/// Current [`LogSinkStats`]. All zero when no optional sink is configured.
+pub fn log_sink_stats() -> LogSinkStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (file_rotations, file_write_errors, file_rotation_errors) = crate::log_file::active()
+        .map(|f| {
+            (
+                f.rotations.load(Relaxed),
+                f.write_errors.load(Relaxed),
+                f.rotation_errors.load(Relaxed),
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    let (syslog_sent, syslog_dropped) = crate::syslog_log::stats().unwrap_or((0, 0));
+    LogSinkStats {
+        file_rotations,
+        file_write_errors,
+        file_rotation_errors,
+        syslog_sent,
+        syslog_dropped,
+    }
 }
 
 /// Build a `tracing_opentelemetry` layer backed by an OTLP gRPC exporter.
