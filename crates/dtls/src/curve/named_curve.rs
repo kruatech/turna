@@ -1,4 +1,8 @@
-use rand_core::OsRng; // requires 'getrandom' feature
+// The curve crates (p256/p384 0.13, x25519-dalek 2) take a rand_core 0.6 RNG, so
+// OsRng comes from the rand_core they re-export rather than a separate direct
+// dependency whose major could drift from theirs. `getrandom` is enabled through
+// p256's default `std` feature (elliptic-curve/std -> rand_core/std).
+use p256::elliptic_curve::rand_core::OsRng;
 
 use crate::error::*;
 
