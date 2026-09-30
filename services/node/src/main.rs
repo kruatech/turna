@@ -3248,8 +3248,11 @@ fn print_dumped_config(cfg: &TurnaConfig, mode: DumpMode) {
         println!("[turn.auth.webhook]");
         println!("enabled           = true");
         println!("url               = \"{}\"", mask_uri_credentials(&w.url));
-        println!("bearer_token      = \"{}\"", mask(&w.bearer_token));
-        println!("signing_secret    = \"{}\"", mask(&w.signing_secret));
+        println!("bearer_token      = \"{}\"", redact_secret(&w.bearer_token));
+        println!(
+            "signing_secret    = \"{}\"",
+            redact_secret(&w.signing_secret)
+        );
         println!("ca_file           = \"{}\"", w.ca_file);
         println!("timeout_ms        = {}", w.timeout_ms);
         println!("max_concurrency   = {}", w.max_concurrency);
