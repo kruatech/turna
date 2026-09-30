@@ -50,8 +50,8 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `listening-device` | — | no equivalent | no `SO_BINDTODEVICE`; bind by address with `[turn] listen` |
 | `listening-port` | `[turn] listen` | key | address and port are one value, e.g. `"0.0.0.0:3478"`. UDP; plain TCP on the same port is the opt-in `[turn.tcp] listen` — see `no-tcp` |
 | `tls-listening-port` | `[tls] listen` | key | plus `[tls] enabled = true`. `tls` is a default feature of `turna-node`, so a standard build has it |
-| `alt-listening-port` | — | no equivalent | the alternate port exists for RFC 5780, which turna does not implement <!-- parity-pr --> |
-| `alt-tls-listening-port` | — | no equivalent | as `alt-listening-port` <!-- parity-pr --> |
+| `alt-listening-port` | `[turn.nat_discovery] alternate_port` | key | RFC 5780 only: the second port of the four discovery sockets (`[turn.nat_discovery] primary_ip` / `[turn.nat_discovery] alternate_ip` × `[turn.nat_discovery] primary_port` / `[turn.nat_discovery] alternate_port`), separate from `[turn] listen`. Off by default |
+| `alt-tls-listening-port` | — | no equivalent | RFC 5780 discovery is UDP only (`[turn.nat_discovery] enabled`); there is no alternate TLS port |
 | `tcp-proxy-port` | `[turn.tcp] proxy_protocol`, `[tls] proxy_protocol` | key | not a separate port: PROXY protocol v1/v2 is switched on per listener and honoured only from `[turn.tcp] proxy_protocol_trusted_cidrs` / `[tls] proxy_protocol_trusted_cidrs`; any other source is closed |
 | `listening-ip` | `[turn] listen`, `[turn] listen_extra` | key | the first address is `[turn] listen`; further `listening-ip` lines go in `[turn] listen_extra` (UDP, tokio datapath only, refused together with `[turn.migration] enabled`). Relayed data leaves from the listener the client used |
 | `aux-server` | — | no equivalent | one UDP listener per process |
@@ -81,7 +81,7 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `multiplex-peer-port` | — | no equivalent | as `multiplex-peer` |
 | `multiplex-peer-max-peers` | — | no equivalent | as `multiplex-peer` |
 | `no-udp-relay` | — | no equivalent | UDP relaying is always available |
-| `no-tcp-relay` | `[turn.tcp_relay] enabled` | key | `false` (no TCP relay) is the default. RFC 6062 is beta, needs `[tls]` or `[turn.tcp]` as the control listener, IPv4 only — see [below](#things-that-are-not-a-translation) |
+| `no-tcp-relay` | `[turn.tcp_relay] enabled` | key | `false` (no TCP relay) is the default. RFC 6062 is beta, needs `[tls]` or `[turn.tcp]` as the control listener, IPv4 by default (IPv6 opt-in: `[turn.tcp_relay] allow_ipv6`) — see [below](#things-that-are-not-a-translation) |
 | `server-relay` | — | no equivalent | the permission check on relayed packets cannot be switched off |
 | `ne` | — | by design | coturn ignores it too |
 | `keep-address-family` | — | by design | the relayed family follows REQUESTED-ADDRESS-FAMILY (RFC 6156), never the client's transport family |
@@ -136,7 +136,7 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `no-stun` | — | no equivalent | Binding cannot be switched off |
 | `no-software-attribute` | `[turn] software_attribute` | key | `"none"`. The default `"product"` sends `turna` without a version; `"full"` is refused under `production = true` |
 | `mobility` | `[turn.migration] enabled` | key | RFC 8016; `ticket_secret` must be stable across restarts and nodes |
-| `rfc5780` | — | no equivalent | RFC 5780 NAT behaviour discovery is not implemented <!-- parity-pr --> |
+| `rfc5780` | `[turn.nat_discovery] enabled` | key | opt-in, UDP only; needs two addresses of one family on this host (`[turn.nat_discovery] primary_ip`, `[turn.nat_discovery] alternate_ip`). CHANGE-REQUEST is answered on the four discovery sockets only; the TURN listener keeps answering it with 420 |
 | `stun-backward-compatibility` | — | no equivalent | Binding responses carry XOR-MAPPED-ADDRESS only, never MAPPED-ADDRESS |
 | `rfc3489-compatibility` | — | no equivalent | a request without the magic cookie is not STUN to turna |
 | `rfc5766-channel-numbers` | — | by design | always accepted: turna takes channel numbers `0x4000`–`0x7FFE`, including the `0x5000`+ range RFC 8656 reserves ([COMPLIANCE.md](COMPLIANCE.md)) |
@@ -254,9 +254,9 @@ Differences an operator comparing the two will ask about, as they stand on
 
 | Feature | turna today |
 |---|---|
-| USERHASH (RFC 8489 §14.4) | not implemented; a request carrying it is answered 420, as for any unknown comprehension-required attribute <!-- parity-pr --> |
+| USERHASH (RFC 8489 §14.4) | supported for long-term users (static, runtime-added, Tarantool-stored); TURN REST and OAuth realms answer 401, since a hash of an ephemeral username cannot be resolved. Advertising it in the nonce is opt-in: `[turn.auth] advertise_userhash` |
 | ADDITIONAL-ADDRESS-FAMILY (one Allocate, both families) | not implemented — blocked on a storage decision, [design/additional-address-family.md](design/additional-address-family.md) <!-- parity-pr --> |
-| IPv6 for RFC 6062 TCP relay | not implemented; a v6 TCP allocation answers 440 <!-- parity-pr --> |
+| IPv6 for RFC 6062 TCP relay | opt-in: `[turn.tcp_relay] allow_ipv6` together with `[turn] external_ip6`; without it a v6 TCP allocation answers 440. Not yet run on an IPv6 host |
 | Authentication through an external HTTP service | not available; users come from config, the REST secret or the Tarantool backend <!-- parity-pr --> |
 | Automatic banning of abusive sources | not available; the per-source rate limits refuse, they do not ban <!-- parity-pr --> |
 | Distribution packages (deb/rpm) | not available; build from source and install the binary with `deploy/systemd`, or build the image from `deploy/Dockerfile` / use the Helm chart ([DEPLOY.md](DEPLOY.md)) <!-- parity-pr --> |
@@ -277,7 +277,8 @@ coturn's own client put the missing evidence on record
 (`docs/interop/coturn-2026-08-23.md`); it is allowed now. Two conditions: a TCP control
 listener must be enabled — `[tls]` (TURNS) or the opt-in plain `[turn.tcp]` —
 because RFC 6062's control connection runs over it (validation refuses
-`[turn.tcp_relay]` without one under `production = true`); and it is IPv4 only. Size for it first — a listener and a
+`[turn.tcp_relay]` without one under `production = true`); and it is IPv4 unless
+`[turn.tcp_relay] allow_ipv6` is set together with `[turn] external_ip6`. Size for it first — a listener and a
 connection per relayed peer is a different profile from UDP relaying.
 
 **io_uring / AF_XDP.** Migrate on `transport = "tokio"` first and evaluate
