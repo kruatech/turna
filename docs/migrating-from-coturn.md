@@ -97,9 +97,9 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `static-auth-secret` | `[turn.auth] shared_secret` | key | file or env form: `"file:///run/secrets/turn"` or `"${TURNA_SHARED_SECRET}"`. Several coturn secrets: turna takes two — the current one and `[turn.auth] previous_shared_secret` for a rotation, reloaded on `SIGHUP`. Expiry is checked with `credential_clock_skew_secs` of grace |
 | `rest-api-separator` | — | by design | fixed: the first `:` separates expiry from user id |
 | `server-name` | `[turn.auth.oauth] server_name` | key | used, as in coturn, for OAuth (the AEAD associated data) |
-| `oauth` | `[turn.auth.oauth] enabled` | key | implemented including `kid` key selection (`[[turn.auth.oauth.keys]]`, `strict_kid`) and the RFC 7635 §6.1 lifetime cap, **but `config::validate()` refuses it under `production = true`** pending interop against a real Authorization Server. Keys come from config, not a database |
+| `oauth` | `[turn.auth.oauth] enabled` | key | implemented including `kid` key selection (`[[turn.auth.oauth.keys]]`, `strict_kid`) and the RFC 7635 §6.1 lifetime cap, **but `config::validate()` refuses it under `production = true`** pending interop against a real Authorization Server ([verification kit](runbooks/oauth-verification.md)). Keys come from config, not a database |
 | `user` | `[[turn.auth.static_users]]` `username` / `password` | key | plaintext password only; coturn's `0x…` pre-hashed key form has no equivalent. At runtime: gRPC `AddUser` / `turnactl user add` (needs the Tarantool backend) |
-| `userdb` | — | by design | no SQLite; runtime users live in the Tarantool backend (`[cluster.backend]`), which stores pre-derived keys, never a password |
+| `userdb` | — | by design | no SQLite; runtime users live in the Tarantool backend (`[cluster.backend]`), which stores pre-derived keys, never a password — or are read per request from your service through `[turn.auth.webhook]`, which can serve the HMAC keys coturn already stores, unchanged ([auth-webhook.md](auth-webhook.md)) |
 | `psql-userdb` | — | by design | as `userdb` |
 | `mysql-userdb` | — | by design | as `userdb` |
 | `mongo-userdb` | — | by design | as `userdb` |
@@ -110,7 +110,7 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `stateless-nonce` | — | by design | nonces are always stateless: an HMAC over client address and issue time under a per-process key |
 | `stateless-nonce-secret` | — | by design | the key is generated per process and not configurable; after a restart clients take one extra 401/438 |
 | `stale-nonce` | — | by design | nonce lifetime fixed at 630 s |
-| `secure-stun` | — | no equivalent | Binding is always answered without credentials (within the per-source budget); MESSAGE-INTEGRITY is verified when present |
+| `secure-stun` | `[turn.auth] require_binding_auth` | key | `true`: an anonymous Binding gets a 401; an authenticated one needs a valid NONCE and gets a signed response. Same caveat as coturn: browsers send an unauthenticated Binding to learn their reflexive address, so leave it off on a node that is also their STUN server |
 
 ### Quotas, lifetimes and rate limits
 
@@ -119,7 +119,7 @@ translation. [CONFIGURATION.md](CONFIGURATION.md) documents every key.
 | `user-quota` | `[turn.relay.quota] max_per_user` | key | concurrent allocations per username. **Default 100** (coturn: 0 = unlimited); 0 is unlimited here too. Runtime: gRPC `SetUserLimits` |
 | `total-quota` | `[turn.relay] max_allocations` | key | must not exceed the number of ports in the relay range — validation refuses it |
 | `max-bps` | `[turn.relay.quota] max_bytes_per_sec_per_allocation` | key | bytes/second per allocation; coturn counts each direction separately, so check [CONFIGURATION.md](CONFIGURATION.md) before reusing a number. `0` (unlimited) is refused under `production = true` unless `allow_unlimited_bandwidth = true` |
-| `bps-capacity` | — | no equivalent | `[turn.relay] max_packets_per_sec` is a capacity figure for reporting (`/capacity`), not an enforced ceiling |
+| `bps-capacity` | `[turn.relay] max_total_bytes_per_sec` | key | bytes/second, both directions combined; `0` (default) is no cap. **Different mechanism**: coturn reserves bandwidth per session and refuses new sessions when it is used up; turna drops relayed packets once the node-wide bucket is empty, so existing calls degrade together. RFC 6062 TCP-relay data is not counted |
 | `max-allocate-lifetime` | — | no equivalent | no config key: the ceiling is fixed at 3600 s (`turn::MAX_LIFETIME`). A lower global, per-tenant or per-user cap is `max_lifetime_secs` in gRPC `SetUserLimits` |
 | `channel-lifetime` | — | by design | fixed at 600 s (RFC 8656) |
 | `permission-lifetime` | — | by design | fixed at 300 s (RFC 8656) |
@@ -257,8 +257,8 @@ Differences an operator comparing the two will ask about, as they stand on
 | USERHASH (RFC 8489 §14.4) | supported for long-term users (static, runtime-added, Tarantool-stored); TURN REST and OAuth realms answer 401, since a hash of an ephemeral username cannot be resolved. Advertising it in the nonce is opt-in: `[turn.auth] advertise_userhash` |
 | ADDITIONAL-ADDRESS-FAMILY (one Allocate, both families) | not implemented — blocked on a storage decision, [design/additional-address-family.md](design/additional-address-family.md) <!-- parity-pr --> |
 | IPv6 for RFC 6062 TCP relay | opt-in: `[turn.tcp_relay] allow_ipv6` together with `[turn] external_ip6`; without it a v6 TCP allocation answers 440. Not yet run on an IPv6 host |
-| Authentication through an external HTTP service | not available; users come from config, the REST secret or the Tarantool backend <!-- parity-pr --> |
-| Automatic banning of abusive sources | not available; the per-source rate limits refuse, they do not ban <!-- parity-pr --> |
+| Authentication through an external HTTP service | opt-in: `[turn.auth.webhook]` — a long-term USERNAME the local table lacks is looked up on an HTTPS endpoint of your service and cached; fails closed, with a per-source lookup budget. Contract in [auth-webhook.md](auth-webhook.md) |
+| Automatic banning of abusive sources | opt-in: `[turn.auto_ban]` — repeated auth failures behind a valid nonce, rate-limit violations or credential lookups ban the source (optionally its prefix) for a while; allowlisted addresses are exempt |
 | Distribution packages (deb/rpm) | not available; build from source and install the binary with `deploy/systemd`, or build the image from `deploy/Dockerfile` / use the Helm chart ([DEPLOY.md](DEPLOY.md)) <!-- parity-pr --> |
 
 ## Things that are not a translation
