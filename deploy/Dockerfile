@@ -42,7 +42,7 @@ RUN cargo build --locked --release --features tls \
 # =============================================================================
 # Stage 2: Runtime
 # =============================================================================
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 # Pinned non-root UID/GID so the Helm chart can set
 # runAsUser/runAsGroup/fsGroup to a known value (65532, the conventional
