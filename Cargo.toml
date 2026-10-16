@@ -80,7 +80,7 @@ toml = "1.1"
 # STUN/TURN cryptography (RFC 5389/5766: long-term credentials)
 hmac = "0.12"
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 md5 = "0.8"
 crc = "3"
 rand = "0.10"
