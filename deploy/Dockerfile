@@ -18,7 +18,7 @@
 # on every build, and the image and CI compiled with different compilers. Lowered
 # rather than raising the pin because the version appears in eight places in
 # .github/workflows/ci.yml plus the msrv job's name.
-FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     cmake \
